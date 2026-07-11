@@ -1,0 +1,91 @@
+# BiliBot .gitignore
+
+# Config & secrets
+config.yaml
+config.local.yaml
+standalone/config.yaml
+demo_video_config.yaml
+demo_video_config.example.yaml
+*.env
+.env
+
+# Non-project and runtime data
+data/
+standalone/data/
+demo/
+clipped/
+.hermes/
+
+# Runtime files
+*.db
+*.db-shm
+*.db-wal
+*.pid
+*.mp4
+*.m4s
+*.flv
+*.webm
+*.wav
+*.mp3
+video_temp/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+.venv-*/
+venv/
+env/
+ENV/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Build
+dist/
+build/
+*.egg-info/
+wheels/
+
+# Temp
+tmp/
+temp/
+.tmp/
+
+# TRAE IDE
+.trae/
+
+# Diagnostic scripts
+scripts/diag_*.py
+scripts/diagnose_web.py
+scripts/smoke_start_server.py
+
+# Test screenshots
+tests/screenshots/
+
+# Design source (Figma export)
+bilibot-console/
+
+# Test results
+test_results.txt

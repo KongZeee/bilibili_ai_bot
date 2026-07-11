@@ -1,0 +1,392 @@
+# BiliBot Standalone Configuration
+# 复制为 config.yaml 并填写实际值
+#
+# ═══ V2 多账号/多 LLM 架构（推荐） ═══
+# 使用 llm_providers + accounts 列表可同时登录多个 B站账号，
+# 每个账号绑定独立人格和 LLM。上面的 bilibili / llm 为 V1 兼容配置，
+# 单账号时仍可直接使用（自动迁移为 default 账号/provider）。
+#
+# ── V2: 多 LLM Provider ──
+llm_providers:
+  - id: siliconflow
+    name: 硅基流动
+    api_key: ""
+    base_url: "https://api.siliconflow.cn/v1"
+    model: "Qwen/Qwen2.5-72B-Instruct"
+    max_tokens: 1024
+    temperature: 0.8
+    enabled: true
+    # 视觉模型（可选）
+    vision:
+      enabled: false
+      api_key: ""
+      base_url: "https://api.siliconflow.cn/v1"
+      model: ""
+    # Embedding 模型（可选）
+    embedding:
+      enabled: false
+      api_key: ""
+      base_url: "https://api.siliconflow.cn/v1"
+      model: "BAAI/bge-m3"
+  # 可添加更多 Provider：
+  # - id: openai
+  #   name: OpenAI
+  #   api_key: ""
+  #   base_url: "https://api.openai.com/v1"
+  #   model: "gpt-4o"
+
+default_llm: siliconflow
+
+# PRD-V5 §5.3 LLM-501：生产模式不允许 LLM 静默回退
+# false（默认）：账号配置的 llm_id 不可用时，不回退到默认，账号标记为 degraded
+# true：账号配置的 llm_id 不可用时，回退到 default_llm 并记录告警
+allow_llm_fallback: false
+
+# ── V2: 多账号 ──
+
+# 人格配置组（profile）：一组人格的集合，账号可引用一个 profile
+# 参考 AstrBot 的多配置文件设计：一个 profile 类似一个 abconf_，含默认人格 + 可用人格池
+# 账号可通过 profile_id 引用 profile，运行时可在 profile.personas 中切换激活人格
+profiles:
+  - id: default
+    name: 默认人格组
+    default_persona: default       # 主人格 ID（账号激活时默认使用）
+    personas:                       # 该 profile 可用的所有人格 ID 列表
+      - default
+    # 可添加更多人格组：
+    # - id: multi_style
+    #   name: 多风格切换
+    #   default_persona: tech_persona
+    #   personas: [tech_persona, casual_persona, gamer_persona]
+
+accounts:
+  - id: main
+    name: 主账号
+    sessdata: ""
+    bili_jct: ""
+    dede_user_id: ""
+    buvid3: ""
+    refresh_token: ""
+    profile_id: default            # 引用人格组（优先于 persona_id）
+    persona_id: default            # 向后兼容：未配 profile_id 时使用单个人格
+    llm_id: siliconflow             # 绑定的 LLM Provider ID（留空用默认）
+    enabled: true
+  # 可添加更多账号：
+  # - id: sub
+  #   name: 小号
+  #   sessdata: ""
+  #   bili_jct: ""
+  #   dede_user_id: ""
+  #   profile_id: multi_style      # 引用多风格 profile，运行时可切换人格
+  #   llm_id: openai
+  #   enabled: true
+
+default_account: main
+
+# ═══ V1 兼容配置（单账号时可用，V2 已配置则忽略） ═══
+
+# ── B站账号（V1） ──
+bilibili:
+  sessdata: ""
+  bili_jct: ""
+  dede_user_id: ""
+  buvid3: ""
+  qrcode_login:
+    enabled: false
+
+# ── LLM 配置（V1） ──
+llm:
+  api_key: ""
+  base_url: "https://api.siliconflow.cn/v1"
+  model: "Qwen/Qwen2.5-72B-Instruct"
+  max_tokens: 1024
+  temperature: 0.8
+  vision:
+    enabled: false
+    api_key: ""
+    base_url: "https://api.siliconflow.cn/v1"
+    model: ""
+  embedding:
+    enabled: false
+    api_key: ""
+    base_url: "https://api.siliconflow.cn/v1"
+    model: "BAAI/bge-m3"
+
+# ── 联网搜索 ──
+web_search:
+  enabled: false
+  backend: "tavily"  # tavily / perplexity / bocha / custom
+  api_key: ""
+  api_base: ""  # custom 后端时需要
+  model: ""  # perplexity/custom 时需要
+  max_results: 5
+  # PRD V4 SEA-006：每账号日预算
+  daily_budget_per_account: 100
+  # PRD-V5 §10.2 SEA-502：Custom 后端显式声明是否具备联网搜索能力
+  # true=显式支持（直接作为搜索后端）；false=显式不支持；留空=运行时能力探测
+  # 普通 Chat Completions（无联网能力）不可标记为已联网搜索
+  supports_web_search: true
+  # PRD-V5 §10.1 SEA-502：429/5xx/网络错误指数退避（受 TaskRun 超时控制）
+  retry:
+    base_delay: 1.0      # 基础延迟（秒）
+    factor: 2.0          # 退避因子
+    max_delay: 60.0      # 最大延迟（秒）
+    max_attempts: 3      # 最大重试次数（不含首次）
+  # PRD V4 SEA-002：场景级开关矩阵
+  scenes:
+    reply_comment: { enabled: true }
+    private_message: { enabled: false, redact_query: true }
+    proactive_video: { enabled: true }
+    dynamic_post: { enabled: false }
+    weekly_summary: { enabled: false }
+  # PRD V4 SEA-006：按 freshness 差异化缓存 TTL
+  cache:
+    realtime_ttl_seconds: 300   # 5 分钟：新闻、热点
+    daily_ttl_seconds: 1800     # 30 分钟：一般信息
+    stable_ttl_seconds: 86400   # 24 小时：百科、历史
+
+# ── Bot 人格 ──
+personality:
+  # 主人UID (特殊对待)
+  owner_mid: ""
+  owner_name: "主人"
+
+  # 是否启用心情系统
+  enable_mood: true
+
+  # 人格库通过 Web 面板管理（PRD §5.3），不再在此处配置 prompt
+
+# ── 功能开关（PRD §5.2 集中管理）──
+features:
+  reply_comment: true        # 评论回复
+  private_message: false     # 私信
+  proactive_video: true      # 主动看视频
+  proactive_comment: true    # 主动评论
+  dynamic_post: true         # 动态发布
+  bangumi: false             # 番剧追更
+  weekly_summary: true       # 周总结
+  web_search: false          # 联网搜索
+  affection: true            # 好感度系统
+  mood: true                 # 心情系统
+
+# ── 动态发布（PRD §5.2 / §5.6）──
+dynamic_publish:
+  # 主题池（留空则由 Bot 自由发挥）
+  topics: []
+  # 是否配图（需要 image_generation.enabled 同时开启）
+  with_image: false
+  # 发布前是否需要 Web 审核
+  review_before_publish: false
+  # 草稿过期时间（秒），过期后自动标记 expired，永不发布
+  draft_expiry_seconds: 86400
+
+# ── 互动决策预算（PRD V4 §8.7 VID-006 / §10.2 COM-002）──
+# 模型只输出建议，最终决策由确定性 PolicyEngine 执行
+# LLM 失败时所有有副作用动作默认为 false
+interactions:
+  like:
+    enabled: false
+    max_per_day: 10
+    score_threshold: 6
+  coin:
+    enabled: false
+    max_per_day: 0
+    max_per_video: 1
+    score_threshold: 8
+  favorite:
+    enabled: false
+    max_per_day: 5
+    score_threshold: 8
+  comment:
+    enabled: true
+    max_per_day: 10
+    score_threshold: 7
+
+# ── 文生图（动态配图） ──
+image_generation:
+  # 启用文生图（agnes-ai / OpenAI 兼容 images/generations API）
+  enabled: false
+  # API Key
+  api_key: ""
+  # API Base URL
+  base_url: "https://apihub.agnes-ai.com/v1"
+  # 模型名称
+  model: "agnes-image-2.1-flash"
+  # 默认图片尺寸
+  default_size: "1024x768"
+  # 超时（秒）
+  timeout: 120
+
+# ── 安全与审核（PRD §5.9 / SAFE-501 账号级隔离）──
+safety:
+  # 发布频率限制（SAFE-501：account_id+scene 隔离，账号间互不抢占配额）
+  rate_limit:
+    enabled: true
+    per_minute: 5          # 每账号+场景：每分钟上限
+    per_hour: 50           # 每账号+场景：每小时上限
+    per_day: 200           # 每账号+场景：每天上限
+    global_quota: 1000     # 全局日配额：所有账号+场景合计上限
+  # 发布前内容检查
+  # content_check_enabled=false 时仅跳过可选内容规则（敏感词/重复度/人格），
+  # 不跳过：全局暂停、账号风险暂停、硬性长度限制
+  content_check_enabled: true
+  min_content_length: 2
+  max_content_length: 2000
+  # 重复度检查（SAFE-501：按 account_id 隔离存储）
+  duplicate_check:
+    enabled: true
+    window_size: 10              # 每账号保留的最近内容条数
+    similarity_threshold: 0.8    # 0-1，相似度 >= 该值视为重复
+
+# ── 主动行为 ──
+proactive:
+  # 主动看视频次数/天
+  video_count: 2
+  # PRD 5.1：video_times 已废弃，实际由 video_count 随机生成时间
+
+  # 发动态次数/天
+  dynamic_count: 1
+  # PRD 5.1：dynamic_times 已废弃，实际由 dynamic_count 随机生成时间
+
+  # PRD 6.2：兴趣关键词（用于主动视频推荐筛选）
+  interest_keywords: ["科技", "AI", "编程", "游戏", "音乐"]
+
+  # PRD 4.17：bangumi/special_follow 在 config_loader 中为 bool 类型，
+  # V2 未实现番剧追更/特别关注，保持 false（旧版对象式配置已清理）
+  bangumi: false
+  special_follow: false
+
+  # PRD-V5 §7 / TASK-501：TaskRun 持久化生命周期配置
+  # 默认迟到窗口（秒）：scheduled_at + grace_window 内仍可 claim，超过则 expired
+  grace_window_seconds: 900  # 15 分钟
+  # 场景级配置（覆盖默认 grace_window_seconds / max_attempts）
+  scenes:
+    proactive_video:
+      grace_window_seconds: 900
+      max_attempts: 3
+    dynamic:
+      grace_window_seconds: 900
+      max_attempts: 3
+    weekly_summary:
+      grace_window_seconds: 3600  # 周总结 1 小时窗口
+      max_attempts: 1
+    proactive_comment:
+      grace_window_seconds: 900
+      max_attempts: 3
+
+# ── 评论回复 ──
+reply:
+  # 是否启用自动回复评论
+  auto_reply: true
+  # 回复过滤关键词
+  block_keywords: ["傻逼", "草泥马", "滚", "死", "废物", "智障", "脑残"]
+  # 最小评论长度才回复
+  min_comment_length: 2
+  # 是否回复自己的评论
+  reply_own: false
+
+# ── 视频分析（视听双轨理解） ──
+video_analysis:
+  # 启用视频下载 + 视听双轨分析（需要 ffmpeg）
+  enabled: false
+  # PRD-V5 §8.2 VID-503：资源边界配置
+  # 视频时长上限（秒），超过则降级为元数据分析
+  max_duration_seconds: 600
+  # 下载字节数上限（200MB），超过则中止下载并清理
+  max_download_bytes: 209715200
+  # 全局并发上限（所有账号合计）
+  max_concurrent_global: 1
+  # 单账号并发上限
+  max_concurrent_per_account: 1
+  # 下载超时（秒）
+  download_timeout_seconds: 90
+  # 预处理超时（秒）
+  preprocess_timeout_seconds: 180
+  # 分析超时（秒）
+  analysis_timeout_seconds: 600
+  # 本地 Whisper ASR 开关（默认关闭，开启时用独立工作池）
+  local_whisper_enabled: false
+  # 本地 Whisper 工作池大小
+  max_local_whisper_workers: 1
+  # 临时磁盘配额（1GB），可用空间不足则降级
+  temp_disk_quota_bytes: 1073741824
+  # 抽帧策略: katna / scenedetect / ffmpeg
+  # - katna: 基于传统图像处理的关键帧提取（短视频推荐）
+  # - scenedetect: 基于内容检测的镜头边界提取（更智能）
+  # - ffmpeg: 等间隔抽帧（兜底，无需额外依赖）
+  frame_extractor: "ffmpeg"
+  # scenedetect 阈值（越小越敏感）
+  scenedetect_threshold: 27.0
+  # 关键帧图片最大边长（像素），用于缩放后送 Vision
+  image_max_size: 768
+  # Vision 并发滑动窗口容量
+  vision_window_size: 5
+  # ASR 配置（语音转文字）
+  asr:
+    # 方式1：OpenAI 兼容 ASR API（配置 model 后生效，推荐）
+    model: ""           # 例如 mimo-v2.5-asr
+    api_key: ""         # 留空则回退到主 LLM 的 api_key
+    base_url: ""        # 留空则回退到主 LLM 的 base_url
+    # 方式2：本地 faster-whisper（model 为空时生效，需 local_whisper_enabled=true）
+    whisper_model_size: "base"    # tiny/base/small/medium/large-v3
+    whisper_device: "cpu"         # cpu/cuda/directml
+    whisper_compute_type: "int8"
+  # 临时目录（留空则用 {data_dir}/video_temp）
+  temp_dir: ""
+
+# ── 记忆系统 ──
+memory:
+  # PRD 6.1：记忆容量上限
+  max_today: 50           # today 级别上限
+  max_recent: 200          # recent 级别上限
+  max_long_term: 1000      # long_term 级别上限
+  enable_forgetting: true  # 启用遗忘
+  forgetting_score: 3     # 遗忘阈值
+  # 评论线压缩阈值
+  thread_compress_threshold: 8
+  # 评论区压缩阈值
+  oid_compress_threshold: 20
+  # OID保留最近条数
+  oid_keep_recent: 8
+  # 用户记忆压缩阈值
+  user_compress_threshold: 20
+  # 用户记忆保留条数
+  user_keep_recent: 5
+  # 语义搜索最大结果数
+  max_semantic_results: 3
+  # 记忆分级
+  consolidation:
+    discard_threshold: 3
+    batch_size: 20
+    recent_promote_days: 14
+    long_term_age_days: 180
+    hour: 3  # 日终清算时间
+
+# ── Web 管理面板 ──
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8080
+  secret_key: "change-this-to-a-random-string"  # 会话签名密钥，生产环境务必修改
+  admin_username: "admin"
+  admin_password: "admin123"  # 默认密码，生产环境务必修改
+  # 会话 TTL（秒），超时自动登出
+  session_ttl_seconds: 3600
+  # CORS 允许来源，留空表示不开放任意跨域（生产建议保持空）
+  # 如需前端独立部署可填具体来源，如 ["http://localhost:3000"]
+  cors_origins: []
+  # 是否启用 Secure Cookie（仅 HTTPS 下生效）
+  secure_cookies: false
+
+# ── CLI ──
+# PRD 5.1：cli.enabled 无代码引用，已删除（CLI 入口由 __main__.py 直接判断 --quickstart 参数）
+
+# ── 数据目录 ──
+data_dir: "./data"  # 默认在当前目录下的data文件夹
+
+# ── 日志 ──
+logging:
+  level: "INFO"  # DEBUG / INFO / WARNING / ERROR
+  file: "./data/bililog.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5

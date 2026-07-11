@@ -1,0 +1,44 @@
+# BiliBot 依赖
+
+# Web 服务
+starlette>=0.27.0
+uvicorn[standard]>=0.24.0
+
+# 配置和数据
+pyyaml>=6.0
+pydantic>=2.0.0
+
+# LLM 调用
+openai>=1.0.0
+
+# HTTP 请求
+aiohttp>=3.9.0
+
+# B站 API 依赖
+qrcode>=7.4.2
+Pillow>=10.0.0
+
+# 中文分词
+jieba>=0.42.1
+
+# 农历日期（可选，用于节日检测）
+lunardate>=0.2.2
+
+# 终端输出
+rich>=13.7.0
+
+# 知识库（可选）
+# faiss-cpu>=1.7.0  # 或 faiss-gpu
+# sentence-transformers>=2.2.0
+
+# 向量数据库（可选）
+# chromadb>=0.4.0
+
+# 测试
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# 开发
+black>=23.0.0
+ruff>=0.1.0
+mypy>=1.7.0
