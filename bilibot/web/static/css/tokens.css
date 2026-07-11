@@ -1,0 +1,72 @@
+/* tokens.css - Material Design 3 设计变量 */
+
+:root {
+    /* 主色 */
+    --primary: #6750A4;
+    --primary-hover: #7965B0;
+    --primary-light: #EADDFF;
+    --primary-dark: #4F378B;
+    --on-primary: #FFFFFF;
+
+    --secondary: #625B71;
+    --tertiary: #7D5260;
+
+    /* 表面层级 */
+    --surface: #FEF7FF;
+    --surface-1: #F7F2FA;
+    --surface-2: #F1ECF4;
+    --surface-3: #E6E0E9;
+    --surface-dim: #DED8E1;
+
+    /* 文字 */
+    --on-surface: #1D1B20;
+    --on-surface-variant: #49454F;
+    --on-surface-muted: #79747E;
+    --outline: #79747E;
+    --outline-variant: #CAC4D0;
+
+    /* 状态色 */
+    --success: #2E7D32;
+    --success-bg: #E8F5E9;
+    --warning: #ED6C02;
+    --warning-bg: #FFF3E0;
+    --danger: #D32F2F;
+    --danger-bg: #FFEBEE;
+    --info: #0288D1;
+    --info-bg: #E1F5FE;
+
+    /* 阴影层级 */
+    --shadow-1: 0 1px 2px 0 rgba(0,0,0,0.06), 0 1px 3px 0 rgba(0,0,0,0.10);
+    --shadow-2: 0 1px 4px 0 rgba(0,0,0,0.08), 0 3px 8px 0 rgba(0,0,0,0.08);
+    --shadow-3: 0 4px 12px 0 rgba(0,0,0,0.10), 0 2px 4px 0 rgba(0,0,0,0.06);
+    --shadow-4: 0 8px 24px 0 rgba(0,0,0,0.12), 0 4px 8px 0 rgba(0,0,0,0.08);
+
+    /* 圆角 */
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 24px;
+    --radius-full: 9999px;
+
+    /* 双栏布局尺寸 */
+    --activity-bar-width: 56px;
+    --sidebar-width: 240px;
+    --header-height: 48px;
+
+    /* 侧边栏深色主题 */
+    --sidebar-bg: linear-gradient(180deg, #2A2438 0%, #1C1726 100%);
+    --sidebar-text: #E6E0E9;
+    --sidebar-text-muted: #CAC4D0;
+    --sidebar-active-bg: rgba(103, 80, 164, 0.3);
+    --sidebar-hover-bg: rgba(255, 255, 255, 0.08);
+
+    /* 语义别名（兼容） */
+    --text-primary: var(--on-surface);
+    --text-secondary: var(--on-surface-variant);
+    --text-muted: var(--on-surface-muted);
+    --bg-primary: var(--surface-1);
+    --bg-secondary: var(--surface-2);
+    --bg-tertiary: var(--surface-2);
+    --border: var(--outline-variant);
+    --accent: var(--primary);
+}
