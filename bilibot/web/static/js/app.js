@@ -17,7 +17,7 @@ const Placeholder = defineComponent({
     props: { name: String },
     setup(props) {
         return () => h('div', { class: 'empty-state' }, [
-            h('div', { class: 'empty-icon' }, '🚧'),
+            h('div', { class: 'empty-icon' }, '[建设中]'),
             h('h3', props.name),
             h('p', { class: 'text-muted' }, '此页面正在重构中，请稍后...'),
         ]);

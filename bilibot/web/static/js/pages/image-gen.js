@@ -1,8 +1,8 @@
 // bilibot/web/static/js/pages/image-gen.js
-import { h, ref, reactive, onMounted, computed } from '../vendor/vue.esm-browser.prod.js';
+const { h, ref, reactive, onMounted, computed } = window.Vue;
 import { appState } from '../state.js';
 import { api } from '../api.js';
-import { Card, Button, Badge, FormInput, FormSelect, FormTextarea, Toggle, FormHint } from '../components.js';
+import { Card, Button, Badge, FormInput, FormSelect, FormTextarea, Toggle, FormHint } from '../components/common.js';
 
 export const ImageGenPage = {
     setup() {

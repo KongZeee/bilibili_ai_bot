@@ -16,6 +16,33 @@ export function formatTime(ts) {
     return d.toLocaleString('zh-CN', { hour12: false });
 }
 
+export function formatDateTime(ts) {
+    if (!ts) return '-';
+    const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+export function getStatusType(status) {
+    const map = {
+        published: 'success',
+        approved: 'success',
+        success: 'success',
+        ok: 'success',
+        active: 'success',
+        failed: 'danger',
+        rejected: 'danger',
+        error: 'danger',
+        banned: 'danger',
+        pending: 'warning',
+        paused: 'warning',
+        waiting: 'warning',
+        draft: 'info',
+        running: 'info',
+    };
+    return map[String(status).toLowerCase()] || 'info';
+}
+
 export function formatRelative(ts) {
     if (!ts) return '-';
     const diff = Date.now() / 1000 - ts;

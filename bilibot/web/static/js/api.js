@@ -99,6 +99,11 @@ export const api = {
         patch: (data) => api.patch('/api/config', data),
         validate: () => api.post('/api/config/validate'),
         reload: () => api.post('/api/config/reload'),
+        // 别名（Phase 5 页面使用）
+        getWithSchema: () => api.get('/api/config?schema=true'),
+        update: (data) => api.patch('/api/config', data),
+        reset: () => api.post('/api/config/reset'),
+        export: () => api.get('/api/config/export'),
     },
 
     // 其他
@@ -117,10 +122,18 @@ export const api = {
     videoAnalysis: {
         get: () => api.get('/api/video-analysis'),
         patch: (data) => api.patch('/api/video-analysis', data),
+        // 别名（Phase 5 页面使用）
+        getConfig: () => api.get('/api/video-analysis'),
+        updateConfig: (data) => api.patch('/api/video-analysis', data),
+        test: (data) => api.post('/api/video-analysis/test', data),
     },
     imageGen: {
         get: () => api.get('/api/image-generation'),
         patch: (data) => api.patch('/api/image-generation', data),
+        // 别名（Phase 5 页面使用）
+        getConfig: () => api.get('/api/image-generation'),
+        updateConfig: (data) => api.patch('/api/image-generation', data),
+        test: (data) => api.post('/api/image-generation/test', data),
     },
     drafts: {
         list: (accId) => api.get(`/api/accounts/${accId}/dynamic-drafts`),
@@ -136,3 +149,6 @@ export const api = {
         delete: (name) => api.delete(`/api/backup/${name}`),
     },
 };
+
+// dynamicDrafts 别名（Phase 5 页面使用，与 drafts 同义）
+api.dynamicDrafts = api.drafts;

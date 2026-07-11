@@ -50,6 +50,9 @@ export async function refreshLlm() {
     }
 }
 
+// refreshLlmProviders 别名（Phase 5 页面通过 appState.refreshLlmProviders() 调用）
+appState.refreshLlmProviders = refreshLlm;
+
 export async function refreshPersonas() {
     try {
         const { api } = window;

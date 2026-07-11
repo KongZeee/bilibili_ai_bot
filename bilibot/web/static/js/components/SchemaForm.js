@@ -1,6 +1,6 @@
 // bilibot/web/static/js/components/SchemaForm.js
-import { h, ref, reactive, computed, watch } from '../vendor/vue.esm-browser.prod.js';
-import { FormInput, FormSelect, FormTextarea, Toggle, FormHint } from '../components.js';
+const { h, ref, reactive, computed, watch } = window.Vue;
+import { FormInput, FormSelect, FormTextarea, Toggle, FormHint } from './common.js';
 
 /**
  * Schema 驱动的表单组件

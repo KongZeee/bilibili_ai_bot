@@ -289,3 +289,94 @@ export const DataTable = defineComponent({
         ]);
     },
 });
+
+// FormTextarea 组件
+export const FormTextarea = defineComponent({
+    name: 'FormTextarea',
+    props: {
+        modelValue: String,
+        placeholder: String,
+        label: String,
+        hint: String,
+        error: String,
+        rows: { type: [Number, String], default: 4 },
+        disabled: Boolean,
+    },
+    emits: ['update:modelValue'],
+    setup(props, { emit }) {
+        return () => h('div', { class: 'form-group' }, [
+            props.label ? h('label', { class: 'form-label' }, props.label) : null,
+            h('textarea', {
+                class: ['form-input', props.error ? 'form-input-error' : ''],
+                value: props.modelValue,
+                placeholder: props.placeholder,
+                rows: props.rows,
+                disabled: props.disabled,
+                onInput: (e) => emit('update:modelValue', e.target.value),
+            }),
+            props.hint ? h('div', { class: 'form-hint' }, props.hint) : null,
+            props.error ? h('div', { class: 'form-error' }, props.error) : null,
+        ]);
+    },
+});
+
+// FormHint 组件 - 表单字段提示文本
+export const FormHint = defineComponent({
+    name: 'FormHint',
+    props: { text: String },
+    setup(props, { slots }) {
+        return () => h('div', { class: 'form-hint' }, props.text || slots.default?.());
+    },
+});
+
+// Pagination 组件 - 分页
+export const Pagination = defineComponent({
+    name: 'Pagination',
+    props: {
+        page: { type: Number, default: 1 },
+        pageSize: { type: Number, default: 20 },
+        total: { type: Number, default: 0 },
+    },
+    emits: ['update:page', 'change'],
+    setup(props, { emit }) {
+        const totalPages = computed(() => Math.max(1, Math.ceil(props.total / props.pageSize) || 1));
+
+        function go(p) {
+            const clamped = Math.min(Math.max(1, p), totalPages.value);
+            if (clamped === props.page) return;
+            emit('update:page', clamped);
+            emit('change', { page: clamped, pageSize: props.pageSize });
+        }
+
+        // 生成页码按钮（当前页前后各 2 页）
+        const pages = computed(() => {
+            const tp = totalPages.value;
+            const cur = props.page;
+            const start = Math.max(1, cur - 2);
+            const end = Math.min(tp, cur + 2);
+            const arr = [];
+            for (let i = start; i <= end; i++) arr.push(i);
+            return arr;
+        });
+
+        return () => h('div', { class: 'pagination flex items-center gap-2' }, [
+            h('span', { class: 'text-muted', style: 'font-size:12px' },
+                `共 ${props.total} 条`),
+            h('button', {
+                class: 'btn btn-secondary btn-sm',
+                disabled: props.page <= 1,
+                onClick: () => go(props.page - 1),
+            }, '上一页'),
+            pages.value.map(p => h('button', {
+                key: p,
+                class: ['btn', 'btn-sm', p === props.page ? 'btn-primary' : 'btn-secondary'],
+                onClick: () => go(p),
+            }, String(p))),
+            h('button', {
+                class: 'btn btn-secondary btn-sm',
+                disabled: props.page >= totalPages.value,
+                onClick: () => go(props.page + 1),
+            }, '下一页'),
+        ]);
+    },
+});

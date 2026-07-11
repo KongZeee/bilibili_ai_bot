@@ -1,8 +1,9 @@
 // bilibot/web/static/js/pages/config.js
-import { h, ref, reactive, onMounted, computed } from '../vendor/vue.esm-browser.prod.js';
+const { h, ref, reactive, onMounted, computed } = window.Vue;
 import { appState } from '../state.js';
 import { api } from '../api.js';
-import { Card, Button, Badge, SchemaForm } from '../components.js';
+import { Card, Button, Badge } from '../components/common.js';
+import { SchemaForm } from '../components/SchemaForm.js';
 
 export const ConfigPage = {
     setup() {

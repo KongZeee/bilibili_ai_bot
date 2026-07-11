@@ -1,8 +1,8 @@
 // bilibot/web/static/js/pages/system.js
-import { h, ref, reactive, onMounted, computed } from '../vendor/vue.esm-browser.prod.js';
+const { h, ref, reactive, onMounted, computed } = window.Vue;
 import { appState } from '../state.js';
 import { api } from '../api.js';
-import { Card, Button, Badge, DataTable, Modal, FormInput, FormTextarea, FormSelect, Toggle, EmptyState, Pagination } from '../components.js';
+import { Card, Button, Badge, DataTable, Modal, FormInput, FormTextarea, FormSelect, Toggle, EmptyState, Pagination } from '../components/common.js';
 import { formatTime, formatDateTime } from '../utils.js';
 
 export const SystemPage = {
