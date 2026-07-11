@@ -15,7 +15,7 @@ from typing import Optional, Dict, Any
 
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse, HTMLResponse, FileResponse
+from starlette.responses import JSONResponse, HTMLResponse
 from starlette.requests import Request
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -139,13 +139,6 @@ def create_web_app(
     async def login_page(request: Request) -> HTMLResponse:
         """登录页面"""
         return HTMLResponse(_get_login_html())
-
-    async def livingmemory_page(request: Request) -> FileResponse:
-        """记忆管理页面"""
-        lm_path = Path(__file__).parent / "static" / "livingmemory" / "index.html"
-        if lm_path.exists():
-            return FileResponse(str(lm_path))
-        return HTMLResponse("<h1>记忆管理页面</h1>")
 
     # ═══════════════════════════════════════════════════════
     #  认证 API
@@ -277,7 +270,6 @@ def create_web_app(
     page_routes = [
         Route("/", dashboard_page, methods=["GET"]),
         Route("/login", login_page, methods=["GET"]),
-        Route("/livingmemory", livingmemory_page, methods=["GET"]),
     ]
 
     # 认证
@@ -518,7 +510,7 @@ def _static_version(filename: str) -> str:
     替代手动维护的 ?v=N，确保每次文件变更后浏览器缓存自动失效。
 
     Args:
-        filename: 相对 static 目录的路径，如 "css/dashboard.css"
+        filename: 相对 static 目录的路径，如 "css/tokens.css"
 
     Returns:
         版本号字符串（mtime 整数）；文件不存在时返回 "0"
