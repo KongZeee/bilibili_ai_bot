@@ -60,6 +60,8 @@ registerRoute('/accounts', AccountListPage, '账号管理');
 registerRoute('/accounts/:id', AccountDetailPage, '账号详情');
 import { MemoryRecallPage } from './components/memory/recall-page.js';
 registerRoute('/memory/recall', MemoryRecallPage, '召回测试');
+import { MemoryListPage } from './components/memory/list-page.js';
+registerRoute('/memory/list', MemoryListPage, '记忆列表');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
