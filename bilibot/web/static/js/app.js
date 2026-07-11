@@ -64,6 +64,8 @@ import { MemoryListPage } from './components/memory/list-page.js';
 registerRoute('/memory/list', MemoryListPage, '记忆列表');
 import { MemoryGraphPage } from './components/memory/graph-page.js';
 registerRoute('/memory/graph', MemoryGraphPage, '记忆图谱');
+import { LogsPage } from './pages/logs.js';
+registerRoute('/logs', LogsPage, '日志');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
