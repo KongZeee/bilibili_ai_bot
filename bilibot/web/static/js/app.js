@@ -66,6 +66,10 @@ import { MemoryGraphPage } from './components/memory/graph-page.js';
 registerRoute('/memory/graph', MemoryGraphPage, '记忆图谱');
 import { LogsPage } from './pages/logs.js';
 registerRoute('/logs', LogsPage, '日志');
+import { CommentsPage } from './pages/comments.js';
+registerRoute('/comments', CommentsPage, '评论');
+import { ProactivePage } from './pages/proactive.js';
+registerRoute('/proactive', ProactivePage, '主动行为');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
