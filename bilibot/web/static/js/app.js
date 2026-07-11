@@ -51,6 +51,9 @@ import { OverviewPage } from './pages/overview.js';
 // 覆盖占位路由
 registerRoute('/', OverviewPage, '总览');
 
+import { PersonaListPage } from './pages/personas.js';
+registerRoute('/personas', PersonaListPage, '人格管理');
+
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
 // --- Toast 容器组件 ---
