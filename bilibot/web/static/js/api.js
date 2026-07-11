@@ -2,6 +2,19 @@
 
 const BASE_URL = '';
 
+// 构建查询字符串，过滤掉 undefined/null/空字符串 值
+// 避免 URLSearchParams 将 undefined 序列化为字符串 "undefined"
+function buildQuery(params) {
+    const sp = new URLSearchParams();
+    if (params && typeof params === 'object') {
+        for (const [k, v] of Object.entries(params)) {
+            if (v === undefined || v === null || v === '') continue;
+            sp.append(k, v);
+        }
+    }
+    return sp.toString();
+}
+
 async function request(url, options = {}) {
     const resp = await fetch(BASE_URL + url, {
         ...options,
@@ -57,7 +70,7 @@ export const api = {
         tasks: (id) => api.get(`/api/accounts/${id}/tasks`),
     },
 
-    // LLM
+    // LLM（旧 V2 接口，仍用于账号绑定等场景）
     llm: {
         list: () => api.get('/api/llm-providers'),
         create: (data) => api.post('/api/llm-providers', data),
@@ -65,6 +78,17 @@ export const api = {
         delete: (id, force) => api.delete(`/api/llm-providers/${id}${force ? '?force=true' : ''}`),
         setDefault: (id) => api.post(`/api/llm-providers/${id}/set-default`),
         test: (id) => api.post(`/api/llm-providers/${id}/test`),
+    },
+
+    // 模型路由（V3）：统一管理 chat/vision/embedding/asr/image 各类 Provider + 功能路由
+    modelRouting: {
+        getOverview: () => api.get('/api/model-routing'),
+        updateRouting: (routing) => api.patch('/api/model-routing', routing),
+        listByType: (type) => api.get(`/api/model-routing/${type}`),
+        addProvider: (type, data) => api.post(`/api/model-routing/${type}`, data),
+        deleteProvider: (type, id) => api.delete(`/api/model-routing/${type}/${id}`),
+        updateProvider: (type, id, data) => api.patch(`/api/model-routing/${type}/${id}`, data),
+        testProvider: (type, id) => api.post(`/api/model-routing/${type}/${id}/test`),
     },
 
     // 人格
@@ -84,7 +108,7 @@ export const api = {
     // 记忆
     memory: {
         stats: (accId) => api.get(`/api/accounts/${accId}/memory/stats`),
-        list: (accId, params) => api.get(`/api/accounts/${accId}/memory?${new URLSearchParams(params)}`),
+        list: (accId, params) => api.get(`/api/accounts/${accId}/memory?${buildQuery(params)}`),
         search: (accId, data) => api.post(`/api/accounts/${accId}/memory/search`, data),
         delete: (accId, memId) => api.delete(`/api/accounts/${accId}/memory/${memId}`),
         graph: (accId) => api.get(`/api/accounts/${accId}/memory/graph`),
@@ -114,9 +138,9 @@ export const api = {
     },
 
     // 其他
-    replies: (params) => api.get(`/api/replies?${new URLSearchParams(params)}`),
-    audits: (params) => api.get(`/api/audit/generations?${new URLSearchParams(params)}`),
-    logs: (params) => api.get(`/api/logs?${new URLSearchParams(params)}`),
+    replies: (params) => api.get(`/api/replies?${buildQuery(params)}`),
+    audits: (params) => api.get(`/api/audit/generations?${buildQuery(params)}`),
+    logs: (params) => api.get(`/api/logs?${buildQuery(params)}`),
     status: () => api.get('/api/status'),
     safety: {
         pauseStatus: () => api.get('/api/safety/pause-status'),

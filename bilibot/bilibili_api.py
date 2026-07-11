@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 import time
 import base64
 import urllib.parse
@@ -189,12 +190,13 @@ class BilibiliAPI:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    imgs = data.get("data", {}).get("wbi_imgs", {})
+                    # B站 nav API 字段为 wbi_img（单数），非 wbi_imgs
+                    imgs = data.get("data", {}).get("wbi_img", {}) or data.get("data", {}).get("wbi_imgs", {})
                     img_url = imgs.get("img_url", "")
                     sub_url = imgs.get("sub_url", "")
 
                     if not img_url or not sub_url:
-                        logger.warning("nav API 未返回 wbi_imgs，WBI 签名不可用")
+                        logger.warning("nav API 未返回 wbi_img，WBI 签名不可用")
                         return None
 
                     # 从 URL 中提取文件名（去掉扩展名）
@@ -230,20 +232,19 @@ class BilibiliAPI:
         mix_key = await self._get_wbi_mixkey()
         if not mix_key:
             return params
-        
-        # 添加timestamp
+
+        # 添加timestamp（wts 必须参与签名计算）
+        params = dict(params)  # 拷贝避免修改入参
         params["wts"] = int(time.time())
-        
-        # 按键排序
+
+        # 按键排序（含 wts）
         params = dict(sorted(params.items()))
-        
-        # 构造签名字符串
-        wts = params.pop("wts", 0)
+
+        # 构造签名字符串（wts 在内）
         query = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
         w_rid = hashlib.md5((query + mix_key).encode()).hexdigest()
-        params["wts"] = wts
         params["w_rid"] = w_rid
-        
+
         return params
     
     # ══════════════════════════════════════
@@ -350,16 +351,19 @@ class BilibiliAPI:
         Returns:
             data.dash 字段，包含 video / audio 流列表
         """
+        # B站 playurl 接口需要 WBI 签名（2024+），否则返回 -400 请求错误
+        # fnval=80 = DASH(64) + MP4(16)，避免使用 404（含无效标志位 4 会被拒绝）
+        params = await self.sign_wbi({
+            "bvid": bvid,
+            "cid": cid,
+            "qn": quality,
+            "fnval": 80,  # DASH + MP4 回退
+            "fnver": 0,
+            "fourk": 1,
+        })
         data, err = await self._http_get(
-            "https://api.bilibili.com/x/player/playurl",
-            params={
-                "bvid": bvid,
-                "cid": cid,
-                "qn": quality,
-                "fnval": 404,  # DASH 格式
-                "fnver": 0,
-                "fourk": 1,
-            },
+            "https://api.bilibili.com/x/player/wbi/playurl",
+            params=params,
         )
         if not data or data.get("code") != 0:
             logger.warning(f"获取视频流失败: {err or data}")

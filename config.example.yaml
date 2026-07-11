@@ -1,13 +1,12 @@
 # BiliBot Standalone Configuration
 # 复制为 config.yaml 并填写实际值
 #
-# ═══ V2 多账号/多 LLM 架构（推荐） ═══
-# 使用 llm_providers + accounts 列表可同时登录多个 B站账号，
-# 每个账号绑定独立人格和 LLM。上面的 bilibili / llm 为 V1 兼容配置，
-# 单账号时仍可直接使用（自动迁移为 default 账号/provider）。
+# ═══ 模型配置中心（V3 统一架构） ═══
+# 参考 AstrBot 设计：每种能力独立 Provider 列表 + model_routing 路由
+# 功能与模型解耦：换模型只改 routing，不碰功能配置
 #
-# ── V2: 多 LLM Provider ──
-llm_providers:
+# ── 对话模型（主动回复 / 动态文本 / 记忆提取） ──
+chat_providers:
   - id: siliconflow
     name: 硅基流动
     api_key: ""
@@ -16,30 +15,66 @@ llm_providers:
     max_tokens: 1024
     temperature: 0.8
     enabled: true
-    # 视觉模型（可选）
-    vision:
-      enabled: false
-      api_key: ""
-      base_url: "https://api.siliconflow.cn/v1"
-      model: ""
-    # Embedding 模型（可选）
-    embedding:
-      enabled: false
-      api_key: ""
-      base_url: "https://api.siliconflow.cn/v1"
-      model: "BAAI/bge-m3"
-  # 可添加更多 Provider：
+  # 可添加更多：
   # - id: openai
   #   name: OpenAI
   #   api_key: ""
   #   base_url: "https://api.openai.com/v1"
   #   model: "gpt-4o"
 
-default_llm: siliconflow
+# ── 视觉模型（视频理解视觉轨） ──
+vision_providers:
+  - id: siliconflow-vision
+    name: 硅基流动视觉
+    api_key: ""                    # 留空则回退到对话模型的 api_key
+    base_url: "https://api.siliconflow.cn/v1"
+    model: "Qwen/Qwen2-VL-72B-Instruct"
+    enabled: false
+
+# ── Embedding 模型（记忆系统向量检索） ──
+embedding_providers:
+  - id: siliconflow-embed
+    name: 硅基流动 Embedding
+    api_key: ""                    # 留空则回退到对话模型的 api_key
+    base_url: "https://api.siliconflow.cn/v1"
+    model: "BAAI/bge-m3"
+    enabled: false
+
+# ── ASR 语音识别模型（视频理解音频轨） ──
+asr_providers:
+  - id: siliconflow-asr
+    name: 硅基流动 ASR
+    api_key: ""                    # 留空则回退到对话模型的 api_key
+    base_url: "https://api.siliconflow.cn/v1"
+    model: ""                      # 例如 mimo-v2.5-asr
+    enabled: false
+  # 本地 Whisper 配置
+  local_whisper:
+    enabled: false
+    model_size: "base"             # tiny/base/small/medium/large-v3
+    device: "cpu"                  # cpu/cuda/directml
+    compute_type: "int8"
+
+# ── 文生图模型（动态配图） ──
+image_providers:
+  - id: agnes-image
+    name: Agnes 文生图
+    api_key: ""
+    base_url: "https://apihub.agnes-ai.com/v1"
+    model: "agnes-image-2.1-flash"
+    default_size: "1024x768"
+    timeout: 120
+    enabled: false
+
+# ── 功能路由（核心：每个功能用哪个 Provider） ──
+model_routing:
+  chat: siliconflow               # 对话（主动回复/动态/记忆提取）
+  vision: siliconflow-vision      # 视频视觉轨
+  embedding: siliconflow-embed    # 记忆向量检索
+  asr: siliconflow-asr            # 视频音频轨
+  image: agnes-image              # 动态配图
 
 # PRD-V5 §5.3 LLM-501：生产模式不允许 LLM 静默回退
-# false（默认）：账号配置的 llm_id 不可用时，不回退到默认，账号标记为 degraded
-# true：账号配置的 llm_id 不可用时，回退到 default_llm 并记录告警
 allow_llm_fallback: false
 
 # ── V2: 多账号 ──
@@ -69,7 +104,7 @@ accounts:
     refresh_token: ""
     profile_id: default            # 引用人格组（优先于 persona_id）
     persona_id: default            # 向后兼容：未配 profile_id 时使用单个人格
-    llm_id: siliconflow             # 绑定的 LLM Provider ID（留空用默认）
+    chat_provider_id: ""           # 绑定的对话 Provider ID（留空用 model_routing.chat）
     enabled: true
   # 可添加更多账号：
   # - id: sub
@@ -82,35 +117,6 @@ accounts:
   #   enabled: true
 
 default_account: main
-
-# ═══ V1 兼容配置（单账号时可用，V2 已配置则忽略） ═══
-
-# ── B站账号（V1） ──
-bilibili:
-  sessdata: ""
-  bili_jct: ""
-  dede_user_id: ""
-  buvid3: ""
-  qrcode_login:
-    enabled: false
-
-# ── LLM 配置（V1） ──
-llm:
-  api_key: ""
-  base_url: "https://api.siliconflow.cn/v1"
-  model: "Qwen/Qwen2.5-72B-Instruct"
-  max_tokens: 1024
-  temperature: 0.8
-  vision:
-    enabled: false
-    api_key: ""
-    base_url: "https://api.siliconflow.cn/v1"
-    model: ""
-  embedding:
-    enabled: false
-    api_key: ""
-    base_url: "https://api.siliconflow.cn/v1"
-    model: "BAAI/bge-m3"
 
 # ── 联网搜索 ──
 web_search:
@@ -203,19 +209,11 @@ interactions:
     score_threshold: 7
 
 # ── 文生图（动态配图） ──
+# 注意：模型配置已迁移到 image_providers + model_routing.image
+# 此段保留动态配图的功能开关
 image_generation:
-  # 启用文生图（agnes-ai / OpenAI 兼容 images/generations API）
-  enabled: false
-  # API Key
-  api_key: ""
-  # API Base URL
-  base_url: "https://apihub.agnes-ai.com/v1"
-  # 模型名称
-  model: "agnes-image-2.1-flash"
-  # 默认图片尺寸
-  default_size: "1024x768"
-  # 超时（秒）
-  timeout: 120
+  # 是否在发动态时配图（需 model_routing.image 指向已启用的 image_provider）
+  with_image: false
 
 # ── 安全与审核（PRD §5.9 / SAFE-501 账号级隔离）──
 safety:
@@ -286,51 +284,26 @@ reply:
   reply_own: false
 
 # ── 视频分析（视听双轨理解） ──
+# 注意：Vision/ASR 模型配置已迁移到 vision_providers / asr_providers + model_routing
+# 此段保留视频分析的资源边界和抽帧策略
 video_analysis:
   # 启用视频下载 + 视听双轨分析（需要 ffmpeg）
   enabled: false
   # PRD-V5 §8.2 VID-503：资源边界配置
-  # 视频时长上限（秒），超过则降级为元数据分析
   max_duration_seconds: 600
-  # 下载字节数上限（200MB），超过则中止下载并清理
   max_download_bytes: 209715200
-  # 全局并发上限（所有账号合计）
   max_concurrent_global: 1
-  # 单账号并发上限
   max_concurrent_per_account: 1
-  # 下载超时（秒）
   download_timeout_seconds: 90
-  # 预处理超时（秒）
   preprocess_timeout_seconds: 180
-  # 分析超时（秒）
   analysis_timeout_seconds: 600
-  # 本地 Whisper ASR 开关（默认关闭，开启时用独立工作池）
-  local_whisper_enabled: false
-  # 本地 Whisper 工作池大小
   max_local_whisper_workers: 1
-  # 临时磁盘配额（1GB），可用空间不足则降级
   temp_disk_quota_bytes: 1073741824
   # 抽帧策略: katna / scenedetect / ffmpeg
-  # - katna: 基于传统图像处理的关键帧提取（短视频推荐）
-  # - scenedetect: 基于内容检测的镜头边界提取（更智能）
-  # - ffmpeg: 等间隔抽帧（兜底，无需额外依赖）
   frame_extractor: "ffmpeg"
-  # scenedetect 阈值（越小越敏感）
   scenedetect_threshold: 27.0
-  # 关键帧图片最大边长（像素），用于缩放后送 Vision
   image_max_size: 768
-  # Vision 并发滑动窗口容量
   vision_window_size: 5
-  # ASR 配置（语音转文字）
-  asr:
-    # 方式1：OpenAI 兼容 ASR API（配置 model 后生效，推荐）
-    model: ""           # 例如 mimo-v2.5-asr
-    api_key: ""         # 留空则回退到主 LLM 的 api_key
-    base_url: ""        # 留空则回退到主 LLM 的 base_url
-    # 方式2：本地 faster-whisper（model 为空时生效，需 local_whisper_enabled=true）
-    whisper_model_size: "base"    # tiny/base/small/medium/large-v3
-    whisper_device: "cpu"         # cpu/cuda/directml
-    whisper_compute_type: "int8"
   # 临时目录（留空则用 {data_dir}/video_temp）
   temp_dir: ""
 

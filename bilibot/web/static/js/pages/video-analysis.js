@@ -1,8 +1,9 @@
 // bilibot/web/static/js/pages/video-analysis.js - 视频理解配置页（Golden Time 设计稿）
-const { h, ref, reactive, onMounted, computed, watch } = window.Vue;
+// ASR/Vision 模型配置已迁移到「模型分配」页，本页保留抽帧/资源边界配置 + 只读 Provider 信息
+const { h, ref, reactive, onMounted } = window.Vue;
 import { appState } from '../state.js';
 import { api } from '../api.js';
-import { Button, Badge, FormInput, FormSelect, FormTextarea, Toggle, FormHint, Loading } from '../components/common.js';
+import { Button, Badge, FormInput, FormSelect, FormTextarea, Toggle, FormHint, Loading, EmptyState } from '../components/common.js';
 
 export const VideoAnalysisPage = {
     name: 'VideoAnalysisPage',
@@ -12,20 +13,20 @@ export const VideoAnalysisPage = {
         const config = reactive({
             enabled: false,
             frame_extractor: 'ffmpeg',
-            vision_window_size: 8,
-            min_scene_len: 2.0,
-            sampling_interval: 2.0,
-            llm_provider_id: '',
-            vision_model: '',
-            description_prompt: '',
-            analysis_timeout_seconds: 120,
-            asr_model: '',
-            asr_api_key: '',
-            asr_base_url: '',
-            asr_whisper_model_size: '',
-            asr_whisper_device: '',
-            asr_whisper_compute_type: '',
+            scenedetect_threshold: 27.0,
+            image_max_size: 768,
+            vision_window_size: 5,
+            analysis_timeout_seconds: 600,
+            max_duration_seconds: 600,
+            max_concurrent_global: 1,
+            max_concurrent_per_account: 1,
+            download_timeout_seconds: 90,
+            preprocess_timeout_seconds: 180,
         });
+        // 只读：从 model-routing 获取
+        const visionProvider = ref(null);
+        const asrProvider = ref(null);
+        const localWhisper = ref(null);
         const testResult = ref(null);
         const testUrl = ref('');
 
@@ -35,45 +36,29 @@ export const VideoAnalysisPage = {
             { value: 'scenedetect', label: 'PySceneDetect（场景检测，需 pip install scenedetect[video]）' },
         ];
 
-        const asrModelOptions = [
-            { value: '', label: '不使用 ASR' },
-            { value: 'api', label: 'API（在线语音识别）' },
-            { value: 'whisper', label: 'Whisper（本地语音识别）' },
-        ];
-
-        const whisperModelSizeOptions = [
-            { value: 'tiny', label: 'tiny' },
-            { value: 'base', label: 'base' },
-            { value: 'small', label: 'small' },
-            { value: 'medium', label: 'medium' },
-            { value: 'large', label: 'large' },
-        ];
-
-        const whisperDeviceOptions = [
-            { value: 'cpu', label: 'CPU' },
-            { value: 'cuda', label: 'CUDA（GPU）' },
-        ];
-
-        const whisperComputeTypeOptions = [
-            { value: 'int8', label: 'int8' },
-            { value: 'float16', label: 'float16' },
-            { value: 'float32', label: 'float32' },
-        ];
-
-        async function loadConfig() {
+        async function loadData() {
             loading.value = true;
             try {
-                const res = await api.videoAnalysis.getConfig();
-                const data = res.data || {};
-                Object.assign(config, data);
-                // 后端 ASR 子段展开为扁平字段供表单使用
-                const asr = data.asr || {};
-                config.asr_model = asr.model || '';
-                config.asr_api_key = asr.api_key || '';
-                config.asr_base_url = asr.base_url || '';
-                config.asr_whisper_model_size = asr.whisper_model_size || '';
-                config.asr_whisper_device = asr.whisper_device || '';
-                config.asr_whisper_compute_type = asr.whisper_compute_type || '';
+                const [vaRes, overview] = await Promise.all([
+                    api.videoAnalysis.getConfig(),
+                    api.modelRouting.getOverview(),
+                ]);
+                const data = vaRes || {};
+                config.enabled = data.enabled ?? false;
+                config.frame_extractor = data.frame_extractor || 'ffmpeg';
+                config.scenedetect_threshold = data.scenedetect_threshold ?? 27.0;
+                config.image_max_size = data.image_max_size ?? 768;
+                config.vision_window_size = data.vision_window_size ?? 5;
+                config.analysis_timeout_seconds = data.analysis_timeout_seconds ?? 600;
+                config.max_duration_seconds = data.max_duration_seconds ?? 600;
+                config.max_concurrent_global = data.max_concurrent_global ?? 1;
+                config.max_concurrent_per_account = data.max_concurrent_per_account ?? 1;
+                config.download_timeout_seconds = data.download_timeout_seconds ?? 90;
+                config.preprocess_timeout_seconds = data.preprocess_timeout_seconds ?? 180;
+                // 只读 provider 信息
+                visionProvider.value = overview.features?.vision?.routed_provider || null;
+                asrProvider.value = overview.features?.asr?.routed_provider || null;
+                localWhisper.value = overview.local_whisper || null;
             } catch (e) {
                 appState.notify('加载配置失败：' + (e.message || e), 'danger');
             } finally {
@@ -81,28 +66,10 @@ export const VideoAnalysisPage = {
             }
         }
 
-        function buildPayload() {
-            // 将扁平 ASR 字段包装为后端期望的 asr 子对象
-            const { asr_model, asr_api_key, asr_base_url,
-                    asr_whisper_model_size, asr_whisper_device, asr_whisper_compute_type,
-                    ...rest } = config;
-            return {
-                ...rest,
-                asr: {
-                    model: asr_model,
-                    api_key: asr_api_key,
-                    base_url: asr_base_url,
-                    whisper_model_size: asr_whisper_model_size,
-                    whisper_device: asr_whisper_device,
-                    whisper_compute_type: asr_whisper_compute_type,
-                },
-            };
-        }
-
         async function saveConfig() {
             loading.value = true;
             try {
-                await api.videoAnalysis.updateConfig(buildPayload());
+                await api.videoAnalysis.updateConfig({ ...config });
                 appState.notify('配置已保存', 'success');
             } catch (e) {
                 appState.notify('保存失败：' + (e.message || e), 'danger');
@@ -121,9 +88,9 @@ export const VideoAnalysisPage = {
             try {
                 const res = await api.videoAnalysis.test({
                     video_url: testUrl.value,
-                    config: buildPayload(),
+                    config: { ...config },
                 });
-                testResult.value = res.data;
+                testResult.value = res;
                 appState.notify('分析完成', 'success');
             } catch (e) {
                 testResult.value = { error: e.message || String(e) };
@@ -133,26 +100,28 @@ export const VideoAnalysisPage = {
             }
         }
 
-        onMounted(() => {
-            loadConfig();
-            if (appState.llmProviders.length === 0) appState.refreshLlmProviders();
-        });
-
-        const llmOptions = computed(() =>
-            appState.llmProviders.map(p => ({ value: p.id, label: `${p.name} (${p.model})` })),
-        );
+        onMounted(loadData);
 
         const cardStyle = 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;';
+
+        // 只读 Provider 信息行
+        function providerRow(label, p) {
+            return h('div', { class: 'flex items-center justify-between' }, [
+                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, label),
+                p
+                    ? h('span', { style: 'font-size:0.88rem;' }, `${p.name || p.id} · ${p.model || '-'}`)
+                    : h(Badge, { type: 'muted' }, () => '未路由'),
+            ]);
+        }
 
         return () => loading.value && !config.frame_extractor
             ? h(Loading)
             : h('div', { class: 'view-frame' }, [
-                // ═══ hero-band：配置状态 + 验证概览 ═══
+                // ═══ hero-band ═══
                 h('section', {
                     class: 'grid gap-3',
                     style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
                 }, [
-                    // 左侧：hero-panel 配置状态
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
                             h('span', { class: 'eyebrow' }, '视频理解'),
@@ -165,29 +134,26 @@ export const VideoAnalysisPage = {
                             h('span', {
                                 style: 'font-size:1.4rem; font-weight:500; line-height:1; font-variant-numeric:tabular-nums;',
                             }, config.frame_extractor || '-'),
-                            h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '· ' + (config.vision_model || '默认视觉模型')),
+                            h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '· ' + (config.image_max_size || 768) + 'px'),
                         ]),
-                        h('p', { class: 'muted m-0' }, '管理视频帧提取、视觉模型与分析参数'),
+                        h('p', { class: 'muted m-0' }, '管理帧提取与资源边界；模型配置由「模型分配」页统一管理'),
                     ]),
-                    // 右侧：验证概览 Card
                     h('article', {
                         class: 'grid gap-3',
                         style: cardStyle,
                     }, [
                         h('div', { class: 'card-header' }, [
                             h('div', { class: 'grid gap-1' }, [
-                                h('span', { class: 'eyebrow' }, '验证'),
-                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '测试概览'),
+                                h('span', { class: 'eyebrow' }, '状态'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '模型路由概览'),
                             ]),
                         ]),
                         h('div', { class: 'card-body grid gap-2' }, [
+                            providerRow('视觉模型', visionProvider.value),
+                            providerRow('ASR 模型', asrProvider.value),
                             h('div', { class: 'flex items-center justify-between' }, [
-                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '服务状态'),
-                                h(Badge, { type: config.enabled ? 'success' : 'muted' }, () => config.enabled ? '可用' : '禁用'),
-                            ]),
-                            h('div', { class: 'flex items-center justify-between' }, [
-                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'LLM Provider'),
-                                h(Badge, { type: 'info' }, () => config.llm_provider_id ? '已指定' : '使用账号绑定'),
+                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '本地 Whisper'),
+                                h(Badge, { type: localWhisper.value?.enabled ? 'success' : 'muted' }, () => localWhisper.value?.enabled ? '已启用' : '未启用'),
                             ]),
                             h('div', { class: 'flex items-center justify-between' }, [
                                 h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '最近测试'),
@@ -199,12 +165,11 @@ export const VideoAnalysisPage = {
                     ]),
                 ]),
 
-                // ═══ 2 列表单网格：配置 + 测试 ═══
+                // ═══ 分析参数 + 测试 ═══
                 h('section', {
                     class: 'grid gap-3',
                     style: 'grid-template-columns: minmax(0, 1.15fr) minmax(0, 0.85fr);',
                 }, [
-                    // 左侧：配置 Card
                     h('article', {
                         class: 'grid gap-3',
                         style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
@@ -236,26 +201,35 @@ export const VideoAnalysisPage = {
                                 h(FormHint, 'katna/scenedetect 需额外安装依赖；ffmpeg 为默认回退方案'),
                             ]),
                             h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, 'scenedetect 阈值'),
+                                h(FormInput, {
+                                    modelValue: String(config.scenedetect_threshold),
+                                    'onUpdate:modelValue': (v) => config.scenedetect_threshold = parseFloat(v) || 27.0,
+                                    type: 'number',
+                                }),
+                                h(FormHint, '越小越敏感（仅 scenedetect 模式生效）'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '关键帧最大边长（px）'),
+                                h(FormInput, {
+                                    modelValue: String(config.image_max_size),
+                                    'onUpdate:modelValue': (v) => config.image_max_size = parseInt(v) || 768,
+                                    type: 'number',
+                                }),
+                            ]),
+                            h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '视觉窗口大小（帧数）'),
                                 h(FormInput, {
                                     modelValue: String(config.vision_window_size),
-                                    'onUpdate:modelValue': (v) => config.vision_window_size = parseInt(v) || 8,
+                                    'onUpdate:modelValue': (v) => config.vision_window_size = parseInt(v) || 5,
                                     type: 'number',
                                 }),
                             ]),
                             h('div', { class: 'form-group' }, [
-                                h('label', { class: 'form-label' }, '最小场景长度（秒）'),
+                                h('label', { class: 'form-label' }, '视频时长上限（秒）'),
                                 h(FormInput, {
-                                    modelValue: String(config.min_scene_len),
-                                    'onUpdate:modelValue': (v) => config.min_scene_len = parseFloat(v) || 2.0,
-                                    type: 'number',
-                                }),
-                            ]),
-                            h('div', { class: 'form-group' }, [
-                                h('label', { class: 'form-label' }, '采样间隔（秒）'),
-                                h(FormInput, {
-                                    modelValue: String(config.sampling_interval),
-                                    'onUpdate:modelValue': (v) => config.sampling_interval = parseFloat(v) || 2.0,
+                                    modelValue: String(config.max_duration_seconds),
+                                    'onUpdate:modelValue': (v) => config.max_duration_seconds = parseInt(v) || 600,
                                     type: 'number',
                                 }),
                             ]),
@@ -263,33 +237,40 @@ export const VideoAnalysisPage = {
                                 h('label', { class: 'form-label' }, '分析超时（秒）'),
                                 h(FormInput, {
                                     modelValue: String(config.analysis_timeout_seconds),
-                                    'onUpdate:modelValue': (v) => config.analysis_timeout_seconds = parseInt(v) || 120,
+                                    'onUpdate:modelValue': (v) => config.analysis_timeout_seconds = parseInt(v) || 600,
                                     type: 'number',
                                 }),
                             ]),
                             h('div', { class: 'form-group' }, [
-                                h('label', { class: 'form-label' }, '使用的 LLM Provider'),
-                                h(FormSelect, {
-                                    modelValue: config.llm_provider_id,
-                                    'onUpdate:modelValue': (v) => config.llm_provider_id = v,
-                                    options: [{ value: '', label: '使用账号绑定 LLM' }, ...llmOptions.value],
+                                h('label', { class: 'form-label' }, '下载超时（秒）'),
+                                h(FormInput, {
+                                    modelValue: String(config.download_timeout_seconds),
+                                    'onUpdate:modelValue': (v) => config.download_timeout_seconds = parseInt(v) || 90,
+                                    type: 'number',
                                 }),
                             ]),
                             h('div', { class: 'form-group' }, [
-                                h('label', { class: 'form-label' }, '视觉模型名称'),
+                                h('label', { class: 'form-label' }, '预处理超时（秒）'),
                                 h(FormInput, {
-                                    modelValue: config.vision_model,
-                                    'onUpdate:modelValue': (v) => config.vision_model = v,
-                                    placeholder: '如 gpt-4o, qwen-vl-max（留空用默认）',
+                                    modelValue: String(config.preprocess_timeout_seconds),
+                                    'onUpdate:modelValue': (v) => config.preprocess_timeout_seconds = parseInt(v) || 180,
+                                    type: 'number',
                                 }),
                             ]),
-                            h('div', { class: 'form-group span-2' }, [
-                                h('label', { class: 'form-label' }, '描述提示词'),
-                                h(FormTextarea, {
-                                    modelValue: config.description_prompt,
-                                    'onUpdate:modelValue': (v) => config.description_prompt = v,
-                                    rows: 4,
-                                    placeholder: '描述视频帧内容时使用的系统提示词...',
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '全局并发上限'),
+                                h(FormInput, {
+                                    modelValue: String(config.max_concurrent_global),
+                                    'onUpdate:modelValue': (v) => config.max_concurrent_global = parseInt(v) || 1,
+                                    type: 'number',
+                                }),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '单账号并发上限'),
+                                h(FormInput, {
+                                    modelValue: String(config.max_concurrent_per_account),
+                                    'onUpdate:modelValue': (v) => config.max_concurrent_per_account = parseInt(v) || 1,
+                                    type: 'number',
                                 }),
                             ]),
                         ]),
@@ -356,74 +337,86 @@ export const VideoAnalysisPage = {
                     ]),
                 ]),
 
-                // ═══ ASR 配置 Card ═══
+                // ═══ 模型路由只读 Card ═══
                 h('article', {
                     class: 'grid gap-3',
                     style: cardStyle,
                 }, [
                     h('div', { class: 'card-header' }, [
                         h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '语音识别'),
-                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, 'ASR 配置'),
+                            h('span', { class: 'eyebrow' }, '模型配置'),
+                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '视听模型 Provider（只读）'),
                         ]),
                     ]),
-                    h('div', { class: 'card-body form-grid-2col' }, [
-                        h('div', { class: 'form-group' }, [
-                            h('label', { class: 'form-label' }, 'ASR 模型'),
-                            h(FormSelect, {
-                                modelValue: config.asr_model,
-                                'onUpdate:modelValue': (v) => config.asr_model = v,
-                                options: asrModelOptions,
-                            }),
-                            h(FormHint, '选择 API 在线识别或 Whisper 本地识别'),
+                    h('div', { class: 'card-body grid gap-3' }, [
+                        h('div', { class: 'form-grid-2col' }, [
+                            // 视觉模型
+                            h('div', { class: 'form-group span-2' }, [
+                                h('label', { class: 'form-label' }, '视觉模型'),
+                                visionProvider.value
+                                    ? h('div', { class: 'grid gap-1' }, [
+                                        h('div', { class: 'flex items-center justify-between' }, [
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'Provider'),
+                                            h('span', { style: 'font-size:0.88rem;' }, visionProvider.value.name || visionProvider.value.id),
+                                        ]),
+                                        h('div', { class: 'flex items-center justify-between' }, [
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '模型'),
+                                            h('span', { style: 'font-size:0.88rem;' }, visionProvider.value.model || '-'),
+                                        ]),
+                                        h('div', { class: 'flex items-center justify-between' }, [
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API Key'),
+                                            h(Badge, { type: visionProvider.value.has_api_key ? 'success' : 'danger' }, () => visionProvider.value.has_api_key ? '已配置' : '未配置'),
+                                        ]),
+                                    ])
+                                    : h(EmptyState, { title: '未路由视觉 Provider', desc: '请到模型分配页配置 vision 类型' }),
+                            ]),
+                            // ASR 模型
+                            h('div', { class: 'form-group span-2' }, [
+                                h('label', { class: 'form-label' }, 'ASR 语音识别'),
+                                asrProvider.value
+                                    ? h('div', { class: 'grid gap-1' }, [
+                                        h('div', { class: 'flex items-center justify-between' }, [
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'Provider'),
+                                            h('span', { style: 'font-size:0.88rem;' }, asrProvider.value.name || asrProvider.value.id),
+                                        ]),
+                                        h('div', { class: 'flex items-center justify-between' }, [
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '模型'),
+                                            h('span', { style: 'font-size:0.88rem;' }, asrProvider.value.model || '-'),
+                                        ]),
+                                        h('div', { class: 'flex items-center justify-between' }, [
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API Key'),
+                                            h(Badge, { type: asrProvider.value.has_api_key ? 'success' : 'danger' }, () => asrProvider.value.has_api_key ? '已配置' : '未配置'),
+                                        ]),
+                                    ])
+                                    : h(EmptyState, { title: '未路由 ASR Provider', desc: '请到模型分配页配置 asr 类型' }),
+                            ]),
+                            // 本地 Whisper
+                            localWhisper.value?.enabled && h('div', { class: 'form-group span-2' }, [
+                                h('label', { class: 'form-label' }, '本地 Whisper'),
+                                h('div', { class: 'grid gap-1' }, [
+                                    h('div', { class: 'flex items-center justify-between' }, [
+                                        h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '模型大小'),
+                                        h('span', { style: 'font-size:0.88rem;' }, localWhisper.value.model_size || 'base'),
+                                    ]),
+                                    h('div', { class: 'flex items-center justify-between' }, [
+                                        h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '设备 / 计算类型'),
+                                        h('span', { style: 'font-size:0.88rem;' }, `${localWhisper.value.device || 'cpu'} / ${localWhisper.value.compute_type || 'int8'}`),
+                                    ]),
+                                ]),
+                            ]),
                         ]),
-                        h('div', { class: 'form-group' }, [
-                            h('label', { class: 'form-label' }, 'ASR API Key'),
-                            h(FormInput, {
-                                modelValue: config.asr_api_key,
-                                'onUpdate:modelValue': (v) => config.asr_api_key = v,
-                                type: 'password',
-                                placeholder: 'ASR 服务密钥（留空不修改）',
-                            }),
-                        ]),
-                        h('div', { class: 'form-group' }, [
-                            h('label', { class: 'form-label' }, 'ASR Base URL'),
-                            h(FormInput, {
-                                modelValue: config.asr_base_url,
-                                'onUpdate:modelValue': (v) => config.asr_base_url = v,
-                                placeholder: '如 https://api.example.com/v1',
-                            }),
-                        ]),
-                        h('div', { class: 'form-group' }, [
-                            h('label', { class: 'form-label' }, 'Whisper 模型大小'),
-                            h(FormSelect, {
-                                modelValue: config.asr_whisper_model_size,
-                                'onUpdate:modelValue': (v) => config.asr_whisper_model_size = v,
-                                options: whisperModelSizeOptions,
-                            }),
-                        ]),
-                        h('div', { class: 'form-group' }, [
-                            h('label', { class: 'form-label' }, 'Whisper 设备'),
-                            h(FormSelect, {
-                                modelValue: config.asr_whisper_device,
-                                'onUpdate:modelValue': (v) => config.asr_whisper_device = v,
-                                options: whisperDeviceOptions,
-                            }),
-                        ]),
-                        h('div', { class: 'form-group' }, [
-                            h('label', { class: 'form-label' }, 'Whisper 计算类型'),
-                            h(FormSelect, {
-                                modelValue: config.asr_whisper_compute_type,
-                                'onUpdate:modelValue': (v) => config.asr_whisper_compute_type = v,
-                                options: whisperComputeTypeOptions,
-                            }),
+                        h('div', { class: 'flex items-center gap-2' }, [
+                            h(Button, {
+                                type: 'ghost',
+                                onClick: () => { window.location.hash = '/model-routing'; },
+                            }, () => '去模型分配页'),
                         ]),
                     ]),
                 ]),
 
                 // ═══ 操作栏 ═══
                 h('div', { class: 'flex items-center justify-end gap-2' }, [
-                    h(Button, { type: 'ghost', onClick: loadConfig }, () => '重置'),
+                    h(Button, { type: 'ghost', onClick: loadData }, () => '重置'),
                     h(Button, { type: 'primary', onClick: saveConfig, loading: loading.value }, () => '保存配置'),
                 ]),
             ]);

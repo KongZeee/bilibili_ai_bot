@@ -241,26 +241,32 @@ class AccountInstance:
             knowledge_memory=self.knowledge_memory,
         )
 
-        # 10.5 视频理解服务（视听双轨分析，可选）
+        # 10.5 视频理解服务（视听双轨分析，可选）— 通过 ModelRouter 解析 vision/asr
         self.video_understanding = None
-        if self.llm:
+        if self.llm_manager:
             try:
                 from bilibot.video_understanding import VideoUnderstandingService
-                self.video_understanding = VideoUnderstandingService(self.llm, self.account_config_loader)
+                self.video_understanding = VideoUnderstandingService(self.llm_manager, self.account_config_loader)
                 if self.video_understanding.is_available():
                     logger.info(f"[{self.account_id}] 视频理解服务已启用")
             except Exception as e:
                 logger.warning(f"[{self.account_id}] 视频理解服务初始化失败: {e}")
 
-        # 10.6 文生图 Provider（动态配图，可选）
+        # 10.6 文生图 Provider（动态配图，可选）— 通过 ModelRouter 解析 image provider
         self.image_provider = None
         try:
             from bilibot.image import ImageProvider
-            raw_cfg = self.account_config_loader.get_raw_config()
-            ig_config = raw_cfg.get("image_generation", {})
-            if ig_config.get("enabled") and ig_config.get("api_key"):
-                self.image_provider = ImageProvider(ig_config)
-                logger.info(f"[{self.account_id}] 文生图 Provider 已启用: {ig_config.get('model', 'agnes-image-2.1-flash')}")
+            img_p = self.llm_manager.resolve_image() if self.llm_manager else None
+            if img_p and img_p.enabled and img_p.api_key:
+                self.image_provider = ImageProvider({
+                    "enabled": True,
+                    "api_key": img_p.api_key,
+                    "base_url": img_p.base_url,
+                    "model": img_p.model,
+                    "default_size": getattr(img_p, "default_size", "1024x768"),
+                    "timeout": getattr(img_p, "timeout", 120),
+                })
+                logger.info(f"[{self.account_id}] 文生图 Provider 已启用: {img_p.model}")
         except Exception as e:
             logger.warning(f"[{self.account_id}] 文生图 Provider 初始化失败: {e}")
 

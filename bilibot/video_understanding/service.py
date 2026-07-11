@@ -2,8 +2,8 @@
 视频理解服务 — 整合视听双轨分析
 
 将 demo/video_understanding 的能力接入 bilibot 主项目：
-- 复用主项目的 LLMProvider（文本 + Vision）
-- 从 config.yaml 的 video_analysis 段读取配置
+- 通过 ModelRouter（LLMManager）解析 vision/asr provider
+- 从 config.yaml 的 video_analysis 段读取非 LLM 配置（资源边界、抽帧策略等）
 - 端到端流程：预处理 → 视觉轨 + 音频轨并行 → 时序缝合 → 行为日志
 
 PRD-V5 §8.2 VID-503：视频资源保护
@@ -14,7 +14,7 @@ PRD-V5 §8.2 VID-503：视频资源保护
 - 降级原因记录在返回结果中
 
 使用方式：
-    service = VideoUnderstandingService(llm_provider, config_loader)
+    service = VideoUnderstandingService(llm_manager, config_loader)
     if service.is_available():
         result = await service.understand("/path/to/video.mp4")
         behavior_log = result["behavior_log"]  # Markdown 结构化日志
@@ -146,14 +146,15 @@ def reset_global_semaphore() -> None:
 
 class LLMVisionAdapter:
     """
-    把 LLMProvider 包装成 demo 的 describe_image / generate 接口。
+    把 LLMManager（ModelRouter）包装成 demo 的 describe_image / generate 接口。
 
-    LLMProvider.vision_analyze 接受 image_url（含 data URL），
+    LLMManager.vision_analyze 通过 resolve_vision() 路由到独立的 vision provider，
+    LLMManager.generate 通过 resolve_chat() 路由到对话 provider。
     这里读取本地图片文件转 base64 data URL 后委托给 vision_analyze。
     """
 
-    def __init__(self, llm_provider):
-        self.llm = llm_provider
+    def __init__(self, llm_manager):
+        self.llm = llm_manager
 
     async def describe_image(
         self, image_path: str, prompt: str = VISION_SYSTEM_PROMPT, max_tokens: int = 250
@@ -178,17 +179,52 @@ class LLMVisionAdapter:
 class VideoUnderstandingService:
     """视频理解服务（端到端）"""
 
-    def __init__(self, llm_provider, config_loader):
-        self.llm_provider = llm_provider
+    def __init__(self, llm_manager, config_loader):
+        self.llm_manager = llm_manager
         raw = config_loader.get_raw_config() if hasattr(config_loader, "get_raw_config") else {}
         data_dir = config_loader.get("data_dir", "./data") if hasattr(config_loader, "get") else "./data"
         self.cfg = VideoUnderstandingConfig(raw, data_dir)
-        self.adapter = LLMVisionAdapter(llm_provider) if llm_provider else None
+
+        # 通过 ModelRouter 覆盖 ASR / local_whisper 配置（优先于 raw config）
+        self._apply_router_config()
+
+        self.adapter = LLMVisionAdapter(llm_manager) if llm_manager else None
 
         # PRD-V5 §8.2 VID-503：受控线程执行器（用于同步工作）
         self._executor: Optional[ThreadPoolExecutor] = None
         # PRD-V5 §8.2 VID-503：关闭标志
         self._shutdown: bool = False
+
+    def _apply_router_config(self) -> None:
+        """从 ModelRouter 覆盖 ASR / local_whisper 配置（如果 llm_manager 支持路由）
+
+        VideoUnderstandingConfig 先从 raw config 读取（V1 兼容），
+        此处用 router 解析的结果覆盖，确保 V3 路由配置优先。
+        """
+        if not self.llm_manager:
+            return
+        # ASR provider（resolve_asr 返回 LLMProvider 或 None）
+        resolve_asr = getattr(self.llm_manager, "resolve_asr", None)
+        if callable(resolve_asr):
+            asr_p = resolve_asr()
+            if asr_p:
+                if asr_p.model:
+                    self.cfg.asr_model = asr_p.model
+                if asr_p.api_key:
+                    self.cfg.asr_api_key = asr_p.api_key
+                if asr_p.base_url:
+                    self.cfg.asr_base_url = asr_p.base_url
+        # local_whisper（property 返回 dict）
+        lw = getattr(self.llm_manager, "local_whisper", None)
+        if lw:
+            if lw.get("enabled"):
+                self.cfg.local_whisper_enabled = True
+            if lw.get("model_size"):
+                self.cfg.whisper_model_size = lw["model_size"]
+            if lw.get("device"):
+                self.cfg.whisper_device = lw["device"]
+            if lw.get("compute_type"):
+                self.cfg.whisper_compute_type = lw["compute_type"]
 
     def _get_executor(self) -> ThreadPoolExecutor:
         """获取或创建受控线程执行器（max_workers = max_concurrent_per_account）"""
@@ -204,7 +240,7 @@ class VideoUnderstandingService:
         """是否可用（启用 + LLM 已配置 + 未关闭）"""
         if not self.cfg.enabled:
             return False
-        if self.llm_provider is None:
+        if self.llm_manager is None:
             return False
         if self._shutdown:
             return False
@@ -212,11 +248,17 @@ class VideoUnderstandingService:
 
     def has_vision(self) -> bool:
         """LLM 是否配置了视觉模型"""
-        if not self.llm_provider:
+        if not self.llm_manager:
             return False
+        # 优先通过 ModelRouter 解析 vision provider
+        resolve_vision = getattr(self.llm_manager, "resolve_vision", None)
+        if callable(resolve_vision):
+            vp = resolve_vision()
+            return bool(vp and vp.client and vp.model)
+        # 向后兼容：直接访问属性（旧 LLMProvider / Mock）
         return bool(
-            getattr(self.llm_provider, "vision_client", None)
-            and getattr(self.llm_provider, "vision_model", None)
+            getattr(self.llm_manager, "vision_client", None)
+            and getattr(self.llm_manager, "vision_model", None)
         )
 
     async def understand(self, video_path: str, question: str = "") -> dict:

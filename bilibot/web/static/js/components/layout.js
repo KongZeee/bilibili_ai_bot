@@ -19,6 +19,7 @@ export const NAV_GROUPS = [
             { path: '/accounts', label: '账号管理', icon: 'user', meta: '已接入' },
             { path: '/personas', label: '人格管理', icon: 'star', meta: '多角色' },
             { path: '/llm', label: 'LLM 管理', icon: 'box', meta: '多模型' },
+            { path: '/model-routing', label: '模型分配', icon: 'arrow-right', meta: '路由' },
         ],
     },
     {
@@ -66,6 +67,7 @@ const PAGE_SUBTITLES = {
     '/video-analysis': '配置与测试视频理解功能。',
     '/system': '系统安全管理与备份恢复。',
     '/llm': '管理 LLM Provider 列表，配置模型与 API 密钥。',
+    '/model-routing': '为对话、视觉、Embedding、ASR、文生图各自指定当前路由的 Provider。',
 };
 
 // 根据路径找到所属分组（返回分组标签）

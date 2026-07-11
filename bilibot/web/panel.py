@@ -337,11 +337,17 @@ def create_web_app(
 
     # 视频理解配置
     from ..api.video_analysis import create_video_analysis_routes
-    video_analysis_routes = create_video_analysis_routes(config_loader, config_path)
+    video_analysis_routes = create_video_analysis_routes(config_loader, config_path, account_manager=account_manager)
 
     # 文生图配置
     from ..api.image_generation import create_image_generation_routes
     image_generation_routes = create_image_generation_routes(config_loader, config_path)
+
+    # 模型路由管理（V3 统一架构）
+    model_routing_routes = []
+    if llm_manager is not None:
+        from ..api.model_routing import create_model_routing_routes
+        model_routing_routes = create_model_routing_routes(llm_manager, config_loader, config_path)
 
     # ───────────────────────────────────────────────────
     # 安全 API（PRD §5.9）：全局暂停 / 黑名单
@@ -447,7 +453,8 @@ def create_web_app(
         dynamic_drafts_routes +
         llm_providers_routes +
         video_analysis_routes +
-        image_generation_routes
+        image_generation_routes +
+        model_routing_routes
     )
 
     # 创建应用

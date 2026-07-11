@@ -72,3 +72,9 @@ a:hover { color: hsl(var(--primary) / 0.7); }
     outline: 2px solid hsl(var(--ring));
     outline-offset: 2px;
 }
+
+/* 终端光标闪烁动画 */
+@keyframes blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+}

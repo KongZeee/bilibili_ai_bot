@@ -132,7 +132,6 @@ export const ConfigPage = defineComponent({
         const schemaByCategory = (cat) => computed(() => schema.value.filter(f => (f.category || '通用') === cat));
 
         const bilibiliSchema = schemaByCategory('bilibili');
-        const llmSchema = schemaByCategory('llm');
         const replySchema = schemaByCategory('reply');
         const proactiveSchema = schemaByCategory('proactive');
 
@@ -248,13 +247,9 @@ export const ConfigPage = defineComponent({
                     ]),
                 ]),
 
-                // ═══ Section 2: 表单网格 2 列 — B站 + LLM ═══
-                h('section', {
-                    class: 'grid gap-4',
-                    style: 'grid-template-columns: repeat(2, minmax(0, 1fr));',
-                }, [
+                // ═══ Section 2: B站配置（LLM 配置已迁移到「模型分配」页面）═══
+                h('section', {}, [
                     renderConfigCard('B站配置', '账号与登录', bilibiliSchema),
-                    renderConfigCard('LLM 配置', '模型与服务', llmSchema),
                 ]),
 
                 // ═══ Section 3: 表单网格 2 列 — 回复 + 主动行为 ═══

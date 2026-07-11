@@ -36,6 +36,7 @@ const pages = [
     { path: '/personas/:id', title: '人格编辑' },
     { path: '/llm', title: 'LLM 管理' },
     { path: '/llm/:id', title: 'LLM 编辑' },
+    { path: '/model-routing', title: '模型分配' },
     { path: '/proactive', title: '主动行为' },
     { path: '/drafts', title: '动态草稿' },
     { path: '/image-gen', title: '文生图' },
@@ -55,6 +56,8 @@ import { PersonaListPage } from './pages/personas.js';
 registerRoute('/personas', PersonaListPage, '人格管理');
 import { LlmListPage } from './components/llm.js';
 registerRoute('/llm', LlmListPage, 'LLM 管理');
+import { ModelRoutingPage } from './pages/model-routing.js';
+registerRoute('/model-routing', ModelRoutingPage, '模型分配', '账号与身份');
 import { AccountListPage, AccountDetailPage } from './components/accounts.js';
 registerRoute('/accounts', AccountListPage, '账号管理');
 registerRoute('/accounts/:id', AccountDetailPage, '账号详情');

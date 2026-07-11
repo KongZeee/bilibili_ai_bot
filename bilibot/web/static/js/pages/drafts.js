@@ -47,8 +47,8 @@ export const DraftsPage = {
             loading.value = true;
             try {
                 const data = await api.dynamicDrafts.list(selectedAccount.value);
-                drafts.value = data || [];
-                total.value = data.length || 0;
+                drafts.value = data.items || data || [];
+                total.value = data.total || drafts.value.length || 0;
             } catch (e) {
                 appState.notify('加载草稿失败：' + (e.message || e), 'danger');
             } finally {

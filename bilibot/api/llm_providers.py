@@ -144,11 +144,11 @@ def create_llm_providers_routes(
         if not provider:
             return fail("NOT_FOUND", f"Provider 不存在: {llm_id}")
         try:
-            success = await provider.test()
+            success, err_msg = await provider.test()
             if success:
                 return ok({"connected": True, "model": provider.model}, "连接成功")
             else:
-                return fail("CONNECTION_FAILED", "连接失败，请检查 api_key / base_url / model")
+                return fail("CONNECTION_FAILED", f"连接失败: {err_msg or '请检查 api_key / base_url / model'}")
         except Exception as e:
             return fail("CONNECTION_FAILED", f"测试失败: {e}")
 
