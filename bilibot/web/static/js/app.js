@@ -62,6 +62,8 @@ import { MemoryRecallPage } from './components/memory/recall-page.js';
 registerRoute('/memory/recall', MemoryRecallPage, '召回测试');
 import { MemoryListPage } from './components/memory/list-page.js';
 registerRoute('/memory/list', MemoryListPage, '记忆列表');
+import { MemoryGraphPage } from './components/memory/graph-page.js';
+registerRoute('/memory/graph', MemoryGraphPage, '记忆图谱');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
