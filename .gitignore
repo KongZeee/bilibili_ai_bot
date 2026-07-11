@@ -76,6 +76,11 @@ temp/
 # TRAE IDE
 .trae/
 
+# Docs / scripts / tests（不推送）
+docs/
+scripts/
+tests/
+
 # Diagnostic scripts
 scripts/diag_*.py
 scripts/diagnose_web.py
