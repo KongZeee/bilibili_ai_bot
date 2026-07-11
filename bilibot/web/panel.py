@@ -531,10 +531,15 @@ def _get_dashboard_html() -> str:
     layout_v = _static_version("css/layout.css")
     comp_v = _static_version("css/components.css")
     return f"""<!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" style="color-scheme: light dark">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#3b352b">
+    <meta name="description" content="BiliBot B站 AI Bot 管理面板">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&display=swap" rel="stylesheet">
     <title>BiliBot - 控制台</title>
     <link rel="stylesheet" href="/static/css/tokens.css?v={tokens_v}">
     <link rel="stylesheet" href="/static/css/base.css?v={base_v}">
@@ -542,7 +547,9 @@ def _get_dashboard_html() -> str:
     <link rel="stylesheet" href="/static/css/components.css?v={comp_v}">
 </head>
 <body>
+    <a href="#app" class="skip-link">跳到主内容</a>
     <div id="app"></div>
+    <noscript>此页面需要 JavaScript 支持，请启用 JavaScript 后访问。</noscript>
     <script src="/static/vendor/vue.global.prod.js?v={vue_v}"></script>
     <script type="module" src="/static/js/app.js?v={app_v}"></script>
 </body>

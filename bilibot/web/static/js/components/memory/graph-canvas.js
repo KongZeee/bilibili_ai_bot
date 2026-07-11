@@ -14,17 +14,34 @@ export class MemoryGraphRenderer {
         this.hoveredNode = null;
         this.options = {
             nodeRadius: 20,
-            Colors: {
-                summary: '#6750A4',
-                person: '#2E7D32',
-                topic: '#0288D1',
-                memory: '#ED6C02',
+            colors: {
+                summary: this._readChartColor(1),  // chart-1: 55 20% 80%
+                person: this._readChartColor(5),   // chart-5: 29 92% 62%
+                topic: this._readChartColor(3),    // chart-3: 70 10% 67%
+                memory: this._readChartColor(4),   // chart-4: 55 24% 49%
             },
             ...options,
         };
         this.onNodeClick = options.onNodeClick || (() => {});
         this.onNodeHover = options.onNodeHover || (() => {});
         this.setupEvents();
+    }
+
+    _readChartColor(index) {
+        const fallbacks = {
+            1: 'hsl(55 20% 80%)',
+            2: 'hsl(0 15% 32%)',
+            3: 'hsl(70 10% 67%)',
+            4: 'hsl(55 24% 49%)',
+            5: 'hsl(29 92% 62%)',
+        };
+        try {
+            const root = getComputedStyle(document.documentElement);
+            const hsl = root.getPropertyValue(`--chart-${index}`).trim();
+            return hsl ? `hsl(${hsl})` : fallbacks[index] || '#cccccc';
+        } catch {
+            return fallbacks[index] || '#cccccc';
+        }
     }
 
     setData(data) {

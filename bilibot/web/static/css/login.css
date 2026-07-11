@@ -1,4 +1,4 @@
-/* BiliBot 登录页样式 - Material Design 3（参考 AstrBot 管理面板） */
+/* BiliBot 登录页样式 - Golden Time 设计风格 */
 
 * {
     margin: 0;
@@ -6,58 +6,28 @@
     box-sizing: border-box;
 }
 
-:root {
-    /* Material Design 3 色板（与 tokens.css 一致） */
-    --primary: #6750A4;
-    --primary-hover: #7965B0;
-    --primary-light: #EADDFF;
-    --on-primary: #FFFFFF;
-
-    --surface: #FEF7FF;
-    --surface-1: #F7F2FA;
-    --surface-2: #F1ECF4;
-    --surface-3: #E6E0E9;
-
-    --on-surface: #1D1B20;
-    --on-surface-variant: #49454F;
-    --on-surface-muted: #79747E;
-    --outline: #79747E;
-    --outline-variant: #CAC4D0;
-
-    --danger: #D32F2F;
-    --danger-bg: #FFEBEE;
-
-    --shadow-1: 0 1px 2px 0 rgba(0,0,0,0.06), 0 1px 3px 0 rgba(0,0,0,0.10);
-    --shadow-3: 0 4px 12px 0 rgba(0,0,0,0.10), 0 2px 4px 0 rgba(0,0,0,0.06);
-    --shadow-4: 0 8px 24px 0 rgba(0,0,0,0.12), 0 4px 8px 0 rgba(0,0,0,0.08);
-
-    --radius-sm: 8px;
-    --radius-md: 12px;
-    --radius-lg: 16px;
-    --radius-xl: 24px;
-    --radius-full: 9999px;
-}
-
 body {
     min-height: 100vh;
     display: flex;
     align-items: center;
     justify-content: center;
-    background: linear-gradient(135deg, #F7F2FA 0%, #EADDFF 100%);
-    font-family: 'Roboto', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    background: linear-gradient(135deg, hsl(40 16% 98%) 0%, hsl(40 24% 90%) 100%);
+    font-family: var(--font-sans, Fraunces, ui-serif, serif);
+    color: hsl(var(--foreground));
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
     padding: 24px;
+    letter-spacing: var(--tracking-normal);
 }
 
 .login-box {
-    background: var(--surface);
-    border-radius: var(--radius-xl);
+    background: hsl(var(--card));
+    border-radius: calc(var(--radius) * 0.82);
     padding: 48px 40px;
     width: 100%;
     max-width: 420px;
-    box-shadow: var(--shadow-4);
-    border: 1px solid rgba(0,0,0,0.04);
+    box-shadow: var(--shadow-lg);
+    border: 1px solid hsl(var(--border));
     animation: card-in 0.4s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -76,18 +46,21 @@ body {
     width: 64px;
     height: 64px;
     margin: 0 auto 20px;
-    border-radius: var(--radius-lg);
-    background: linear-gradient(135deg, var(--primary) 0%, var(--primary-hover) 100%);
+    border-radius: calc(var(--radius) * 0.5);
+    background: hsl(37.5 15.69% 20%);
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: 32px;
-    color: var(--on-primary);
-    box-shadow: 0 4px 12px rgba(103,80,164,0.3);
+    font-family: var(--font-sans, Fraunces, ui-serif, serif);
+    font-weight: 600;
+    color: hsl(var(--primary-foreground));
+    box-shadow: 0 4px 12px hsl(37.5 15.69% 20% / 0.25);
 }
 
 h1 {
-    color: var(--on-surface);
+    color: hsl(var(--foreground));
+    font-family: var(--font-sans, Fraunces, ui-serif, serif);
     font-size: 26px;
     font-weight: 600;
     text-align: center;
@@ -96,7 +69,7 @@ h1 {
 }
 
 .subtitle {
-    color: var(--on-surface-variant);
+    color: hsl(var(--muted-foreground));
     text-align: center;
     margin-bottom: 36px;
     font-size: 14px;
@@ -108,7 +81,7 @@ h1 {
 
 label {
     display: block;
-    color: var(--on-surface-variant);
+    color: hsl(var(--muted-foreground));
     font-size: 13px;
     font-weight: 500;
     margin-bottom: 8px;
@@ -118,52 +91,50 @@ label {
 input {
     width: 100%;
     padding: 14px 16px;
-    background: var(--surface);
-    border: 1px solid var(--outline-variant);
-    border-radius: var(--radius-sm);
-    color: var(--on-surface);
+    background: hsl(var(--card));
+    border: 1px solid hsl(var(--input));
+    border-radius: calc(var(--radius) * 0.76);
+    color: hsl(var(--foreground));
     font-size: 15px;
     font-family: inherit;
-    transition: all 0.2s;
+    transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 input::placeholder {
-    color: var(--on-surface-muted);
+    color: hsl(var(--muted-foreground));
 }
 
 input:focus {
     outline: none;
-    border-color: var(--primary);
-    border-width: 2px;
-    padding: 13px 15px;
-    box-shadow: 0 0 0 3px rgba(103,80,164,0.12);
+    border-color: hsl(var(--ring));
+    box-shadow: 0 0 0 2px hsl(var(--ring) / 0.18);
 }
 
 button {
     width: 100%;
     padding: 14px;
-    background: var(--primary);
+    background: hsl(var(--primary));
     border: none;
-    border-radius: var(--radius-full);
-    color: var(--on-primary);
+    border-radius: calc(var(--radius) * 0.76);
+    color: hsl(var(--primary-foreground));
     font-size: 15px;
     font-weight: 500;
+    font-family: inherit;
     cursor: pointer;
-    transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-    box-shadow: var(--shadow-1);
+    transition: background-color 0.2s, box-shadow 0.2s, transform 0.2s;
     letter-spacing: 0.3px;
     margin-top: 8px;
 }
 
 button:hover {
-    background: var(--primary-hover);
-    box-shadow: var(--shadow-3);
+    background: hsl(var(--primary));
+    box-shadow: var(--shadow-md);
     transform: translateY(-1px);
 }
 
 button:active {
     transform: translateY(0);
-    box-shadow: var(--shadow-1);
+    box-shadow: var(--shadow-sm);
 }
 
 button:disabled {
@@ -174,9 +145,9 @@ button:disabled {
 }
 
 .error {
-    color: var(--danger);
-    background: var(--danger-bg);
-    border-radius: var(--radius-sm);
+    color: hsl(var(--destructive));
+    background: hsl(var(--destructive) / 0.08);
+    border-radius: calc(var(--radius) * 0.76);
     padding: 12px 16px;
     font-size: 14px;
     margin-top: 16px;

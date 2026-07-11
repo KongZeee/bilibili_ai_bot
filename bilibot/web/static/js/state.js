@@ -30,7 +30,10 @@ export async function refreshAccounts() {
     // 见 app.js 中的 initGlobalState()
     try {
         const { api } = window;
-        appState.accounts = await api.accounts.list();
+        const list = await api.accounts.list();
+        // 规范化：后端返回 account_id，统一映射为 id 供前端使用
+        list.forEach(acc => { if (!acc.id) acc.id = acc.account_id; });
+        appState.accounts = list;
         appState.accountsLoaded = true;
         if (!appState.currentAccountId && appState.accounts.length > 0) {
             appState.currentAccountId = appState.accounts[0].id;
@@ -52,6 +55,13 @@ export async function refreshLlm() {
 
 // refreshLlmProviders 别名（Phase 5 页面通过 appState.refreshLlmProviders() 调用）
 appState.refreshLlmProviders = refreshLlm;
+
+// notify 别名（Phase 5 页面通过 appState.notify(msg, type) 调用）
+// type 映射：danger→error，其他保持不变
+appState.notify = function(message, type = 'info') {
+    const typeMap = { danger: 'error', success: 'success', warning: 'warning', info: 'info', error: 'error' };
+    showToast(message, typeMap[type] || type);
+};
 
 export async function refreshPersonas() {
     try {

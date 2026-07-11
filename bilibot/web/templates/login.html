@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="zh-CN" style="color-scheme: light dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#3b352b">
+    <meta name="description" content="BiliBot B站 AI Bot 管理面板">
+    <title>BiliBot - 登录</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/static/css/tokens.css">
+    <link rel="stylesheet" href="/static/css/login.css">
+</head>
+<body>
+    <div class="login-box">
+        <div class="login-logo" aria-hidden="true">B</div>
+        <h1>BiliBot</h1>
+        <p class="subtitle">B站 AI Bot 管理面板</p>
+        <form id="loginForm">
+            <div class="form-group">
+                <label for="username">用户名</label>
+                <input type="text" id="username" name="username" autocomplete="username" spellcheck="false" placeholder="请输入用户名…" required>
+            </div>
+            <div class="form-group">
+                <label for="password">密码</label>
+                <input type="password" id="password" name="password" autocomplete="current-password" placeholder="请输入密码…" required>
+            </div>
+            <button type="submit" id="submitBtn">登录</button>
+            <p class="error" id="error" role="alert" aria-live="assertive"></p>
+        </form>
+    </div>
+    <script src="/static/js/login.js"></script>
+</body>
+</html>

@@ -64,6 +64,8 @@ import { MemoryListPage } from './components/memory/list-page.js';
 registerRoute('/memory/list', MemoryListPage, '记忆列表');
 import { MemoryGraphPage } from './components/memory/graph-page.js';
 registerRoute('/memory/graph', MemoryGraphPage, '记忆图谱');
+import { MemoryGraph3DPage } from './components/memory/graph-3d-page.js';
+registerRoute('/memory/graph-3d', MemoryGraph3DPage, '图谱 3D');
 import { LogsPage } from './pages/logs.js';
 registerRoute('/logs', LogsPage, '日志');
 import { CommentsPage } from './pages/comments.js';
@@ -86,9 +88,13 @@ pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 // --- Toast 容器组件 ---
 const ToastContainer = defineComponent({
     setup() {
-        return () => h('div', { class: 'toast-container' },
+        return () => h('div', { class: 'toast-container', 'aria-live': 'polite', 'aria-atomic': 'true' },
             appState.toasts.map(t =>
-                h('div', { class: `toast toast-${t.type}`, key: t.id }, t.message)
+                h('div', {
+                    class: `toast toast-${t.type}`,
+                    key: t.id,
+                    role: (t.type === 'error' || t.type === 'warning') ? 'alert' : 'status',
+                }, t.message)
             )
         );
     },

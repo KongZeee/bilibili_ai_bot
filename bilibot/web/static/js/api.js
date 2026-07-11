@@ -76,7 +76,7 @@ export const api = {
         delete: (id) => api.delete(`/api/personas/${id}`),
         activate: (id) => api.post(`/api/personas/${id}/activate`),
         copy: (id) => api.post(`/api/personas/${id}/copy`),
-        test: (id, data) => api.post(`/api/personas/${id}/test`, data),
+        test: (id, data) => api.post('/api/personas/test', { ...data, persona_id: id }),
         export: (id) => api.get(`/api/personas/${id}/export`),
         import: (data) => api.post('/api/personas/import', data),
     },
@@ -100,7 +100,14 @@ export const api = {
         validate: () => api.post('/api/config/validate'),
         reload: () => api.post('/api/config/reload'),
         // 别名（Phase 5 页面使用）
-        getWithSchema: () => api.get('/api/config?schema=true'),
+        // 后端无 GET /api/config，改为并行拉取 schema + full 后组合返回
+        getWithSchema: async () => {
+            const [schema, config] = await Promise.all([
+                api.get('/api/config/schema'),
+                api.get('/api/config/full'),
+            ]);
+            return { data: { schema, config, version: 0 } };
+        },
         update: (data) => api.patch('/api/config', data),
         reset: () => api.post('/api/config/reset'),
         export: () => api.get('/api/config/export'),
@@ -141,12 +148,18 @@ export const api = {
         approve: (accId, id) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/approve`),
         reject: (accId, id, reason) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/reject`, { reason }),
         retry: (accId, id) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/retry`),
+        update: (accId, id, data) => api.patch(`/api/accounts/${accId}/dynamic-drafts/${id}`, data),
     },
     backup: {
         create: () => api.post('/api/backup/create'),
         list: () => api.get('/api/backup/list'),
         restore: (name) => api.post('/api/backup/restore', { name }),
         delete: (name) => api.delete(`/api/backup/${name}`),
+        download: async (name) => {
+            const resp = await fetch(`/api/backup/${name}/download`, { credentials: 'same-origin' });
+            if (!resp.ok) throw new Error(`下载失败: HTTP ${resp.status}`);
+            return await resp.blob();
+        },
     },
 };
 

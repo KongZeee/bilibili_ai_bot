@@ -1,57 +1,34 @@
 // components/common.js - 通用 Vue 组件库
-const { defineComponent, h, ref, computed, watch, onMounted, onUnmounted } = window.Vue;
+const { defineComponent, h, ref, computed, watch, onMounted, onBeforeUnmount, onUnmounted } = window.Vue;
 
 // ═══════════════════════════════════════════════════
-// Icon 组件 - 扁平化 SVG 图标系统
-// 使用 Material Design / Feather 风格的 24x24 线性图标
+// Icon 组件 - 基于 CSS mask 的图标系统
+// SVG 图标文件位于 /static/icons/{name}.svg
+// background-color: currentColor 由 [data-icon] CSS 规则处理
 // ═══════════════════════════════════════════════════
-const ICON_PATHS = {
-    // 运营总览
-    dashboard: 'M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z',
-    comments: 'M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z',
-    logs: 'M14 2H6c-1.1 0-2 .9-2 2v16c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V8l-4-6zM6 20V4h7v5h5v11H6z',
-    // 账号与身份
-    accounts: 'M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z',
-    personas: 'M3 5h18v14H3V5zm2 2v10h14V7H5zm4 2h6v2H9V9z M12 2l3 3-3 3-3-3 3-3z',
-    llm: 'M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5',
-    // 内容创作
-    sparkles: 'M12 2l1.5 4.5L18 8l-4.5 1.5L12 14l-1.5-4.5L6 8l4.5-1.5L12 2zM5 14l.75 2.25L8 17l-2.25.75L5 20l-.75-2.25L2 17l2.25-.75L5 14zm14 0l.75 2.25L22 17l-2.25.75L19 20l-.75-2.25L16 17l2.25-.75L19 14z',
-    proactive: 'M17.65 6.35A7.958 7.958 0 0012 4a8 8 0 108 8h-2c0 3.31-2.69 6-6 6s-6-2.69-6-6 2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
-    drafts: 'M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM20.71 7.04c.39-.39.39-1.02 0-1.41l-2.34-2.34a.996.996 0 00-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83z',
-    image: 'M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z',
-    video: 'M17 10.5V7c0-.55-.45-1-1-1H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4z',
-    // 记忆与知识
-    memory: 'M21 11.5a8.38 8.38 0 01-.9 3.8 8.5 8.5 0 01-7.6 4.7 8.38 8.38 0 01-3.8-.9L3 21l1.9-5.7a8.38 8.38 0 01-.9-3.8 8.5 8.5 0 014.7-7.6 8.38 8.38 0 013.8-.9h.5a8.48 8.48 0 018 8v.5z M12 8v4 M12 12l3 3',
-    graph: 'M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z',
-    search: 'M15.5 14h-.79l-.28-.27a6.5 6.5 0 10-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0A4.5 4.5 0 1114 9.5 4.5 4.5 0 019.5 14z',
-    // 系统
-    system: 'M12 1L3 5v6c0 5.55 3.84 10.74 9 12 5.16-1.26 9-6.45 9-12V5l-9-4z',
-    config: 'M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.488.488 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z',
-    logout: 'M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.58L17 17l5-5zM4 5h8V3H4c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h8v-2H4V5z',
-    // 通用
-    empty: 'M19 3H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2V5c0-1.1-.9-2-2-2zm0 16H5V5h14v14zM7 11h2v2H7zm4 0h2v2h-2zm4 0h2v2h-2z',
-    refresh: 'M17.65 6.35A7.958 7.958 0 0012 4a8 8 0 108 8h-2c0 3.31-2.69 6-6 6s-6-2.69-6-6 2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z',
-};
-
 export const Icon = defineComponent({
     name: 'Icon',
     props: {
         name: { type: String, required: true },
-        size: { type: [Number, String], default: 20 },
+        size: { type: [String, Number], default: null },
     },
-    inheritAttrs: true,
-    setup(props, { attrs }) {
-        return () => h('svg', {
-            class: 'icon-svg',
-            width: props.size,
-            height: props.size,
-            viewBox: '0 0 24 24',
-            fill: 'currentColor',
-            'aria-hidden': 'true',
-            ...attrs,
-        }, [
-            h('path', { d: ICON_PATHS[props.name] || ICON_PATHS.empty }),
-        ]);
+    setup(props) {
+        return () => {
+            const style = {
+                '-webkit-mask-image': `url('/static/icons/${props.name}.svg')`,
+                'mask-image': `url('/static/icons/${props.name}.svg')`,
+            };
+            if (props.size) {
+                const s = typeof props.size === 'number' ? props.size + 'rem' : props.size;
+                style.width = s;
+                style.height = s;
+            }
+            return h('span', {
+                'data-icon': '',
+                style: style,
+                'aria-hidden': 'true',
+            });
+        };
     },
 });
 
@@ -71,6 +48,7 @@ export const Card = defineComponent({
                 ])
                 : null,
             h('div', { class: 'card-body' }, slots.default?.()),
+            slots.footer ? h('div', { class: 'card-footer' }, slots.footer()) : null,
         ]);
     },
 });
@@ -83,6 +61,7 @@ export const Button = defineComponent({
         size: { type: String, default: 'md' }, // sm/md
         loading: Boolean,
         disabled: Boolean,
+        ariaLabel: String, // 图标按钮的无障碍标签
     },
     emits: ['click'],
     setup(props, { slots, emit }) {
@@ -94,9 +73,11 @@ export const Button = defineComponent({
                 props.loading ? 'btn-loading' : '',
             ],
             disabled: props.disabled || props.loading,
+            'aria-label': props.ariaLabel || undefined,
+            'aria-busy': props.loading || undefined,
             onClick: (e) => emit('click', e),
         }, [
-            props.loading ? h('span', { class: 'spinner spinner-sm' }) : null,
+            props.loading ? h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' }) : null,
             h('span', slots.default?.()),
         ]);
     },
@@ -108,17 +89,23 @@ export const Toggle = defineComponent({
     props: {
         modelValue: Boolean,
         disabled: Boolean,
+        id: String,
+        name: String,
+        ariaLabel: String,
     },
     emits: ['update:modelValue'],
     setup(props, { emit }) {
-        return () => h('label', { class: ['toggle', props.disabled ? 'toggle-disabled' : ''] }, [
+        return () => h('label', { class: ['toggle', props.disabled ? 'toggle-disabled' : ''], for: props.id || undefined }, [
             h('input', {
                 type: 'checkbox',
+                id: props.id || undefined,
+                name: props.name || undefined,
                 checked: props.modelValue,
                 disabled: props.disabled,
+                'aria-label': props.ariaLabel || undefined,
                 onChange: (e) => emit('update:modelValue', e.target.checked),
             }),
-            h('span', { class: 'toggle-slider' }),
+            h('span', { class: 'toggle-slider', 'aria-hidden': 'true' }),
         ]);
     },
 });
@@ -148,21 +135,34 @@ export const FormInput = defineComponent({
         hint: String,
         error: String,
         disabled: Boolean,
+        id: String,
+        name: String,
+        autocomplete: String,
+        spellcheck: { type: Boolean, default: undefined },
     },
     emits: ['update:modelValue'],
     setup(props, { emit }) {
+        const hintId = props.id ? `${props.id}-hint` : undefined;
+        const errorId = props.id ? `${props.id}-error` : undefined;
+        const describedBy = [hintId, props.error ? errorId : null].filter(Boolean).join(' ') || undefined;
         return () => h('div', { class: 'form-group' }, [
-            props.label ? h('label', { class: 'form-label' }, props.label) : null,
+            props.label ? h('label', { class: 'form-label', for: props.id || undefined }, props.label) : null,
             h('input', {
                 class: ['form-input', props.error ? 'form-input-error' : ''],
                 type: props.type,
                 value: props.modelValue,
                 placeholder: props.placeholder,
                 disabled: props.disabled,
+                id: props.id || undefined,
+                name: props.name || undefined,
+                autocomplete: props.autocomplete || undefined,
+                spellcheck: props.spellcheck,
+                'aria-invalid': props.error ? 'true' : undefined,
+                'aria-describedby': describedBy,
                 onInput: (e) => emit('update:modelValue', e.target.value),
             }),
-            props.hint ? h('div', { class: 'form-hint' }, props.hint) : null,
-            props.error ? h('div', { class: 'form-error' }, props.error) : null,
+            props.hint ? h('div', { class: 'form-hint', id: hintId }, props.hint) : null,
+            props.error ? h('div', { class: 'form-error', id: errorId, role: 'alert' }, props.error) : null,
         ]);
     },
 });
@@ -175,21 +175,34 @@ export const FormSelect = defineComponent({
         options: Array, // [{value, label}]
         label: String,
         hint: String,
+        error: String,
         disabled: Boolean,
+        id: String,
+        name: String,
+        autocomplete: String,
     },
     emits: ['update:modelValue'],
     setup(props, { emit }) {
+        const hintId = props.id ? `${props.id}-hint` : undefined;
+        const errorId = props.id ? `${props.id}-error` : undefined;
+        const describedBy = [hintId, props.error ? errorId : null].filter(Boolean).join(' ') || undefined;
         return () => h('div', { class: 'form-group' }, [
-            props.label ? h('label', { class: 'form-label' }, props.label) : null,
+            props.label ? h('label', { class: 'form-label', for: props.id || undefined }, props.label) : null,
             h('select', {
-                class: 'form-input',
+                class: ['form-input', props.error ? 'form-input-error' : ''],
                 value: props.modelValue,
                 disabled: props.disabled,
+                id: props.id || undefined,
+                name: props.name || undefined,
+                autocomplete: props.autocomplete || undefined,
+                'aria-invalid': props.error ? 'true' : undefined,
+                'aria-describedby': describedBy,
                 onChange: (e) => emit('update:modelValue', e.target.value),
             }, (props.options || []).map(opt =>
                 h('option', { value: opt.value }, opt.label)
             )),
-            props.hint ? h('div', { class: 'form-hint' }, props.hint) : null,
+            props.hint ? h('div', { class: 'form-hint', id: hintId }, props.hint) : null,
+            props.error ? h('div', { class: 'form-error', id: errorId, role: 'alert' }, props.error) : null,
         ]);
     },
 });
@@ -205,17 +218,100 @@ export const Modal = defineComponent({
     emits: ['update:modelValue', 'close'],
     setup(props, { slots, emit }) {
         const close = () => { emit('update:modelValue', false); emit('close'); };
+        const modalRef = ref(null);
+        let prevFocus = null;
+        let keydownHandler = null;
+
+        const trapFocus = (e) => {
+            if (e.key === 'Escape') {
+                close();
+                return;
+            }
+            if (e.key !== 'Tab') return;
+            const modal = modalRef.value;
+            if (!modal) return;
+            const focusables = modal.querySelectorAll(
+                'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])'
+            );
+            if (focusables.length === 0) {
+                e.preventDefault();
+                modal.focus();
+                return;
+            }
+            const first = focusables[0];
+            const last = focusables[focusables.length - 1];
+            if (e.shiftKey && document.activeElement === first) {
+                e.preventDefault();
+                last.focus();
+            } else if (!e.shiftKey && document.activeElement === last) {
+                e.preventDefault();
+                first.focus();
+            }
+        };
+
+        onMounted(() => {
+            // watch modelValue 变化
+        });
+        onBeforeUnmount(() => {
+            if (keydownHandler) {
+                document.removeEventListener('keydown', keydownHandler);
+                keydownHandler = null;
+            }
+            if (prevFocus) {
+                prevFocus.focus();
+                prevFocus = null;
+            }
+        });
+
+        // 用 watch 监听 modelValue
+        watch(() => props.modelValue, (val) => {
+            if (val) {
+                prevFocus = document.activeElement;
+                // 等 DOM 更新后聚焦 modal
+                setTimeout(() => {
+                    if (modalRef.value) {
+                        modalRef.value.focus();
+                    }
+                }, 0);
+                keydownHandler = trapFocus;
+                document.addEventListener('keydown', keydownHandler);
+            } else {
+                if (keydownHandler) {
+                    document.removeEventListener('keydown', keydownHandler);
+                    keydownHandler = null;
+                }
+                if (prevFocus) {
+                    prevFocus.focus();
+                    prevFocus = null;
+                }
+            }
+        });
+
+        const titleId = `modal-title-${Math.random().toString(36).slice(2, 8)}`;
 
         return () => props.modelValue
-            ? h('div', { class: 'modal-overlay', onClick: close }, [
+            ? h('div', {
+                class: 'modal-overlay',
+                onClick: close,
+                role: 'presentation',
+            }, [
                 h('div', {
                     class: 'modal',
+                    ref: modalRef,
                     style: { maxWidth: props.width },
+                    role: 'dialog',
+                    'aria-modal': 'true',
+                    'aria-labelledby': titleId,
+                    tabindex: '-1',
                     onClick: (e) => e.stopPropagation(),
                 }, [
                     h('div', { class: 'modal-header' }, [
-                        h('h3', props.title || ''),
-                        h('button', { class: 'modal-close', onClick: close }, '×'),
+                        h('h3', { id: titleId }, props.title || ''),
+                        h('button', {
+                            class: 'modal-close',
+                            onClick: close,
+                            'aria-label': '关闭',
+                        }, '×'),
                     ]),
                     h('div', { class: 'modal-body' }, slots.default?.()),
                     slots.footer
@@ -230,7 +326,7 @@ export const Modal = defineComponent({
 // EmptyState 组件
 export const EmptyState = defineComponent({
     name: 'EmptyState',
-    props: { icon: { type: String, default: 'empty' }, title: String, desc: String },
+    props: { icon: { type: String, default: 'folder' }, title: String, desc: String },
     setup(props, { slots }) {
         return () => h('div', { class: 'empty-state' }, [
             h('div', { class: 'empty-icon' }, [h(Icon, { name: props.icon, size: 48 })]),
@@ -252,41 +348,87 @@ export const Loading = defineComponent({
     },
 });
 
-// DataTable 组件
+// DataTable 组件（支持虚拟滚动）
 export const DataTable = defineComponent({
     name: 'DataTable',
     props: {
         columns: Array, // [{key, label, width}]
         rows: Array,
         loading: Boolean,
+        virtualScroll: { type: Boolean, default: false },
+        itemHeight: { type: Number, default: 48 },
+        maxHeight: { type: String, default: '600px' },
     },
     setup(props, { slots }) {
-        return () => h('div', { class: 'table-container' }, [
-            h('table', [
-                h('thead', h('tr',
-                    props.columns.map(col =>
-                        h('th', { style: col.width ? { width: col.width } : {} }, col.label)
-                    )
-                )),
-                h('tbody',
-                    props.loading
-                        ? [h('tr', h('td', {
-                              colspan: props.columns.length,
-                              style: 'text-align:center;padding:32px',
-                          }, [h('div', { class: 'loading' }, h('div', { class: 'spinner' }))]))]
-                        : (props.rows || []).map((row, idx) =>
-                            h('tr', { key: idx },
-                                props.columns.map(col =>
-                                    h('td', slots[col.key]
-                                        ? slots[col.key]({ row, value: row[col.key] })
-                                        : String(row[col.key] ?? '')
-                                    )
-                                )
+        const scrollTop = ref(0);
+        const containerRef = ref(null);
+        const BUFFER = 5;
+        const THRESHOLD = 50; // 超过此项数才启用虚拟滚动
+
+        const shouldVirtualize = computed(() =>
+            props.virtualScroll && (props.rows || []).length > THRESHOLD
+        );
+
+        const visibleRange = computed(() => {
+            if (!shouldVirtualize.value) return { start: 0, end: (props.rows || []).length };
+            const total = props.rows.length;
+            const itemH = props.itemHeight;
+            const viewH = containerRef.value?.clientHeight || 600;
+            const start = Math.max(0, Math.floor(scrollTop.value / itemH) - BUFFER);
+            const visibleCount = Math.ceil(viewH / itemH) + BUFFER * 2;
+            const end = Math.min(total, start + visibleCount);
+            return { start, end };
+        });
+
+        const onScroll = (e) => {
+            scrollTop.value = e.target.scrollTop;
+        };
+
+        return () => {
+            const rows = props.rows || [];
+            const { start, end } = visibleRange.value;
+            const visibleRows = shouldVirtualize.value ? rows.slice(start, end) : rows;
+
+            const tbodyChildren = props.loading
+                ? [h('tr', h('td', {
+                      colspan: props.columns.length,
+                      style: 'text-align:center;padding:32px',
+                  }, [h('div', { class: 'loading' }, h('div', { class: 'spinner' }))]))]
+                : visibleRows.map((row, i) =>
+                    h('tr', { key: shouldVirtualize.value ? start + i : i },
+                        props.columns.map(col =>
+                            h('td', slots[col.key]
+                                ? slots[col.key]({ row, value: row[col.key] })
+                                : String(row[col.key] ?? '')
                             )
                         )
-                ),
-            ]),
-        ]);
+                    )
+                );
+
+            // 虚拟滚动时，在可见行前后加占位 spacer
+            const spacerBefore = shouldVirtualize.value && start > 0
+                ? h('tr', { style: { height: `${start * props.itemHeight}px` }, 'aria-hidden': 'true' })
+                : null;
+            const spacerAfter = shouldVirtualize.value && end < rows.length
+                ? h('tr', { style: { height: `${(rows.length - end) * props.itemHeight}px` }, 'aria-hidden': 'true' })
+                : null;
+
+            return h('div', {
+                class: 'table-container',
+                style: shouldVirtualize.value ? { maxHeight: props.maxHeight, overflowY: 'auto' } : {},
+                ref: containerRef,
+                onScroll: shouldVirtualize.value ? onScroll : undefined,
+            }, [
+                h('table', [
+                    h('thead', h('tr',
+                        props.columns.map(col =>
+                            h('th', { style: col.width ? { width: col.width } : {} }, col.label)
+                        )
+                    )),
+                    h('tbody', [spacerBefore, ...tbodyChildren, spacerAfter].filter(Boolean)),
+                ]),
+            ]);
+        };
     },
 });
 
@@ -301,21 +443,32 @@ export const FormTextarea = defineComponent({
         error: String,
         rows: { type: [Number, String], default: 4 },
         disabled: Boolean,
+        id: String,
+        name: String,
+        spellcheck: { type: Boolean, default: undefined },
     },
     emits: ['update:modelValue'],
     setup(props, { emit }) {
+        const hintId = props.id ? `${props.id}-hint` : undefined;
+        const errorId = props.id ? `${props.id}-error` : undefined;
+        const describedBy = [hintId, props.error ? errorId : null].filter(Boolean).join(' ') || undefined;
         return () => h('div', { class: 'form-group' }, [
-            props.label ? h('label', { class: 'form-label' }, props.label) : null,
+            props.label ? h('label', { class: 'form-label', for: props.id || undefined }, props.label) : null,
             h('textarea', {
                 class: ['form-input', props.error ? 'form-input-error' : ''],
                 value: props.modelValue,
                 placeholder: props.placeholder,
                 rows: props.rows,
                 disabled: props.disabled,
+                id: props.id || undefined,
+                name: props.name || undefined,
+                spellcheck: props.spellcheck,
+                'aria-invalid': props.error ? 'true' : undefined,
+                'aria-describedby': describedBy,
                 onInput: (e) => emit('update:modelValue', e.target.value),
             }),
-            props.hint ? h('div', { class: 'form-hint' }, props.hint) : null,
-            props.error ? h('div', { class: 'form-error' }, props.error) : null,
+            props.hint ? h('div', { class: 'form-hint', id: hintId }, props.hint) : null,
+            props.error ? h('div', { class: 'form-error', id: errorId, role: 'alert' }, props.error) : null,
         ]);
     },
 });
@@ -378,5 +531,172 @@ export const Pagination = defineComponent({
                 onClick: () => go(props.page + 1),
             }, '下一页'),
         ]);
+    },
+});
+
+// KpiCard 组件 - KPI 指标卡片
+export const KpiCard = defineComponent({
+    name: 'KpiCard',
+    props: {
+        eyebrow: { type: String, default: '指标' },
+        iconName: { type: String, default: '' },
+        value: { type: [String, Number], required: true },
+        trend: { type: String, default: '' },
+        trendDirection: { type: String, default: 'up' },
+        label: { type: String, default: '' },
+        valueLabel: { type: String, default: '' },
+    },
+    setup(props) {
+        return () => h('article', {
+            class: 'card',
+            style: { display: 'grid', gap: 'calc(var(--spacing) * 3)', alignContent: 'start', minHeight: '10rem' },
+        }, [
+            h('div', {
+                class: 'flex items-center justify-between gap-2',
+            }, [
+                h('span', { class: 'eyebrow' }, props.eyebrow),
+                props.iconName ? h(Icon, { name: props.iconName, size: '1.15rem' }) : null,
+            ]),
+            h('div', { class: 'grid gap-1' }, [
+                props.valueLabel ? h('span', { class: 'kpi-label' }, props.valueLabel) : null,
+                h('div', { class: 'flex items-baseline gap-2 flex-wrap' }, [
+                    h('span', { class: 'kpi-value' }, String(props.value)),
+                    props.trend ? h('span', { class: ['kpi-trend', props.trendDirection === 'down' ? 'down' : 'up'] }, [
+                        h(Icon, { name: props.trendDirection === 'down' ? 'arrow-down' : 'arrow-up', size: '0.8rem' }),
+                        props.trend,
+                    ]) : null,
+                ]),
+            ]),
+            props.label ? h('p', { class: 'muted m-0' }, props.label) : null,
+        ]);
+    },
+});
+
+// HeroPanel 组件 - 页面顶部大号摘要面板
+export const HeroPanel = defineComponent({
+    name: 'HeroPanel',
+    props: {
+        eyebrow: { type: String, default: '' },
+        title: { type: String, default: '' },
+        badge: { type: String, default: '' },
+        badgeType: { type: String, default: 'success' },
+        trend: { type: String, default: '' },
+        ctaText: { type: String, default: '' },
+        ctaIcon: { type: String, default: '' },
+        onCta: { type: Function, default: null },
+    },
+    emits: ['cta'],
+    setup(props, { emit, slots }) {
+        return () => h('div', { class: 'hero-panel' }, [
+            (props.eyebrow || props.badge) ? h('div', {
+                class: 'flex items-start justify-between gap-2 flex-wrap',
+            }, [
+                props.eyebrow ? h('span', { class: 'eyebrow' }, props.eyebrow) : null,
+                props.badge ? h('span', { class: ['badge', `badge-${props.badgeType}`] }, props.badge) : null,
+            ]) : null,
+            props.title ? h('h2', {
+                style: 'margin:0; font-size:1.65rem; line-height:1.1; text-wrap:balance; word-break:keep-all;',
+            }, props.title) : null,
+            slots.default ? slots.default() : null,
+            props.trend ? h('p', { class: 'muted m-0' }, props.trend) : null,
+            props.ctaText ? h('button', {
+                class: 'btn primary',
+                onClick: (e) => { emit('cta', e); if (props.onCta) props.onCta(e); },
+            }, [
+                props.ctaIcon ? h(Icon, { name: props.ctaIcon, size: '1.05rem' }) : null,
+                h('span', props.ctaText),
+            ]) : null,
+        ]);
+    },
+});
+
+// ActionList 组件 - 带 chevron-right 的可点击列表项
+export const ActionList = defineComponent({
+    name: 'ActionList',
+    props: {
+        items: {
+            type: Array,
+            default: () => [],
+        },
+    },
+    setup(props) {
+        return () => h('div', { class: 'action-list' },
+            props.items.map((item, i) => {
+                const content = [
+                    h('span', { class: 'action-list-item-copy' }, [
+                        item.iconName ? h('span', { class: 'action-list-item-icon' }, [
+                            h(Icon, { name: item.iconName, size: '1rem' }),
+                        ]) : null,
+                        h('span', { class: 'truncate', style: 'font-size:0.97rem;' }, item.label),
+                    ]),
+                    h(Icon, { name: 'chevron-right', size: '1rem' }),
+                ];
+                const cls = 'action-list-item';
+                if (item.href) {
+                    return h('a', {
+                        key: i,
+                        class: cls,
+                        href: item.href,
+                    }, content);
+                }
+                return h('button', {
+                    key: i,
+                    class: cls,
+                    onClick: (e) => item.onClick && item.onClick(e),
+                }, content);
+            }),
+        );
+    },
+});
+
+// ProgressBar 组件 - 进度条
+export const ProgressBar = defineComponent({
+    name: 'ProgressBar',
+    props: {
+        value: { type: Number, required: true },
+        max: { type: Number, default: 100 },
+        colorToken: { type: String, default: '' },
+        label: { type: String, default: '' },
+        showValue: { type: Boolean, default: false },
+    },
+    setup(props) {
+        const percent = computed(() => {
+            const p = props.max > 0 ? Math.min(100, Math.max(0, (props.value / props.max) * 100)) : 0;
+            return Math.round(p);
+        });
+        return () => h('div', { class: 'grid gap-1' }, [
+            (props.label || props.showValue) ? h('div', {
+                class: 'flex items-center justify-between gap-2',
+            }, [
+                props.label ? h('span', { class: 'muted', style: 'font-size:0.88rem;' }, props.label) : null,
+                props.showValue ? h('span', {
+                    style: 'font-size:0.82rem; color:hsl(var(--muted-foreground)); font-variant-numeric:tabular-nums;',
+                }, `${props.value} / ${props.max}`) : null,
+            ]) : null,
+            h('div', { class: 'progress-bar' }, [
+                h('div', {
+                    class: ['progress-bar-fill', props.colorToken ? props.colorToken : ''].filter(Boolean).join(' '),
+                    style: { width: `${percent.value}%` },
+                    role: 'progressbar',
+                    'aria-valuenow': props.value,
+                    'aria-valuemin': 0,
+                    'aria-valuemax': props.max,
+                }),
+            ]),
+        ]);
+    },
+});
+
+// StatusDot 组件 - 状态指示点
+export const StatusDot = defineComponent({
+    name: 'StatusDot',
+    props: {
+        status: { type: String, default: 'offline' },
+        label: { type: String, default: '' },
+    },
+    setup(props) {
+        return () => h('span', {
+            class: ['status-dot', props.status],
+        }, props.label);
     },
 });

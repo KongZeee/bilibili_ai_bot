@@ -40,23 +40,38 @@ export const SchemaForm = {
         function renderField(field) {
             const value = localModel[field.key];
             const onInput = (v) => update(field.key, v);
+            const fieldId = field.id || `sf-${field.key.replace(/\./g, '-')}`;
+            const autocomplete = field.sensitive ? 'off' : (field.autocomplete || undefined);
+            const spellcheck = field.sensitive ? false : (field.spellcheck);
 
             switch (field.type) {
                 case 'boolean':
                     return h('div', { class: 'flex items-center gap-2' }, [
-                        h(Toggle, { modelValue: !!value, 'onUpdate:modelValue': onInput }),
+                        h(Toggle, {
+                            modelValue: !!value,
+                            'onUpdate:modelValue': onInput,
+                            id: fieldId,
+                            name: fieldId,
+                            ariaLabel: field.label,
+                        }),
                         h('span', { class: 'form-hint' }, value ? '已启用' : '已禁用'),
                     ]);
                 case 'select':
                     return h(FormSelect, {
                         modelValue: value,
                         'onUpdate:modelValue': onInput,
+                        id: fieldId,
+                        name: fieldId,
+                        autocomplete,
                         options: field.options || [],
                     });
                 case 'textarea':
                     return h(FormTextarea, {
                         modelValue: value ?? '',
                         'onUpdate:modelValue': onInput,
+                        id: fieldId,
+                        name: fieldId,
+                        spellcheck,
                         rows: field.rows || 4,
                         placeholder: field.placeholder || '',
                     });
@@ -64,44 +79,71 @@ export const SchemaForm = {
                     return h(FormInput, {
                         modelValue: value ?? '',
                         'onUpdate:modelValue': onInput,
+                        id: fieldId,
+                        name: fieldId,
                         type: 'password',
+                        autocomplete: 'off',
+                        spellcheck: false,
                         placeholder: field.sensitive ? '编辑时留空表示不修改' : '',
                     });
                 case 'number':
                     return h(FormInput, {
                         modelValue: value != null ? String(value) : '',
                         'onUpdate:modelValue': (v) => onInput(field.type === 'integer' ? parseInt(v) || 0 : parseFloat(v) || 0),
+                        id: fieldId,
+                        name: fieldId,
                         type: 'number',
                         min: field.min,
                         max: field.max,
+                        autocomplete,
+                        spellcheck,
                     });
                 case 'string':
                 default:
                     return h(FormInput, {
                         modelValue: value ?? '',
                         'onUpdate:modelValue': onInput,
+                        id: fieldId,
+                        name: fieldId,
+                        autocomplete,
+                        spellcheck,
                         placeholder: field.placeholder || '',
                     });
             }
         }
 
         return () => h('div', { class: 'schema-form' },
-            groupedFields.value.map(group => h('div', { class: 'schema-group mb-4' }, [
-                h('h4', { class: 'schema-group-title mb-3', style: 'font-size:14px; font-weight:600; color:var(--on-surface-variant); padding-bottom:8px; border-bottom:1px solid var(--outline-variant)' },
-                    group.name),
-                h('div', { class: 'form-grid-2col' },
-                    group.fields.map(field => h('div', {
-                        class: ['form-group', field.span === 2 && 'span-2'].filter(Boolean).join(' '),
-                    }, [
-                        h('label', { class: 'form-label' }, [
-                            field.label,
-                            field.immediate && h('span', { class: 'badge badge-info ml-2', style: 'font-size:10px; padding:2px 6px; background:var(--info-bg); color:var(--info); border-radius:4px' }, '即时'),
-                            field.sensitive && h('span', { class: 'badge badge-warning ml-1', style: 'font-size:10px; padding:2px 6px; background:var(--warning-bg); color:var(--warning); border-radius:4px' }, '敏感'),
-                        ]),
-                        renderField(field),
-                        field.hint && h(FormHint, field.hint),
-                    ])),
-                ),
+            groupedFields.value.map(group => h('div', {
+                class: 'card',
+                style: { marginBottom: 'calc(var(--spacing) * 4)' },
+            }, [
+                h('div', { class: 'card-header' }, [
+                    h('div', { class: 'grid gap-1' }, [
+                        h('span', { class: 'eyebrow' }, '配置分组'),
+                        h('h3', {
+                            style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500; text-wrap:balance; word-break:keep-all;',
+                        }, group.name),
+                    ]),
+                ]),
+                h('div', { class: 'card-body' }, [
+                    h('div', { class: 'form-grid-2col' },
+                        group.fields.map(field => {
+                            const fieldId = field.id || `sf-${field.key.replace(/\./g, '-')}`;
+                            return h('div', {
+                                class: ['form-group', field.span === 2 ? 'span-2' : ''].filter(Boolean).join(' '),
+                                style: field.span === 2 ? { gridColumn: '1 / -1' } : {},
+                            }, [
+                                h('label', { class: 'form-label', for: fieldId }, [
+                                    field.label,
+                                    field.immediate && h('span', { class: 'badge badge-info badge-sm', style: 'margin-left:calc(var(--spacing) * 1);' }, '即时'),
+                                    field.sensitive && h('span', { class: 'badge badge-warning badge-sm', style: 'margin-left:calc(var(--spacing) * 1);' }, '敏感'),
+                                ]),
+                                renderField(field),
+                                field.hint && h(FormHint, field.hint),
+                            ]);
+                        }),
+                    ),
+                ]),
             ])),
         );
     },
