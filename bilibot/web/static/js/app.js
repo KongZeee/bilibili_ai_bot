@@ -74,6 +74,8 @@ import { DraftsPage } from './pages/drafts.js';
 registerRoute('/drafts', DraftsPage, '动态草稿', '内容创作');
 import { ImageGenPage } from './pages/image-gen.js';
 registerRoute('/image-gen', ImageGenPage, '文生图', '内容创作');
+import { VideoAnalysisPage } from './pages/video-analysis.js';
+registerRoute('/video-analysis', VideoAnalysisPage, '视频理解', '内容创作');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
