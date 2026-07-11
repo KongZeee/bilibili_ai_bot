@@ -58,6 +58,8 @@ registerRoute('/llm', LlmListPage, 'LLM 管理');
 import { AccountListPage, AccountDetailPage } from './components/accounts.js';
 registerRoute('/accounts', AccountListPage, '账号管理');
 registerRoute('/accounts/:id', AccountDetailPage, '账号详情');
+import { MemoryRecallPage } from './components/memory/recall-page.js';
+registerRoute('/memory/recall', MemoryRecallPage, '召回测试');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
