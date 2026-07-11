@@ -55,6 +55,9 @@ import { PersonaListPage } from './pages/personas.js';
 registerRoute('/personas', PersonaListPage, '人格管理');
 import { LlmListPage } from './components/llm.js';
 registerRoute('/llm', LlmListPage, 'LLM 管理');
+import { AccountListPage, AccountDetailPage } from './components/accounts.js';
+registerRoute('/accounts', AccountListPage, '账号管理');
+registerRoute('/accounts/:id', AccountDetailPage, '账号详情');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
