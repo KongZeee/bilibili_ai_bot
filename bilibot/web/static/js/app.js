@@ -70,6 +70,8 @@ import { CommentsPage } from './pages/comments.js';
 registerRoute('/comments', CommentsPage, '评论');
 import { ProactivePage } from './pages/proactive.js';
 registerRoute('/proactive', ProactivePage, '主动行为');
+import { DraftsPage } from './pages/drafts.js';
+registerRoute('/drafts', DraftsPage, '动态草稿', '内容创作');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
