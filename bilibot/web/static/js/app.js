@@ -53,6 +53,8 @@ registerRoute('/', OverviewPage, '总览');
 
 import { PersonaListPage } from './pages/personas.js';
 registerRoute('/personas', PersonaListPage, '人格管理');
+import { LlmListPage } from './components/llm.js';
+registerRoute('/llm', LlmListPage, 'LLM 管理');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
