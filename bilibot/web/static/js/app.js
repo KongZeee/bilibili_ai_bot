@@ -78,6 +78,8 @@ import { VideoAnalysisPage } from './pages/video-analysis.js';
 registerRoute('/video-analysis', VideoAnalysisPage, '视频理解', '内容创作');
 import { SystemPage } from './pages/system.js';
 registerRoute('/system', SystemPage, '系统管理', '系统');
+import { ConfigPage } from './pages/config.js';
+registerRoute('/config', ConfigPage, '系统配置', '系统');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
