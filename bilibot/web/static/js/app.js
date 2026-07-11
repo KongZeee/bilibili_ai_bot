@@ -72,6 +72,8 @@ import { ProactivePage } from './pages/proactive.js';
 registerRoute('/proactive', ProactivePage, '主动行为');
 import { DraftsPage } from './pages/drafts.js';
 registerRoute('/drafts', DraftsPage, '动态草稿', '内容创作');
+import { ImageGenPage } from './pages/image-gen.js';
+registerRoute('/image-gen', ImageGenPage, '文生图', '内容创作');
 
 pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
