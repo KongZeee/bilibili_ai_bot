@@ -5,10 +5,15 @@ LLM 提供商 — 封装单个 OpenAI 兼容 API 调用
 支持文本生成、流式生成、Vision、Embedding。
 """
 import base64
+import asyncio
+import hashlib
 import logging
 import re
 import json
-from typing import Optional, List, Any, Tuple
+import threading
+import weakref
+from contextlib import asynccontextmanager
+from typing import Optional, List, Any, Tuple, Sequence
 
 # 可选依赖：openai 未安装或环境异常时仍允许模块被导入
 try:
@@ -17,6 +22,152 @@ except Exception:  # pragma: no cover  (ImportError / SystemError / pydantic 冲
     AsyncOpenAI = None  # type: ignore[assignment]
 
 logger = logging.getLogger("bilibot.llm")
+
+
+class CompletionConcurrencyGate:
+    """Loop-local concurrency gate shared by providers using one API quota."""
+
+    def __init__(self, max_concurrency: int = 2):
+        self.max_concurrency = max(1, int(max_concurrency))
+        self._semaphores = weakref.WeakKeyDictionary()
+        self._lock = threading.Lock()
+
+    def _semaphore(self) -> asyncio.Semaphore:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            semaphore = self._semaphores.get(loop)
+            if semaphore is None:
+                semaphore = asyncio.Semaphore(self.max_concurrency)
+                self._semaphores[loop] = semaphore
+            return semaphore
+
+    @asynccontextmanager
+    async def slot(self):
+        async with self._semaphore():
+            yield
+
+
+def completion_endpoint_identity(base_url: str, api_key: str) -> Optional[Tuple[str, bytes]]:
+    """Return a non-reversible quota identity without retaining another key copy."""
+
+    if not base_url or not api_key:
+        return None
+    digest = hashlib.sha256(api_key.encode("utf-8")).digest()
+    return (LLMProvider._normalize_base_url(base_url).lower(), digest)
+
+
+@asynccontextmanager
+async def _optional_gate(gate: Optional[CompletionConcurrencyGate]):
+    if gate is None:
+        yield
+        return
+    async with gate.slot():
+        yield
+
+
+class ASRResponseError(ValueError):
+    """An HTTP-successful ASR response that cannot yield a transcript."""
+
+    def __init__(self, code: str, reason: str):
+        self.code = code
+        self.reason = reason
+        super().__init__(f"{code}: {reason}")
+
+
+def _asr_field(value: Any, name: str) -> Any:
+    if isinstance(value, dict):
+        return value.get(name)
+    return getattr(value, name, None)
+
+
+def _asr_text(value: Any) -> str:
+    """Read text from OpenAI objects and common compatible dict payloads."""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)):
+        return "\n".join(filter(None, (_asr_text(part) for part in value))).strip()
+    if value is None:
+        return ""
+    for name in ("transcript", "text", "content"):
+        nested = _asr_field(value, name)
+        if nested is value:
+            continue
+        text = _asr_text(nested)
+        if text:
+            return text
+    return ""
+
+
+def asr_response_signals_no_speech(response: Any) -> bool:
+    """Return True only for an explicit provider no-speech/silence marker."""
+
+    def _marked(value: Any) -> bool:
+        if value is True:
+            return True
+        if isinstance(value, str):
+            return value.strip().lower() in {
+                "no_speech",
+                "no-speech",
+                "silence",
+                "silent",
+            }
+        return False
+
+    choices = _asr_field(response, "choices") or []
+    try:
+        choice = choices[0] if choices else None
+    except (KeyError, IndexError, TypeError):
+        choice = None
+    message = _asr_field(choice, "message")
+    audio = _asr_field(message, "audio")
+    containers = [
+        response,
+        _asr_field(response, "metadata"),
+        choice,
+        message,
+        _asr_field(message, "metadata"),
+        audio,
+    ]
+    for container in containers:
+        for name in ("no_speech", "silence", "status", "finish_reason"):
+            if _marked(_asr_field(container, name)):
+                return True
+    return False
+
+
+def extract_asr_transcript(response: Any) -> str:
+    """Extract an ASR transcript or raise a stable, diagnosable error."""
+    if response is None:
+        raise ASRResponseError("ASR_RESPONSE_MISSING", "API returned no response object")
+
+    choices = _asr_field(response, "choices")
+    if not choices:
+        raise ASRResponseError("ASR_EMPTY_CHOICES", "API returned no completion choices")
+
+    try:
+        first_choice = choices[0]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ASRResponseError(
+            "ASR_INVALID_CHOICES", "completion choices are not an indexable sequence"
+        ) from exc
+
+    message = _asr_field(first_choice, "message")
+    if message is None:
+        raise ASRResponseError("ASR_MISSING_MESSAGE", "first choice has no message")
+
+    text = _asr_text(_asr_field(message, "content"))
+    if not text:
+        # Xiaomi MiMo responses normally contain transcript text in content and
+        # explicitly return audio=null. Other compatible APIs may put it here.
+        text = _asr_text(_asr_field(message, "audio"))
+    if not text:
+        if asr_response_signals_no_speech(response):
+            return ""
+        raise ASRResponseError(
+            "ASR_EMPTY_TRANSCRIPT",
+            "first choice message contains no transcript in content or audio",
+        )
+    return text
 
 
 class LLMProvider:
@@ -51,22 +202,32 @@ class LLMProvider:
         self.temperature: float = config.get("temperature", 0.8)
         self.name: str = config.get("name", llm_id)
         self.enabled: bool = config.get("enabled", True)
+        self.max_retries: int = max(0, int(config.get("max_retries", 2)))
 
         # 文生图扩展字段（仅 image 类型 Provider 使用）
         self.default_size: str = config.get("default_size", "1024x768")
         self.timeout: int = int(config.get("timeout", 120))
 
         # Vision 配置（可选）
-        vision = config.get("vision", {})
-        self.vision_enabled: bool = vision.get("enabled", False)
-        self.vision_api_key: str = vision.get("api_key", "")
+        # BUG 修复：迁移路径（B-003 子段包装）只写入 model/api_key/base_url，
+        # 经常遗漏 enabled 字段，导致 vision_enabled 恒为 False、客户端不初始化。
+        # 改为「有 model 且有 api_key（可回退到主 api_key）即视为启用」，向后兼容。
+        vision = config.get("vision") or {}
+        _vision_key = vision.get("api_key") or self.api_key
+        self.vision_enabled: bool = bool(vision.get("enabled", False)) or bool(
+            vision.get("model") and _vision_key
+        )
+        self.vision_api_key: str = _vision_key
         self.vision_base_url: str = self._normalize_base_url(vision.get("base_url", self.base_url))
         self.vision_model: str = vision.get("model", "")
 
-        # Embedding 配置（可选）
-        embedding = config.get("embedding", {})
-        self.embedding_enabled: bool = embedding.get("enabled", False)
-        self.embedding_api_key: str = embedding.get("api_key", "")
+        # Embedding 配置（可选）——同样修复遗漏 enabled 的问题
+        embedding = config.get("embedding") or {}
+        _emb_key = embedding.get("api_key") or self.api_key
+        self.embedding_enabled: bool = bool(embedding.get("enabled", False)) or bool(
+            embedding.get("model") and _emb_key
+        )
+        self.embedding_api_key: str = _emb_key
         self.embedding_base_url: str = self._normalize_base_url(embedding.get("base_url", self.base_url))
         self.embedding_model: str = embedding.get("model", "BAAI/bge-m3")
 
@@ -74,26 +235,49 @@ class LLMProvider:
         self.client = None
         self.vision_client = None
         self.embedding_client = None
+        self._chat_completion_gate: Optional[CompletionConcurrencyGate] = None
+        self._vision_completion_gate: Optional[CompletionConcurrencyGate] = None
 
         if AsyncOpenAI is None:
             logger.warning(f"[{llm_id}] openai 库未安装，跳过客户端初始化")
             return
 
         if self.api_key:
-            self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
-            logger.info(f"[{llm_id}] LLM 客户端已初始化: {self.model}")
+            # BUG B-006：timeout 已定义但从未传给客户端
+            self.client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
+            )
+            logger.info(f"[{llm_id}] LLM 客户端已初始化: {self.model} (timeout={self.timeout}s)")
 
         if self.vision_enabled and self.vision_api_key:
             self.vision_client = AsyncOpenAI(
-                api_key=self.vision_api_key, base_url=self.vision_base_url
+                api_key=self.vision_api_key,
+                base_url=self.vision_base_url,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
             )
             logger.info(f"[{llm_id}] Vision 客户端已初始化")
 
         if self.embedding_enabled and self.embedding_api_key:
             self.embedding_client = AsyncOpenAI(
-                api_key=self.embedding_api_key, base_url=self.embedding_base_url
+                api_key=self.embedding_api_key,
+                base_url=self.embedding_base_url,
+                timeout=self.timeout,
+                max_retries=self.max_retries,
             )
-            logger.info(f"[{llm_id}] Embedding 客户端已初始化")
+            logger.info(f"[{llm_id}] Embedding 客户端已初始化 (timeout={self.timeout}s)")
+
+    def set_completion_gates(
+        self,
+        *,
+        chat: Optional[CompletionConcurrencyGate] = None,
+        vision: Optional[CompletionConcurrencyGate] = None,
+    ) -> None:
+        self._chat_completion_gate = chat
+        self._vision_completion_gate = vision
 
     async def generate(
         self,
@@ -114,22 +298,25 @@ class LLMProvider:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
 
-            response = await self.client.chat.completions.create(
-                model=model or self.model,
-                messages=messages,
-                max_tokens=max_tokens or self.max_tokens,
-                temperature=temperature if temperature is not None else self.temperature,
-            )
+            async with _optional_gate(self._chat_completion_gate):
+                response = await self.client.chat.completions.create(
+                    model=model or self.model,
+                    messages=messages,
+                    max_tokens=max_tokens or self.max_tokens,
+                    temperature=temperature if temperature is not None else self.temperature,
+                )
 
             if response.choices:
                 result = response.choices[0].message.content
-                logger.debug(f"[{self.llm_id}] LLM 生成成功: {len(result)} 字符")
-                return result.strip()
+                if result:
+                    logger.debug(f"[{self.llm_id}] LLM 生成成功: {len(result)} 字符")
+                    return result.strip()
+                return None
             return None
 
         except Exception as e:
             logger.error(f"[{self.llm_id}] LLM 生成失败: {e}")
-            return None
+            raise
 
     async def generate_stream(
         self,
@@ -148,20 +335,22 @@ class LLMProvider:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
 
-            stream = await self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=max_tokens or self.max_tokens,
-                temperature=temperature if temperature is not None else self.temperature,
-                stream=True,
-            )
+            async with _optional_gate(self._chat_completion_gate):
+                stream = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    max_tokens=max_tokens or self.max_tokens,
+                    temperature=temperature if temperature is not None else self.temperature,
+                    stream=True,
+                )
 
-            async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
+                async for chunk in stream:
+                    if chunk.choices and chunk.choices[0].delta.content:
+                        yield chunk.choices[0].delta.content
 
         except Exception as e:
             logger.error(f"[{self.llm_id}] LLM 流式生成失败: {e}")
+            raise
 
     async def vision_analyze(
         self,
@@ -180,11 +369,12 @@ class LLMProvider:
                 {"type": "text", "text": prompt},
             ]
 
-            response = await self.vision_client.chat.completions.create(
-                model=self.vision_model,
-                messages=[{"role": "user", "content": content}],
-                max_tokens=max_tokens,
-            )
+            async with _optional_gate(self._vision_completion_gate):
+                response = await self.vision_client.chat.completions.create(
+                    model=self.vision_model,
+                    messages=[{"role": "user", "content": content}],
+                    max_tokens=max_tokens,
+                )
 
             if response.choices:
                 return response.choices[0].message.content.strip()
@@ -199,19 +389,54 @@ class LLMProvider:
         if not self.embedding_client or not self.embedding_model:
             logger.warning(f"[{self.llm_id}] Embedding 客户端未初始化")
             return None
-
         try:
             response = await self.embedding_client.embeddings.create(
                 model=self.embedding_model,
                 input=text,
             )
-
             if response.data:
                 return response.data[0].embedding
             return None
-
         except Exception as e:
             logger.error(f"[{self.llm_id}] Embedding 获取失败: {e}")
+            return None
+
+    async def get_embeddings(
+        self, texts: Sequence[str]
+    ) -> Optional[List[List[float]]]:
+        """Embed a batch in one request while preserving input order."""
+        values = [str(text) for text in texts]
+        if not values:
+            return []
+        if not self.embedding_client or not self.embedding_model:
+            logger.warning(f"[{self.llm_id}] Embedding 客户端未初始化")
+            return None
+
+        try:
+            response = await self.embedding_client.embeddings.create(
+                model=self.embedding_model,
+                input=values,
+            )
+
+            data = list(response.data or ())
+            if len(data) != len(values):
+                return None
+            ordered: List[Optional[List[float]]] = [None] * len(values)
+            for position, item in enumerate(data):
+                index = getattr(item, "index", position)
+                if index is None:
+                    index = position
+                if not isinstance(index, int) or not 0 <= index < len(values):
+                    return None
+                if ordered[index] is not None:
+                    return None
+                ordered[index] = list(item.embedding)
+            if any(vector is None for vector in ordered):
+                return None
+            return [vector for vector in ordered if vector is not None]
+
+        except Exception as e:
+            logger.error(f"[{self.llm_id}] Embedding 批量获取失败: {e}")
             return None
 
     async def test(self) -> Tuple[bool, str]:
@@ -239,11 +464,12 @@ class LLMProvider:
                 {"type": "image_url", "image_url": {"url": test_img}},
                 {"type": "text", "text": "这是什么颜色？"},
             ]
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": content}],
-                max_tokens=20,
-            )
+            async with _optional_gate(self._chat_completion_gate):
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": content}],
+                    max_tokens=20,
+                )
             if response.choices:
                 return True, ""
             return False, "API 返回空响应"
@@ -330,9 +556,15 @@ class LLMProvider:
                     ],
                     max_tokens=20,
                 )
-                if response.choices:
+                try:
+                    extract_asr_transcript(response)
                     return True, ""
-                return False, "API 返回空响应"
+                except ASRResponseError as response_error:
+                    # The probe audio is silence, so an empty transcript still
+                    # proves auth, routing, and model availability.
+                    if response_error.code == "ASR_EMPTY_TRANSCRIPT":
+                        return True, ""
+                    return False, str(response_error)
             except Exception as inner2:
                 msg2 = str(inner2).lower()
                 # 模型不支持、音频相关错误但鉴权通过 → 连接正常

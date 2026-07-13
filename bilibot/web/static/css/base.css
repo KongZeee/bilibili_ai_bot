@@ -27,6 +27,9 @@ body {
     color: hsl(var(--foreground));
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    /* 触屏优化：清除 iOS 点击高亮，禁用双击缩放延迟 */
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
     font-size: 14px;
     line-height: 1.5;
 }

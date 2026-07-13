@@ -4,13 +4,7 @@ import { api } from '../api.js';
 import { Card, Button, Badge, Loading, EmptyState, Icon, KpiCard, ActionList } from '../components/common.js';
 import { showToast } from '../state.js';
 import { navigate } from '../router.js';
-
-// 格式化时间戳为 HH:MM
-function formatTime(ts) {
-    if (!ts) return '--:--';
-    const d = new Date(ts);
-    return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
-}
+import { formatTime } from '../utils.js';
 
 export const OverviewPage = defineComponent({
     name: 'OverviewPage',
@@ -18,18 +12,35 @@ export const OverviewPage = defineComponent({
         const status = ref(null);
         const audits = ref([]);
         const auditsTotal = ref(0);
+        const commentAuditsTotal = ref(0);
+        const memoryTotal = ref(0);
         const loading = ref(true);
 
         async function loadData() {
             loading.value = true;
             try {
-                const [statusData, auditsData] = await Promise.all([
+                const [statusData, auditsData, commentAuditsData] = await Promise.all([
                     api.status(),
                     api.audits({ page: 1, page_size: 5 }).catch(() => ({ items: [], total: 0 })),
+                    api.audits({ scene: 'reply_comment', page: 1, page_size: 1 }).catch(() => ({ total: 0 })),
                 ]);
                 status.value = statusData;
                 audits.value = auditsData?.items || auditsData || [];
                 auditsTotal.value = auditsData?.total || audits.value.length || 0;
+                commentAuditsTotal.value = commentAuditsData?.total || 0;
+
+                // 尝试获取记忆条数（取第一个账号）
+                try {
+                    const accounts = await api.accounts.list();
+                    const accList = accounts?.items || accounts || [];
+                    if (accList.length > 0) {
+                        const firstAcc = accList[0].id || accList[0].account_id;
+                        if (firstAcc) {
+                            const memStats = await api.memory.stats(firstAcc);
+                            memoryTotal.value = memStats?.total || 0;
+                        }
+                    }
+                } catch (_) { /* 无账号或记忆统计失败，保持 0 */ }
             } catch (e) {
                 showToast('加载失败: ' + e.message, 'error');
             } finally {
@@ -62,9 +73,9 @@ export const OverviewPage = defineComponent({
                             ]),
                             h('span', {
                                 class: 'inline-flex items-center gap-1 whitespace-nowrap',
-                                style: 'padding: calc(var(--spacing) * 0.8) calc(var(--spacing) * 1.6); border-radius: 999px; background: hsl(var(--accent) / 0.34); color: hsl(var(--accent-foreground)); font-size: 0.82rem;',
+                                style: `padding: calc(var(--spacing) * 0.8) calc(var(--spacing) * 1.6); border-radius: 999px; background: hsl(${status.value?.bilibili?.authenticated ? 'var(--accent)' : 'var(--destructive)'} / 0.34); color: hsl(${status.value?.bilibili?.authenticated ? 'var(--accent-foreground)' : 'var(--destructive-foreground)'}); font-size: 0.82rem;`,
                             }, [
-                                h(Icon, { name: 'circle-check', size: '0.9rem' }),
+                                h(Icon, { name: status.value?.bilibili?.authenticated ? 'circle-check' : 'triangle-alert', size: '0.9rem' }),
                                 status.value?.bilibili?.authenticated ? '正常' : '异常',
                             ]),
                         ]),
@@ -86,9 +97,9 @@ export const OverviewPage = defineComponent({
                             ]),
                             h('span', {
                                 class: 'inline-flex items-center gap-1 whitespace-nowrap',
-                                style: 'padding: calc(var(--spacing) * 0.8) calc(var(--spacing) * 1.6); border-radius: 999px; background: hsl(var(--accent) / 0.34); color: hsl(var(--accent-foreground)); font-size: 0.82rem;',
+                                style: `padding: calc(var(--spacing) * 0.8) calc(var(--spacing) * 1.6); border-radius: 999px; background: hsl(${status.value?.llm?.connected ? 'var(--accent)' : 'var(--destructive)'} / 0.34); color: hsl(${status.value?.llm?.connected ? 'var(--accent-foreground)' : 'var(--destructive-foreground)'}); font-size: 0.82rem;`,
                             }, [
-                                h(Icon, { name: 'circle-check', size: '0.9rem' }),
+                                h(Icon, { name: status.value?.llm?.connected ? 'circle-check' : 'triangle-alert', size: '0.9rem' }),
                                 status.value?.llm?.connected ? '正常' : '异常',
                             ]),
                         ]),
@@ -105,29 +116,23 @@ export const OverviewPage = defineComponent({
                     h(KpiCard, {
                         eyebrow: '指标',
                         iconName: 'message-circle-more',
-                        value: auditsTotal.value ? String(auditsTotal.value) : '-',
-                        trend: '+12%',
-                        trendDirection: 'up',
+                        value: commentAuditsTotal.value ? String(commentAuditsTotal.value) : '-',
                         valueLabel: '今日评论数',
-                        label: '较昨日',
+                        label: '暂无趋势',
                     }),
                     h(KpiCard, {
                         eyebrow: '指标',
                         iconName: 'pen-line',
                         value: auditsTotal.value ? String(auditsTotal.value) : '-',
-                        trend: '+8%',
-                        trendDirection: 'up',
                         valueLabel: '生成审计数',
-                        label: '较昨日',
+                        label: '暂无趋势',
                     }),
                     h(KpiCard, {
                         eyebrow: '指标',
                         iconName: 'folder-open',
-                        value: '-',
-                        trend: '+3%',
-                        trendDirection: 'up',
+                        value: memoryTotal.value ? String(memoryTotal.value) : '-',
                         valueLabel: '记忆条数',
-                        label: '本周新增',
+                        label: '暂无趋势',
                     }),
                 ]),
 
@@ -161,7 +166,7 @@ export const OverviewPage = defineComponent({
                                 // 表头
                                 h('div', {
                                     class: 'grid items-center',
-                                    style: 'grid-template-columns: 3rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.14em;',
+                                    style: 'grid-template-columns: 8.5rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.14em;',
                                 }, [
                                     h('span', { class: 'whitespace-nowrap' }, '时间'),
                                     h('span', { class: 'whitespace-nowrap' }, '账号'),
@@ -172,7 +177,7 @@ export const OverviewPage = defineComponent({
                                 // 数据行
                                 ...audits.value.map(a => h('div', {
                                     class: 'grid items-center',
-                                    style: 'grid-template-columns: 3rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;',
+                                    style: 'grid-template-columns: 8.5rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;',
                                 }, [
                                     h('span', {
                                         class: 'whitespace-nowrap',

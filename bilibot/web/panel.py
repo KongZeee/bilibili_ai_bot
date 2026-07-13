@@ -8,8 +8,10 @@ import logging
 import time
 import json
 import hashlib
-import os
+import hmac
+import random
 import secrets
+import bcrypt
 from pathlib import Path
 from typing import Optional, Dict, Any
 
@@ -26,6 +28,16 @@ from ..prompts import PromptOrchestrator
 
 logger = logging.getLogger("bilibot.web")
 
+
+class NoCacheStaticFiles(StaticFiles):
+    """Prevent stale ES modules from keeping an older control panel alive."""
+
+    async def get_response(self, path: str, scope):
+        response = await super().get_response(path, scope)
+        if path.endswith((".js", ".css")):
+            response.headers["Cache-Control"] = "no-store"
+        return response
+
 # ═══════════════════════════════════════════════════════
 # 认证中间件
 # ═══════════════════════════════════════════════════════
@@ -37,29 +49,42 @@ class AuthMiddleware(BaseHTTPMiddleware):
     # PRD V4 ACC-003：QR 登录端点不再匿名，需要管理员鉴权
     ANON_PATHS = {
         "/", "/login",
-        "/api/login", "/api/logout",
+        "/api/login",
         "/api/status/public",
     }
 
     def _is_anon(self, path: str) -> bool:
         if path.startswith("/static/"):
             return True
-        if path in self.ANON_PATHS:
-            return True
-        # /api/login 带 query 也放行
-        if path.startswith("/api/login"):
-            return True
-        return False
+        return path in self.ANON_PATHS
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
+
+        # BUG F-007：OPTIONS 预检请求直接放行，避免被 CORS 中间件之前拦截
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Task 32：CSRF 防护——非 GET 的 state-changing 请求必须携带自定义请求头
+        # 浏览器同源策略保证：跨站 form/fetch 无法设置自定义头，从而阻止 CSRF；
+        # 登录请求也需检查，前端 login.js 已统一带上该头。
+        if request.method in ("POST", "PATCH", "PUT", "DELETE"):
+            if not request.headers.get("X-Requested-With"):
+                return JSONResponse(
+                    {"success": False, "error": {"code": "CSRF_TOKEN_MISSING", "message": "缺少 CSRF 请求头", "details": {}}},
+                    status_code=403,
+                )
 
         # 匿名路径直接放行
         if self._is_anon(path):
             return await call_next(request)
 
-        # 检查 session token
+        # 检查 session token（BUG F-007：同时支持 cookie 和 Bearer token）
         token = request.cookies.get("token")
+        if not token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
         if not token or token not in _sessions:
             return JSONResponse(
                 {"success": False, "error": {"code": "UNAUTHORIZED", "message": "请先登录", "details": {}}},
@@ -77,6 +102,22 @@ class AuthMiddleware(BaseHTTPMiddleware):
                 status_code=401,
             )
 
+        # Task 30：滑动续期——长时间无活动则失效（idle_timeout，默认 15 分钟）
+        last_activity = session.get("last_activity", login_ts)
+        if time.time() - last_activity > _idle_timeout:
+            _sessions.pop(token, None)
+            return JSONResponse(
+                {"success": False, "error": {"code": "SESSION_EXPIRED", "message": "会话因长时间无活动已失效", "details": {}}},
+                status_code=401,
+            )
+        # 刷新最后活动时间，实现滑动续期
+        session["last_activity"] = time.time()
+
+        # M23：轻量级会话清理（按概率触发，与会话数解耦）
+        # 放在会话检查之后，避免提前删除过期会话导致 SESSION_EXPIRED 变为 UNAUTHORIZED
+        if random.random() < 0.01:  # 1% 概率
+            cleanup_sessions()
+
         return await call_next(request)
 
 
@@ -86,11 +127,67 @@ class AuthMiddleware(BaseHTTPMiddleware):
 
 _sessions: Dict[str, dict] = {}
 _session_ttl: int = 3600  # 默认 1h，由配置覆盖
+_idle_timeout: int = 900  # Task 30：无活动超时（滑动续期），默认 15 分钟
+
+# M22 登录频率限制：IP -> 失败时间戳列表
+_login_attempts: Dict[str, list] = {}
+_LOGIN_WINDOW_SECONDS: int = 300  # 5 分钟窗口
+_LOGIN_MAX_FAILURES: int = 10     # 窗口内最大失败次数
 
 
 def _set_session_ttl(seconds: int):
     global _session_ttl
     _session_ttl = max(60, seconds)
+
+
+def cleanup_sessions() -> None:
+    """M23：清理所有过期会话 + 单用户会话数限制（轻量级，调用方应自行限制频次）"""
+    now = time.time()
+    expired = [
+        token for token, sess in _sessions.items()
+        if now - sess.get("login_time", 0) > _session_ttl
+        or now - sess.get("last_activity", sess.get("login_time", 0)) > _idle_timeout
+    ]
+    for token in expired:
+        _sessions.pop(token, None)
+    # Task 6：单用户最大活跃会话数限制（遍历所有用户）
+    seen_users = set()
+    for sess in _sessions.values():
+        uname = sess.get("username", "")
+        if uname not in seen_users:
+            seen_users.add(uname)
+            _enforce_user_session_limit(uname)
+
+
+def _enforce_user_session_limit(username: str, max_per_user: int = 5) -> None:
+    """Task 6：限制单用户最大活跃会话数，超过时删除最旧的
+
+    Args:
+        username: 目标用户名
+        max_per_user: 单用户最大活跃会话数（默认 5）
+    """
+    user_sessions = [
+        (sess.get("login_time", 0), token)
+        for token, sess in _sessions.items()
+        if sess.get("username", "") == username
+    ]
+    if len(user_sessions) > max_per_user:
+        # 按 login_time 升序，删除最旧的
+        user_sessions.sort(key=lambda x: x[0])
+        for _, token in user_sessions[:len(user_sessions) - max_per_user]:
+            _sessions.pop(token, None)
+
+
+def _cleanup_login_attempts() -> None:
+    """M22：清理过期的登录失败记录"""
+    now = time.time()
+    for ip in list(_login_attempts.keys()):
+        _login_attempts[ip] = [
+            ts for ts in _login_attempts[ip]
+            if now - ts < _LOGIN_WINDOW_SECONDS
+        ]
+        if not _login_attempts[ip]:
+            _login_attempts.pop(ip, None)
 
 
 def create_web_app(
@@ -147,40 +244,96 @@ def create_web_app(
     async def api_login(request: Request) -> JSONResponse:
         """登录"""
         from ..api.responses import fail, fail_internal
+        client_ip = request.client.host if request.client else "unknown"
         try:
-            body = await request.json()
-            username = body.get("username", "")
-            password = body.get("password", "")
+            # M22：IP 频率限制
+            # Task 5：仅当直连 IP 属于可信代理时才信任 X-Forwarded-For，防止伪造绕过限流
+            trusted_proxies = config_loader.web.trusted_proxies or []
+            if trusted_proxies and client_ip in trusted_proxies:
+                # 仅可信代理时才解析 x-forwarded-for
+                xff = request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+                if xff:
+                    client_ip = xff
+            _cleanup_login_attempts()
+            attempts = _login_attempts.get(client_ip, [])
+            if len(attempts) >= _LOGIN_MAX_FAILURES:
+                return JSONResponse(
+                    {"success": False, "error": {"code": "TOO_MANY_REQUESTS", "message": "登录失败次数过多，请稍后再试", "details": {}}},
+                    status_code=429,
+                )
 
-            if username == config_loader.web.admin_username and password == config_loader.web.admin_password:
-                token = hashlib.sha256(
-                    f"{username}{secrets.token_hex(16)}{time.time()}".encode()
-                ).hexdigest()
+            body = await request.json()
+            # Task 18：请求体类型校验
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+            username = str(body.get("username", ""))
+            password = str(body.get("password", ""))
+
+            # Task 16：密码哈希校验（支持 bcrypt，兼容明文）
+            stored_password = config_loader.web.admin_password
+            username_ok = hmac.compare_digest(username.encode(), config_loader.web.admin_username.encode())
+            if stored_password.startswith("$2b$"):
+                password_ok = bcrypt.checkpw(password.encode(), stored_password.encode())
+            else:
+                password_ok = hmac.compare_digest(password.encode(), stored_password.encode())
+                if username_ok and password_ok:
+                    logger.warning("admin_password 仍为明文存储，建议改为 bcrypt 哈希")
+
+            if username_ok and password_ok:
+                # Task 30：使用 secrets.token_urlsafe 生成 token，简化并保证密码学安全
+                token = secrets.token_urlsafe(32)
 
                 _sessions[token] = {
                     "username": username,
                     "login_time": time.time(),
+                    "last_activity": time.time(),
                 }
+                # Task 6：单用户最大活跃会话数限制（5 个），删除最旧的
+                _enforce_user_session_limit(username)
+                # M23：登录成功后顺便清理过期会话（按概率触发，与会话数解耦）
+                if random.random() < 0.01:
+                    cleanup_sessions()
+                # M22：登录成功，清除该 IP 的失败记录
+                _login_attempts.pop(client_ip, None)
 
-                resp = JSONResponse({"success": True, "token": token})
+                # Task 30：token 仅通过 HttpOnly Cookie 下发，不再放入响应体
+                resp = JSONResponse({"success": True})
                 resp.set_cookie(
                     key="token", value=token,
                     httponly=True, max_age=_session_ttl,
                     secure=config_loader.web.secure_cookies,
+                    samesite="lax",
                 )
                 return resp
             else:
+                # M22：记录失败时间戳
+                _login_attempts.setdefault(client_ip, []).append(time.time())
                 return fail("INVALID_CREDENTIALS", "用户名或密码错误", status_code=401)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"登录处理异常: {e}", exc_info=True)
+            # Task 18：异常路径也计入登录失败次数
+            _login_attempts.setdefault(client_ip, []).append(time.time())
+            return fail_internal()
 
     async def api_logout(request: Request) -> JSONResponse:
         """登出"""
-        token = request.cookies.get("token")
+        token = request.cookies.get("token") or ""
+        # Task 21：同时支持 Cookie 和 Bearer Token
+        if not token:
+            auth = request.headers.get("authorization", "")
+            if auth.lower().startswith("bearer "):
+                token = auth[7:]
         if token and token in _sessions:
             del _sessions[token]
         resp = JSONResponse({"success": True})
-        resp.delete_cookie(key="token")
+        # L14：delete_cookie 属性需与 set_cookie 一致，否则浏览器可能无法正确删除
+        resp.delete_cookie(
+            key="token",
+            path="/",
+            httponly=True,
+            secure=config_loader.web.secure_cookies,
+            samesite="lax",
+        )
         return resp
 
     # ═══════════════════════════════════════════════════════
@@ -189,9 +342,10 @@ def create_web_app(
 
     async def api_status_public(request: Request) -> JSONResponse:
         """公开健康状态（不泄露敏感信息）"""
+        import bilibot
         return JSONResponse({
             "running": True,
-            "version": "2.0.0",
+            "version": bilibot.__version__,
         })
 
     async def api_status(request: Request) -> JSONResponse:
@@ -287,7 +441,7 @@ def create_web_app(
     ]
 
     # 人格
-    persona_routes = create_personas_routes(persona_store, orchestrator)
+    persona_routes = create_personas_routes(persona_store, orchestrator, llm_manager)
 
     # 记忆（旧路由，标记废弃）—— 显式 data_dir 参数，PRD V3 §9.2
     # PRD-V5 §9.2 MEM-502：传入 account_manager 以解析默认账号数据目录
@@ -317,7 +471,7 @@ def create_web_app(
     tasks_routes = create_tasks_routes(scheduler)
 
     # 备份恢复（PRD §5.7）
-    backup_routes = create_backup_routes(data_dir)
+    backup_routes = create_backup_routes(data_dir, account_manager=account_manager)
 
     # 账号管理 + LLM 管理（PRD V2 多账号/多 LLM）
     accounts_routes = []
@@ -466,7 +620,7 @@ def create_web_app(
     # 静态文件
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
-        app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+        app.mount("/static", NoCacheStaticFiles(directory=str(static_dir)), name="static")
 
     # CORS：从配置读取 origins，默认空（不开放任意跨域，PRD V3 §4.3）
     cors_origins: list = []
@@ -476,11 +630,17 @@ def create_web_app(
     except Exception:
         pass
 
+    # M21：allow_credentials=True 时，CORS 不可使用通配符 "*"，否则浏览器会拒绝；
+    # 同时通配符 + 凭证是危险组合（任何站点都能携带 cookie 跨域请求）。
+    if "*" in cors_origins:
+        logger.warning("cors_origins 含 '*' 且 allow_credentials=True，已移除通配符")
+        cors_origins = [o for o in cors_origins if o != "*"]
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=cors_origins,
         allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-        allow_headers=["Content-Type", "Authorization"],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
         allow_credentials=True,
     )
 
@@ -511,20 +671,30 @@ def _get_login_html() -> str:
     return _LOGIN_HTML_CACHE
 
 
-def _static_version(filename: str) -> str:
-    """UI-607：基于文件 mtime 自动生成静态资源版本号
+_STATIC_VERSION_CACHE: Dict[str, str] = {}
 
-    替代手动维护的 ?v=N，确保每次文件变更后浏览器缓存自动失效。
+
+def _static_version(filename: str) -> str:
+    """Task 30：基于文件内容 md5 生成静态资源版本号
+
+    替代原先暴露文件 mtime 的方式，改用内容哈希前 8 位，避免泄露修改时间。
+    结果带缓存，避免每次请求都读取文件。
 
     Args:
         filename: 相对 static 目录的路径，如 "css/tokens.css"
 
     Returns:
-        版本号字符串（mtime 整数）；文件不存在时返回 "0"
+        版本号字符串（md5 前 8 位）；文件不存在时返回 "0"
     """
+    cached = _STATIC_VERSION_CACHE.get(filename)
+    if cached is not None:
+        return cached
     try:
         path = Path(__file__).parent / "static" / filename
-        return str(int(os.path.getmtime(str(path))))
+        content = path.read_bytes()
+        v = hashlib.md5(content).hexdigest()[:8]
+        _STATIC_VERSION_CACHE[filename] = v
+        return v
     except Exception:
         return "0"
 

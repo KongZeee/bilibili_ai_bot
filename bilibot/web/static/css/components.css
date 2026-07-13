@@ -303,14 +303,24 @@ tr:hover td { background: hsl(var(--accent) / 0.12); }
 
 /* ============ 10. EmptyState ============ */
 .empty-state {
+    min-width: 0;
+    max-width: 100%;
     text-align: center;
     padding: calc(var(--spacing) * 12) calc(var(--spacing) * 4);
     color: hsl(var(--muted-foreground));
     display: grid;
     gap: calc(var(--spacing) * 2);
     justify-items: center;
+    overflow-wrap: anywhere;
 }
-.empty-state .empty-icon { font-size: 2rem; color: hsl(var(--muted-foreground)); }
+.empty-state .empty-icon {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    max-width: 100%;
+    font-size: 2rem;
+    color: hsl(var(--muted-foreground));
+}
 .empty-state h3 { font-size: 1.1rem; margin: 0; color: hsl(var(--foreground)); }
 
 /* ============ 11. Pagination ============ */
@@ -322,8 +332,8 @@ tr:hover td { background: hsl(var(--accent) / 0.12); }
     padding: calc(var(--spacing) * 3) 0;
 }
 .pagination-btn {
-    min-width: 2.2rem;
-    height: 2.2rem;
+    min-width: 2.75rem;
+    height: 2.75rem;
     border: 1px solid hsl(var(--border));
     border-radius: calc(var(--radius) * 0.5);
     background: hsl(var(--card));
@@ -478,3 +488,86 @@ tr:hover td { background: hsl(var(--accent) / 0.12); }
 .progress-bar-fill.chart-3 { background: hsl(var(--chart-3)); }
 .progress-bar-fill.chart-4 { background: hsl(var(--chart-4)); }
 .progress-bar-fill.chart-5 { background: hsl(var(--chart-5)); }
+
+/* ============ V6 memory views ============ */
+.memory-panel {
+    min-width: 0;
+    max-width: 100%;
+}
+.memory-table-scroll {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-gutter: stable;
+}
+.memory-break {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.memory-detail-scroll {
+    min-width: 0;
+    max-height: 72vh;
+    overflow: auto;
+    padding-right: calc(var(--spacing) * 1);
+}
+.memory-source-text,
+.memory-source-json {
+    min-width: 0;
+    max-width: 100%;
+    margin: 0;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    font: inherit;
+    line-height: 1.65;
+}
+.memory-source-json {
+    max-height: 20rem;
+    overflow: auto;
+    padding: calc(var(--spacing) * 2);
+    background: hsl(var(--muted) / 0.32);
+    border: 1px solid hsl(var(--border));
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 0.78rem;
+}
+.memory-graph-canvas {
+    width: 100%;
+    height: min(68vh, 720px);
+    min-height: 360px;
+    position: relative;
+    overflow: hidden;
+    background: hsl(var(--muted) / 0.3);
+    border-top: 1px solid hsl(var(--border));
+    border-bottom: 1px solid hsl(var(--border));
+}
+.memory-graph-canvas > canvas {
+    display: block;
+    width: 100% !important;
+    height: 100% !important;
+}
+.memory-graph-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: grid;
+    place-items: center;
+    padding: calc(var(--spacing) * 3);
+    background: hsl(var(--muted) / 0.92);
+    color: hsl(var(--muted-foreground));
+    text-align: center;
+    font-size: 0.92rem;
+}
+
+@media (max-width: 600px) {
+    .memory-detail-scroll {
+        max-height: 76vh;
+        padding-right: 0;
+    }
+    .memory-graph-canvas {
+        height: 56vh;
+        min-height: 300px;
+        max-height: 560px;
+    }
+}

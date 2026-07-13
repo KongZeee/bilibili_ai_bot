@@ -10,12 +10,16 @@ B站 API 适配器
 - 私信管理
 - 动态管理
 - 搜索
+
+TODO(M3): download_video 使用同步文件写入（with open + f.write），
+大文件下载时会阻塞事件循环，后续应引入 aiofiles 改为异步写入。
 """
 import asyncio
 import hashlib
 import hmac
 import json
 import os
+import random
 import time
 import base64
 import urllib.parse
@@ -46,6 +50,9 @@ JNrRuoEUXpabUzGB8QIDAQAB
 -----END PUBLIC KEY-----"""
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+AUTH_REQUIRED_CODE = -101
+AUTH_BACKOFF_BASE_SECONDS = 300
+AUTH_BACKOFF_MAX_SECONDS = 3600
 
 
 class BilibiliAPI:
@@ -54,11 +61,22 @@ class BilibiliAPI:
     def __init__(self, config):
         self.config = config
         self.session: Optional[aiohttp.ClientSession] = None
+        # M2：保护 session 创建，避免并发时产生多个 session
+        self._session_lock = asyncio.Lock()
         self._wbi_imgs: Optional[Dict[str, str]] = None
         self._wbi_mixkey: Optional[str] = None
+        # M4：WBI 混键缓存时间戳，24 小时过期刷新
+        self._wbi_mixkey_ts: float = 0
         self._csrf_token: str = config.bilibili.bili_jct or ""
         # PRD 4.9：记录最近 API 错误码，scheduler 据此判断风控
         self.last_api_code: int = 0
+        # Task 14：保护 last_api_code 写入，避免并发 POST 调用互相覆盖返回码，
+        # 导致 scheduler 风控检测（-352）读到另一个调用的返回码。
+        self._api_code_lock = asyncio.Lock()
+        # Authentication-only polling (notifications/private messages) backs off
+        # after Bilibili reports -101. Public APIs remain available.
+        self._auth_failure_count: int = 0
+        self._auth_backoff_until: float = 0.0
 
     def reload_credentials(self, config=None):
         """PRD V3 §3.3：热重载凭据（不重建 session）
@@ -71,10 +89,52 @@ class BilibiliAPI:
             self.config = config
         self._csrf_token = self.config.bilibili.bili_jct or ""
         self.last_api_code = 0
+        self.clear_auth_backoff()
+
+    def clear_auth_backoff(self) -> None:
+        """Allow authenticated polling immediately (used after credential reload)."""
+        self._auth_failure_count = 0
+        self._auth_backoff_until = 0.0
+
+    def auth_poll_allowed(self, now: Optional[float] = None) -> bool:
+        """Return whether an authentication-required poll may contact Bilibili."""
+        current = time.monotonic() if now is None else float(now)
+        return current >= self._auth_backoff_until
+
+    def auth_backoff_remaining(self, now: Optional[float] = None) -> float:
+        current = time.monotonic() if now is None else float(now)
+        return max(0.0, self._auth_backoff_until - current)
+
+    def _record_authenticated_response(self, data: Optional[Dict]) -> None:
+        """Update authenticated-poll backoff from an auth-required API response."""
+        if not isinstance(data, dict):
+            return
+        code = data.get("code")
+        if code == AUTH_REQUIRED_CODE:
+            self._auth_failure_count += 1
+            delay = min(
+                AUTH_BACKOFF_MAX_SECONDS,
+                AUTH_BACKOFF_BASE_SECONDS
+                * (2 ** min(self._auth_failure_count - 1, 4)),
+            )
+            self._auth_backoff_until = time.monotonic() + delay
+            logger.info(
+                "B站认证轮询暂停 %d 秒（连续 -101 次数=%d），重新加载凭据后会立即恢复",
+                delay,
+                self._auth_failure_count,
+            )
+        elif code == 0:
+            self.clear_auth_backoff()
     
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建aiohttp会话"""
-        if self.session is None or self.session.closed:
+        # M2：double-check 模式，避免并发创建多个 session
+        if self.session is not None and not self.session.closed:
+            return self.session
+        async with self._session_lock:
+            # 拿到锁后再次检查，防止等待期间已被其他协程创建
+            if self.session is not None and not self.session.closed:
+                return self.session
             connector = aiohttp.TCPConnector(limit=100, force_close=False)
             self.session = aiohttp.ClientSession(
                 headers={
@@ -87,8 +147,9 @@ class BilibiliAPI:
     
     async def close(self):
         """关闭会话"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+        async with self._session_lock:
+            if self.session and not self.session.closed:
+                await self.session.close()
     
     def _get_headers(self, extra_cookies: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """获取请求头，包含Cookie"""
@@ -113,13 +174,29 @@ class BilibiliAPI:
         headers["Cookie"] = cookies
         return headers
     
-    async def _http_get(self, url: str, params: Optional[Dict] = None, timeout: int = 10) -> Tuple[Optional[Dict], Optional[str]]:
+    async def _http_get(
+        self,
+        url: str,
+        params: Optional[Dict] = None,
+        timeout: int = 10,
+        *,
+        allow_not_found: bool = False,
+    ) -> Tuple[Optional[Dict], Optional[str]]:
         """
         HTTP GET请求
         
         Returns:
             (parsed_json, error_text)
         """
+        if url == "https://api.bilibili.com/x/v2/reply/wbi/root":
+            logger.warning("????????? /x/v2/reply/wbi/root??? /x/v2/reply")
+            url = "https://api.bilibili.com/x/v2/reply"
+            if params is not None:
+                params = dict(params)
+                params.pop("w_rid", None)
+                params.pop("wts", None)
+                params.setdefault("sort", 0)
+
         session = await self._get_session()
         try:
             async with session.get(
@@ -139,7 +216,10 @@ class BilibiliAPI:
                         logger.error(f"JSON解析失败: {text[:200]}")
                         return None, text
                 else:
-                    logger.error(f"HTTP {resp.status} for {url}")
+                    if resp.status == 404 and allow_not_found:
+                        logger.debug(f"可选 API 不存在: HTTP 404 for {url}")
+                    else:
+                        logger.error(f"HTTP {resp.status} for {url}")
                     return None, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
             logger.error(f"请求超时: {url}")
@@ -161,10 +241,12 @@ class BilibiliAPI:
                 if resp.status == 200:
                     text = await resp.text()
                     try:
-                        data = json.loads(text)
+                        resp_data = json.loads(text)
                         # MISC-601：所有 POST API 调用统一记录返回码，供风控检测（-352）使用
-                        self.last_api_code = (data or {}).get("code", -1)
-                        return data, None
+                        # Task 14：加锁保护写入，避免并发 POST 互相覆盖返回码
+                        async with self._api_code_lock:
+                            self.last_api_code = (resp_data or {}).get("code", -1)
+                        return resp_data, None
                     except json.JSONDecodeError:
                         return None, text
                 else:
@@ -179,7 +261,8 @@ class BilibiliAPI:
     
     async def _get_wbi_mixkey(self) -> Optional[str]:
         """获取WBI混键"""
-        if self._wbi_mixkey:
+        # M4：缓存 24 小时内有效，过期则刷新
+        if self._wbi_mixkey and (time.time() - self._wbi_mixkey_ts < 86400):
             return self._wbi_mixkey
 
         session = await self._get_session()
@@ -187,6 +270,7 @@ class BilibiliAPI:
             async with session.get(
                 "https://api.bilibili.com/x/web-interface/nav",
                 headers=self._get_headers(),
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -205,6 +289,8 @@ class BilibiliAPI:
                     mix_key = img_key + sub_key
                     self._wbi_imgs = imgs
                     self._wbi_mixkey = self._encrypt_mixkey(mix_key)
+                    # M4：更新缓存时间戳
+                    self._wbi_mixkey_ts = time.time()
                     return self._wbi_mixkey
         except Exception as e:
             logger.error(f"获取WBI混键失败: {e}")
@@ -254,6 +340,12 @@ class BilibiliAPI:
     async def get_nav_status(self) -> Optional[Dict]:
         """获取用户登录状态"""
         data, _ = await self._http_get("https://api.bilibili.com/x/web-interface/nav")
+        if isinstance(data, dict):
+            nav_data = data.get("data") or {}
+            if data.get("code") == AUTH_REQUIRED_CODE:
+                self._record_authenticated_response(data)
+            elif data.get("code") == 0 and nav_data.get("isLogin") is True:
+                self.clear_auth_backoff()
         return data
     
     async def get_user_info(self, mid: int) -> Optional[Dict]:
@@ -286,15 +378,55 @@ class BilibiliAPI:
             return data["data"].get("aid")
         return None
     
-    async def get_video_tags(self, bvid: str) -> List[str]:
-        """获取视频标签"""
+    async def get_video_tags(
+        self,
+        bvid: str,
+        video_info: Optional[Dict] = None,
+    ) -> List[str]:
+        """获取视频标签，接口不可用时回退到已有视频元数据。"""
         data, _ = await self._http_get(
-            "https://api.bilibili.com/x/web-interface/view/tag",
+            "https://api.bilibili.com/x/tag/archive/tags",
             params={"bvid": bvid},
+            allow_not_found=True,
         )
-        if data and data.get("data"):
-            return [tag.get("tag_name", "") for tag in data["data"]]
-        return []
+
+        tags: List[str] = []
+
+        def add_tag(value) -> None:
+            if not isinstance(value, str):
+                return
+            value = value.strip()
+            if value and value not in tags:
+                tags.append(value)
+
+        payload = data.get("data") if isinstance(data, dict) else None
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    add_tag(item.get("tag_name") or item.get("name"))
+                else:
+                    add_tag(item)
+        if tags:
+            return tags
+
+        info = video_info if isinstance(video_info, dict) else {}
+        for field in ("tags", "tag"):
+            raw_tags = info.get(field)
+            if isinstance(raw_tags, str):
+                for item in raw_tags.replace("，", ",").split(","):
+                    add_tag(item)
+            elif isinstance(raw_tags, (list, tuple)):
+                for item in raw_tags:
+                    if isinstance(item, dict):
+                        add_tag(item.get("tag_name") or item.get("name"))
+                    else:
+                        add_tag(item)
+
+        # view/popular 的分区字段并非真正标签，但在标签接口不可用时
+        # 比完全丢失主题信息更有用。两类响应的 v2 字段命名不同。
+        for field in ("tname_v2", "tnamev2", "tname", "pid_name_v2"):
+            add_tag(info.get(field))
+        return tags
     
     async def get_hot_comments(self, oid: int, limit: int = 5) -> List[str]:
         """获取热门评论"""
@@ -329,7 +461,11 @@ class BilibiliAPI:
                 # 下载字幕
                 session = await self._get_session()
                 try:
-                    async with session.get(subtitle_url, headers=self._get_headers()) as resp:
+                    async with session.get(
+                        subtitle_url,
+                        headers=self._get_headers(),
+                        timeout=aiohttp.ClientTimeout(total=15),
+                    ) as resp:
                         if resp.status == 200:
                             caption_data = await resp.json()
                             for caption in caption_data.get("body", []):
@@ -508,17 +644,46 @@ class BilibiliAPI:
     #  评论管理
     # ══════════════════════════════════════
     
-    async def get_replies(self, oid: int, comment_type: int = 1, pn: int = 1, ps: int = 20) -> Optional[Dict]:
+    async def get_replies(
+        self,
+        oid: int,
+        comment_type: int = 1,
+        pn: int = 1,
+        ps: int = 20,
+        sort: int = 0,
+    ) -> Optional[Dict]:
         """获取评论列表"""
+        # /x/v2/reply/wbi/root 曾经被当作根评论列表接口使用，但当前
+        # B站 Web 端会直接返回 404。优先使用稳定的非 WBI 主列表接口，
+        # 失败时再尝试新版 wbi/main，避免每轮自动态补扫刷 ERROR。
+        base_params = {
+            "oid": oid,
+            "type": comment_type,
+            "pn": pn,
+            "ps": ps,
+            "sort": sort,  # 0=最新评论；自动态补扫必须拉最新评论
+        }
+        data, err = await self._http_get(
+            "https://api.bilibili.com/x/v2/reply",
+            params=base_params,
+            allow_not_found=True,
+        )
+        if data and data.get("code") == 0:
+            return data
+
+        logger.debug(f"评论主列表接口失败，尝试 wbi/main: {err or data}")
+        wbi_params = await self.sign_wbi({
+            "oid": oid,
+            "type": comment_type,
+            "mode": 3,
+            "pagination_str": json.dumps({"offset": ""}, separators=(",", ":")),
+            "plat": 1,
+            "web_location": 1315875,
+        })
         data, _ = await self._http_get(
-            "https://api.bilibili.com/x/v2/reply/wbi/root",
-            params={
-                "oid": oid,
-                "type": comment_type,
-                "pn": pn,
-                "ps": ps,
-                "sort": 1,  # 按热度
-            },
+            "https://api.bilibili.com/x/v2/reply/wbi/main",
+            params=wbi_params,
+            allow_not_found=True,
         )
         return data
     
@@ -569,11 +734,13 @@ class BilibiliAPI:
         )
 
         if data and data.get("code") == 0:
-            self.last_api_code = 0
+            async with self._api_code_lock:
+                self.last_api_code = 0
             logger.info(f"评论成功: oid={oid}")
             return True
         else:
-            self.last_api_code = (data or {}).get("code", -1)
+            async with self._api_code_lock:
+                self.last_api_code = (data or {}).get("code", -1)
             logger.error(f"评论失败: {err or data}")
             return False
 
@@ -639,6 +806,7 @@ class BilibiliAPI:
                 "mobi_app": "web",
             },
         )
+        self._record_authenticated_response(data)
         return data
 
     async def get_session_messages(self, sender_uid: int, receiver_uid: int,
@@ -671,7 +839,12 @@ class BilibiliAPI:
             return False
 
         import uuid
-        sender_uid = int(self.config.bilibili.dede_user_id or 0)
+        # M7：dede_user_id 可能是非数字字符串，转换失败时记录并返回
+        try:
+            sender_uid = int(self.config.bilibili.dede_user_id or 0)
+        except (TypeError, ValueError) as e:
+            logger.warning(f"dede_user_id 非法，无法发送私信: {e}")
+            return False
         if not sender_uid:
             logger.error("发送私信需要 dede_user_id")
             return False
@@ -740,43 +913,94 @@ class BilibiliAPI:
 
         import aiohttp as _aiohttp
 
-        url = "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/upload_pic"
-        form = _aiohttp.FormData()
-        form.add_field("biz", "draw")
-        form.add_field(
-            "file", image_bytes,
-            filename="image.png",
-            content_type="image/png",
-        )
-
         session = await self._get_session()
-        try:
+
+        async def _post_multipart(url: str, fields: Dict[str, str], file_field: str) -> Optional[Dict]:
+            form = _aiohttp.FormData()
+            for key, value in fields.items():
+                form.add_field(key, value)
+            form.add_field(
+                file_field,
+                image_bytes,
+                filename="image.png",
+                content_type="image/png",
+            )
+            headers = self._get_headers()
+            # aiohttp must set the multipart boundary itself.  Keeping the
+            # default x-www-form-urlencoded header makes B站 return an HTML
+            # error page instead of JSON.
+            headers.pop("Content-Type", None)
+            headers["Origin"] = "https://www.bilibili.com"
+            headers["Referer"] = "https://www.bilibili.com/"
             async with session.post(
-                url, data=form,
-                headers=self._get_headers(),
+                url,
+                data=form,
+                headers=headers,
                 timeout=aiohttp.ClientTimeout(total=60),
             ) as resp:
                 text = await resp.text()
                 try:
-                    result = json.loads(text)
+                    return json.loads(text)
                 except json.JSONDecodeError:
-                    logger.error(f"图片上传返回非 JSON: {text[:200]}")
+                    logger.error(f"图片上传返回非 JSON({resp.status}) {url}: {text[:200]}")
                     return None
 
-                if result.get("code") == 0:
-                    img_data = result.get("data", {})
-                    image_url = img_data.get("image_url", "")
-                    width = img_data.get("width", 0)
-                    height = img_data.get("height", 0)
-                    logger.info(f"图片上传成功: {image_url} ({width}x{height})")
-                    return {
-                        "img_src": image_url,
-                        "img_width": width,
-                        "img_height": height,
-                    }
-                else:
-                    logger.error(f"图片上传失败: {result}")
-                    return None
+        def _normalize_uploaded_image(result: Optional[Dict], *, endpoint: str) -> Optional[Dict]:
+            if not result:
+                return None
+            if result.get("code") != 0:
+                logger.warning(f"图片上传失败({endpoint}): {result}")
+                return None
+            img_data = result.get("data", {}) or {}
+            image_url = (
+                img_data.get("image_url")
+                or img_data.get("img_src")
+                or img_data.get("url")
+                or ""
+            )
+            width = (
+                img_data.get("image_width")
+                or img_data.get("img_width")
+                or img_data.get("width")
+                or 0
+            )
+            height = (
+                img_data.get("image_height")
+                or img_data.get("img_height")
+                or img_data.get("height")
+                or 0
+            )
+            img_size = img_data.get("img_size") or 0
+            if not image_url:
+                logger.warning(f"图片上传成功但缺少 image_url({endpoint}): {result}")
+                return None
+            logger.info(f"图片上传成功({endpoint}): {image_url} ({width}x{height})")
+            return {
+                "img_src": image_url,
+                "img_width": int(width or 0),
+                "img_height": int(height or 0),
+                "img_size": float(img_size or 0),
+            }
+
+        try:
+            # New web dynamic upload endpoint.  The legacy dynamic_svr endpoint
+            # often returns an HTML error page for current web sessions.
+            result = await _post_multipart(
+                "https://api.bilibili.com/x/dynamic/feed/draw/upload_bfs",
+                {"biz": "new_dyn", "category": "daily", "csrf": self._csrf_token},
+                "file_up",
+            )
+            normalized = _normalize_uploaded_image(result, endpoint="upload_bfs")
+            if normalized:
+                return normalized
+
+            # Fallback for accounts where B站 still accepts the older endpoint.
+            result = await _post_multipart(
+                "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/upload_pic",
+                {"biz": "draw", "csrf": self._csrf_token},
+                "file",
+            )
+            return _normalize_uploaded_image(result, endpoint="dynamic_svr")
         except Exception as e:
             logger.error(f"图片上传异常: {e}")
             return None
@@ -793,21 +1017,93 @@ class BilibiliAPI:
         if not self.config.bilibili.is_authenticated:
             return False
 
+        async def _post_new_dynamic() -> Tuple[Optional[Dict], Optional[str]]:
+            # 官方文档 (bilibili-api-collect-new/docs/dynamic/publish.md):
+            # - URL 必须带 ?csrf={bili_jct}
+            # - Content-Type: application/json
+            # - 请求体为 JSON 对象，顶层只有 dyn_req（csrf 通过 URL/Cookie 传递）
+            # - dyn_req.scene: 1=纯文本 2=图文 4=转发
+            # - dyn_req.pics[] 字段: img_src/img_width/img_height/img_size
+            contents = [{"raw_text": content, "type": 1, "biz_id": ""}]
+            dyn_req: Dict[str, object] = {
+                "content": {"contents": contents},
+                "scene": 2 if images else 1,
+                "meta": {
+                    "app_meta": {
+                        "from": "create.dynamic.web",
+                        "mobi_app": "web",
+                    }
+                },
+            }
+            if images:
+                dyn_req["pics"] = [
+                    {
+                        "img_src": img.get("img_src") or img.get("image_url") or "",
+                        "img_width": int(img.get("img_width") or img.get("width") or 0),
+                        "img_height": int(img.get("img_height") or img.get("height") or 0),
+                        "img_size": float(img.get("img_size") or 0),
+                    }
+                    for img in images
+                    if img.get("img_src") or img.get("image_url")
+                ]
+                if not dyn_req["pics"]:
+                    return None, "empty image list"
+
+            # B 站新版动态接口要求 JSON 请求体
+            payload = {"dyn_req": dyn_req}
+            headers = self._get_headers()
+            headers["Content-Type"] = "application/json"
+            headers["Origin"] = "https://www.bilibili.com"
+            headers["Referer"] = "https://www.bilibili.com/"
+            session = await self._get_session()
+            try:
+                async with session.post(
+                    f"https://api.bilibili.com/x/dynamic/feed/create/dyn?csrf={self._csrf_token}",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    text = await resp.text()
+                    try:
+                        resp_data = json.loads(text)
+                    except json.JSONDecodeError:
+                        return None, text[:200]
+                    async with self._api_code_lock:
+                        self.last_api_code = (resp_data or {}).get("code", -1)
+                    return resp_data, None
+            except Exception as exc:
+                return None, str(exc)
+
+        if images:
+            logger.info(f"发布图文动态: {len(images)} 张配图")
+
+        data, err = await _post_new_dynamic()
+
+        if data and data.get("code") == 0:
+            async with self._api_code_lock:
+                self.last_api_code = 0
+            logger.info(f"动态发布成功: {content[:50]}...")
+            return True
+
+        logger.warning(f"新版动态发布失败，尝试旧接口兜底: {err or data}")
+
         post_data = {
             "uid": self.config.bilibili.dede_user_id,
             "content": content,
             "up_choose_comment": 0,
             "csrf": self._csrf_token,
+            "csrf_token": self._csrf_token,
         }
 
         if images:
-            # 图文动态 type=4
-            post_data["type"] = 4
-            post_data["pictures"] = json.dumps(images, ensure_ascii=False)
-            logger.info(f"发布图文动态: {len(images)} 张配图")
+            # 旧接口 type: 2=带图 4=纯文本（注意：旧 dynamic_svr 接口仅支持图片 URL 数组）
+            post_data["type"] = 2
+            post_data["pictures"] = json.dumps(
+                [{"img_src": img.get("img_src"), "img_width": img.get("img_width", 0), "img_height": img.get("img_height", 0)} for img in images],
+                ensure_ascii=False,
+            )
         else:
-            # 纯文字动态 type=1
-            post_data["type"] = 1
+            post_data["type"] = 4
 
         data, err = await self._http_post(
             "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/create",
@@ -816,16 +1112,32 @@ class BilibiliAPI:
         )
 
         if data and data.get("code") == 0:
-            self.last_api_code = 0
-            logger.info(f"动态发布成功: {content[:50]}...")
+            async with self._api_code_lock:
+                self.last_api_code = 0
+            logger.info(f"动态发布成功(旧接口兜底): {content[:50]}...")
             return True
         else:
-            self.last_api_code = (data or {}).get("code", -1)
+            async with self._api_code_lock:
+                self.last_api_code = (data or {}).get("code", -1)
             logger.error(f"动态发布失败: {err or data}")
             return False
     
     async def get_user_dynamics(self, host_uid: int, offset: int = 0, limit: int = 20) -> Optional[Dict]:
         """获取用户动态"""
+        params = {
+            "host_mid": host_uid,
+            "visit_id": "",
+            "offset": str(offset) if offset else "",
+            "timezone_offset": -480,
+            "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,forwardListHidden,ugcDelete",
+        }
+        data, err = await self._http_get(
+            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
+            params=params,
+        )
+        if data and data.get("code") == 0:
+            return data
+        logger.warning(f"新版动态列表获取失败，尝试旧接口兜底: {err or data}")
         data, _ = await self._http_get(
             "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/new_dyn",
             params={
@@ -1019,13 +1331,296 @@ class BilibiliAPI:
         )
         if data and data.get("result"):
             return data
-        
+
         # 回退v2
         data, _ = await self._http_get(
             "https://api.bilibili.com/pgc/web/timeline/v2",
             params={"season_type": 1, "day_before": day_before, "day_after": day_after},
         )
         return data
+
+    async def get_bangumi_play_url(self, ep_id: int, cid: int, quality: int = 64) -> Optional[Dict]:
+        """获取番剧（PGC）播放流地址（DASH 格式）
+
+        PGC 番剧使用 /pgc/player/web/playurl，不需要 WBI 签名，但需要 Cookie。
+        某些番剧需要大会员才能获取高清晰度。
+
+        Args:
+            ep_id: 番剧剧集 ID
+            cid: 视频 CID
+            quality: 清晰度（64=720P, 32=480P, 16=360P）
+
+        Returns:
+            DASH 流字典，包含 video/audio 流列表
+        """
+        params = {
+            "ep_id": ep_id,
+            "cid": cid,
+            "qn": quality,
+            "fnval": 80,  # DASH + MP4 回退
+            "fnver": 0,
+            "fourk": 0,
+        }
+        data, err = await self._http_get(
+            "https://api.bilibili.com/pgc/player/web/playurl",
+            params=params,
+        )
+        if not data or data.get("code") != 0:
+            logger.warning(f"获取番剧视频流失败: ep_id={ep_id} err={err or data}")
+            return None
+        # 注意：/pgc/player/web/playurl 的播放信息在 result 字段，不是 data
+        payload = data.get("result") or data.get("data") or {}
+        dash = payload.get("dash")
+        if not dash:
+            logger.warning(f"番剧视频流无 dash: ep_id={ep_id} err={err or data}")
+            return None
+        return dash
+
+    async def get_bangumi_subtitles(self, ep_id: int, cid: int) -> Optional[List[Dict]]:
+        """获取番剧（PGC）字幕段（带时间轴）
+
+        番剧一般都有字幕。字幕来自 PGC playurl 响应的 `subtitle.subtitles`，
+        每个字幕文件是 JSON，body 为 [{"from": 秒, "to": 秒, "content": 文本}]。
+
+        Args:
+            ep_id: 番剧剧集 ID
+            cid: 视频 CID
+
+        Returns:
+            字幕段列表 [{"from": float, "to": float, "content": str}]；无字幕返回 None
+        """
+        data, err = await self._http_get(
+            "https://api.bilibili.com/pgc/player/web/playurl",
+            params={"ep_id": ep_id, "cid": cid, "qn": 64, "fnval": 0, "fnver": 0, "fourk": 0},
+        )
+        if not data or data.get("code") != 0:
+            logger.warning(f"获取番剧字幕失败(playurl): ep_id={ep_id} err={err or data}")
+            return None
+
+        # 注意：/pgc/player/web/playurl 的字幕信息在 result 字段，不是 data
+        payload = data.get("result") or data.get("data") or {}
+        subtitle_info = payload.get("subtitle") or {}
+        subs = subtitle_info.get("subtitles") or []
+        if not subs:
+            logger.info(f"该番剧无字幕轨道: ep_id={ep_id}")
+            return None
+
+        session = await self._get_session()
+        headers = self._get_headers()
+        segments: List[Dict] = []
+        for label in subs:
+            subtitle_url = label.get("subtitle_url", "")
+            if not subtitle_url:
+                continue
+            # 字幕 URL 可能是协议相对地址
+            if subtitle_url.startswith("//"):
+                subtitle_url = "https:" + subtitle_url
+            try:
+                async with session.get(
+                    subtitle_url, headers=headers, timeout=aiohttp.ClientTimeout(total=15)
+                ) as resp:
+                    if resp.status != 200:
+                        continue
+                    caption_data = await resp.json()
+                    for cap in caption_data.get("body", []):
+                        content = (cap.get("content") or "").strip()
+                        if content:
+                            segments.append({
+                                "from": float(cap.get("from", 0) or 0),
+                                "to": float(cap.get("to", 0) or 0),
+                                "content": content,
+                            })
+            except Exception as e:
+                logger.warning(f"下载番剧字幕文件失败: {e}")
+
+        if not segments:
+            return None
+        logger.info(f"番剧字幕获取成功: ep_id={ep_id} 共 {len(segments)} 段")
+        return segments
+
+    async def download_bangumi_video(self, ep_id: int, cid: int, save_path: str,
+                                      quality: int = 64, with_audio: bool = True) -> Optional[str]:
+        """下载番剧视频到本地（DASH 格式，分别下载视频和音频流后合并）
+
+        PGC 内容需要 Cookie + 正确的 Referer。低清晰度(360P/480P)通常不需要大会员。
+
+        Args:
+            ep_id: 番剧剧集 ID
+            cid: 视频 CID
+            save_path: 保存路径（含文件名，不含扩展名）
+            quality: 清晰度（默认 64=720P）
+            with_audio: 是否下载并合并音频流。番剧走字幕识别时设为 False，
+                完全不消耗音频带宽（"不用声音"）。
+
+        Returns:
+            成功返回 mp4 文件路径，失败返回 None
+        """
+        dash = await self.get_bangumi_play_url(ep_id, cid, quality=quality)
+        if not dash:
+            logger.warning(f"无法获取番剧视频流: ep_id={ep_id}")
+            return None
+
+        videos = dash.get("video", [])
+        audios = dash.get("audio", [])
+        if not videos:
+            logger.warning("番剧无可用视频流（可能需要大会员或地区限制）")
+            return None
+
+        # 选最低清晰度
+        videos_sorted = sorted(videos, key=lambda v: v.get("id", 0), reverse=True)
+        target_video = None
+        for v in videos_sorted:
+            if v.get("id", 0) <= quality:
+                target_video = v
+                break
+        if not target_video:
+            target_video = videos_sorted[-1]
+
+        video_url = target_video.get("baseUrl") or target_video.get("base_url") or target_video.get("url")
+        if not video_url:
+            logger.warning("番剧视频流 URL 为空")
+            return None
+
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)
+        video_file = f"{save_path}_video.m4s"
+        audio_file = f"{save_path}_audio.m4s"
+        output_file = f"{save_path}.mp4"
+
+        headers = self._get_headers()
+        # PGC 必须设置正确的 Referer，否则 CDN 会返回 403
+        headers["Referer"] = f"https://www.bilibili.com/bangumi/play/ep{ep_id}"
+
+        session = await self._get_session()
+
+        # 下载视频流
+        try:
+            async with session.get(video_url, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
+                if resp.status != 200:
+                    logger.warning(f"下载番剧视频流失败: HTTP {resp.status}")
+                    return None
+                with open(video_file, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 256):
+                        f.write(chunk)
+            logger.info(f"番剧视频流下载完成: {video_file}")
+        except Exception as e:
+            logger.error(f"下载番剧视频流异常: {e}")
+            return None
+
+        # 下载音频流（可选；番剧字幕识别模式可跳过以节省带宽）
+        audio_downloaded = False
+        if with_audio and audios:
+            audio_url = audios[0].get("baseUrl") or audios[0].get("base_url") or audios[0].get("url")
+            if audio_url:
+                try:
+                    async with session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                        if resp.status == 200:
+                            with open(audio_file, "wb") as f:
+                                async for chunk in resp.content.iter_chunked(1024 * 256):
+                                    f.write(chunk)
+                            audio_downloaded = True
+                            logger.info(f"番剧音频流下载完成: {audio_file}")
+                except Exception as e:
+                    logger.warning(f"下载番剧音频流失败（不影响视频分析）: {e}")
+
+        # ffmpeg 合并
+        import subprocess
+        try:
+            if audio_downloaded:
+                proc = subprocess.run(
+                    ["ffmpeg", "-y", "-i", video_file, "-i", audio_file,
+                     "-c", "copy", "-movflags", "+faststart", output_file],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=120, encoding="utf-8", errors="ignore",
+                )
+            else:
+                proc = subprocess.run(
+                    ["ffmpeg", "-y", "-i", video_file,
+                     "-c", "copy", "-movflags", "+faststart", output_file],
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    text=True, timeout=120, encoding="utf-8", errors="ignore",
+                )
+            if proc.returncode != 0:
+                logger.warning(f"ffmpeg 合并番剧失败: {proc.stderr[:300]}")
+                # 合并失败时用纯视频流
+                import shutil as _shutil
+                _shutil.move(video_file, output_file)
+        except Exception as e:
+            logger.error(f"ffmpeg 合并番剧异常: {e}")
+            import shutil as _shutil
+            _shutil.move(video_file, output_file)
+
+        # 清理临时文件
+        for tmp in (video_file, audio_file):
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except Exception:
+                pass
+
+        logger.info(f"番剧下载完成: {output_file}")
+        return output_file
+
+    async def follow_bangumi(self, season_id: int) -> bool:
+        """追番（点追番按钮）
+
+        Args:
+            season_id: 番剧 season_id
+
+        Returns:
+            成功返回 True
+        """
+        data, err = await self._http_post(
+            "https://api.bilibili.com/pgc/web/follow/add",
+            data={"season_id": season_id, "csrf": self.config.bilibili.bili_jct or ""},
+        )
+        if isinstance(data, dict) and data.get("code") == 0:
+            logger.info(f"追番成功: season_id={season_id}")
+            return True
+        logger.debug(f"追番失败: {err or data}")
+        return False
+
+    async def get_followed_bangumi(self, follow_status: int = 0, page: int = 1,
+                                    page_size: int = 30) -> list:
+        """获取已追番列表
+
+        Args:
+            follow_status: 0=全部 1=想看 2=在看 3=看过
+            page: 页码
+            page_size: 每页条数
+
+        Returns:
+            追番列表，每项含 season_id/title/new_ep_id/new_ep_index/total_count
+        """
+        vmid = self.config.bilibili.dede_user_id or ""
+        if not vmid:
+            logger.warning("获取追番列表需要 dede_user_id")
+            return []
+        data, _ = await self._http_get(
+            "https://api.bilibili.com/x/space/bangumi/follow/list",
+            params={
+                "vmid": vmid, "type": 1,
+                "follow_status": follow_status,
+                "pn": page, "ps": page_size,
+            },
+        )
+        if not isinstance(data, dict) or data.get("code") != 0:
+            logger.debug(f"获取追番列表失败: {str(data)[:200]}")
+            return []
+        items = (data.get("data") or {}).get("list") or []
+        result = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            new_ep = item.get("new_ep") or {}
+            result.append({
+                "season_id": item.get("season_id", 0),
+                "title": item.get("title", ""),
+                "new_ep_id": new_ep.get("id", 0) if isinstance(new_ep, dict) else 0,
+                "new_ep_index": new_ep.get("index_show", "") if isinstance(new_ep, dict) else "",
+                "total_count": item.get("total_count", 0),
+            })
+        logger.info(f"获取追番列表: {len(result)} 部")
+        return result
     
     async def get_hot_videos(self, page: int = 1) -> Optional[Dict]:
         """获取热门视频"""
@@ -1034,6 +1629,52 @@ class BilibiliAPI:
             params={"ps": 50, "pn": page},
         )
         return data
+
+    async def get_recommend_videos(self, ps: int = 20) -> Optional[Dict]:
+        """获取首页推荐流视频（需要登录态）
+
+        返回格式归一化为 {"data": {"list": [...]}}，与 get_hot_videos 一致。
+        """
+        data, _ = await self._http_get(
+            "https://api.bilibili.com/x/web-interface/index/top/feed/rcmd",
+            params={"ps": ps, "fresh_idx": 1, "fresh_type": 4, "version": 1},
+        )
+        if not data:
+            return None
+        items = []
+        try:
+            items = data.get("data", {}).get("item", []) or []
+        except Exception:
+            items = []
+        return {"data": {"list": items}}
+
+    async def get_region_hot_videos(self, rid: int = 0, page: int = 1, ps: int = 30) -> Optional[Dict]:
+        """获取分区热门视频
+
+        rid=0 时随机选一个分区。返回格式归一化为 {"data": {"list": [...]}}。
+        """
+        regions = [
+            1, 3, 4, 5, 36, 188, 234, 223, 160, 211,
+            217, 119, 155, 202, 181, 177, 129, 251,
+        ]
+        if rid == 0:
+            rid = random.choice(regions)
+        data, _ = await self._http_get(
+            "https://api.bilibili.com/x/web-interface/ranking/region",
+            params={"ps": ps, "pn": page, "rid": rid, "day": 7},
+        )
+        if not data:
+            return None
+        raw_list = []
+        try:
+            d = data.get("data")
+            if isinstance(d, list):
+                raw_list = d
+            elif isinstance(d, dict):
+                raw_list = d.get("list", d.get("archives", [])) or []
+        except Exception:
+            raw_list = []
+        return {"data": {"list": raw_list}}
     
     async def get_reply_notifications(self) -> Optional[Dict]:
         """获取回复我的评论通知（msgfeed/reply）"""
@@ -1041,6 +1682,20 @@ class BilibiliAPI:
             "https://api.bilibili.com/x/msgfeed/reply",
             params={"platform": "web", "build": 0, "mobi_app": "web"},
         )
+        self._record_authenticated_response(data)
+        return data
+
+    async def get_at_notifications(self) -> Optional[Dict]:
+        """获取@我的通知（msgfeed/at）
+
+        返回结构与 get_reply_notifications 一致（items[]/user/item），
+        item.type 通常为 "at"，business_id 视场景而定（视频评论/动态评论等）。
+        """
+        data, _ = await self._http_get(
+            "https://api.bilibili.com/x/msgfeed/at",
+            params={"platform": "web", "build": 0, "mobi_app": "web"},
+        )
+        self._record_authenticated_response(data)
         return data
     
     async def get_videos_by_uid(self, uid: int, page: int = 1, ps: int = 30) -> Optional[Dict]:

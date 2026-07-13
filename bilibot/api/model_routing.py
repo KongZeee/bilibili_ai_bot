@@ -94,7 +94,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
             _save_to_config(config_loader, router, config_path)
             return ok(router.get_routing(), "路由已更新")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"更新模型路由失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def list_by_type(request: Request) -> JSONResponse:
         """列出指定类型的 Provider"""
@@ -118,7 +119,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
         except ValueError as e:
             return fail("VALIDATION_ERROR", str(e))
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"添加 Provider 失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def delete_by_type(request: Request) -> JSONResponse:
         """删除 Provider"""
@@ -127,8 +129,7 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
         if ptype not in PROVIDER_TYPES:
             return fail_invalid_input(f"未知 Provider 类型: {ptype}")
         # 不允许删除路由中唯一启用的 Provider
-        pool = router._pools.get(ptype, {})
-        if len(pool) <= 1 and router.get_routing().get(ptype) == pid:
+        if router.count_providers(ptype) <= 1 and router.get_routing().get(ptype) == pid:
             return fail("LAST_PROVIDER", f"不能删除最后一个 {ptype} Provider")
         if not router.remove_provider(ptype, pid):
             return fail("NOT_FOUND", f"Provider 不存在: {pid}")
@@ -148,7 +149,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
             _save_to_config(config_loader, router, config_path)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 已更新")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"更新 Provider 失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def test_by_type(request: Request) -> JSONResponse:
         """测试 Provider 连接（按类型调用不同测试方法）"""

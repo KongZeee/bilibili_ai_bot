@@ -155,7 +155,25 @@ class MemoryWriteQueue:
                     f"{item.idempotency_key} - {e}"
                 )
                 await asyncio.sleep(backoff)
-                await self._queue.put(item)
+                # Task 16: 用 put_nowait 避免队列满时自死锁
+                # （worker 是唯一消费者，await put 满时会永久阻塞）
+                try:
+                    self._queue.put_nowait(item)
+                except asyncio.QueueFull:
+                    # 队列满，无法重入队 → 进死信队列并告警
+                    dl = DeadLetter(
+                        idempotency_key=item.idempotency_key,
+                        error=f"queue full after {item.retries} retries: {e}",
+                        created_at=item.created_at,
+                        failed_at=time.time(),
+                        retries=item.retries,
+                    )
+                    self._dead_letters.append(dl)
+                    self._pending_keys.discard(item.idempotency_key)
+                    logger.error(
+                        f"记忆写入死信（队列满，无法重入队）: "
+                        f"{item.idempotency_key} - {e}"
+                    )
 
     async def drain(self, timeout: float = 10.0) -> bool:
         """优雅关闭：停止接收新任务，等待队列排空

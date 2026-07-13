@@ -28,7 +28,13 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from .alignment import align_events, build_behavior_log
-from .audio_track import shutdown_whisper_executor, transcribe_audio
+from .audio_track import (
+    ASRTranscriptionError,
+    ASRTranscriptionResult,
+    AudioEvent,
+    shutdown_whisper_executor,
+    transcribe_audio,
+)
 from .cleanup import schedule_cleanup
 from .preprocess import (
     DEGRADATION_DOWNLOAD_SIZE_EXCEEDED,
@@ -38,7 +44,11 @@ from .preprocess import (
     check_resource_limits,
     preprocess_video,
 )
-from .visual_track import describe_visual_track
+from .visual_track import (
+    SUBTITLE_VISION_PROMPT,
+    VisionTrackIncompleteError,
+    describe_visual_track,
+)
 
 logger = logging.getLogger("bilibot.video_u.service")
 
@@ -83,7 +93,12 @@ class VideoUnderstandingConfig:
         self.frame_extractor: str = va.get("frame_extractor", "katna")
         self.scenedetect_threshold: float = float(va.get("scenedetect_threshold", 27.0))
         self.image_max_size: int = int(va.get("image_max_size", 768))
-        self.vision_window_size: int = int(va.get("vision_window_size", 5))
+        requested_vision_window = int(va.get("vision_window_size", 2))
+        self.vision_window_size: int = max(1, min(requested_vision_window, 2))
+        requested_vision_rate = int(va.get("vision_requests_per_minute", 10))
+        self.vision_requests_per_minute: int = max(
+            1, min(requested_vision_rate, 60)
+        )
 
         # PRD-V5 §8.2 VID-503：资源边界配置
         self.max_duration_seconds: int = int(va.get("max_duration_seconds", 600))
@@ -130,7 +145,16 @@ def configure_global_semaphore(max_concurrent: int) -> None:
 
 
 def get_global_semaphore() -> asyncio.Semaphore:
-    """获取全局 semaphore（如未配置则默认 max=1）"""
+    """获取全局 semaphore（如未配置则默认 max=1）
+
+    修复 Task 3：原实现通过 `getattr(_global_semaphore, '_loop', None) is not loop`
+    检查并重建 semaphore，但 asyncio.Semaphore._loop 属性在 Python 3.10 已被移除，
+    导致 3.10+ 下 `getattr(..., '_loop', None)` 恒为 None，`None is not loop` 恒为 True，
+    每次调用 understand() 都会重建一个全新的 semaphore，全局并发限制完全失效。
+
+    现改为仅返回缓存实例；semaphore 由 configure_global_semaphore 在 app 初始化时
+    创建一次并缓存，后续不再因 loop 变化重建。
+    """
     global _global_semaphore
     if _global_semaphore is None:
         configure_global_semaphore(1)
@@ -160,6 +184,15 @@ class LLMVisionAdapter:
         self, image_path: str, prompt: str = VISION_SYSTEM_PROMPT, max_tokens: int = 250
     ) -> Optional[str]:
         try:
+            # L4：检查文件大小，超过 20MB 时跳过避免内存暴增
+            max_size = 20 * 1024 * 1024  # 20MB
+            file_size = os.path.getsize(image_path)
+            if file_size > max_size:
+                logger.warning(
+                    f"图片文件过大，跳过 vision 分析: {image_path} "
+                    f"({file_size / 1024 / 1024:.1f}MB > 20MB)"
+                )
+                return None
             with open(image_path, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("utf-8")
             data_url = f"data:image/jpeg;base64,{b64}"
@@ -261,13 +294,32 @@ class VideoUnderstandingService:
             and getattr(self.llm_manager, "vision_model", None)
         )
 
-    async def understand(self, video_path: str, question: str = "") -> dict:
+    async def understand(
+        self,
+        video_path: str,
+        question: str = "",
+        subtitle_segments: Optional[list] = None,
+        read_subtitles: bool = False,
+        defer_cleanup: bool = False,
+        require_complete_audio: bool = False,
+        require_complete_visual: bool = False,
+    ) -> dict:
         """
         端到端视频理解
 
         Args:
             video_path: 本地视频文件路径
             question: 可选问题（为空则只生成行为日志不问答）
+            subtitle_segments: 可选字幕段列表 [{"from": float, "to": float, "content": str}]。
+                提供时跳过音频 ASR，直接用字幕轨替代声音轨（番剧场景：
+                番剧一般都有字幕，且无需消耗音频下载/转写资源）。
+            read_subtitles: 番剧字幕识别模式。True 时 Vision LLM 在描述每帧画面的
+                同时转写画面里的硬字幕（B站正版番剧的中文字幕通常压在画面内，无独立
+                字幕轨文件），并跳过音频 ASR（严格"不用声音"）。与 subtitle_segments
+                互斥但可叠加：有字幕文件优先用文件，否则用帧内字幕识别。
+            defer_cleanup: V6 归档调用方设为 True；完整提取内容提交后由调用方清理。
+            require_complete_audio: 音轨 ASR 失败时抛出可重试错误，禁止将不完整提取归档。
+            require_complete_visual: 任一视觉帧未完成描述时抛出可重试错误。
 
         Returns:
             {behavior_log, answer, work_dir, degradation_reason}  失败时 behavior_log 为空字符串
@@ -340,19 +392,29 @@ class VideoUnderstandingService:
 
                 async def _visual_task():
                     if not use_vision or not self.adapter:
+                        if require_complete_visual:
+                            raise VisionTrackIncompleteError(
+                                "VISION_NOT_CONFIGURED",
+                                "video extraction requires a configured vision provider",
+                            )
                         logger.info("Vision 未配置，跳过视觉轨")
                         return [], False
+                    # 番剧字幕识别模式：使用带字幕转写指令的视觉 prompt
+                    vision_prompt = SUBTITLE_VISION_PROMPT if read_subtitles else VISION_SYSTEM_PROMPT
                     return await describe_visual_track(
                         prep.video_path, prep.fps, prep.duration, frames_dir, self.adapter,
                         frame_extractor=cfg.frame_extractor,
                         scenedetect_threshold=cfg.scenedetect_threshold,
                         image_max_size=cfg.image_max_size,
                         vision_window_size=cfg.vision_window_size,
+                        vision_requests_per_minute=cfg.vision_requests_per_minute,
+                        vision_prompt=vision_prompt,
+                        require_complete=require_complete_visual,
                     )
 
                 def _audio_task():
                     if prep.audio_path:
-                        return transcribe_audio(
+                        result = transcribe_audio(
                             prep.audio_path,
                             asr_model=cfg.asr_model,
                             asr_api_key=cfg.asr_api_key,
@@ -363,14 +425,63 @@ class VideoUnderstandingService:
                             local_whisper_enabled=cfg.local_whisper_enabled,
                             max_local_whisper_workers=cfg.max_local_whisper_workers,
                             whisper_timeout=cfg.analysis_timeout_seconds,
+                            return_result=True,
+                            raise_on_error=require_complete_audio,
                         )
-                    return []
+                        if (
+                            require_complete_audio
+                            and prep.has_audio
+                            and result.status == "skipped"
+                        ):
+                            raise ASRTranscriptionError(
+                                "ASR_NOT_CONFIGURED",
+                                "video has an audio track but no ASR provider is enabled",
+                            )
+                        return result
+                    if require_complete_audio and prep.has_audio:
+                        raise ASRTranscriptionError(
+                            "ASR_AUDIO_EXTRACTION_MISSING",
+                            "video reports an audio track but preprocessing produced no audio file",
+                        )
+                    return ASRTranscriptionResult([], "not_present")
+
+                # 番剧字幕识别：用字幕轨替代声音轨，跳过音频 ASR（不消耗音频资源）
+                subtitle_events = None
+                if subtitle_segments:
+                    subtitle_events = [
+                        AudioEvent(
+                            start=float(seg.get("from", 0) or 0),
+                            end=float(seg.get("to", 0) or 0),
+                            text=(seg.get("content") or "").strip(),
+                            source="subtitle",
+                        )
+                        for seg in subtitle_segments
+                        if (seg.get("content") or "").strip()
+                    ]
 
                 # VID-605：确保 audio_task 抛异常时 visual_future 被取消，避免 Vision LLM 调用泄漏
                 visual_future = asyncio.create_task(_visual_task())
                 try:
-                    audio_events = await asyncio.to_thread(_audio_task)
-                    visual_events, is_static = await visual_future
+                    if subtitle_events or read_subtitles:
+                        # 字幕轨：不调用 ASR（番剧字幕识别模式严格"不用声音"）
+                        audio_events = subtitle_events or []
+                        audio_result = ASRTranscriptionResult(
+                            audio_events,
+                            "subtitle" if subtitle_events else "visual_subtitle",
+                        )
+                        if read_subtitles and not subtitle_events:
+                            logger.info(
+                                "番剧字幕识别模式：跳过音频 ASR，由 Vision LLM 从画面帧转写硬字幕"
+                            )
+                        elif subtitle_events:
+                            logger.info(
+                                f"番剧字幕识别模式：跳过音频 ASR，使用 {len(audio_events)} 段字幕作为文本轨"
+                            )
+                        visual_events, is_static = await visual_future
+                    else:
+                        audio_result = await asyncio.to_thread(_audio_task)
+                        audio_events = audio_result.events
+                        visual_events, is_static = await visual_future
                 except Exception:
                     visual_future.cancel()
                     try:
@@ -381,13 +492,31 @@ class VideoUnderstandingService:
 
                 # 3. 时序缝合
                 blocks = align_events(audio_events, visual_events, prep.duration, is_static=is_static)
-                no_audio = not prep.has_audio or not audio_events
+                # no_audio：无声音轨且无字幕轨时，按视觉轨独立分析
+                no_audio = (not prep.has_audio and not subtitle_events) or not audio_events
                 if no_audio and visual_events:
                     logger.info("音频轨为空，使用视觉轨独立分析")
 
                 behavior_log = build_behavior_log(blocks, is_static=is_static, no_audio=no_audio)
 
                 # 保存日志
+                nonempty_audio_texts = {
+                    " ".join(event.text.split()).casefold()
+                    for event in audio_events
+                    if event.text and event.text.strip()
+                }
+                audio_segment_count = len(audio_events)
+                duplicate_ratio = (
+                    1.0 - (len(nonempty_audio_texts) / audio_segment_count)
+                    if audio_segment_count
+                    else 0.0
+                )
+                audio_quality_status = (
+                    "repetitive"
+                    if audio_segment_count >= 5 and duplicate_ratio >= 0.7
+                    else "normal"
+                )
+
                 log_path = os.path.join(prep.work_dir, "behavior_log.md")
                 try:
                     with open(log_path, "w", encoding="utf-8") as f:
@@ -405,19 +534,91 @@ class VideoUnderstandingService:
                     "behavior_log": behavior_log,
                     "answer": answer,
                     "work_dir": prep.work_dir,
-                    "degradation_reason": "",
+                    "degradation_reason": (
+                        f"asr_failed:{audio_result.error_code}"
+                        if audio_result.status == "failed"
+                        else ""
+                    ),
+                    "audio_status": {
+                        "status": audio_result.status,
+                        "error_code": audio_result.error_code,
+                        "error_reason": audio_result.error_reason,
+                        "retryable": audio_result.retryable,
+                        "duration_seconds": audio_result.duration_seconds or prep.duration,
+                        "segment_count": audio_segment_count,
+                        "unique_text_count": len(nonempty_audio_texts),
+                        "duplicate_ratio": round(duplicate_ratio, 4),
+                        "timestamp_clamped_count": audio_result.timestamp_clamped_count,
+                        "quality_status": audio_quality_status,
+                    },
+                    # V6 memory brain: preserve every extracted textual observation.
+                    # Frame paths are intentionally omitted because keyframes/media are
+                    # temporary processing artifacts and must never enter long-term memory.
+                    "audio_observations": [
+                        {
+                            "start": event.start,
+                            "end": event.end,
+                            "text": event.text,
+                            "source": getattr(event, "source", "asr"),
+                        }
+                        for event in audio_events
+                    ],
+                    "visual_observations": [
+                        {
+                            "timestamp": event.timestamp,
+                            "frame_number": event.frame_number,
+                            "description": event.description,
+                        }
+                        for event in visual_events
+                    ],
+                    "timeline_observations": [
+                        {
+                            "start": block.start,
+                            "end": block.end,
+                            "is_gap_fill": block.is_gap_fill,
+                            "audio": [
+                                {
+                                    "text": event.text,
+                                    "source": getattr(event, "source", "asr"),
+                                    "start": event.start,
+                                    "end": event.end,
+                                }
+                                for event in block.audio
+                            ],
+                            "visual": [event.description for event in block.visuals],
+                        }
+                        for block in blocks
+                    ],
                 }
-            except Exception:
-                # PRD 3.9：异常时立即清理 work_dir，避免临时文件残留
-                try:
-                    import shutil
-                    shutil.rmtree(prep.work_dir, ignore_errors=True)
-                except Exception:
-                    pass
+            except Exception as error:
+                if defer_cleanup:
+                    if isinstance(
+                        error, (ASRTranscriptionError, VisionTrackIncompleteError)
+                    ):
+                        error.work_dir = prep.work_dir
+                    else:
+                        try:
+                            error.work_dir = prep.work_dir
+                        except Exception:
+                            pass
+                    logger.warning(
+                        "视频提取未完成，保留处理目录等待重试: work_dir=%s error=%s",
+                        prep.work_dir,
+                        type(error).__name__,
+                    )
+                else:
+                    # 非归档调用保持原有异常清理策略。
+                    try:
+                        import shutil
+                        shutil.rmtree(prep.work_dir, ignore_errors=True)
+                    except Exception:
+                        pass
                 raise
             finally:
-                # 正常完成时延迟清理（30 分钟）
-                schedule_cleanup([prep.work_dir], delay_seconds=1800)
+                # V6 ingestion retains artifacts until the extracted observation
+                # commits. Other callers keep the existing delayed cleanup behavior.
+                if not defer_cleanup:
+                    schedule_cleanup([prep.work_dir], delay_seconds=1800)
 
     async def _answer_question(
         self, behavior_log: str, question: str, max_tokens: int = 1024

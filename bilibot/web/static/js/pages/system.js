@@ -2,8 +2,79 @@
 const { h, ref, reactive, onMounted, computed } = window.Vue;
 import { appState } from '../state.js';
 import { api } from '../api.js';
-import { Button, Badge, Modal, FormInput, EmptyState } from '../components/common.js';
+import { Button, Badge, Modal, ConfirmModal, createConfirmHelper, FormInput, EmptyState, Loading, Icon } from '../components/common.js';
+import { SchemaForm } from '../components/SchemaForm.js';
 import { formatTime } from '../utils.js';
+
+// Task 28：schema 嵌套 dict → 扁平数组（与 config.js 一致的逻辑）
+function flattenSchema(nested, prefix = '', category = '', labelPrefix = '') {
+    const result = [];
+    if (!nested || typeof nested !== 'object') return result;
+    if (Array.isArray(nested)) return nested;
+    for (const [key, def] of Object.entries(nested)) {
+        if (!def || typeof def !== 'object') continue;
+        const dotKey = prefix ? `${prefix}.${key}` : key;
+        const cat = category || key;
+        const fieldLabel = def.label || key;
+        const nextLabelPrefix = prefix
+            ? [labelPrefix, fieldLabel].filter(Boolean).join(' / ')
+            : labelPrefix;
+        if (def.type === 'object' && def.fields) {
+            result.push(...flattenSchema(def.fields, dotKey, cat, nextLabelPrefix));
+        } else {
+            result.push({
+                key: dotKey,
+                id: `cfg-${dotKey.replace(/\./g, '-')}`,
+                label: [labelPrefix, fieldLabel].filter(Boolean).join(' / '),
+                type: def.sensitive ? 'password' : (def.type || 'string'),
+                category: cat,
+                sensitive: !!def.sensitive,
+                options: def.options,
+                hint: def.description,
+                deprecated: !!def.deprecated,
+                itemType: def.itemType,
+                default: def.default,
+                min: def.min,
+                max: def.max,
+                placeholder: def.placeholder,
+                rows: def.rows,
+                immediate: !!def.immediate,
+                autocomplete: def.sensitive ? 'off' : (def.autocomplete || undefined),
+                spellcheck: def.sensitive ? false : (def.spellcheck ?? undefined),
+            });
+        }
+    }
+    return result;
+}
+
+function flattenConfig(obj, prefix = '') {
+    const result = {};
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) return result;
+    for (const [key, value] of Object.entries(obj)) {
+        const dotKey = prefix ? `${prefix}.${key}` : key;
+        if (value !== null && typeof value === 'object' && !Array.isArray(value)) {
+            Object.assign(result, flattenConfig(value, dotKey));
+        } else {
+            result[dotKey] = value;
+        }
+    }
+    return result;
+}
+
+function unflattenConfig(flat) {
+    const result = {};
+    for (const [dotKey, value] of Object.entries(flat)) {
+        if (value === undefined || value === null) continue;
+        const keys = dotKey.split('.');
+        let cur = result;
+        for (let i = 0; i < keys.length - 1; i++) {
+            if (!cur[keys[i]] || typeof cur[keys[i]] !== 'object') cur[keys[i]] = {};
+            cur = cur[keys[i]];
+        }
+        cur[keys[keys.length - 1]] = value;
+    }
+    return result;
+}
 
 export const SystemPage = {
     name: 'SystemPage',
@@ -26,6 +97,16 @@ export const SystemPage = {
             confirming: false,
         });
 
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
+
+        // Task 28：安全配置 / 面板配置（schema 驱动）
+        const configSchema = ref([]);
+        const configLocalModel = ref({});
+        const configOriginalModel = ref({});
+        const configVersion = ref(0);
+        const configSaving = ref(false);
+        const configLoading = ref(false);
+
         async function loadPauseStatus() {
             securityLoading.value = true;
             try {
@@ -40,19 +121,26 @@ export const SystemPage = {
         async function togglePause() {
             if (!pauseStatus.value) return;
             const isPaused = pauseStatus.value.paused;
-            if (!confirm(isPaused ? '确认恢复 Bot 运行？' : '确认全局暂停 Bot？所有自动行为将停止。')) return;
-            try {
-                if (isPaused) {
-                    await api.safety.resume();
-                    appState.notify('已恢复运行', 'success');
-                } else {
-                    await api.safety.pause();
-                    appState.notify('已暂停', 'warning');
-                }
-                loadPauseStatus();
-            } catch (e) {
-                appState.notify('操作失败：' + (e.message || e), 'danger');
-            }
+            showConfirm({
+                title: isPaused ? '确认恢复' : '确认暂停',
+                message: isPaused ? '确认恢复 Bot 运行？' : '确认全局暂停 Bot？所有自动行为将停止。',
+                confirmText: isPaused ? '恢复运行' : '全局暂停',
+                danger: !isPaused,
+                action: async () => {
+                    try {
+                        if (isPaused) {
+                            await api.safety.resume();
+                            appState.notify('已恢复运行', 'success');
+                        } else {
+                            await api.safety.pause();
+                            appState.notify('已暂停', 'warning');
+                        }
+                        loadPauseStatus();
+                    } catch (e) {
+                        appState.notify('操作失败：' + (e.message || e), 'danger');
+                    }
+                },
+            });
         }
 
         async function loadBlacklist() {
@@ -80,14 +168,21 @@ export const SystemPage = {
         }
 
         async function removeBlacklist(item) {
-            if (!confirm(`确认从黑名单移除 ${item.user_id || item.value}？`)) return;
-            try {
-                await api.safety.delBlacklist(item.user_id || item.id || item.value);
-                appState.notify('已移除', 'success');
-                loadBlacklist();
-            } catch (e) {
-                appState.notify('移除失败：' + (e.message || e), 'danger');
-            }
+            showConfirm({
+                title: '确认移除',
+                message: `确认从黑名单移除 ${item.user_id || item.value}？`,
+                confirmText: '移除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.safety.delBlacklist(item.user_id || item.id || item.value);
+                        appState.notify('已移除', 'success');
+                        loadBlacklist();
+                    } catch (e) {
+                        appState.notify('移除失败：' + (e.message || e), 'danger');
+                    }
+                },
+            });
         }
 
         async function loadBackups() {
@@ -149,24 +244,100 @@ export const SystemPage = {
         }
 
         async function deleteBackup(backup) {
-            if (!confirm(`确认删除备份 ${backup.name}？此操作不可撤销。`)) return;
+            showConfirm({
+                title: '确认删除备份',
+                message: `确认删除备份 ${backup.name}？此操作不可撤销。`,
+                confirmText: '删除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.backup.delete(backup.name);
+                        appState.notify('备份已删除', 'success');
+                        loadBackups();
+                    } catch (e) {
+                        appState.notify('删除失败：' + (e.message || e), 'danger');
+                    }
+                },
+            });
+        }
+
+        // Task 28：加载配置 schema + 完整配置
+        async function loadConfigData() {
+            configLoading.value = true;
             try {
-                await api.backup.delete(backup.name);
-                appState.notify('备份已删除', 'success');
-                loadBackups();
+                const [schemaData, configResponse] = await Promise.all([
+                    api.config.schema(),
+                    api.config.fullWithMeta(),
+                ]);
+                configSchema.value = flattenSchema(schemaData || {});
+                const configData = configResponse?.data || {};
+                const flat = flattenConfig(configData || {});
+                configLocalModel.value = flat;
+                configOriginalModel.value = { ...flat };
+                configVersion.value = configResponse?.config_revision || 0;
             } catch (e) {
-                appState.notify('删除失败：' + (e.message || e), 'danger');
+                appState.notify('加载配置失败：' + (e.message || e), 'danger');
+            } finally {
+                configLoading.value = false;
             }
         }
+
+        // Task 28：保存指定 category 的配置段
+        async function saveConfigSection(category) {
+            configSaving.value = true;
+            try {
+                const sectionKeys = new Set(
+                    configSchema.value
+                        .filter(f => f.category === category)
+                        .map(f => f.key)
+                );
+                const filtered = {};
+                for (const [key, value] of Object.entries(configLocalModel.value)) {
+                    if (sectionKeys.has(key)) {
+                        filtered[key] = value;
+                    }
+                }
+                const nested = unflattenConfig(filtered);
+                if (configVersion.value > 0) nested._expected_revision = configVersion.value;
+                await api.config.patch(nested);
+                appState.notify('配置已保存', 'success');
+                await loadConfigData();
+            } catch (e) {
+                const msg = e.message || String(e);
+                if (msg.includes('version') || msg.includes('409') || e.code === 'CONFIG_REVISION_CONFLICT') {
+                    appState.notify('配置已被其他人修改，请刷新后重试', 'warning');
+                    await loadConfigData();
+                } else {
+                    appState.notify('保存失败：' + msg, 'danger');
+                }
+            } finally {
+                configSaving.value = false;
+            }
+        }
+
+        // Task 28：按 category 过滤 schema
+        const schemaByCategory = (cat) => computed(() =>
+            configSchema.value.filter(f => (f.category || '通用') === cat)
+        );
+        const safetySchema = schemaByCategory('safety');
+        const webSchema = schemaByCategory('web');
+
+        // Task 28：配置 dirty 检测
+        const configIsDirty = computed(() =>
+            JSON.stringify(configLocalModel.value) !== JSON.stringify(configOriginalModel.value)
+        );
 
         onMounted(() => {
             loadPauseStatus();
             loadBlacklist();
             loadBackups();
+            loadConfigData();
         });
 
         const tabs = [
             { value: 'security', label: '安全控制' },
+            { value: 'safety', label: '安全配置' },
+            { value: 'web', label: '面板配置' },
             { value: 'backup', label: '备份恢复' },
         ];
 
@@ -330,7 +501,96 @@ export const SystemPage = {
                 ]),
             ]),
 
-            // ═══ Tab 2: 备份恢复 ═══
+            // ═══ Tab 2: 安全配置（schema 驱动）═══
+            activeTab.value === 'safety' && (configLoading.value
+                ? h(Loading)
+                : h('div', { class: 'grid gap-3' }, [
+                    h('article', {
+                        class: 'grid gap-3',
+                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
+                    }, [
+                        h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'eyebrow' }, '安全配置'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '安全与审核'),
+                            ]),
+                            h('div', { class: 'flex items-center gap-2' }, [
+                                h(Button, {
+                                    type: 'ghost',
+                                    size: 'sm',
+                                    onClick: loadConfigData,
+                                }, () => '刷新'),
+                                h(Button, {
+                                    type: 'primary',
+                                    size: 'sm',
+                                    onClick: () => saveConfigSection('safety'),
+                                    loading: configSaving.value,
+                                    disabled: !configIsDirty.value,
+                                }, () => '保存'),
+                            ]),
+                        ]),
+                        h('div', { class: 'card-body' }, [
+                            safetySchema.value.length > 0
+                                ? h(SchemaForm, {
+                                    schema: safetySchema.value,
+                                    modelValue: configLocalModel.value,
+                                    'onUpdate:modelValue': (v) => { configLocalModel.value = v; },
+                                })
+                                : h(EmptyState, { title: '暂无配置项', desc: '该分类下没有可配置字段' }),
+                        ]),
+                    ]),
+                ])),
+
+            // ═══ Tab 3: 面板配置（schema 驱动）═══
+            activeTab.value === 'web' && (configLoading.value
+                ? h(Loading)
+                : h('div', { class: 'grid gap-3' }, [
+                    h('article', {
+                        class: 'grid gap-3',
+                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
+                    }, [
+                        h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'eyebrow' }, '面板配置'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, 'Web 管理面板'),
+                            ]),
+                            h('div', { class: 'flex items-center gap-2' }, [
+                                h(Button, {
+                                    type: 'ghost',
+                                    size: 'sm',
+                                    onClick: loadConfigData,
+                                }, () => '刷新'),
+                                h(Button, {
+                                    type: 'primary',
+                                    size: 'sm',
+                                    onClick: () => saveConfigSection('web'),
+                                    loading: configSaving.value,
+                                    disabled: !configIsDirty.value,
+                                }, () => '保存'),
+                            ]),
+                        ]),
+                        h('div', { class: 'card-body' }, [
+                            webSchema.value.length > 0
+                                ? h(SchemaForm, {
+                                    schema: webSchema.value,
+                                    modelValue: configLocalModel.value,
+                                    'onUpdate:modelValue': (v) => { configLocalModel.value = v; },
+                                })
+                                : h(EmptyState, { title: '暂无配置项', desc: '该分类下没有可配置字段' }),
+                        ]),
+                    ]),
+                    h('div', {
+                        class: 'grid gap-2',
+                        style: 'padding: calc(var(--spacing) * 3); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--chart-5) / 0.08); border: 1px solid hsl(var(--chart-5) / 0.2);',
+                    }, [
+                        h('p', {
+                            class: 'muted m-0',
+                            style: 'font-size:0.88rem; line-height:1.6;',
+                        }, '注意：修改 host / port / enabled / secret_key / secure_cookies 等字段需要重启应用才能生效。'),
+                    ]),
+                ])),
+
+            // ═══ Tab 4: 备份恢复 ═══
             activeTab.value === 'backup' && h('div', { class: 'grid gap-3' }, [
                 h('article', {
                     class: 'grid gap-3',
@@ -412,6 +672,20 @@ export const SystemPage = {
                     h(Button, { onClick: () => restoreModal.visible = false }, () => '取消'),
                     h(Button, { type: 'ghost', onClick: confirmRestore, loading: restoreModal.confirming }, () => '确认恢复'),
                 ]),
+            }),
+
+            // ═══ 统一确认对话框 ═══
+            h(ConfirmModal, {
+                modelValue: confirmState.visible,
+                title: confirmState.title,
+                message: confirmState.message,
+                confirmText: confirmState.confirmText,
+                cancelText: confirmState.cancelText,
+                danger: confirmState.danger,
+                prompt: confirmState.prompt,
+                promptPlaceholder: confirmState.promptPlaceholder,
+                'onUpdate:modelValue': (v) => confirmState.visible = v,
+                onConfirm: handleConfirm,
             }),
         ]);
     },

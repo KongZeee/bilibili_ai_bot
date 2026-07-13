@@ -5,9 +5,13 @@
 - scene / persona_id / input_summary / context_summary
 - prompt_preview / output / published / target / created_at
 """
+import asyncio
 import json
 import logging
+import os
 import sqlite3
+import tempfile
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -40,10 +44,23 @@ class AuditStore:
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.data_dir / "audit.db"
+        # 线程本地连接缓存：同一线程复用连接，避免每次操作都新建/关闭 SQLite 连接
+        self._tls = threading.local()
         self._init_db()
 
+    # BUG C-002：统一连接参数（WAL + busy_timeout + check_same_thread），
+    # 与 pm_state_store/task_store/reply_state 对齐
+    def _get_conn(self):
+        conn = getattr(self._tls, "conn", None)
+        if conn is None:
+            conn = sqlite3.connect(str(self.db_path), timeout=30, check_same_thread=False)
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
+            self._tls.conn = conn
+        return conn
+
     def _init_db(self):
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS generation_audits (
                 id TEXT PRIMARY KEY,
@@ -92,7 +109,6 @@ class AuditStore:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_scene ON external_disclosures(scene)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_disc_created ON external_disclosures(created_at)")
         conn.commit()
-        conn.close()
 
     def record(
         self,
@@ -120,7 +136,7 @@ class AuditStore:
             logger.warning(f"record: 未知 status={status}，回退为 generated")
             status = "generated"
 
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.execute(
             "INSERT INTO generation_audits (id, scene, persona_id, input_summary, context_summary, prompt_preview, output, published, target, created_at, status) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -128,7 +144,6 @@ class AuditStore:
              prompt_preview[:2000], output[:2000], int(published), target_json, created_at, status),
         )
         conn.commit()
-        conn.close()
 
         # JSON backup
         try:
@@ -144,13 +159,32 @@ class AuditStore:
                 "published": published, "target": target or {}, "created_at": created_at,
                 "status": status,
             })
-            with open(backup, "w", encoding="utf-8") as f:
-                json.dump(records[-500:], f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+            # 原子写：临时文件 + os.replace，避免崩溃导致文件损坏
+            fd, tmp_path = tempfile.mkstemp(dir=str(self.data_dir), suffix=".json.tmp")
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(records[-500:], f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, str(backup))
+            except Exception:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
+        except Exception as e:
+            # L10：JSON 备份失败不影响主流程（SQLite 已写入），仅记录 warning
+            logger.warning(f"审计 JSON 备份写入失败: {e}")
 
         logger.debug(f"审计记录: {aid} scene={scene} status={status}")
         return aid
+
+    async def record_async(self, *args, **kwargs) -> str:
+        """record() 的异步包装——将 SQLite 写入和 JSON 备份的同步 I/O 卸载到线程。
+
+        Task 25 SubTask 25.3：JSON 备份读写用 asyncio.to_thread 包装，
+        避免在事件循环中阻塞。
+        """
+        return await asyncio.to_thread(self.record, *args, **kwargs)
 
     def record_external_disclosure(
         self,
@@ -180,7 +214,7 @@ class AuditStore:
         did = f"disc_{uuid.uuid4().hex[:12]}"
         created_at = datetime.now().isoformat()
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = self._get_conn()
             conn.execute(
                 "INSERT INTO external_disclosures "
                 "(id, scene, backend, query_hash, redacted_preview, field_types, account_id, created_at) "
@@ -190,7 +224,6 @@ class AuditStore:
                  account_id or "", created_at),
             )
             conn.commit()
-            conn.close()
             logger.debug(f"外部披露记录: {did} scene={scene} backend={backend}")
         except Exception as e:
             logger.error(f"record_external_disclosure 失败: {e}")
@@ -203,7 +236,7 @@ class AuditStore:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """查询外部数据披露记录"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         sql = "SELECT * FROM external_disclosures WHERE 1=1"
         params: list = []
@@ -213,7 +246,6 @@ class AuditStore:
         sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = conn.execute(sql, params).fetchall()
-        conn.close()
         return [dict(row) for row in rows]
 
     def query(
@@ -226,7 +258,7 @@ class AuditStore:
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
         """查询审计记录"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
 
         sql = "SELECT * FROM generation_audits WHERE 1=1"
@@ -250,16 +282,13 @@ class AuditStore:
         params.extend([limit, offset])
 
         rows = conn.execute(sql, params).fetchall()
-        conn.close()
-
         return [dict(row) for row in rows]
 
     def get(self, audit_id: str) -> Optional[Dict[str, Any]]:
         """获取单条审计记录"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
         row = conn.execute("SELECT * FROM generation_audits WHERE id = ?", (audit_id,)).fetchone()
-        conn.close()
         return dict(row) if row else None
 
     def list_by_status(
@@ -290,41 +319,38 @@ class AuditStore:
         page_size = max(1, int(page_size))
         offset = (page - 1) * page_size
 
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
-        try:
-            base_sql = "FROM generation_audits WHERE scene = ?"
-            params: list = [scene]
+        base_sql = "FROM generation_audits WHERE scene = ?"
+        params: list = [scene]
 
-            if status == "pending":
-                # 未发布 且 无 failure_reason
-                base_sql += (
-                    " AND published = 0"
-                    " AND (json_extract(target, '$.failure_reason') IS NULL"
-                    "      OR json_extract(target, '$.failure_reason') = '')"
-                )
-            elif status == "replied":
-                base_sql += " AND published = 1"
-            elif status == "failed":
-                # 未发布 且 failure_reason 非空
-                base_sql += (
-                    " AND published = 0"
-                    " AND json_extract(target, '$.failure_reason') IS NOT NULL"
-                    " AND json_extract(target, '$.failure_reason') != ''"
-                )
-            # else: status 为空或未知 → 不附加条件，返回全部
+        if status == "pending":
+            # 未发布 且 无 failure_reason
+            base_sql += (
+                " AND published = 0"
+                " AND (json_extract(target, '$.failure_reason') IS NULL"
+                "      OR json_extract(target, '$.failure_reason') = '')"
+            )
+        elif status == "replied":
+            base_sql += " AND published = 1"
+        elif status == "failed":
+            # 未发布 且 failure_reason 非空
+            base_sql += (
+                " AND published = 0"
+                " AND json_extract(target, '$.failure_reason') IS NOT NULL"
+                " AND json_extract(target, '$.failure_reason') != ''"
+            )
+        # else: status 为空或未知 → 不附加条件，返回全部
 
-            total = conn.execute(
-                f"SELECT COUNT(*) {base_sql}", params
-            ).fetchone()[0]
+        total = conn.execute(
+            f"SELECT COUNT(*) {base_sql}", params
+        ).fetchone()[0]
 
-            rows = conn.execute(
-                f"SELECT * {base_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
-                params + [page_size, offset],
-            ).fetchall()
-            items = [dict(r) for r in rows]
-        finally:
-            conn.close()
+        rows = conn.execute(
+            f"SELECT * {base_sql} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+            params + [page_size, offset],
+        ).fetchall()
+        items = [dict(r) for r in rows]
 
         return {
             "items": items,
@@ -357,29 +383,19 @@ class AuditStore:
             True 表示更新成功，False 表示记录不存在或写入失败
         """
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = self._get_conn()
             conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT target FROM generation_audits WHERE id = ?", (audit_id,)
-            ).fetchone()
-            if row is None:
-                conn.close()
-                logger.warning(f"mark_published: 审计记录不存在 {audit_id}")
-                return False
 
-            # 合并 target
-            try:
-                existing_target = json.loads(row["target"] or "{}")
-            except Exception:
-                existing_target = {}
+            # 构造 JSON merge patch（包含 target 与 failure_reason）
+            patch: Dict[str, Any] = {}
             if target:
                 try:
-                    existing_target.update(target)
+                    patch.update(target)
                 except Exception:
                     pass
             if failure_reason:
-                existing_target["failure_reason"] = failure_reason
-            target_json = json.dumps(existing_target, ensure_ascii=False)
+                patch["failure_reason"] = failure_reason
+            patch_json = json.dumps(patch, ensure_ascii=False)
 
             # OBS-501：根据发布结果推导语义化状态
             if published:
@@ -389,20 +405,67 @@ class AuditStore:
             else:
                 new_status = None  # 保持原状
 
-            if new_status is not None:
-                conn.execute(
-                    "UPDATE generation_audits SET published = ?, target = ?, status = ? WHERE id = ?",
-                    (int(published), target_json, new_status, audit_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE generation_audits SET published = ?, target = ? WHERE id = ?",
-                    (int(published), target_json, audit_id),
-                )
-            conn.commit()
-            conn.close()
-            logger.debug(f"审计 {audit_id} 发布状态更新为 published={published}")
-            return True
+            # 优先使用 SQLite json_patch 在 SQL 层原子合并 target，
+            # 避免非原子读-改-写导致并发更新丢失
+            try:
+                if new_status is not None:
+                    cur = conn.execute(
+                        "UPDATE generation_audits "
+                        "SET target = json_patch(COALESCE(target, '{}'), ?), "
+                        "    published = ?, status = ? "
+                        "WHERE id = ?",
+                        (patch_json, int(published), new_status, audit_id),
+                    )
+                else:
+                    cur = conn.execute(
+                        "UPDATE generation_audits "
+                        "SET target = json_patch(COALESCE(target, '{}'), ?), "
+                        "    published = ? "
+                        "WHERE id = ?",
+                        (patch_json, int(published), audit_id),
+                    )
+                conn.commit()
+                if cur.rowcount == 0:
+                    logger.warning(f"mark_published: 审计记录不存在 {audit_id}")
+                    return False
+                logger.debug(f"审计 {audit_id} 发布状态更新为 published={published}")
+                return True
+            except sqlite3.OperationalError:
+                # SQLite 版本不支持 json_patch，回退到 Python 层合并
+                conn.rollback()
+                row = conn.execute(
+                    "SELECT target FROM generation_audits WHERE id = ?", (audit_id,)
+                ).fetchone()
+                if row is None:
+                    logger.warning(f"mark_published: 审计记录不存在 {audit_id}")
+                    return False
+
+                try:
+                    existing_target = json.loads(row["target"] or "{}")
+                except Exception:
+                    existing_target = {}
+                if target:
+                    try:
+                        existing_target.update(target)
+                    except Exception:
+                        pass
+                if failure_reason:
+                    existing_target["failure_reason"] = failure_reason
+                target_json = json.dumps(existing_target, ensure_ascii=False)
+
+                if new_status is not None:
+                    conn.execute(
+                        "UPDATE generation_audits SET published = ?, target = ?, status = ? WHERE id = ?",
+                        (int(published), target_json, new_status, audit_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE generation_audits SET published = ?, target = ? WHERE id = ?",
+                        (int(published), target_json, audit_id),
+                    )
+                conn.commit()
+                logger.debug(f"审计 {audit_id} 发布状态更新为 published={published}")
+                return True
         except Exception as e:
             logger.error(f"mark_published 失败 audit_id={audit_id}: {e}")
             return False
@@ -421,13 +484,12 @@ class AuditStore:
             logger.warning(f"set_status: 非法 status={status}")
             return False
         try:
-            conn = sqlite3.connect(str(self.db_path))
+            conn = self._get_conn()
             cur = conn.execute(
                 "UPDATE generation_audits SET status = ? WHERE id = ?",
                 (status, audit_id),
             )
             conn.commit()
-            conn.close()
             if cur.rowcount == 0:
                 logger.warning(f"set_status: 审计记录不存在 {audit_id}")
                 return False
@@ -451,12 +513,11 @@ class AuditStore:
 
     def count(self, scene: Optional[str] = None) -> int:
         """统计记录数"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         if scene:
             row = conn.execute("SELECT COUNT(*) FROM generation_audits WHERE scene = ?", (scene,)).fetchone()
         else:
             row = conn.execute("SELECT COUNT(*) FROM generation_audits").fetchone()
-        conn.close()
         return row[0] if row else 0
 
     def stats(self) -> Dict[str, Any]:
@@ -466,7 +527,7 @@ class AuditStore:
         返回的 by_status 字典保证包含全部 STATUS_VALUES 中的 10 个状态键
         （无记录时为 0）。
         """
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
 
         total = conn.execute("SELECT COUNT(*) FROM generation_audits").fetchone()[0]
@@ -477,7 +538,6 @@ class AuditStore:
         status_rows = conn.execute(
             "SELECT status, COUNT(*) as cnt FROM generation_audits GROUP BY status"
         ).fetchall()
-        conn.close()
 
         by_status: Dict[str, int] = {s: 0 for s in STATUS_VALUES}
         for r in status_rows:
@@ -494,7 +554,7 @@ class AuditStore:
 
     def stats_by_day(self, days: int = 30) -> list[dict]:
         """按天统计生成量（用于趋势图）"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
 
         cutoff = datetime.fromtimestamp(
@@ -507,12 +567,11 @@ class AuditStore:
             "GROUP BY DATE(created_at) ORDER BY day",
             (cutoff,),
         ).fetchall()
-        conn.close()
         return [{"day": r["day"], "count": r["cnt"]} for r in rows]
 
     def stats_by_persona(self) -> list[dict]:
         """按人格统计（含平均输出长度）"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
 
         rows = conn.execute(
@@ -521,7 +580,6 @@ class AuditStore:
             "SUM(CASE WHEN published=1 THEN 1 ELSE 0 END) as pub_cnt "
             "FROM generation_audits GROUP BY persona_id ORDER BY cnt DESC"
         ).fetchall()
-        conn.close()
         return [
             {
                 "persona_id": r["persona_id"],
@@ -534,7 +592,7 @@ class AuditStore:
 
     def stats_by_hour(self, days: int = 7) -> list[dict]:
         """按小时统计（24 小时热度分布）"""
-        conn = sqlite3.connect(str(self.db_path))
+        conn = self._get_conn()
         conn.row_factory = sqlite3.Row
 
         cutoff = datetime.fromtimestamp(
@@ -547,7 +605,6 @@ class AuditStore:
             "WHERE created_at >= ? GROUP BY hour ORDER BY hour",
             (cutoff,),
         ).fetchall()
-        conn.close()
         return [{"hour": r["hour"], "count": r["cnt"]} for r in rows]
 
     def analytics(self) -> Dict[str, Any]:

@@ -14,6 +14,7 @@ PRD-V5 §6.1 / REP-501：
   直接消费 GenerationOutcome。
 """
 import asyncio
+import hashlib
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -198,6 +199,41 @@ class ReplyGenerator:
                             search_query, scene=scene,
                         )
                         if search_ref_block:
+                            if scene == "private_message" and self.knowledge_memory:
+                                search_ref_block = self.knowledge_memory.redact_private_message(
+                                    search_ref_block,
+                                    actor_id=user_id,
+                                    username=username,
+                                ).text
+                            # Anything entering the model context must be durably
+                            # archived first. Failure degrades to no web reference.
+                            if self.knowledge_memory:
+                                try:
+                                    from bilibot.memory_brain.ingestion import text_observation
+
+                                    digest = hashlib.sha256(
+                                        (scene + "\0" + search_query + "\0" + search_ref_block).encode("utf-8")
+                                    ).hexdigest()
+                                    await self.knowledge_memory.archive_observation_async(
+                                        text_observation(
+                                            account_id=self.account_id or "default",
+                                            idempotency_key=digest,
+                                            source_type="web_reference",
+                                            event_type="web_observation",
+                                            text=search_ref_block,
+                                            title="联网搜索参考",
+                                            scene=scene,
+                                            metadata={"query_hash": hashlib.sha256(search_query.encode("utf-8")).hexdigest()},
+                                            importance=0.35,
+                                        )
+                                    )
+                                except Exception as archive_exc:
+                                    logger.warning(
+                                        "联网搜索参考归档失败，取消注入: %s",
+                                        type(archive_exc).__name__,
+                                    )
+                                    search_ref_block = ""
+                        if search_ref_block:
                             logger.info(f"联网搜索 Reference Block 已注入: {len(search_ref_block)} 字")
                 except Exception as e:
                     logger.debug(f"联网搜索失败（降级为无搜索）: {e}")
@@ -222,6 +258,11 @@ class ReplyGenerator:
 
             # 模型明确不回复 / 空回复 → skip
             if not reply_text:
+                # Task 7.2：区分 Provider 不可用 vs 模型空回复
+                # 若 client 在调用过程中变为不可用，视为可重试而非 skip
+                if not getattr(self.llm, "client", None):
+                    logger.warning("LLM 返回空回复且 Provider client 不可用，retryable")
+                    return GenerationOutcome.retryable(LLM_CLIENT_UNAVAILABLE)
                 logger.debug("LLM 返回空回复，skip")
                 return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
 
@@ -237,8 +278,8 @@ class ReplyGenerator:
                 return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
 
             # 3. 写入 audit（含 persona_id / context_summary，PRD V3 §8.6 / V4 §4.5.3）
-            audit_id = self._record_audit(
-                scene="reply_comment",
+            audit_id = await self._record_audit(
+                scene=scene,
                 input_summary=comment[:200],
                 output=reply_text,
                 published=False,
@@ -405,7 +446,7 @@ class ReplyGenerator:
 
     # ── 私有：审计写入 ──
 
-    def _record_audit(
+    async def _record_audit(
         self,
         scene: str,
         input_summary: str = "",
@@ -427,7 +468,7 @@ class ReplyGenerator:
             input_summary_clean = (input_summary or "")[:500]
             # prompt_preview 不包含敏感字段（仅 system_prompt，无 api_key 等）
             prompt_preview = (system_prompt or "")[:2000]
-            audit_id = self.audit_store.record(
+            audit_id = await self.audit_store.record_async(
                 scene=scene,
                 persona_id=persona_id or "unknown",
                 input_summary=input_summary_clean,
@@ -438,7 +479,9 @@ class ReplyGenerator:
                 target=target,
             )
             return audit_id
-        except Exception:
+        except Exception as e:
+            # M12：记录审计写入失败，便于排查，不再静默吞掉
+            logger.warning(f"审计记录写入失败: {e}")
             return None
 
 

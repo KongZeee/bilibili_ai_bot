@@ -47,7 +47,7 @@ body {
     height: 64px;
     margin: 0 auto 20px;
     border-radius: calc(var(--radius) * 0.5);
-    background: hsl(37.5 15.69% 20%);
+    background: hsl(var(--primary));
     display: flex;
     align-items: center;
     justify-content: center;
@@ -55,7 +55,7 @@ body {
     font-family: var(--font-sans, Fraunces, ui-serif, serif);
     font-weight: 600;
     color: hsl(var(--primary-foreground));
-    box-shadow: 0 4px 12px hsl(37.5 15.69% 20% / 0.25);
+    box-shadow: 0 4px 12px hsl(var(--primary) / 0.25);
 }
 
 h1 {
@@ -160,4 +160,15 @@ button:disabled {
     0%, 100% { transform: translateX(0); }
     25% { transform: translateX(-6px); }
     75% { transform: translateX(6px); }
+}
+
+/* 动画退化 - 尊重用户的 reduced-motion 偏好 */
+@media (prefers-reduced-motion: reduce) {
+    .login-box,
+    .error {
+        animation: none !important;
+    }
+    button {
+        transition: none !important;
+    }
 }

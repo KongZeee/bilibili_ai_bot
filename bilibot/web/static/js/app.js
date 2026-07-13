@@ -24,6 +24,19 @@ const Placeholder = defineComponent({
     },
 });
 
+// --- 重定向组件（将 /personas/:id、/llm/:id 等子路由回退到父列表页） ---
+function createRedirect(to) {
+    return defineComponent({
+        name: 'Redirect',
+        setup() {
+            onMounted(() => { window.location.hash = '#' + to; });
+            return () => h('div', { class: 'empty-state' }, [
+                h('p', { class: 'text-muted' }, '正在跳转...'),
+            ]);
+        },
+    });
+}
+
 // --- 注册路由 ---
 // Phase 1 先注册占位路由，后续 Phase 替换为真实组件
 const pages = [
@@ -33,9 +46,7 @@ const pages = [
     { path: '/accounts', title: '账号管理' },
     { path: '/accounts/:id', title: '账号详情' },
     { path: '/personas', title: '人格管理' },
-    { path: '/personas/:id', title: '人格编辑' },
     { path: '/llm', title: 'LLM 管理' },
-    { path: '/llm/:id', title: 'LLM 编辑' },
     { path: '/model-routing', title: '模型分配' },
     { path: '/proactive', title: '主动行为' },
     { path: '/drafts', title: '动态草稿' },
@@ -54,8 +65,10 @@ registerRoute('/', OverviewPage, '总览');
 
 import { PersonaListPage } from './pages/personas.js';
 registerRoute('/personas', PersonaListPage, '人格管理');
+registerRoute('/personas/:id', createRedirect('/personas'), '人格编辑');
 import { LlmListPage } from './components/llm.js';
 registerRoute('/llm', LlmListPage, 'LLM 管理');
+registerRoute('/llm/:id', createRedirect('/llm'), 'LLM 编辑');
 import { ModelRoutingPage } from './pages/model-routing.js';
 registerRoute('/model-routing', ModelRoutingPage, '模型分配', '账号与身份');
 import { AccountListPage, AccountDetailPage } from './components/accounts.js';
@@ -65,10 +78,8 @@ import { MemoryRecallPage } from './components/memory/recall-page.js';
 registerRoute('/memory/recall', MemoryRecallPage, '召回测试');
 import { MemoryListPage } from './components/memory/list-page.js';
 registerRoute('/memory/list', MemoryListPage, '记忆列表');
-import { MemoryGraphPage } from './components/memory/graph-page.js';
-registerRoute('/memory/graph', MemoryGraphPage, '记忆图谱');
 import { MemoryGraph3DPage } from './components/memory/graph-3d-page.js';
-registerRoute('/memory/graph-3d', MemoryGraph3DPage, '图谱 3D');
+registerRoute('/memory/graph', MemoryGraph3DPage, '记忆图谱');
 import { LogsPage } from './pages/logs.js';
 registerRoute('/logs', LogsPage, '日志');
 import { CommentsPage } from './pages/comments.js';
@@ -85,8 +96,6 @@ import { SystemPage } from './pages/system.js';
 registerRoute('/system', SystemPage, '系统管理', '系统');
 import { ConfigPage } from './pages/config.js';
 registerRoute('/config', ConfigPage, '系统配置', '系统');
-
-pages.forEach(p => registerRoute(p.path, Placeholder, p.title));
 
 // --- Toast 容器组件 ---
 const ToastContainer = defineComponent({

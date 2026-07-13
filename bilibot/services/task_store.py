@@ -339,6 +339,58 @@ class TaskRunStore:
         finally:
             conn.close()
 
+    def list_by_account(
+        self,
+        account_id: str,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+    ) -> List[TaskRun]:
+        """列出某账号的所有 TaskRun（跨场景，按 scheduled_at 倒序）
+
+        支持分页（limit/offset）与可选状态过滤，用于
+        GET /api/accounts/{id}/tasks 列表端点。
+        """
+        conn = self._get_conn()
+        try:
+            if status:
+                rows = conn.execute(
+                    "SELECT * FROM task_runs WHERE account_id=? AND status=? "
+                    "ORDER BY scheduled_at DESC LIMIT ? OFFSET ?",
+                    (account_id, status, limit, offset),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM task_runs WHERE account_id=? "
+                    "ORDER BY scheduled_at DESC LIMIT ? OFFSET ?",
+                    (account_id, limit, offset),
+                ).fetchall()
+            return [TaskRun.from_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def count_by_account(
+        self,
+        account_id: str,
+        status: Optional[str] = None,
+    ) -> int:
+        """统计某账号的 TaskRun 总数（可选按状态过滤）"""
+        conn = self._get_conn()
+        try:
+            if status:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE account_id=? AND status=?",
+                    (account_id, status),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM task_runs WHERE account_id=?",
+                    (account_id,),
+                ).fetchone()
+            return row[0] if row else 0
+        finally:
+            conn.close()
+
     def count_succeeded_today(
         self, account_id: str, scene: str, now: Optional[float] = None,
     ) -> int:
@@ -388,6 +440,18 @@ class TaskRunStore:
                 "WHERE status=? AND next_retry_at IS NOT NULL AND next_retry_at <= ? "
                 "ORDER BY next_retry_at ASC LIMIT 50",
                 (STATUS_RETRY_WAIT, now),
+            ).fetchall()
+            return [TaskRun.from_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def list_interrupted(self) -> List[TaskRun]:
+        """Task 5：列出所有 interrupted 状态的任务（启动恢复用）"""
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM task_runs WHERE status=? ORDER BY updated_at ASC",
+                (STATUS_INTERRUPTED,),
             ).fetchall()
             return [TaskRun.from_row(r) for r in rows]
         finally:
@@ -469,7 +533,6 @@ class TaskRunStore:
                 (task_id,),
             ).fetchone()
             if row is None:
-                conn.close()
                 return False
             attempt = row["attempt"]
             max_att = row["max_attempts"]

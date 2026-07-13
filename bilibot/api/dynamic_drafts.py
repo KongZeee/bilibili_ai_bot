@@ -11,6 +11,7 @@
 """
 import hashlib
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -30,7 +31,7 @@ def _get_draft_store_for_account(account_manager, acc_id: str):
     if not acc or not acc.scheduler:
         return None
     # 复用 scheduler 的懒加载 store（同 DB 路径）
-    return acc.scheduler._get_draft_store()
+    return acc.scheduler.get_draft_store()
 
 
 def _get_session_hash(request: Request) -> str:
@@ -50,7 +51,7 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
             return None, None, fail("NOT_FOUND", f"账号不存在: {acc_id}", status_code=404)
         if acc.scheduler is None:
             return None, None, fail("SCHEDULER_UNAVAILABLE", "账号调度器未初始化", status_code=503)
-        store = acc.scheduler._get_draft_store()
+        store = acc.scheduler.get_draft_store()
         return acc, store, None
 
     async def list_drafts(request: Request) -> JSONResponse:
@@ -68,10 +69,12 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                 page = int(request.query_params.get("page", "1"))
             except (ValueError, TypeError):
                 page = 1
+            page = max(1, page)
             try:
                 page_size = int(request.query_params.get("page_size", "20"))
             except (ValueError, TypeError):
                 page_size = 20
+            page_size = max(1, min(page_size, 100))
 
             drafts = store.list_by_account(acc_id, status=status, page=page, page_size=page_size)
             total = store.count_by_account(acc_id, status=status)
@@ -83,7 +86,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                 "status_filter": status,
             })
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"列出动态草稿失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def get_draft(request: Request) -> JSONResponse:
         """GET /api/accounts/{account_id}/dynamic-drafts/{draft_id}"""
@@ -101,7 +105,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                             "草稿不属于该账号", status_code=403)
             return ok(draft.to_dict())
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"获取动态草稿失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def patch_draft(request: Request) -> JSONResponse:
         """PATCH /api/accounts/{account_id}/dynamic-drafts/{draft_id}
@@ -156,7 +161,7 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                         safety_snapshot = {
                             "passed": passed,
                             "reason": reason,
-                            "checked_at": __import__("datetime").datetime.now().isoformat(),
+                            "checked_at": datetime.now().isoformat(),
                             "edited": True,
                         }
                     except Exception as e:
@@ -186,7 +191,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
             fresh = store.get(draft_id)
             return ok(fresh.to_dict(), "草稿已编辑，revision 已自增")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"编辑动态草稿失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def approve_draft(request: Request) -> JSONResponse:
         """POST /api/accounts/{account_id}/dynamic-drafts/{draft_id}/approve
@@ -246,9 +252,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                 # 这里改用 reset_to_awaiting_review 让管理员可重新审核。
                 store.reset_to_awaiting_review(draft_id)
                 return fail_internal("创建发布 TaskRun 失败")
-            scheduler._spawn_memory_task(
-                scheduler._do_publish_approved_draft(publish_task_id, draft_id),
-                tag=f"publish_draft:{draft_id}",
+            scheduler.spawn_publish_task(
+                publish_task_id, draft_id, tag=f"publish_draft:{draft_id}"
             )
             return ok({
                 "draft_id": draft_id,
@@ -256,7 +261,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                 "publish_task_id": publish_task_id,
             }, "草稿已审核通过，发布任务已创建", status_code=202)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"审核通过动态草稿失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def reject_draft(request: Request) -> JSONResponse:
         """POST /api/accounts/{account_id}/dynamic-drafts/{draft_id}/reject
@@ -308,7 +314,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
             fresh = store.get(draft_id)
             return ok(fresh.to_dict(), "草稿已拒绝，永不会发布")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"拒绝动态草稿失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def retry_draft(request: Request) -> JSONResponse:
         """POST /api/accounts/{account_id}/dynamic-drafts/{draft_id}/retry
@@ -352,9 +359,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
             publish_task_id = scheduler.create_draft_publish_task(draft_id)
             if not publish_task_id:
                 return fail_internal("创建发布 TaskRun 失败")
-            scheduler._spawn_memory_task(
-                scheduler._do_publish_approved_draft(publish_task_id, draft_id),
-                tag=f"retry_draft:{draft_id}",
+            scheduler.spawn_publish_task(
+                publish_task_id, draft_id, tag=f"retry_draft:{draft_id}"
             )
             return ok({
                 "draft_id": draft_id,
@@ -362,7 +368,8 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                 "publish_task_id": publish_task_id,
             }, "草稿已重新入队发布", status_code=202)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"重试动态草稿失败: {e}", exc_info=True)
+            return fail_internal()
 
     return [
         Route("/api/accounts/{account_id}/dynamic-drafts", list_drafts, methods=["GET"]),

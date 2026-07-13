@@ -14,12 +14,24 @@ openai>=1.0.0
 # HTTP 请求
 aiohttp>=3.9.0
 
+# 密码哈希（Task 16）
+bcrypt>=4.0.0
+
 # B站 API 依赖
 qrcode>=7.4.2
 Pillow>=10.0.0
 
+# 视频镜头检测（Python 3.10+；0.7 声明 OpenCV 运行依赖）
+scenedetect>=0.7,<0.8
+
+# 云端 ASR 失败时的本地完整性后备
+faster-whisper>=1.2,<2
+
 # 中文分词
 jieba>=0.42.1
+
+# V6 记忆向量（float32 BLOB 分批点积）
+numpy>=1.24.0
 
 # 农历日期（可选，用于节日检测）
 lunardate>=0.2.2

@@ -1,16 +1,44 @@
 // components/memory/graph-3d-page.js - 3D 记忆图谱页（Golden Time 设计稿）
 const { defineComponent, h, ref, computed, onMounted, onUnmounted, watch, nextTick } = window.Vue;
 import { api } from '../../api.js';
-import { Card, Button, Badge, Loading, EmptyState, Icon, HeroPanel } from '../common.js';
+import { Button, Loading, EmptyState, Icon, HeroPanel } from '../common.js';
 import { appState, showToast } from '../../state.js';
 
 // 节点类型 → chart 色号映射（与 2D 版一致）
-const TYPE_COLOR_INDEX = { summary: 1, person: 5, topic: 3 };
-const TYPE_LABELS = { summary: '记忆节点', person: '用户节点', topic: '分类节点' };
+const TYPE_COLOR_INDEX = {
+    event: 1,
+    person: 5,
+    topic: 3,
+    organization: 4,
+    place: 2,
+    location: 2,
+    media: 4,
+    object: 3,
+    concept: 3,
+};
+const TYPE_LABELS = {
+    event: '经历事件',
+    person: '人物实体',
+    topic: '主题实体',
+    organization: '组织实体',
+    place: '地点实体',
+    location: '地点实体',
+    media: '内容实体',
+    object: '对象实体',
+    concept: '概念实体',
+};
+const RELATION_LABELS = {
+    mentions: '提及实体',
+    contradicts: '相互矛盾',
+    supersedes: '替代旧结论',
+    updates: '更新',
+    reflection: '反思',
+    related_to: '主题关联',
+};
 
-// CDN 地址
-const THREE_URL = 'https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js';
-const OC_URL = 'https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/controls/OrbitControls.js';
+// 本地 vendor 路径（已消除 CDN 依赖，文件已下载到 /static/vendor/）
+const THREE_URL = '/static/vendor/three.module.js';
+const OC_URL = '/static/vendor/OrbitControls.js';
 
 // 读取 CSS 变量 --chart-N 的 HSL 字符串
 function getChartHsl(index) {
@@ -62,32 +90,12 @@ function nodeRadius3D(node) {
     return Math.max(8, Math.min(24, 8 + deg * 1.4));
 }
 
-// 动态加载 Three.js + OrbitControls（不依赖 importmap）
-// OrbitControls.js 内部 `import * as THREE from 'three'` 为 bare specifier，
-// 通过 fetch + 字符串替换 + Blob URL 加载，避免修改 HTML shell 加 importmap。
+// 动态加载 Three.js + OrbitControls（本地 vendor 文件）
+// OrbitControls.js 内部的 bare specifier 'three' 已替换为 './three.module.js'，
+// 浏览器原生 ES module 解析即可，无需 fetch + Blob URL hack。
 async function loadThree() {
     const THREE = await import(/* @vite-ignore */ THREE_URL);
-
-    let OrbitControls;
-    try {
-        const resp = await fetch(OC_URL);
-        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-        let src = await resp.text();
-        // 将 bare specifier 'three' 替换为完整 URL
-        src = src.replace(/from\s*['"]three['"]/g, `from '${THREE_URL}'`);
-        const blob = new Blob([src], { type: 'application/javascript' });
-        const blobUrl = URL.createObjectURL(blob);
-        try {
-            const mod = await import(/* @vite-ignore */ blobUrl);
-            OrbitControls = mod.OrbitControls;
-        } finally {
-            // 模块已加载并缓存，可安全 revoke
-            URL.revokeObjectURL(blobUrl);
-        }
-    } catch (e) {
-        throw new Error('加载 OrbitControls 失败: ' + e.message);
-    }
-
+    const { OrbitControls } = await import(/* @vite-ignore */ OC_URL);
     return { THREE, OrbitControls };
 }
 
@@ -98,6 +106,7 @@ export const MemoryGraph3DPage = defineComponent({
         const graphData = ref({ nodes: [], edges: [], memories: [], summary: {} });
         const totalCounts = ref({ nodes: 0, edges: 0, memories: 0 });
         const loading = ref(true);
+        const loadError = ref('');
         const selectedNode = ref(null);
         const hoveredNode = ref(null);
         const filterCategory = ref('');
@@ -105,9 +114,11 @@ export const MemoryGraph3DPage = defineComponent({
         const layout = ref('sphere'); // sphere / helix
         const canvasRef = ref(null);
         const threeReady = ref(false);
+        const threeError = ref('');
         let threeCleanup = null;
         let threeCtx = null; // { scene, camera, renderer, controls, nodeMeshes, nodeGroup, edgeGroup, disposables, updateScene }
         let initializing = false;
+        let mounted = false;
 
         // ── 过滤后的节点/边 ──
         const filteredNodes = computed(() => {
@@ -153,6 +164,10 @@ export const MemoryGraph3DPage = defineComponent({
                 .sort((a, b) => b.count - a.count);
         });
 
+        const relationStats = computed(() => Object.entries(graphData.value.summary?.relation_breakdown || {})
+            .map(([key, count]) => ({ key, label: RELATION_LABELS[key] || key, count: count || 0 }))
+            .sort((a, b) => b.count - a.count));
+
         const avgDegree = computed(() => {
             const n = nodeCount.value;
             return n > 0 ? ((edgeCount.value * 2) / n).toFixed(1) : '0';
@@ -165,9 +180,11 @@ export const MemoryGraph3DPage = defineComponent({
         });
 
         // ── 选中节点的关联节点 ──
+        const detailNode = computed(() => selectedNode.value || hoveredNode.value || null);
+
         const connectedNodes = computed(() => {
-            if (!selectedNode.value) return [];
-            const sid = selectedNode.value.id;
+            if (!detailNode.value) return [];
+            const sid = detailNode.value.id;
             const allNodes = graphData.value.nodes || [];
             const result = [];
             const seen = new Set();
@@ -177,7 +194,13 @@ export const MemoryGraph3DPage = defineComponent({
                     if (!seen.has(otherId)) {
                         seen.add(otherId);
                         const node = allNodes.find(n => n.id === otherId);
-                        if (node) result.push(node);
+                        if (node) {
+                            result.push({
+                                ...node,
+                                relation_type: e.relation_type || 'related_to',
+                                relation_weight: Number(e.weight || e.confidence || 0),
+                            });
+                        }
                     }
                 }
             }
@@ -185,10 +208,10 @@ export const MemoryGraph3DPage = defineComponent({
         });
 
         const selectedMemory = computed(() => {
-            if (!selectedNode.value) return null;
-            if (selectedNode.value.type !== 'summary') return null;
-            const mid = selectedNode.value.id;
-            return (graphData.value.memories || []).find(m => m.memory_id === mid) || null;
+            if (!detailNode.value) return null;
+            if (detailNode.value.node_kind !== 'event' && detailNode.value.type !== 'event') return null;
+            const mid = detailNode.value.id;
+            return (graphData.value.memories || []).find(m => (m.event_id || m.memory_id || m.id) === mid) || null;
         });
 
         // ── 数据加载 ──
@@ -199,6 +222,7 @@ export const MemoryGraph3DPage = defineComponent({
                 return;
             }
             loading.value = true;
+            loadError.value = '';
             selectedNode.value = null;
             hoveredNode.value = null;
             try {
@@ -217,6 +241,7 @@ export const MemoryGraph3DPage = defineComponent({
                 };
             } catch (e) {
                 showToast('加载图谱失败: ' + e.message, 'error');
+                loadError.value = e.message || '无法读取图谱数据';
                 graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
                 totalCounts.value = { nodes: 0, edges: 0, memories: 0 };
             } finally {
@@ -231,6 +256,7 @@ export const MemoryGraph3DPage = defineComponent({
                 return;
             }
             loading.value = true;
+            loadError.value = '';
             selectedNode.value = null;
             try {
                 const data = await api.memory.graphQuery(accountId.value, { keyword: searchQuery.value.trim() });
@@ -248,6 +274,7 @@ export const MemoryGraph3DPage = defineComponent({
                 };
             } catch (e) {
                 showToast('搜索失败: ' + e.message, 'error');
+                loadError.value = e.message || '无法搜索图谱';
             } finally {
                 loading.value = false;
             }
@@ -272,33 +299,53 @@ export const MemoryGraph3DPage = defineComponent({
             { key: 'helix', label: '螺旋' },
         ];
 
+        function destroyThree() {
+            const cleanup = threeCleanup;
+            threeCleanup = null;
+            if (cleanup) cleanup();
+            threeCtx = null;
+            threeReady.value = false;
+        }
+
+        async function retryThree() {
+            destroyThree();
+            threeError.value = '';
+            await nextTick();
+            await ensureThree();
+        }
+
         // ── Three.js 初始化 ──
         async function ensureThree() {
-            if (initializing || threeCtx) return;
-            if (!canvasRef.value) return;
-            if ((graphData.value.nodes || []).length === 0) return;
+            if (initializing || !mounted) return;
             initializing = true;
             try {
                 await nextTick();
-                await initThree();
+                const container = canvasRef.value;
+                if (!mounted || !container || !container.isConnected) return;
+                if (filteredNodes.value.length === 0) return;
+                if (threeCtx?.container === container) return;
+                if (threeCtx) destroyThree();
+                threeError.value = '';
+                await initThree(container);
             } catch (e) {
-                showToast('初始化 3D 场景失败: ' + (e.message || e), 'error');
+                const message = e.message || String(e);
+                threeError.value = message;
+                threeReady.value = false;
+                showToast('初始化 3D 场景失败: ' + message, 'error');
             } finally {
                 initializing = false;
             }
         }
 
-        async function initThree() {
-            if (!canvasRef.value) return;
-            const container = canvasRef.value;
+        async function initThree(container) {
+            const { THREE, OrbitControls } = await loadThree();
+            if (!mounted || filteredNodes.value.length === 0 || canvasRef.value !== container || !container.isConnected) return;
 
-            let THREE, OrbitControls;
-            try {
-                ({ THREE, OrbitControls } = await loadThree());
-            } catch (e) {
-                showToast('加载 Three.js 失败: ' + e.message, 'error');
-                return;
-            }
+            // A renderer belongs to exactly one live graph container. Remove
+            // orphan canvases left by an interrupted or older initializer.
+            container.querySelectorAll(
+                'canvas[data-memory-graph-renderer="true"], canvas[data-engine^="three.js"]'
+            ).forEach(canvas => canvas.remove());
 
             // ── 场景 ──
             const scene = new THREE.Scene();
@@ -317,6 +364,7 @@ export const MemoryGraph3DPage = defineComponent({
 
             // ── 渲染器 ──
             const renderer = new THREE.WebGLRenderer({ alpha: true, antialias: true });
+            renderer.domElement.dataset.memoryGraphRenderer = 'true';
             renderer.setClearColor(0x000000, 0);
             renderer.setSize(cw, ch);
             renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -359,6 +407,7 @@ export const MemoryGraph3DPage = defineComponent({
 
             const nodeMeshes = [];
             const disposables = []; // { dispose } 资源
+            let hoveredMesh = null;
 
             // ── 标签 Sprite ──
             function createLabel(text, colorIdx) {
@@ -383,6 +432,8 @@ export const MemoryGraph3DPage = defineComponent({
 
             // ── 更新场景节点/边（筛选/布局变化时调用） ──
             function updateScene() {
+                hoveredMesh = null;
+                hoveredNode.value = null;
                 // 清理旧的节点/边
                 while (nodeGroup.children.length) nodeGroup.remove(nodeGroup.children[0]);
                 while (edgeGroup.children.length) edgeGroup.remove(edgeGroup.children[0]);
@@ -396,20 +447,26 @@ export const MemoryGraph3DPage = defineComponent({
                 const nodeMap = new Map(nodes.map(n => [n.id, n]));
 
                 // 边
-                const borderColor = 0xddd3c0;
-                const accentColor = 0x8a7d5b;
+                const relationColors = {
+                    mentions: 0x8a7d5b,
+                    contradicts: 0xc35a45,
+                    supersedes: 0x4f7b65,
+                    updates: 0x4f7b65,
+                    reflection: 0x7b668f,
+                    related_to: 0xaaa08e,
+                };
                 filteredEdges.value.forEach(e => {
                     const sn = nodeMap.get(e.source);
                     const tn = nodeMap.get(e.target);
                     if (!sn || !tn) return;
-                    const strong = (sn.degree > 5 || tn.degree > 5);
+                    const strong = (e.weight || 0) >= 0.75 || sn.degree > 5 || tn.degree > 5;
                     const points = [
                         new THREE.Vector3(sn.x, sn.y, sn.z),
                         new THREE.Vector3(tn.x, tn.y, tn.z),
                     ];
                     const geometry = new THREE.BufferGeometry().setFromPoints(points);
                     const material = new THREE.LineBasicMaterial({
-                        color: strong ? accentColor : borderColor,
+                        color: relationColors[e.relation_type] || relationColors.related_to,
                         transparent: true,
                         opacity: strong ? 0.8 : 0.35,
                     });
@@ -470,7 +527,6 @@ export const MemoryGraph3DPage = defineComponent({
             // ── Raycaster 悬停检测 ──
             const raycaster = new THREE.Raycaster();
             const mouse = new THREE.Vector2();
-            let hoveredMesh = null;
 
             function onPointerMove(e) {
                 const rect = renderer.domElement.getBoundingClientRect();
@@ -536,6 +592,10 @@ export const MemoryGraph3DPage = defineComponent({
             renderer.domElement.addEventListener('pointerleave', onPointerLeave);
             renderer.domElement.addEventListener('click', onClick);
             window.addEventListener('resize', onResize);
+            const resizeObserver = typeof ResizeObserver === 'function'
+                ? new ResizeObserver(onResize)
+                : null;
+            resizeObserver?.observe(container);
 
             // ── 动画循环 ──
             let animationId = null;
@@ -548,6 +608,7 @@ export const MemoryGraph3DPage = defineComponent({
 
             threeCtx = {
                 THREE, OrbitControls, scene, camera, renderer, controls,
+                container,
                 nodeMeshes, nodeGroup, edgeGroup, disposables, updateScene,
                 listeners: { onPointerMove, onPointerLeave, onClick, onResize, onControlsStart },
                 autoRotateTimer, animationId,
@@ -563,6 +624,7 @@ export const MemoryGraph3DPage = defineComponent({
                 renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
                 renderer.domElement.removeEventListener('click', onClick);
                 window.removeEventListener('resize', onResize);
+                resizeObserver?.disconnect();
 
                 controls.dispose();
 
@@ -589,20 +651,27 @@ export const MemoryGraph3DPage = defineComponent({
         }
 
         onMounted(async () => {
+            mounted = true;
             await loadData();
-            await ensureThree();
         });
 
         onUnmounted(() => {
-            if (threeCleanup) threeCleanup();
+            mounted = false;
+            destroyThree();
         });
 
         // 筛选/布局变化时更新场景
-        watch([filteredNodes, filteredEdges, layout], () => {
-            if (threeCtx && threeCtx.updateScene) {
+        watch([filteredNodes, filteredEdges, layout], async () => {
+            if (filteredNodes.value.length === 0) {
+                destroyThree();
+                return;
+            }
+            await nextTick();
+            if (threeCtx && threeCtx.container !== canvasRef.value) destroyThree();
+            if (threeCtx?.updateScene) {
                 threeCtx.updateScene();
             } else {
-                ensureThree();
+                await ensureThree();
             }
         });
 
@@ -626,14 +695,15 @@ export const MemoryGraph3DPage = defineComponent({
                 return h(Loading);
             }
 
-            const hasGraph = (graphData.value.nodes || []).length > 0;
-            const heroTitle = `${nodeCount.value.toLocaleString()} 条记忆 · ${categoryStats.value.length} 个分类 · ${edgeCount.value.toLocaleString()} 条关联`;
+            const hasGraph = filteredNodes.value.length > 0;
+            const memoryCount = totalCounts.value.memories || (graphData.value.memories || []).length;
+            const heroTitle = `${memoryCount.toLocaleString()} 个经历 · ${nodeCount.value.toLocaleString()} 个节点 · ${edgeCount.value.toLocaleString()} 条关系`;
 
             return h('div', { class: 'view-frame' }, [
                 // ═══════ Section 1: hero-band — 统计面板 + 图谱控制 ═══════
                 h('section', {
                     class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
+                    style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));',
                 }, [
                     // 左：统计面板（hero-panel accent 背景）
                     h(HeroPanel, {
@@ -650,7 +720,7 @@ export const MemoryGraph3DPage = defineComponent({
                         h('span', {
                             class: 'muted',
                             style: 'font-size: 0.92rem;',
-                        }, `条记忆节点 · ${edgeCount.value.toLocaleString()} 条关联`),
+                        }, `个真实节点 · ${edgeCount.value.toLocaleString()} 条关系`),
                     ])),
 
                     // 右：图谱控制面板
@@ -710,7 +780,7 @@ export const MemoryGraph3DPage = defineComponent({
                         h('p', {
                             class: 'muted m-0',
                             style: 'font-size: 0.82rem; line-height: 1.5;',
-                        }, '拖拽旋转 · 滚轮缩放 · 悬停查看'),
+                        }, `${(graphData.value.summary?.relation_breakdown?.mentions || 0)} 条实体引用`),
                     ]),
                 ]),
 
@@ -718,7 +788,7 @@ export const MemoryGraph3DPage = defineComponent({
                 h('section', {}, [
                     h('article', {
                         class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
+                        style: 'padding: calc(var(--spacing) * 2) 0 0;',
                     }, [
                         // 面板头
                         h('div', {
@@ -745,21 +815,39 @@ export const MemoryGraph3DPage = defineComponent({
                         hasGraph
                             ? h('div', {
                                 ref: canvasRef,
-                                style: 'width: 100%; height: 65vh; min-height: 480px; position: relative; border-radius: calc(var(--radius) * 0.82); overflow: hidden; background: radial-gradient(ellipse at center, hsl(var(--foreground) / 0.12), hsl(var(--foreground) / 0.04));',
-                            }, !threeReady.value ? h('div', {
-                                style: 'position: absolute; inset: 0; display: grid; place-items: center; color: hsl(var(--muted-foreground)); font-size: 0.92rem;',
-                            }, '正在加载 3D 场景...') : null)
+                                class: 'memory-graph-canvas',
+                            }, threeError.value
+                                ? h('div', { class: 'memory-graph-overlay', role: 'alert' }, [
+                                    h(EmptyState, {
+                                        icon: 'triangle-alert',
+                                        title: '3D 场景不可用',
+                                        desc: threeError.value,
+                                    }, {
+                                        default: () => h(Button, { type: 'ghost', size: 'sm', onClick: retryThree }, () => '重新加载场景'),
+                                    }),
+                                ])
+                                : !threeReady.value
+                                    ? h('div', { class: 'memory-graph-overlay muted' }, '正在加载 3D 场景...')
+                                    : null)
                             : h('div', {
                                 class: 'grid',
                                 style: 'padding: calc(var(--spacing) * 6) 0; justify-items: center; border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82);',
-                            }, [h(EmptyState, { icon: 'folder', title: '暂无图谱数据', desc: '记忆库为空，或当前筛选条件下无匹配节点。' })]),
+                            }, [h(EmptyState, {
+                                icon: loadError.value ? 'triangle-alert' : 'folder',
+                                title: loadError.value ? '图谱加载失败' : '暂无图谱数据',
+                                desc: loadError.value || ((filterCategory.value || searchQuery.value)
+                                    ? '当前筛选条件下无匹配节点。'
+                                    : '记忆库中还没有可显示的事件或实体。'),
+                            }, loadError.value ? {
+                                default: () => h(Button, { type: 'ghost', size: 'sm', onClick: loadData }, () => '重新加载'),
+                            } : undefined)]),
                     ]),
                 ]),
 
                 // ═══════ Section 3: split grid — 分类图例/统计 + 选中节点详情 ═══════
                 h('section', {
                     class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1.15fr) minmax(18rem, 0.85fr);',
+                    style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));',
                 }, [
                     // 左：分类图例 + 图谱统计
                     h('article', {
@@ -800,6 +888,14 @@ export const MemoryGraph3DPage = defineComponent({
                                 ]))
                             ),
                         ),
+                        h('div', { class: 'grid gap-2' }, [
+                            h('span', { class: 'eyebrow' }, '关系类型'),
+                            relationStats.value.length
+                                ? h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, relationStats.value.map(relation =>
+                                    h('span', { key: relation.key, class: 'badge badge-info' }, `${relation.label} ${relation.count}`)
+                                ))
+                                : h('p', { class: 'muted m-0', style: 'font-size: .92rem;' }, '暂无关系数据'),
+                        ]),
                         // 图谱统计
                         h('div', {
                             class: 'grid gap-2',
@@ -842,9 +938,9 @@ export const MemoryGraph3DPage = defineComponent({
                                 style: 'font-size: 1.35rem; line-height: 1.08;',
                             }, selectedNode.value ? '选中节点' : (hoveredNode.value ? '悬停节点' : '选中节点')),
                         ]),
-                        (selectedNode.value || hoveredNode.value
+                        (detailNode.value
                             ? (() => {
-                                const node = selectedNode.value || hoveredNode.value;
+                                const node = detailNode.value;
                                 const colorIdx = TYPE_COLOR_INDEX[node.type] || 2;
                                 return h('div', { class: 'grid gap-3' }, [
                                     // 分类标签
@@ -901,12 +997,13 @@ export const MemoryGraph3DPage = defineComponent({
                                                     key: `cn-${n.id}`,
                                                     type: 'ghost',
                                                     size: 'sm',
+                                                    ariaLabel: `${RELATION_LABELS[n.relation_type] || n.relation_type}: ${n.label || n.id}`,
                                                     onClick: () => selectNode(n),
                                                 }, () => [
                                                     h('span', {
                                                         style: `display:inline-block; width:0.6rem; height:0.6rem; border-radius:999px; background: hsl(var(--chart-${TYPE_COLOR_INDEX[n.type] || 2}));`,
                                                     }),
-                                                    (n.label || String(n.id)).slice(0, 12),
+                                                    `${(n.label || String(n.id)).slice(0, 12)} · ${RELATION_LABELS[n.relation_type] || n.relation_type}`,
                                                 ]))
                                             ),
                                     ]),

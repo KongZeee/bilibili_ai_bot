@@ -96,13 +96,15 @@ class LLMAdapter:
             
             if response.choices:
                 result = response.choices[0].message.content
-                logger.debug(f"LLM生成成功: {len(result)} 字符")
-                return result.strip()
+                if result:
+                    logger.debug(f"LLM生成成功: {len(result)} 字符")
+                    return result.strip()
+                return None
             return None
-            
+
         except Exception as e:
             logger.error(f"LLM生成失败: {e}")
-            return None
+            raise
     
     async def generate_stream(
         self,
@@ -140,7 +142,8 @@ class LLMAdapter:
                     
         except Exception as e:
             logger.error(f"LLM流式生成失败: {e}")
-    
+            raise
+
     async def vision_analyze(
         self,
         image_url: str,

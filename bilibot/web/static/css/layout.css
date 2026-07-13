@@ -9,7 +9,10 @@
 
 .app-shell {
   display: grid;
-  grid-template-columns: 280px 1fr;
+  grid-template-columns: 280px minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   min-height: 100vh;
   background: hsl(var(--background));
   color: hsl(var(--foreground));
@@ -201,8 +204,11 @@
 /* ── Main area ──────────────────────────────────────── */
 .main-area {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   grid-template-rows: auto 1fr;
+  width: 100%;
   min-width: 0;
+  max-width: 100%;
 }
 
 /* ── Topbar ─────────────────────────────────────────── */
@@ -217,8 +223,17 @@
   position: sticky;
   top: 0;
   z-index: 1;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
 }
 .topbar-copy {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  min-width: 0;
+}
+.topbar-titles {
   display: grid;
   gap: calc(var(--spacing) * 1);
   min-width: 0;
@@ -244,6 +259,48 @@
   flex-wrap: wrap;
   justify-content: flex-end;
   flex-shrink: 0;
+}
+
+/* ── Menu toggle (mobile only, hidden on desktop) ──── */
+.menu-toggle {
+  display: none;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  width: 2.9rem;
+  height: 2.9rem;
+  background: hsl(var(--card));
+  border: 1px solid hsl(var(--border));
+  border-radius: calc(var(--radius) * 0.76);
+  cursor: pointer;
+  padding: 0;
+  flex-shrink: 0;
+  transition: border-color .18s ease;
+}
+.menu-toggle:hover {
+  border-color: hsl(var(--accent));
+}
+.menu-toggle-bar {
+  display: block;
+  width: 1.4rem;
+  height: 2px;
+  background: hsl(var(--foreground));
+  margin: 0 auto;
+  transition: transform .2s ease, opacity .2s ease;
+}
+.menu-toggle[aria-expanded="true"] .menu-toggle-bar:nth-child(1) {
+  transform: translateY(6px) rotate(45deg);
+}
+.menu-toggle[aria-expanded="true"] .menu-toggle-bar:nth-child(2) {
+  opacity: 0;
+}
+.menu-toggle[aria-expanded="true"] .menu-toggle-bar:nth-child(3) {
+  transform: translateY(-6px) rotate(-45deg);
+}
+
+/* ── Sidebar overlay (mobile only) ──────────────────── */
+.sidebar-overlay {
+  display: none;
 }
 
 /* ── Search field wrap ──────────────────────────────── */
@@ -357,8 +414,16 @@
 .view-frame {
   padding: calc(var(--spacing) * 5) calc(var(--spacing) * 6) calc(var(--spacing) * 7);
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: calc(var(--spacing) * 4);
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   animation: viewIn .28s ease;
+}
+.view-frame > * {
+  min-width: 0;
+  max-width: 100%;
 }
 @keyframes viewIn {
   from { opacity: 0; transform: translateY(12px); }
@@ -368,14 +433,45 @@
 /* ── Responsive ─────────────────────────────────────── */
 @media (max-width: 1100px) {
   .app-shell {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
+  /* 侧边栏改为抽屉式：固定定位，默认滑出视口左侧 */
   .sidebar {
-    position: relative;
-    top: auto;
-    max-height: none;
-    border-right: 0;
-    border-bottom: 1px solid hsl(var(--sidebar-border));
+    position: fixed;
+    top: 0;
+    left: 0;
+    bottom: 0;
+    width: 280px;
+    max-height: 100vh;
+    border-right: 1px solid hsl(var(--sidebar-border));
+    border-bottom: 0;
+    transform: translateX(-100%);
+    transition: transform .28s ease;
+    z-index: 1001;
+    overflow-y: auto;
+  }
+  .sidebar[data-open="true"] {
+    transform: translateX(0);
+    box-shadow: 4px 0 24px hsl(var(--foreground) / 0.12);
+  }
+  /* 遮罩层：抽屉打开时显示 */
+  .sidebar-overlay {
+    display: block;
+    position: fixed;
+    inset: 0;
+    background: hsl(var(--foreground) / 0.32);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .28s ease;
+    z-index: 1000;
+  }
+  .sidebar-overlay[data-open="true"] {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  /* 汉堡按钮：移动端显示 */
+  .menu-toggle {
+    display: flex;
   }
   .topbar {
     flex-direction: column;
@@ -386,12 +482,39 @@
     width: 100%;
     justify-content: flex-start;
   }
-  .field-wrap {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
   .view-frame {
     padding: calc(var(--spacing) * 4) calc(var(--spacing) * 4) calc(var(--spacing) * 6);
+  }
+}
+
+/* ── Inline grid responsive breakpoint ──────────────── */
+@media (max-width: 768px) {
+  .view-frame > section[style*="grid-template-columns"] {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* ── Small screens (phones ≤480px) ──────────────────── */
+@media (max-width: 480px) {
+  .sidebar {
+    padding: calc(var(--spacing) * 4);
+  }
+  .topbar {
+    padding: calc(var(--spacing) * 3) calc(var(--spacing) * 4);
+  }
+  .page-title {
+    font-size: 1.4rem;
+  }
+  .page-subtitle {
+    font-size: 0.88rem;
+  }
+  .view-frame {
+    padding: calc(var(--spacing) * 3) calc(var(--spacing) * 3) calc(var(--spacing) * 5);
+    gap: calc(var(--spacing) * 3);
+  }
+  .btn {
+    padding: calc(var(--spacing) * 2) calc(var(--spacing) * 3);
+    min-height: 2.6rem;
   }
 }
 

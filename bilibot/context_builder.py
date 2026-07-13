@@ -95,6 +95,7 @@ class ContextBuilder:
         thread = _value(context, "thread")
         user_profile = _value(context, "user_profile")
         memory_context = _value(context, "memory_context", []) or []
+        memory_evidence = _value(context, "memory_evidence", "") or ""
         bot_thread_replies = _value(context, "bot_thread_replies", []) or []
         mood = _value(context, "mood", "")
         video_context_complete = _value(context, "video_context_complete", True)
@@ -175,6 +176,9 @@ class ContextBuilder:
                 mem_block += f"  - {m}\n"
             parts.append(mem_block)
             meta["sources"].append("memory")
+        if memory_evidence:
+            parts.append(str(memory_evidence))
+            meta["sources"].append("memory_brain")
 
         # 5. Bot 最近主动行为
         recent = self._get_recent_actions(limit=5)

@@ -12,7 +12,7 @@ export function escHtml(str) {
 
 export function formatTime(ts) {
     if (!ts) return '-';
-    const d = new Date(ts * 1000);
+    const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
     return d.toLocaleString('zh-CN', { hour12: false });
 }
 
@@ -45,7 +45,8 @@ export function getStatusType(status) {
 
 export function formatRelative(ts) {
     if (!ts) return '-';
-    const diff = Date.now() / 1000 - ts;
+    const ms = typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts;
+    const diff = (Date.now() - ms) / 1000;
     if (diff < 60) return '刚刚';
     if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
     if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;

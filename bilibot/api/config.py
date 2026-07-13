@@ -10,8 +10,16 @@
 """
 import logging
 import copy
+import bcrypt
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+
+from ..app.config_loader import (
+    SENSITIVE_LEAF_NAMES,
+    is_sensitive_placeholder,
+    validate_memory_config_values,
+)
+from .responses import fail
 
 logger = logging.getLogger("bilibot.api.config")
 
@@ -98,45 +106,91 @@ WEB_FIELD_CONTRACT = {
     "secure_cookies": "restart_app",
 }
 
-# PRD V5 Task 16：memory 子字段级别契约
-# - max_today/max_recent/enable_forgetting/forgetting_score：下个任务周期生效
-#   （KnowledgeBaseMemory.apply_memory_config 在调度器下个周期拾取）
-# - max_long_term：需重启账号实例（涉及记忆存储初始化参数）
+# PRD V6：仅暴露账号级永久记忆大脑的真实运行时参数。
+# ConfigLoader 仍可读取旧键，但管理 API 不再宣称它们会生效。
 MEMORY_FIELD_CONTRACT = {
-    "max_today": "next_task",
-    "max_recent": "next_task",
-    "max_long_term": "restart_account",
-    "enable_forgetting": "next_task",
-    "forgetting_score": "next_task",
+    "recall_candidate_limit": "restart_account",
+    "recall_inject_limit": "restart_account",
+    "recall_association_limit": "restart_account",
+    "rerank_relevance_baseline": "restart_account",
+    "prompt_char_budget": "restart_account",
+    "chunk_target_chars": "restart_account",
+    "chunk_hard_chars": "restart_account",
+    "chunk_target_tokens": "restart_account",
+    "chunk_hard_tokens": "restart_account",
+    "chunk_overlap_chars": "restart_account",
+    "job_max_attempts": "restart_account",
+    "vector_cache_limit": "restart_account",
+    "vector_batch_size": "restart_account",
 }
 
-# PRD V5 Task 16：memory 配置字段消费映射（schema_path → owner → reload_level → test_id）
+# V6 memory 配置字段消费映射（schema_path → owner → reload_level → test_id）
 # 用于断言每个暴露给用户的配置字段都有真实消费者，避免"幽灵配置"。
 MEMORY_CONFIG_FIELD_MAP = {
-    "memory.max_today": {
-        "owner": "KnowledgeBaseMemory.__init__ / apply_memory_config",
-        "reload_level": "next_task",
-        "test_id": "test_max_today_consumed_by_knowledge_memory",
-    },
-    "memory.max_recent": {
-        "owner": "KnowledgeBaseMemory.__init__ / apply_memory_config",
-        "reload_level": "next_task",
-        "test_id": "test_max_recent_consumed_by_knowledge_memory",
-    },
-    "memory.max_long_term": {
-        "owner": "KnowledgeBaseMemory.__init__ / forget_low_importance",
+    "memory.recall_candidate_limit": {
+        "owner": "MemoryRecallEngine",
         "reload_level": "restart_account",
-        "test_id": "test_max_long_term_consumed_by_knowledge_memory",
+        "test_id": "test_v6_recall_limits",
     },
-    "memory.enable_forgetting": {
-        "owner": "KnowledgeBaseMemory.forget_low_importance",
-        "reload_level": "next_task",
-        "test_id": "test_enable_forgetting_consumed_by_knowledge_memory",
+    "memory.recall_inject_limit": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_recall_limits",
     },
-    "memory.forgetting_score": {
-        "owner": "KnowledgeBaseMemory.forget_low_importance",
-        "reload_level": "next_task",
-        "test_id": "test_forgetting_score_consumed_by_knowledge_memory",
+    "memory.recall_association_limit": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_recall_limits",
+    },
+    "memory.rerank_relevance_baseline": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_rerank_contract",
+    },
+    "memory.prompt_char_budget": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_prompt_budget",
+    },
+    "memory.chunk_target_chars": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_chunk_boundaries",
+    },
+    "memory.chunk_hard_chars": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_chunk_boundaries",
+    },
+    "memory.chunk_target_tokens": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_chunk_boundaries",
+    },
+    "memory.chunk_hard_tokens": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_chunk_boundaries",
+    },
+    "memory.chunk_overlap_chars": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_chunk_boundaries",
+    },
+    "memory.job_max_attempts": {
+        "owner": "MemoryBrainWorker",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_job_retry_limit",
+    },
+    "memory.vector_cache_limit": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_vector_batches",
+    },
+    "memory.vector_batch_size": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_vector_batches",
     },
 }
 
@@ -373,7 +427,7 @@ def _normalize_by_schema(updates: dict, schema: dict, prefix: str = "") -> dict:
         is_sensitive = bool(field_def.get("sensitive"))
 
         if is_sensitive:
-            if value == "" or value == SENSITIVE_PLACEHOLDER or value is None:
+            if value == "" or is_sensitive_placeholder(value) or value is None:
                 # 占位符 / 空值：跳过，保留原值
                 continue
             result[key] = value
@@ -421,8 +475,44 @@ def validate_config_structure(updates: dict) -> None:
                 )
 
 
+def _merge_sensitive_object_list(original: list, updates: list, prefix: str) -> list:
+    """Merge submitted object-list items while preserving list deletion semantics.
+
+    Only submitted items remain in the returned list. Existing items are matched by
+    stable ``id`` (or by index when no id exists) so redacted leaf values can be
+    restored without retaining list entries that the caller intentionally removed.
+    """
+    original_by_id = {
+        str(item.get("id")): item
+        for item in original
+        if isinstance(item, dict) and item.get("id") not in (None, "")
+    }
+    merged = []
+    for index, item in enumerate(updates):
+        if not isinstance(item, dict):
+            merged.append(copy.deepcopy(item))
+            continue
+        item_id = item.get("id")
+        previous = original_by_id.get(str(item_id)) if item_id not in (None, "") else None
+        if (
+            previous is None
+            and item_id in (None, "")
+            and index < len(original)
+            and isinstance(original[index], dict)
+        ):
+            previous = original[index]
+        if isinstance(previous, dict):
+            merged.append(_merge_with_preserved_sensitive(previous, item, f"{prefix}[]"))
+        else:
+            # A redaction marker has no meaning for a brand-new identity. Merge
+            # against an empty object so it is omitted instead of persisted as
+            # if it were a usable secret.
+            merged.append(_merge_with_preserved_sensitive({}, item, f"{prefix}[]"))
+    return merged
+
+
 def _merge_with_preserved_sensitive(original: dict, updates: dict, prefix: str = "") -> dict:
-    """合并配置时保留敏感字段原值"""
+    """合并配置时保留敏感字段原值，包括对象数组中的敏感叶子。"""
     result = copy.deepcopy(original)
     for key, value in updates.items():
         full_path = f"{prefix}.{key}" if prefix else key
@@ -430,13 +520,17 @@ def _merge_with_preserved_sensitive(original: dict, updates: dict, prefix: str =
             result[key] = _merge_with_preserved_sensitive(
                 result[key], value, full_path
             )
+        elif isinstance(value, list) and isinstance(result.get(key), list):
+            result[key] = _merge_sensitive_object_list(
+                result[key], value, full_path
+            )
         elif (
             value == "" or
-            value == SENSITIVE_PLACEHOLDER or
+            is_sensitive_placeholder(value) or
             value is None
         ):
             # 敏感字段保护：空值或占位符保留原值
-            if full_path in SENSITIVE_FIELDS:
+            if full_path in SENSITIVE_FIELDS or key in SENSITIVE_LEAF_NAMES:
                 pass  # 保持原值
             else:
                 result[key] = value
@@ -446,64 +540,22 @@ def _merge_with_preserved_sensitive(original: dict, updates: dict, prefix: str =
 
 
 def _build_config_schema() -> dict:
+    # PRD V3：bilibili / llm 分组已移除（V2 遗留）
+    # V3 使用 accounts 数组（账号管理页）和 chat_providers 列表（模型分配页）管理
     return {
-        "bilibili": {
-            "type": "object",
-            "label": "B站账号",
-            "description": "B站登录凭证",
-            "fields": {
-                "sessdata": {"type": "string", "label": "SESSDATA", "sensitive": True},
-                "bili_jct": {"type": "string", "label": "bili_jct", "sensitive": True},
-                "dede_user_id": {"type": "string", "label": "UID"},
-                "buvid3": {"type": "string", "label": "BUVID3", "sensitive": True},
-                "refresh_token": {"type": "string", "label": "刷新令牌", "sensitive": True},
-            }
-        },
-        "llm": {
-            "type": "object",
-            "label": "LLM 配置",
-            "description": "语言模型设置",
-            "fields": {
-                "api_key": {"type": "string", "label": "API Key", "sensitive": True},
-                "base_url": {"type": "string", "label": "API 地址"},
-                "model": {"type": "string", "label": "模型名称"},
-                "max_tokens": {"type": "number", "label": "最大 Token"},
-                "temperature": {"type": "number", "label": "Temperature"},
-                "vision": {
-                    "type": "object",
-                    "label": "视觉模型",
-                    "fields": {
-                        "enabled": {"type": "boolean", "label": "启用"},
-                        "api_key": {"type": "string", "label": "API Key", "sensitive": True},
-                        "base_url": {"type": "string", "label": "API 地址"},
-                        "model": {"type": "string", "label": "模型名称"},
-                    }
-                },
-                "embedding": {
-                    "type": "object",
-                    "label": "Embedding 模型",
-                    "fields": {
-                        "enabled": {"type": "boolean", "label": "启用"},
-                        "api_key": {"type": "string", "label": "API Key", "sensitive": True},
-                        "base_url": {"type": "string", "label": "API 地址"},
-                        "model": {"type": "string", "label": "模型名称"},
-                    }
-                }
-            }
-        },
         "web_search": {
             "type": "object",
             "label": "联网搜索",
             "fields": {
-                "enabled": {"type": "boolean", "label": "启用"},
-                "backend": {"type": "select", "label": "后端", "options": ["tavily", "perplexity", "bocha", "custom"]},
+                "enabled": {"type": "boolean", "label": "启用", "default": False},
+                "backend": {"type": "select", "label": "后端", "options": ["tavily", "perplexity", "bocha", "custom"], "default": "tavily"},
                 "api_key": {"type": "string", "label": "API Key", "sensitive": True},
-                "api_base": {"type": "string", "label": "自定义地址"},
-                "model": {"type": "string", "label": "模型"},
-                "max_results": {"type": "number", "label": "最大结果数"},
-                "daily_budget_per_account": {"type": "number", "label": "每账号日预算"},
+                "api_base": {"type": "string", "label": "自定义地址", "default": ""},
+                "model": {"type": "string", "label": "模型", "default": ""},
+                "max_results": {"type": "number", "label": "最大结果数", "default": 5},
+                "daily_budget_per_account": {"type": "number", "label": "每账号日预算", "default": 100},
                 # CFG-603：SEA-502 Custom 后端显式声明联网搜索能力
-                "supports_web_search": {"type": "boolean", "label": "显式支持联网搜索"},
+                "supports_web_search": {"type": "boolean", "label": "显式支持联网搜索", "default": False},
                 # CFG-603：SEA-002 场景级开关矩阵
                 "scenes": {
                     "type": "object",
@@ -593,7 +645,7 @@ def _build_config_schema() -> dict:
                 "proactive_video": {"type": "boolean", "label": "主动看视频"},
                 "proactive_comment": {"type": "boolean", "label": "主动评论"},
                 "dynamic_post": {"type": "boolean", "label": "动态发布"},
-                "bangumi": {"type": "boolean", "label": "番剧追更"},
+                "bangumi": {"type": "boolean", "label": "番剧追更", "description": "启用后每日检查追番更新并观看新集"},
                 "weekly_summary": {"type": "boolean", "label": "周总结"},
                 "web_search": {"type": "boolean", "label": "联网搜索(已迁移到web_search.enabled)", "deprecated": True},
                 "affection": {"type": "boolean", "label": "好感度系统"},
@@ -699,34 +751,24 @@ def _build_config_schema() -> dict:
                 },
             }
         },
-        "memory": {  # PRD 6.1：新增 memory 配置段
+        "memory": {
             "type": "object",
-            "label": "记忆系统",
-            "description": "记忆容量与遗忘策略",
+            "label": "统一记忆大脑",
+            "description": "账号级永久归档、召回重排、分块与索引参数",
             "fields": {
-                "max_today": {"type": "number", "label": "今日记忆上限"},
-                "max_recent": {"type": "number", "label": "近期记忆上限"},
-                "max_long_term": {"type": "number", "label": "长期记忆上限"},
-                "enable_forgetting": {"type": "boolean", "label": "启用遗忘"},
-                "forgetting_score": {"type": "number", "label": "遗忘阈值"},
-                # PRD V3 §6.1：补全缺失的 6 个字段
-                "thread_compress_threshold": {"type": "number", "label": "评论线压缩阈值"},
-                "oid_compress_threshold": {"type": "number", "label": "评论区压缩阈值"},
-                "oid_keep_recent": {"type": "number", "label": "OID保留条数"},
-                "user_compress_threshold": {"type": "number", "label": "用户记忆压缩阈值"},
-                "user_keep_recent": {"type": "number", "label": "用户记忆保留条数"},
-                "max_semantic_results": {"type": "number", "label": "语义搜索结果数"},
-                "consolidation": {
-                    "type": "object",
-                    "label": "日终清算",
-                    "fields": {
-                        "discard_threshold": {"type": "number", "label": "丢弃阈值"},
-                        "recent_promote_days": {"type": "number", "label": "近期提升天数"},
-                        "long_term_age_days": {"type": "number", "label": "长期记忆天数"},
-                        "hour": {"type": "number", "label": "清算时间（小时）"},
-                        "batch_size": {"type": "number", "label": "批量大小"},
-                    }
-                }
+                "recall_candidate_limit": {"type": "number", "label": "重排候选上限"},
+                "recall_inject_limit": {"type": "number", "label": "注入事件上限"},
+                "recall_association_limit": {"type": "number", "label": "联想事件上限"},
+                "rerank_relevance_baseline": {"type": "number", "label": "重排相关度基线"},
+                "prompt_char_budget": {"type": "number", "label": "记忆证据字符预算"},
+                "chunk_target_chars": {"type": "number", "label": "分块目标字符"},
+                "chunk_hard_chars": {"type": "number", "label": "分块字符硬上限"},
+                "chunk_target_tokens": {"type": "number", "label": "分块目标 Token"},
+                "chunk_hard_tokens": {"type": "number", "label": "分块 Token 硬上限"},
+                "chunk_overlap_chars": {"type": "number", "label": "相邻分块重叠字符"},
+                "job_max_attempts": {"type": "number", "label": "索引任务最大重试"},
+                "vector_cache_limit": {"type": "number", "label": "向量缓存上限"},
+                "vector_batch_size": {"type": "number", "label": "向量扫描批大小"},
             }
         },
         "reply": {
@@ -992,7 +1034,26 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                     normalized[k] = v
 
             # 3. 合并（保留敏感原值）
+            # Task 16：admin_password 自动 bcrypt 哈希化必须在合并之前进行，
+            # 仅对新提交的明文密码哈希，占位符 ***已配置*** 不哈希（由 merge 保留原值）
+            try:
+                web_norm = normalized.get("web", {})
+                if isinstance(web_norm, dict):
+                    new_pwd = web_norm.get("admin_password")
+                    if (new_pwd and isinstance(new_pwd, str)
+                            and not new_pwd.startswith("$2b$")
+                            and not is_sensitive_placeholder(new_pwd)):
+                        web_norm["admin_password"] = bcrypt.hashpw(
+                            new_pwd.encode(), bcrypt.gensalt()
+                        ).decode()
+            except Exception as e:
+                logger.warning(f"admin_password 哈希化失败: {e}")
+
             merged = _merge_with_preserved_sensitive(raw_config, normalized)
+            try:
+                validate_memory_config_values(merged.get("memory", {}))
+            except ValueError as exc:
+                raise ConfigValidationError(str(exc)) from exc
 
             # PRD V4 CFG-005：递增 config_revision
             merged["config_revision"] = current_revision + 1
@@ -1048,10 +1109,19 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
     async def validate_config(request: Request) -> JSONResponse:
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             errors = []
             warnings = []
             # 合并现有配置（敏感字段未发送时用现有值兜底）
             raw = config_loader.get_raw_config()
+            try:
+                validate_config_structure(body)
+                normalized = _normalize_by_schema(body, _build_config_schema())
+                validation_config = _merge_with_preserved_sensitive(raw, normalized)
+                validate_memory_config_values(validation_config.get("memory", {}))
+            except (ConfigValidationError, ValueError) as exc:
+                errors.append({"field": "memory", "message": str(exc)})
             if "llm" in body:
                 llm_cfg = body["llm"]
                 # 敏感字段未在 payload 中时，用现有配置兜底

@@ -14,13 +14,15 @@ PRD V3 §8.4 / §8.5 / §9.3：
 - 接收应用级 audit_store / context_builder 单例
 """
 import asyncio
+import hashlib
 import logging
 import random
 import json
+import re
 import time
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 from bilibot.config_loader import ConfigLoader
 from bilibot.bilibili_api import BilibiliAPI
@@ -37,6 +39,7 @@ from bilibot.humanized_behavior import (
 )
 from bilibot.models import SceneType
 from bilibot.models.proactive_video_context import ProactiveVideoContext
+from bilibot.video_understanding.audio_track import ASRTranscriptionError
 
 logger = logging.getLogger("bilibot.scheduler")
 
@@ -49,7 +52,7 @@ class Scheduler:
                  audit_store=None, context_builder=None, comment_context_service=None,
                  safety_checker=None, account_id: str = "", video_understanding_service=None,
                  image_provider=None, knowledge_memory=None, memory_write_queue=None,
-                 proactive_comment_store=None):
+                 proactive_comment_store=None, memory_brain=None):
         self.config_loader = config_loader
         self.user_state = user_state
         self.llm = llm
@@ -67,6 +70,16 @@ class Scheduler:
         self.safety_checker = safety_checker
         # PRD V2：账号 ID（用于多账号人格解析 / 日志隔离）
         self.account_id = account_id
+        # AccountInstance explicitly supplies memory_brain in V6.  A direct
+        # Scheduler construction without it is retained only as a legacy/test
+        # compatibility surface and must not mistake an arbitrary MagicMock
+        # knowledge_memory for the V6 service.
+        legacy_brain = None
+        if knowledge_memory is not None and callable(
+            getattr(type(knowledge_memory), "archive_observation_async", None)
+        ):
+            legacy_brain = knowledge_memory
+        resolved_memory_brain = memory_brain or legacy_brain
         # 视频理解服务（视听双轨分析，可选）
         self.video_understanding = video_understanding_service
         # 文生图 Provider（动态配图，可选）
@@ -88,6 +101,26 @@ class Scheduler:
                     logger.info("联网搜索服务已启用")
         except Exception as e:
             logger.warning(f"联网搜索服务初始化失败: {e}")
+
+        # 番剧追番服务（可选，需 features.bangumi=true + video_understanding）
+        self.bangumi_service = None
+        self._last_bangumi_check_date = None
+        try:
+            raw = config_loader.get_raw_config()
+            if raw.get("features", {}).get("bangumi", False):
+                from bilibot.bangumi import BangumiService
+                data_dir = raw.get("data_dir", "./data")
+                self.bangumi_service = BangumiService(
+                    bili_api=bili, llm_manager=llm,
+                    video_service=self.video_understanding,
+                    config_loader=config_loader, data_dir=data_dir,
+                    memory_brain=resolved_memory_brain,
+                    account_id=self.account_id,
+                )
+                logger.info("番剧追番服务已启用")
+        except Exception as e:
+            logger.warning(f"番剧追番服务初始化失败: {e}")
+
         self.running = False
 
         # PRD V3 §3.2 / §4.2：后台任务引用集合，防止 GC + 记录异常
@@ -98,6 +131,8 @@ class Scheduler:
 
         # MEM-501：knowledge_memory 由 AccountInstance 注入（单一实例，不再自行创建）
         self.knowledge_memory = knowledge_memory
+        self.memory_brain = resolved_memory_brain
+        self._memory_brain_required = resolved_memory_brain is not None
         # MEM-501：记忆写入队列（由 AccountInstance 注入，业务代码通过此队列写入）
         self.memory_write_queue = memory_write_queue
 
@@ -142,7 +177,12 @@ class Scheduler:
         self._proactive_triggered: set = set()
         self._dynamic_times: List[tuple] = []
         self._dynamic_triggered: set = set()
-        self._consolidation_triggered: set = set()  # 日终记忆清算触发标记
+        # PRD V6：轮询状态去重日志——只在数值变化时打印 INFO，否则 DEBUG，避免日志膨胀
+        self._last_notify_count: Optional[int] = None
+        self._last_own_dynamic_count: Optional[int] = None
+        self._last_all_replied_fingerprint: Optional[str] = None
+        self._last_dm_session_count: Optional[int] = None
+        self._last_consolidation_date = None  # 日终记忆清算上次执行日期
         self._schedule_date = None  # 当前调度日期，用于检测跨天重置
         # PRD V4 REP-001：结构化回复状态机，替换 _replied:bool 字典
         from bilibot.services.reply_state import ReplyStateStore
@@ -222,6 +262,317 @@ class Scheduler:
         task.add_done_callback(_on_done)
         return task
 
+    async def _archive_required(self, envelope):
+        """Archive a raw observation before any irreversible business action."""
+        brain = getattr(self, "memory_brain", None)
+        if brain is None and not getattr(self, "_memory_brain_required", False):
+            # Compatibility for direct legacy/minimal Scheduler construction.
+            # Production AccountInstance always injects the V6 service.
+            return None
+        if brain is None:
+            raise RuntimeError("V6 memory brain is not initialized")
+        try:
+            result = await brain.archive_observation_async(envelope)
+            if result is None:
+                raise RuntimeError("V6 archive returned no commit result")
+            if getattr(result, "source_committed", True) is False:
+                raise RuntimeError("V6 archive source commit was not confirmed")
+            return result
+        except Exception as exc:
+            # IdempotencyConflictError / ReingestBlockedError 是良性条件
+            # （数据已存在或已被删除 tombstone），不是存储故障，不应暂停账号。
+            # 这些异常向上传播让调用方决定如何处理，但不触发风险暂停。
+            from bilibot.memory_brain.models import (
+                IdempotencyConflictError,
+                ReingestBlockedError,
+            )
+            if isinstance(exc, (IdempotencyConflictError, ReingestBlockedError)):
+                logger.warning(
+                    "memory archive skipped (idempotency conflict or blocked): "
+                    "account=%s key=%s",
+                    self.account_id,
+                    getattr(envelope, "idempotency_key", ""),
+                )
+                raise
+            self._pause_for_memory_failure()
+            logger.error(
+                "required memory archive failed; account actions paused: account=%s",
+                self.account_id,
+                exc_info=True,
+            )
+            raise
+
+    def _pause_for_memory_failure(self) -> None:
+        safety = getattr(self, "safety_checker", None)
+        account_id = str(getattr(self, "account_id", "") or "")
+        if safety is None or not account_id:
+            return
+        try:
+            safety.pause_account(account_id, reason="memory_archive_failed")
+        except Exception:
+            pass
+
+    async def _archive_bot_action(
+        self,
+        *,
+        action_key: str,
+        action_type: str,
+        text: str,
+        published: bool,
+        title: str = "",
+        scene: str = "system",
+        metadata: Optional[Dict[str, Any]] = None,
+        importance: float = 0.6,
+        status: str = "",
+    ):
+        from bilibot.memory_brain.ingestion import bot_action_observation
+
+        return await self._archive_required(
+            bot_action_observation(
+                account_id=self.account_id or "default",
+                action_key=action_key,
+                action_type=action_type,
+                text=text,
+                published=published,
+                persona_id=self._get_current_persona_id(),
+                title=title,
+                scene=scene,
+                metadata=metadata or {},
+                importance=importance,
+                state=status,
+            )
+        )
+
+    def _bot_aliases(self) -> set[str]:
+        aliases = {"bot", "亚托莉", "亚托莉小姐", "atri", "ATRI"}
+        bot_name = str(getattr(self, "_bot_name", "") or "").strip()
+        if bot_name:
+            aliases.add(bot_name)
+        try:
+            persona_id = str(self._get_current_persona_id() or "").strip()
+        except Exception:
+            persona_id = ""
+        if persona_id:
+            aliases.add(persona_id)
+        return {alias.casefold() for alias in aliases if alias}
+
+    def _is_bot_speaker(self, actor_id: str | int = "", username: str = "", text: str = "") -> bool:
+        bot_uid = str(getattr(self, "_bot_uid", "") or "")
+        actor = str(actor_id or "")
+        if bot_uid and actor and actor == bot_uid:
+            return True
+        aliases = self._bot_aliases()
+        uname = str(username or "").strip().casefold()
+        if uname and uname in aliases:
+            return True
+        lowered = str(text or "").casefold()
+        return any(f"@{alias}" in lowered for alias in aliases if alias not in {"bot", "atri"})
+
+    def _comment_memory_title(self, username: str, text: str, reply_id: str | int = "") -> str:
+        name = str(username or "未知用户").strip() or "未知用户"
+        snippet = " ".join(str(text or "").split())
+        if len(snippet) > 36:
+            snippet = snippet[:36] + "…"
+        return f"{name} 评论：{snippet}" if snippet else f"{name} 的评论 {reply_id}"
+
+    def _dynamic_card_context(self, card: Dict[str, Any]) -> Dict[str, Any]:
+        """Extract a small target context for comments under Bot's own dynamics."""
+        basic = card.get("basic") or {}
+        modules = card.get("modules") or {}
+        dynamic = modules.get("module_dynamic") or {}
+        desc = card.get("desc") or {}
+        item = card.get("item") or {}
+
+        text_candidates: List[str] = []
+        major = dynamic.get("major") if isinstance(dynamic, dict) else {}
+        opus = major.get("opus") if isinstance(major, dict) else {}
+        opus_summary = opus.get("summary") if isinstance(opus, dict) else {}
+        dynamic_desc = dynamic.get("desc") if isinstance(dynamic, dict) else {}
+        for value in (
+            dynamic_desc.get("text") if isinstance(dynamic_desc, dict) else "",
+            opus_summary.get("text") if isinstance(opus_summary, dict) else "",
+            item.get("description"),
+            item.get("content"),
+            item.get("title"),
+            card.get("title"),
+        ):
+            if isinstance(value, str) and value.strip():
+                text_candidates.append(value.strip())
+
+        return {
+            "kind": "own_dynamic",
+            "dynamic_id": str(
+                card.get("id_str")
+                or card.get("id")
+                or desc.get("dynamic_id_str")
+                or desc.get("dynamic_id")
+                or ""
+            ),
+            "comment_oid": str(
+                basic.get("comment_id_str")
+                or basic.get("comment_id")
+                or basic.get("rid_str")
+                or basic.get("rid")
+                or ""
+            ),
+            "dynamic_text": (text_candidates[0] if text_candidates else "")[:500],
+        }
+
+    def _redact_private_message_runtime(
+        self, text: str, *, actor_id: str | int, username: str = ""
+    ):
+        """Return a PM-safe value even on the legacy direct-construction path."""
+        brain = getattr(self, "memory_brain", None)
+        if brain is not None:
+            return brain.redact_private_message(
+                text, actor_id=actor_id, username=username
+            )
+        from bilibot.memory_brain.redaction import redact_private_message
+
+        salt = hashlib.sha256(
+            f"bilibot:legacy-pm:{getattr(self, 'account_id', '')}".encode("utf-8")
+        ).digest()
+        return redact_private_message(
+            text,
+            actor_id=actor_id,
+            account_salt=salt,
+            current_username=username,
+        )
+
+    @staticmethod
+    def _bounded_recent_turns(
+        turns: List[str], *, max_turns: int = 6, max_chars: int = 1200
+    ) -> List[str]:
+        selected: List[str] = []
+        remaining = max(0, int(max_chars))
+        for value in reversed(list(turns or [])[-max_turns:]):
+            text = str(value or "")
+            if not text or remaining <= 0:
+                continue
+            if len(text) > remaining:
+                text = text[-remaining:]
+            selected.append(text)
+            remaining -= len(text)
+        selected.reverse()
+        return selected
+
+    async def _archive_comment_thread_context(
+        self,
+        replies: List[Dict[str, Any]],
+        *,
+        oid: str | int,
+        comment_type: int,
+        thread_key: str | int,
+    ) -> List[str]:
+        rows: List[Dict[str, Any]] = []
+        prompt_lines: List[str] = []
+        bot_name = str(getattr(self, "_bot_name", "") or "Bot")
+        for reply in replies or []:
+            member = reply.get("member", {}) or {}
+            content = reply.get("content", {}) or {}
+            text = str(content.get("message") or "")
+            if not text:
+                continue
+            actor_id = str(reply.get("mid") or member.get("mid") or "")
+            username = str(member.get("uname") or "?")
+            is_bot = self._is_bot_speaker(actor_id, username, text)
+            speaker = bot_name if is_bot else username
+            prompt_lines.append(f"{speaker}: {text}")
+            rows.append(
+                {
+                    "external_id": str(reply.get("rpid") or reply.get("id") or len(rows)),
+                    "actor_id": actor_id,
+                    "username": username,
+                    "text": text,
+                    "is_bot": is_bot,
+                    "occurred_at": reply.get("ctime") or reply.get("timestamp"),
+                    "raw": reply,
+                }
+            )
+        if rows:
+            from bilibot.memory_brain.ingestion import comment_thread_observation
+
+            await self._archive_required(
+                comment_thread_observation(
+                    account_id=getattr(self, "account_id", "") or "default",
+                    thread_key=str(thread_key),
+                    rows=rows,
+                    oid=str(oid),
+                    comment_type=comment_type,
+                    persona_id=self._get_current_persona_id(),
+                )
+            )
+        return prompt_lines
+
+    @staticmethod
+    def _private_message_text(message: Dict[str, Any]) -> str:
+        raw = message.get("content", "") if isinstance(message, dict) else ""
+        if not raw:
+            return ""
+        try:
+            value = json.loads(raw) if isinstance(raw, str) else raw
+        except (json.JSONDecodeError, TypeError):
+            value = raw
+        if isinstance(value, dict):
+            return str(value.get("content") or "")
+        return str(value or "")
+
+    async def _archive_pm_recent_history(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        current_message_id: str,
+        talker_id: int,
+        talker_name: str,
+        my_uid: int,
+    ) -> List[str]:
+        from bilibot.services.pm_state_store import extract_platform_message_id
+
+        turns: List[str] = []
+        brain = getattr(self, "memory_brain", None)
+        for message in messages or []:
+            if not isinstance(message, dict):
+                continue
+            text = self._private_message_text(message)
+            if not text:
+                continue
+            message_id = extract_platform_message_id(message)
+            if not message_id:
+                digest = hashlib.sha256(
+                    json.dumps(
+                        message,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        default=str,
+                    ).encode("utf-8")
+                ).hexdigest()
+                message_id = f"history:{digest}"
+            if str(message_id) == str(current_message_id):
+                continue
+            sender_id = str(message.get("sender_uid") or "")
+            is_self = bool(my_uid and sender_id == str(my_uid))
+            direction = "outgoing" if is_self else "incoming"
+            safe = self._redact_private_message_runtime(
+                text,
+                actor_id="self" if is_self else str(talker_id),
+                username=talker_name,
+            )
+            if brain is not None:
+                _, result = await brain.archive_private_message(
+                    platform_message_id=str(message_id),
+                    text=text,
+                    actor_id="self" if is_self else str(talker_id),
+                    username=talker_name,
+                    direction=direction,
+                    persona_id=self._get_current_persona_id(),
+                    redacted=safe,
+                )
+                if result is None or getattr(result, "source_committed", True) is False:
+                    raise RuntimeError("PM history source commit was not confirmed")
+            speaker = "我" if is_self else "私信用户"
+            turns.append(f"{speaker}: {safe.text}")
+        return self._bounded_recent_turns(turns)
+
     async def start(self):
         """启动调度器"""
         self.running = True
@@ -233,21 +584,7 @@ class Scheduler:
         # PRD V3 §4.8：加载评论失败计数器（重启后恢复阈值保护）
         self._load_fail_counts()
 
-        # PRD 4.15：启动时清理过期记忆原子（PRD V3 §4.6：用 async 版本避免阻塞）
-        if self.knowledge_memory and hasattr(self.knowledge_memory, "cleanup_expired_async"):
-            try:
-                purged = await self.knowledge_memory.cleanup_expired_async()
-                if purged:
-                    logger.info(f"启动清理过期记忆原子: {purged} 条")
-            except Exception as e:
-                logger.warning(f"启动清理过期记忆失败: {e}")
-        elif self.knowledge_memory and hasattr(self.knowledge_memory, "cleanup_expired"):
-            try:
-                purged = self.knowledge_memory.cleanup_expired()
-                if purged:
-                    logger.info(f"启动清理过期记忆原子: {purged} 条")
-            except Exception as e:
-                logger.warning(f"启动清理过期记忆失败: {e}")
+        # V6 memories never expire or auto-prune. Durable jobs resume from SQLite.
 
         # PRD-V5 §7.2 / §6.3：启动时恢复未完成的 TaskRun
         # claimed/running → interrupted（重启前在运行，需按场景恢复）
@@ -261,6 +598,62 @@ class Scheduler:
                 logger.info(f"启动过期清理：{expired} 个 TaskRun 标记为 expired")
         except Exception as e:
             logger.warning(f"TaskRun 启动恢复失败: {e}")
+
+        # Task 5：启动时恢复 interrupted 状态的 TaskRun
+        # 按场景重新入队（retry → scheduled）或立即重跑（retry → claim → dispatch）
+        try:
+            interrupted = self.task_store.list_interrupted()
+            if interrupted:
+                logger.info(f"Task 5: 发现 {len(interrupted)} 个 interrupted TaskRun，开始恢复")
+                for task in interrupted:
+                    scene = task.scene
+                    if scene in ("proactive_video", "dynamic"):
+                        # 立即重跑：retry → claim → dispatch（start 由 _do_xxx 完成）
+                        if not self.task_store.retry(task.task_id):
+                            logger.warning(f"Task 5: TaskRun {task.task_id} retry 失败")
+                            continue
+                        if not self.task_store.claim(task.task_id):
+                            logger.warning(f"Task 5: TaskRun {task.task_id} claim 失败")
+                            continue
+                        if scene == "proactive_video":
+                            self._spawn_memory_task(
+                                self._do_proactive_video(task_id=task.task_id),
+                                tag=f"recovery_proactive_video:{task.task_id}",
+                            )
+                            logger.info(f"Task 5: interrupted TaskRun {task.task_id} 重新执行（proactive_video）")
+                        else:
+                            self._spawn_memory_task(
+                                self._do_post_dynamic(task_id=task.task_id),
+                                tag=f"recovery_dynamic:{task.task_id}",
+                            )
+                            logger.info(f"Task 5: interrupted TaskRun {task.task_id} 重新执行（dynamic）")
+                    else:
+                        # 其他场景：重新入队（转 scheduled，由各自调度机制拾取）
+                        if self.task_store.retry(task.task_id):
+                            logger.info(f"Task 5: TaskRun {task.task_id} 重新入队（scene={scene}）")
+        except Exception as e:
+            logger.warning(f"Task 5: interrupted 恢复失败: {e}")
+
+        # Task 4：启动时恢复卡在 publishing 状态的主动评论（崩溃前 mark_publishing 后未完成）
+        try:
+            stuck = self.proactive_comment_store.recover_stuck_publishing()
+            if stuck:
+                logger.warning(
+                    f"Task 4: 启动恢复 {stuck} 个卡在 publishing 的主动评论 → result_unknown"
+                )
+        except Exception as e:
+            logger.warning(f"Task 4: 启动恢复 publishing 卡死失败: {e}")
+
+        # Task 42：启动时恢复卡住的动态草稿（approved 超期 / publishing 超阈值）
+        try:
+            stuck_drafts = self._get_draft_store().recover_stuck_drafts()
+            if stuck_drafts.get("approved_expired") or stuck_drafts.get("publishing_stuck"):
+                logger.warning(
+                    f"Task 42: 启动恢复动态草稿: approved_expired={stuck_drafts.get('approved_expired', 0)}, "
+                    f"publishing_stuck={stuck_drafts.get('publishing_stuck', 0)}"
+                )
+        except Exception as e:
+            logger.warning(f"Task 42: 启动恢复动态草稿卡死失败: {e}", exc_info=True)
 
         # 生成今日调度计划
         self._generate_daily_schedule()
@@ -308,7 +701,7 @@ class Scheduler:
                     self._schedule_date = now.date()
                     self._proactive_triggered.clear()
                     self._dynamic_triggered.clear()
-                    self._consolidation_triggered.clear()
+                    self._last_consolidation_date = None
                     self._generate_daily_schedule()
                     self._mark_overdue_as_triggered()
 
@@ -325,36 +718,33 @@ class Scheduler:
                     pass
                 if (
                     now.hour == consolidation_hour
-                    and now.minute == 0
-                    and current_time not in self._consolidation_triggered
+                    and now.date() != self._last_consolidation_date
                 ):
-                    self._consolidation_triggered.add(current_time)
+                    self._last_consolidation_date = now.date()
                     try:
-                        # PRD V3 §2.2.2：日终清算改为 KnowledgeBaseMemory.cleanup_expired()
-                        # PRD V3 §4.6：用 async 版本避免阻塞事件循环
-                        if self.knowledge_memory and hasattr(self.knowledge_memory, "cleanup_expired_async"):
-                            purged = await self.knowledge_memory.cleanup_expired_async()
-                            if purged:
-                                logger.info(f"日终清理过期记忆原子: {purged} 条")
-                            else:
-                                logger.info("日终清算完成：无过期记忆")
-                        elif self.knowledge_memory and hasattr(self.knowledge_memory, "cleanup_expired"):
-                            purged = self.knowledge_memory.cleanup_expired()
-                            if purged:
-                                logger.info(f"日终清理过期记忆原子: {purged} 条")
-                            else:
-                                logger.info("日终清算完成：无过期记忆")
-                        # PRD V5 Task 16 / MEM-601：日终遗忘低重要性记忆
-                        # forget_low_importance 内部会检查 enable_forgetting
-                        if self.knowledge_memory and hasattr(self.knowledge_memory, "forget_low_importance_async"):
-                            try:
-                                forgotten = await self.knowledge_memory.forget_low_importance_async()
-                                if forgotten:
-                                    logger.info(f"日终遗忘低重要性记忆: {forgotten} 条")
-                            except Exception as fe:
-                                logger.error(f"日终遗忘低重要性记忆失败: {fe}", exc_info=True)
+                        brain = getattr(self, "memory_brain", None)
+                        if brain:
+                            await brain.run_jobs_until_idle(max_jobs=1000)
+                            reflections = await brain.consolidate_recent(
+                                now.date().isoformat()
+                            )
+                            logger.info("夜间记忆巩固完成：新增 %d 条反思", reflections)
                     except Exception as e:
-                        logger.error(f"日终记忆清算失败: {e}", exc_info=True)
+                        logger.error("夜间记忆巩固失败: %s", type(e).__name__)
+
+                # 番剧追番更新检测（每天一次）
+                if self.bangumi_service and now.date() != self._last_bangumi_check_date:
+                    try:
+                        result = await self.bangumi_service.check_updates()
+                        self._last_bangumi_check_date = now.date()
+                        if result.get("updated", 0) > 0:
+                            logger.info(f"追番更新检测: {result['updated']} 部有更新，已观看 {result.get('watched', 0)} 集")
+                    except Exception as e:
+                        logger.error(
+                            "追番更新检测失败，保留为可重试状态: %s",
+                            type(e).__name__,
+                            exc_info=True,
+                        )
 
                 # REP-602：恢复卡在中间态的评论（context_building/
                 # generation_pending/safety_pending/publish_pending 超过 10 分钟
@@ -366,6 +756,28 @@ class Scheduler:
                         f"REP-602: 恢复卡在中间态评论失败: {e}", exc_info=True
                     )
 
+                # Task 4：周期性恢复卡在 publishing 状态的主动评论
+                # （mark_publishing 后崩溃 → lease_until 超时 → result_unknown）
+                try:
+                    stuck = self.proactive_comment_store.recover_stuck_publishing()
+                    if stuck:
+                        logger.warning(
+                            f"Task 4: 恢复 {stuck} 个卡在 publishing 的主动评论 → result_unknown"
+                        )
+                except Exception as e:
+                    logger.warning(f"Task 4: 恢复 publishing 卡死失败: {e}")
+
+                # Task 42：恢复卡住的动态草稿（approved 超期 / publishing 超阈值）
+                try:
+                    stuck_drafts = self._get_draft_store().recover_stuck_drafts()
+                    if stuck_drafts.get("approved_expired") or stuck_drafts.get("publishing_stuck"):
+                        logger.warning(
+                            f"Task 42: 动态草稿恢复: approved_expired={stuck_drafts.get('approved_expired', 0)}, "
+                            f"publishing_stuck={stuck_drafts.get('publishing_stuck', 0)}"
+                        )
+                except Exception as e:
+                    logger.warning(f"Task 42: 动态草稿卡死恢复失败: {e}", exc_info=True)
+
                 # 1. 检查评论回复
                 await self._check_new_comments()
 
@@ -374,6 +786,9 @@ class Scheduler:
 
                 # 1.25 PRD-V5 §10.2 COM-501：重试 retry_wait 的主动评论
                 await self._process_retryable_proactive_comments()
+
+                # 1.3 Task 5：重试 retry_wait 的 TaskRun（主动视频/动态等到期自动重试）
+                await self._process_retryable_tasks()
 
                 # 1.5 检查私信
                 await self._check_new_messages()
@@ -419,11 +834,31 @@ class Scheduler:
                 await self.web_search.close()
         except Exception:
             pass
+        # BUG A-004：取消并等待所有后台记忆任务完成，防止资源泄漏和协程悬挂
+        tasks = list(self._running_tasks)
+        if tasks:
+            logger.info(f"正在取消 {len(tasks)} 个后台任务...")
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            logger.info("后台任务已全部取消")
         logger.info("调度器已关闭")
 
     def stop(self):
         """停止调度器"""
         self.running = False
+
+    def _authenticated_poll_allowed(self) -> bool:
+        """Apply BilibiliAPI's -101 backoff to auth-only polling endpoints."""
+        if self.bili is None:
+            return False
+        checker = getattr(self.bili, "auth_poll_allowed", None)
+        if not callable(checker):
+            return True
+        try:
+            return bool(checker())
+        except Exception:
+            return True
 
     # ══════════════════════════════════════════
     #  评论检查
@@ -436,6 +871,8 @@ class Scheduler:
             return
         if not self.bili:
             logger.info("bili API 未初始化，跳过评论检查")
+            return
+        if not self._authenticated_poll_allowed():
             return
 
         # PRD §5.9：全局暂停或账号风险暂停时跳过所有自动行为
@@ -455,22 +892,75 @@ class Scheduler:
             return
 
         try:
+            items = []
             notifications = await self.bili.get_reply_notifications()
             if not notifications:
                 logger.info("通知 API 返回空")
-                return
-            if notifications.get("code") != 0:
+            elif notifications.get("code") != 0:
                 logger.info(f"通知 API 返回错误: code={notifications.get('code')} msg={notifications.get('message')}")
-                return
+            else:
+                items = notifications.get("data", {}).get("items", []) or []
+                # PRD V6：通知数变化时才打 INFO，否则降级 DEBUG
+                _count = len(items)
+                if _count != self._last_notify_count:
+                    logger.info(f"通知 API 返回 {_count} 条评论")
+                    self._last_notify_count = _count
+                else:
+                    logger.debug(f"通知 API 返回 {_count} 条评论（无变化）")
 
-            items = notifications.get("data", {}).get("items", [])
+            # 合并 @我的 通知（结构与 reply 一致，标记 _source="at" 以便后续区分）
+            try:
+                at_notifications = await self.bili.get_at_notifications()
+                if at_notifications and at_notifications.get("code") == 0:
+                    at_items = at_notifications.get("data", {}).get("items", []) or []
+                    if at_items:
+                        # 标记 at 来源，后续处理时优先看视频
+                        for at_item in at_items:
+                            at_item["_source"] = "at"
+                        # 去重：与 reply 通知按 source_id 去重
+                        existing_ids = {
+                            str((it.get("item") or {}).get("source_id") or it.get("id") or "")
+                            for it in items
+                        }
+                        for at_item in at_items:
+                            at_id = str((at_item.get("item") or {}).get("source_id") or at_item.get("id") or "")
+                            if at_id and at_id not in existing_ids:
+                                items.append(at_item)
+                                existing_ids.add(at_id)
+                        logger.info(f"@我的 通知返回 {len(at_items)} 条，合并后候选共 {len(items)} 条")
+            except Exception as at_exc:
+                logger.warning(f"获取@我的通知失败: {at_exc}")
+
+            batch_size = config.get("reply", {}).get("batch_size", 10)
+            try:
+                own_dynamic_items = await self._collect_own_dynamic_comment_items(
+                    config=config,
+                    limit=batch_size,
+                )
+                if own_dynamic_items:
+                    existing_ids = {
+                        str((it.get("item") or {}).get("source_id") or it.get("id") or "")
+                        for it in items
+                    }
+                    for own_item in own_dynamic_items:
+                        own_id = str((own_item.get("item") or {}).get("source_id") or own_item.get("id") or "")
+                        if own_id and own_id not in existing_ids:
+                            items.append(own_item)
+                            existing_ids.add(own_id)
+                    _own_count = len(own_dynamic_items)
+                    # PRD V6：候选数变化时才打 INFO
+                    if _own_count != self._last_own_dynamic_count:
+                        logger.info(f"自动态补扫发现 {_own_count} 条候选评论")
+                        self._last_own_dynamic_count = _own_count
+                    else:
+                        logger.debug(f"自动态补扫发现 {_own_count} 条候选评论（无变化）")
+            except Exception as own_exc:
+                logger.warning(f"自动态评论补扫失败: {own_exc}")
+
             if not items:
                 logger.info("评论区无新通知")
                 return
 
-            logger.info(f"通知 API 返回 {len(items)} 条评论")
-
-            batch_size = config.get("reply", {}).get("batch_size", 10)
             new_items = []
             for item in items:
                 # source_id 是触发通知的评论 rpid（用户的评论），用于去重
@@ -487,9 +977,20 @@ class Scheduler:
             new_items = new_items[:batch_size]
 
             if not new_items:
-                logger.info(f"评论通知 {len(items)} 条，全部已回复过，跳过")
+                # PRD V6：全部已回复时用指纹（数量+rpid 集合）判断是否变化
+                _fp = f"{len(items)}:" + ",".join(sorted(
+                    str((it.get("item") or {}).get("source_id") or it.get("id") or "")
+                    for it in items
+                ))
+                if _fp != self._last_all_replied_fingerprint:
+                    logger.info(f"评论通知 {len(items)} 条，全部已回复过，跳过")
+                    self._last_all_replied_fingerprint = _fp
+                else:
+                    logger.debug(f"评论通知 {len(items)} 条，全部已回复过，跳过（无变化）")
                 return
 
+            # 有新评论待回复时重置指纹，下次全回复时会重新打 INFO
+            self._last_all_replied_fingerprint = None
             logger.info(f"发现 {len(new_items)} 条新评论待回复")
 
             for item in new_items:
@@ -513,6 +1014,33 @@ class Scheduler:
                                 f"root_id={root_id}, source_id={source_id}, username={username}")
 
                     if not comment_text:
+                        continue
+
+                    # V6: every observed comment is archived before reply filters.
+                    try:
+                        from bilibot.memory_brain.ingestion import comment_observation
+
+                        await self._archive_required(
+                            comment_observation(
+                                account_id=self.account_id or "default",
+                                comment_type=comment_type,
+                                reply_id=reply_id,
+                                text=comment_text,
+                                actor_id=user_id,
+                                username=username,
+                                oid=str(oid),
+                                title=self._comment_memory_title(username, comment_text, reply_id),
+                                context=item_detail.get("target_context") or {},
+                                persona_id=self._get_current_persona_id(),
+                            )
+                        )
+                    except Exception as archive_exc:
+                        self.reply_state_store.mark_deferred(
+                            comment_type,
+                            reply_id,
+                            reason="memory_archive_failed",
+                            error_code="MEMORY_ARCHIVE_FAILED",
+                        )
                         continue
 
                     # PRD V4 REP-002：过滤规则真实生效
@@ -569,30 +1097,54 @@ class Scheduler:
 
                     # 获取评论上下文（楼中楼对话历史）
                     comment_context = ""
+                    reply_replies = []
+                    context_root = root_id if root_id else source_id
                     if root_id or source_id:
                         try:
-                            context_root = root_id if root_id else source_id
                             replies_data = await self.bili.get_comment_replies(
                                 oid=oid, root=context_root, comment_type=comment_type, ps=30,
                             )
                             if replies_data and replies_data.get("code") == 0:
                                 reply_replies = replies_data.get("data", {}).get("replies", [])
-                                if reply_replies:
-                                    context_lines = []
-                                    for r in reply_replies:
-                                        r_user = r.get("member", {}).get("uname", "?")
-                                        r_text = r.get("content", {}).get("message", "")
-                                        if r_text:
-                                            # 标记 Bot 自己的回复（PRD 3.10：修复运算符优先级 bug）
-                                            bot_uid_int = int(self._bot_uid) if self._bot_uid else None
-                                            is_bot = bot_uid_int is not None and r.get("mid", 0) == bot_uid_int
-                                            speaker = self._bot_name if is_bot else r_user
-                                            context_lines.append(f"{speaker}: {r_text}")
-                                    if context_lines:
-                                        comment_context = "\n".join(context_lines)
-                                        logger.info(f"获取评论上下文: {len(context_lines)} 条对话")
                         except Exception as e:
                             logger.warning(f"获取评论上下文失败: {e}")
+                    # 通知自带的上下文字段：根评论 + 被回复评论（楼中楼接口不返回这些）
+                    # 这对 @ 通知尤其重要：bot 需要知道 @ 发生在什么对话语境下
+                    _notify_context_lines = []
+                    root_reply_content = (item_detail.get("root_reply_content") or "").strip()
+                    if root_reply_content:
+                        _notify_context_lines.append(f"[根评论] {root_reply_content}")
+                    target_reply_content = (item_detail.get("target_reply_content") or "").strip()
+                    if target_reply_content:
+                        _notify_context_lines.append(f"[被回复的评论] {target_reply_content}")
+                    if _notify_context_lines:
+                        if comment_context:
+                            comment_context = "\n".join(_notify_context_lines) + "\n" + comment_context
+                        else:
+                            comment_context = "\n".join(_notify_context_lines)
+                        logger.info(f"通知自带上下文: 根评论={'有' if root_reply_content else '无'}, 被回复={'有' if target_reply_content else '无'}")
+                    if reply_replies:
+                        try:
+                            context_lines = await self._archive_comment_thread_context(
+                                reply_replies,
+                                oid=oid,
+                                comment_type=comment_type,
+                                thread_key=context_root,
+                            )
+                        except Exception:
+                            self.reply_state_store.mark_deferred(
+                                comment_type,
+                                reply_id,
+                                reason="comment_context_archive_failed",
+                                error_code="MEMORY_ARCHIVE_FAILED",
+                            )
+                            continue
+                        if context_lines:
+                            if comment_context:
+                                comment_context = comment_context + "\n" + "\n".join(context_lines)
+                            else:
+                                comment_context = "\n".join(context_lines)
+                            logger.info(f"获取评论上下文: {len(context_lines)} 条对话")
 
                     # PRD §5.9：黑名单过滤 → ignored（终态）
                     if self.safety_checker is not None and self.safety_checker.is_blacklisted(user_id):
@@ -602,14 +1154,41 @@ class Scheduler:
                         )
                         continue
 
+                    # @来源的视频评论：先看视频再回复，让回复基于真实观看内容
+                    if item.get("_source") == "at" and comment_type == 1 and oid:
+                        try:
+                            watched = await self._watch_video_for_reply(bvid="", oid=oid)
+                            if watched:
+                                logger.info(f"@回复：已预观看视频 oid={oid}，回复将基于完整视频上下文")
+                            else:
+                                logger.info(f"@回复：预观看失败/降级，回复将基于元数据")
+                        except Exception as watch_exc:
+                            logger.warning(f"@回复：预观看异常，降级为元数据回复: {watch_exc}")
+
                     # PRD V4 §4.3.1：构建完整 ReplyContext
                     reply_context = None
                     if self.comment_context_service is not None:
                         try:
                             reply_context = await self.comment_context_service.build_context(
-                                notification=item, current_user_id=user_id,
+                                notification=item,
+                                current_user_id=user_id,
+                                persona_id=self._get_current_persona_id(),
+                                recent_turns=self._bounded_recent_turns(
+                                    comment_context.splitlines()
+                                ),
                             )
                         except Exception as e:
+                            from bilibot.services.comment_context import ContextArchiveError
+
+                            if isinstance(e, ContextArchiveError):
+                                self._pause_for_memory_failure()
+                                self.reply_state_store.mark_deferred(
+                                    comment_type,
+                                    reply_id,
+                                    reason="video_context_archive_failed",
+                                    error_code="MEMORY_ARCHIVE_FAILED",
+                                )
+                                continue
                             logger.warning(f"构建评论上下文失败，降级处理: {e}")
                             reply_context = None
 
@@ -617,8 +1196,10 @@ class Scheduler:
                     self.reply_state_store.upsert(comment_type, reply_id, "generation_pending")
 
                     # 生成回复（传入 reply_context + 评论上下文）
+                    # BUG A-001：直接调用 _generate_reply_impl 以获取 GenerationOutcome，
+                    # 不再通过 generate_reply 包装器（它把 skip/retryable/permanent 全折叠成 None）
                     try:
-                        reply_result = await self.reply_gen.generate_reply(
+                        outcome = await self.reply_gen._generate_reply_impl(
                             user_id=user_id,
                             username=username,
                             comment=comment_text,
@@ -637,7 +1218,8 @@ class Scheduler:
                         )
                         continue
 
-                    if not reply_result or not reply_result.get("reply"):
+                    # BUG A-001：按 outcome.status 分派，不再用 None 判断
+                    if outcome.is_skip:
                         # LLM 明确决定不回复 → ignored（终态）
                         logger.debug(f"LLM 决定跳过回复 from {username}")
                         self.reply_state_store.mark_ignored(
@@ -645,9 +1227,21 @@ class Scheduler:
                         )
                         continue
 
-                    reply_text = reply_result["reply"]
-                    audit_id = reply_result.get("audit_id")
-                    context_meta = reply_result.get("context_meta", {}) or {}
+                    if not outcome.is_generated:
+                        # retryable / permanent → deferred（非终态，可恢复）
+                        logger.warning(
+                            f"LLM 生成未成功 (status={outcome.status}, code={outcome.error_code})，deferred"
+                        )
+                        self.reply_state_store.mark_deferred(
+                            comment_type, reply_id,
+                            reason=f"generation_{outcome.status}: {outcome.error_code}",
+                            error_code=outcome.error_code or "GEN_FAILED",
+                        )
+                        continue
+
+                    reply_text = outcome.text
+                    audit_id = outcome.audit_id
+                    context_meta = outcome.context_meta or {}
 
                     # PRD-V5 §6.2 / REP-502：获取有效文本后、安全检查之前持久化生成结果
                     # 确保即使安全检查或发布失败，重试时也能使用原始文本而非重新生成
@@ -690,6 +1284,20 @@ class Scheduler:
                                 self.reply_state_store.mark_rejected(
                                     comment_type, reply_id, reason=f"safety_check: {reason}",
                                 )
+                                await self._archive_bot_action(
+                                    action_key=f"comment_reply:{comment_type}:{reply_id}",
+                                    action_type="reply_comment",
+                                    text=reply_text,
+                                    published=False,
+                                    status="rejected",
+                                    title=f"回复评论 {reply_id}",
+                                    scene="reply_comment",
+                                    metadata={
+                                        "reply_id": reply_id,
+                                        "oid": str(oid),
+                                        "reason_code": "SAFETY_REJECTED",
+                                    },
+                                )
                                 continue
                             if not self.safety_checker.check_rate_limit(scene="reply_comment", account_id=self.account_id):
                                 # PRD V4 §9.1：限流 → deferred（非终态，可恢复）
@@ -717,13 +1325,42 @@ class Scheduler:
                     # root = 根评论rpid（一级评论时=source_id，二级评论时=root_id）
                     # parent = 要回复的那条评论rpid（始终=source_id，即用户的评论）
                     comment_root = root_id if root_id else source_id
-                    success = await self.bili.post_comment(
-                        oid=oid,
-                        content=reply_text,
-                        comment_type=comment_type,
-                        rpid=comment_root,
-                        parent=source_id,
-                    )
+                    try:
+                        success = await self.bili.post_comment(
+                            oid=oid,
+                            content=reply_text,
+                            comment_type=comment_type,
+                            rpid=comment_root,
+                            parent=source_id,
+                        )
+                    except Exception as post_err:
+                        logger.error(f"发表评论异常 reply_id={reply_id}: {post_err}")
+                        self.reply_state_store.mark_retry_wait(
+                            comment_type, reply_id,
+                            reason=f"post_exception: {post_err}",
+                            error_code="POST_EXCEPTION",
+                        )
+                        try:
+                            await self._archive_bot_action(
+                                action_key=f"comment_reply:{comment_type}:{reply_id}",
+                                action_type="reply_comment",
+                                text=reply_text,
+                                published=False,
+                                status="failed",
+                                title=f"回复评论 {reply_id}",
+                                scene="reply_comment",
+                                metadata={
+                                    "reply_id": reply_id,
+                                    "oid": str(oid),
+                                    "reason_code": "POST_EXCEPTION",
+                                },
+                            )
+                        except Exception:
+                            logger.error(
+                                "failed comment result could not be archived: reply_id=%s",
+                                reply_id,
+                            )
+                        continue
                     if not success:
                         self._check_bili_risk_control("reply_comment")
 
@@ -761,25 +1398,22 @@ class Scheduler:
                         # PRD V4 REP-001：标记终态 published
                         self.reply_state_store.mark_published(comment_type, reply_id)
 
-                        # PRD V3 §3.2：记忆写入改为异步，不阻塞回复链路
-                        if self.knowledge_memory:
-                            # PRD V4 REP-006：记忆写入传入 persona_id（账号隔离）
-                            _persona_id = self._get_current_persona_id()
-                            self._spawn_memory_task(
-                                self.knowledge_memory.save_conversation_as_memory(
-                                    conversation_history=[
-                                        {"role": "user", "content": comment_text,
-                                         "user_id": user_id, "username": username},
-                                        {"role": "assistant", "content": reply_text,
-                                         "user_id": self._bot_uid, "username": self._bot_name},
-                                    ],
-                                    user_id=user_id,
-                                    username=username,
-                                    session_id=str(reply_id),
-                                    bot_name=self._bot_name,
-                                    persona_id=_persona_id,
-                                ),
-                                tag=f"save_conversation_as_memory(reply_id={reply_id})",
+                        try:
+                            await self._archive_bot_action(
+                                action_key=f"comment_reply:{comment_type}:{reply_id}",
+                                action_type="reply_comment",
+                                text=reply_text,
+                                published=True,
+                                title=f"已回复评论 {reply_id}",
+                                scene="reply_comment",
+                                metadata={"reply_id": reply_id, "oid": str(oid)},
+                            )
+                        except Exception:
+                            # The platform action already happened. Pause subsequent
+                            # actions and leave the durable intent as evidence.
+                            logger.error(
+                                "published comment result could not be archived: reply_id=%s",
+                                reply_id,
                             )
 
                         # PRD V4 REP-006：好感度仅在发布成功后应用
@@ -798,6 +1432,26 @@ class Scheduler:
                             reason="bili.post_comment returned False",
                             error_code="PUBLISH_FAILED",
                         )
+                        try:
+                            await self._archive_bot_action(
+                                action_key=f"comment_reply:{comment_type}:{reply_id}",
+                                action_type="reply_comment",
+                                text=reply_text,
+                                published=False,
+                                status="failed",
+                                title=f"回复评论 {reply_id}",
+                                scene="reply_comment",
+                                metadata={
+                                    "reply_id": reply_id,
+                                    "oid": str(oid),
+                                    "reason_code": "PUBLISH_FAILED",
+                                },
+                            )
+                        except Exception:
+                            logger.error(
+                                "failed comment result could not be archived: reply_id=%s",
+                                reply_id,
+                            )
 
                     await asyncio.sleep(2)
 
@@ -806,6 +1460,159 @@ class Scheduler:
 
         except Exception as e:
             logger.error(f"检查评论失败: {e}")
+
+    async def _collect_own_dynamic_comment_items(self, config: Dict[str, Any], limit: int = 10) -> List[Dict[str, Any]]:
+        """补扫 Bot 自己动态下的评论，并转换成通知中心 item 形状。
+
+        B站通知中心有时不会把“别人评论了我的动态”稳定返回到
+        /x/msgfeed/reply，尤其是新动态接口发布的内容。这里只拉取最近几条
+        自己动态的评论区，后续仍复用 _check_new_comments 的归档、过滤、
+        生成、安全和发布流程。
+        """
+        if not self.bili or not hasattr(self.bili, "get_user_dynamics"):
+            return []
+        if not hasattr(self.bili, "get_replies"):
+            return []
+
+        reply_cfg = config.get("reply", {}) if isinstance(config, dict) else {}
+        if reply_cfg.get("poll_own_dynamics", True) is False:
+            return []
+
+        bot_uid = self._bot_uid
+        if not bot_uid:
+            try:
+                bot_uid = getattr(self.bili.config.bilibili, "dede_user_id", 0)
+            except Exception:
+                bot_uid = 0
+        try:
+            bot_uid_int = int(bot_uid or 0)
+        except Exception:
+            bot_uid_int = 0
+        if bot_uid_int <= 0:
+            return []
+
+        dynamics_limit = int(reply_cfg.get("own_dynamic_poll_limit", 5) or 5)
+        replies_ps = int(reply_cfg.get("own_dynamic_reply_ps", 20) or 20)
+        dynamics_data = await self.bili.get_user_dynamics(bot_uid_int, limit=dynamics_limit)
+        if not dynamics_data or dynamics_data.get("code") != 0:
+            return []
+
+        cards = (dynamics_data.get("data") or {}).get("items") or []
+        if not cards and (dynamics_data.get("data") or {}).get("cards"):
+            cards = (dynamics_data.get("data") or {}).get("cards") or []
+
+        found: List[Dict[str, Any]] = []
+        for card in cards[:dynamics_limit]:
+            oid, comment_type = self._extract_dynamic_comment_target(card)
+            if not oid:
+                continue
+            replies_data = await self.bili.get_replies(
+                oid=int(oid),
+                comment_type=int(comment_type or 17),
+                pn=1,
+                ps=replies_ps,
+                sort=0,
+            )
+            if not replies_data or replies_data.get("code") != 0:
+                continue
+            replies = (replies_data.get("data") or {}).get("replies") or []
+            target_context = self._dynamic_card_context(card)
+            for reply in replies:
+                found.extend(
+                    self._reply_to_notification_items(
+                        reply,
+                        oid,
+                        int(comment_type or 17),
+                        root_id=0,
+                        target_context=target_context,
+                    )
+                )
+                if len(found) >= limit:
+                    return found[:limit]
+        return found[:limit]
+
+    def _extract_dynamic_comment_target(self, card: Dict[str, Any]) -> Tuple[int, int]:
+        """Return (comment_oid, comment_type) for a dynamic feed card."""
+        basic = card.get("basic") or {}
+        oid = (
+            basic.get("comment_id_str")
+            or basic.get("comment_id")
+            or basic.get("rid_str")
+            or basic.get("rid")
+        )
+        comment_type = basic.get("comment_type") or 17
+        if oid:
+            try:
+                return int(oid), int(comment_type or 17)
+            except Exception:
+                return 0, 17
+
+        desc = card.get("desc") or {}
+        oid = (
+            desc.get("dynamic_id")
+            or desc.get("dynamic_id_str")
+            or desc.get("rid")
+            or desc.get("rid_str")
+        )
+        comment_type = desc.get("type") or 17
+        if oid:
+            try:
+                return int(oid), int(comment_type or 17)
+            except Exception:
+                return 0, 17
+        return 0, 17
+
+    def _reply_to_notification_items(
+        self,
+        reply: Dict[str, Any],
+        oid: int,
+        comment_type: int,
+        *,
+        root_id: int = 0,
+        target_context: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Convert a B站 reply object and its floor replies to notification-like items."""
+        items: List[Dict[str, Any]] = []
+
+        def _one(reply_obj: Dict[str, Any], root: int) -> Optional[Dict[str, Any]]:
+            rpid = reply_obj.get("rpid") or reply_obj.get("rpid_str") or reply_obj.get("id") or 0
+            try:
+                rpid_int = int(rpid)
+            except Exception:
+                rpid_int = 0
+            if not rpid_int:
+                return None
+            content = (reply_obj.get("content") or {}).get("message") or ""
+            if not content:
+                return None
+            member = reply_obj.get("member") or {}
+            mid = str(member.get("mid") or "")
+            uname = member.get("uname") or member.get("name") or "未知用户"
+            if self._is_bot_speaker(mid, uname, content):
+                return None
+            return {
+                "id": str(rpid_int),
+                "user": {"mid": mid, "nickname": uname},
+                "item": {
+                    "subject_id": int(oid),
+                    "business_id": int(comment_type),
+                    "root_id": int(root or 0),
+                    "source_id": int(rpid_int),
+                    "source_content": content,
+                    "target_context": dict(target_context or {}),
+                },
+                "source": "own_dynamic_poll",
+            }
+
+        top = _one(reply, root_id)
+        if top:
+            items.append(top)
+        top_rpid = int((reply.get("rpid") or reply.get("rpid_str") or 0) or 0)
+        for child in reply.get("replies") or []:
+            child_item = _one(child, top_rpid)
+            if child_item:
+                items.append(child_item)
+        return items
 
     def _save_replied_state(self):
         """PRD V4 REP-001：状态机自动持久化（SQLite），此方法保留为空操作兼容旧调用"""
@@ -819,6 +1626,8 @@ class Scheduler:
                 if isinstance(data, list) and data:
                     self.reply_state_store.migrate_from_replied_json(data)
                     logger.info(f"已从 replied.json 迁移 {len(data)} 条旧回复记录")
+                    # 迁移成功后清空文件，避免每次启动重复迁移
+                    self.ds.save_json("replied.json", [])
         except Exception as e:
             logger.warning(f"加载回复状态失败: {e}")
 
@@ -891,7 +1700,11 @@ class Scheduler:
                                 replies_data = await self.bili.get_comment_replies(
                                     oid=oid, root=comment_root, comment_type=ct, ps=30,
                                 )
-                                existing = replies_data and replies_data.get("replies") or []
+                                existing = (
+                                    replies_data.get("data", {}).get("replies", [])
+                                    if replies_data and replies_data.get("code") == 0
+                                    else []
+                                )
                                 already_replied = any(
                                     str(r.get("member", {}).get("mid", "")) == self._bot_uid
                                     for r in existing
@@ -899,17 +1712,98 @@ class Scheduler:
                                 if already_replied:
                                     logger.info(f"幂等检查：rpid={rpid} 已有 Bot 回复，跳过重试")
                                     self.reply_state_store.mark_published(ct, rpid)
+                                    await self._archive_bot_action(
+                                        action_key=f"comment_reply:{ct}:{rpid}",
+                                        action_type="reply_comment",
+                                        text=reply_text,
+                                        published=True,
+                                        title=f"已回复评论 {rpid}",
+                                        scene="reply_comment",
+                                        metadata={
+                                            "reply_id": rpid,
+                                            "oid": str(oid),
+                                            "confirmed_by": "thread_lookup",
+                                        },
+                                    )
                                     continue
                             except Exception as e:
                                 logger.warning(f"幂等检查失败，继续重试: {e}")
+                        # Task 9：重试路径也需频率检查和预占配额（与主路径一致）
+                        if self.safety_checker is not None:
+                            if not self.safety_checker.check_rate_limit(
+                                scene="reply_comment", account_id=self.account_id
+                            ):
+                                logger.warning("重试路径评论发布频率限制触发，deferred")
+                                self.reply_state_store.mark_deferred(
+                                    ct, rpid,
+                                    reason="rate_limited", error_code="RATE_LIMIT",
+                                )
+                                continue
+                            # PRD 4.4：预占频率配额（失败也计数）
+                            self.safety_checker.record_publish(
+                                scene="reply_comment", account_id=self.account_id
+                            )
                         # 直接使用原始文本重新发布（不调用 generate_reply）
-                        success = await self.bili.post_comment(
-                            oid=oid, content=reply_text, comment_type=ct,
-                            rpid=comment_root, parent=source_id,
+                        await self._archive_bot_action(
+                            action_key=(
+                                f"comment_reply:{ct}:{rpid}:"
+                                f"retry_intent:{int(item_state.get('attempts') or 0) + 1}"
+                            ),
+                            action_type="reply_comment",
+                            text=reply_text,
+                            published=False,
+                            title=f"回复评论 {rpid}",
+                            scene="reply_comment",
+                            metadata={"reply_id": rpid, "oid": str(oid)},
                         )
+                        try:
+                            success = await self.bili.post_comment(
+                                oid=oid, content=reply_text, comment_type=ct,
+                                rpid=comment_root, parent=source_id,
+                            )
+                        except Exception as post_err:
+                            logger.error(f"重试发表评论异常 rpid={rpid}: {post_err}")
+                            self.reply_state_store.mark_deferred(
+                                ct, rpid,
+                                reason=f"post_exception: {post_err}",
+                                error_code="POST_EXCEPTION",
+                            )
+                            try:
+                                await self._archive_bot_action(
+                                    action_key=(
+                                        f"comment_reply:{ct}:{rpid}:"
+                                        f"retry:{int(item_state.get('attempts') or 0) + 1}"
+                                    ),
+                                    action_type="reply_comment",
+                                    text=reply_text,
+                                    published=False,
+                                    status="failed",
+                                    title=f"回复评论 {rpid}",
+                                    scene="reply_comment",
+                                    metadata={
+                                        "reply_id": rpid,
+                                        "oid": str(oid),
+                                        "reason_code": "POST_EXCEPTION",
+                                    },
+                                )
+                            except Exception:
+                                logger.error(
+                                    "failed retried comment result could not be archived: rpid=%s",
+                                    rpid,
+                                )
+                            continue
                         if success:
                             # PRD-V5 §6.2：发布成功保留同一 generation_hash
                             self.reply_state_store.mark_published(ct, rpid)
+                            await self._archive_bot_action(
+                                action_key=f"comment_reply:{ct}:{rpid}",
+                                action_type="reply_comment",
+                                text=reply_text,
+                                published=True,
+                                title=f"已回复评论 {rpid}",
+                                scene="reply_comment",
+                                metadata={"reply_id": rpid, "oid": str(oid)},
+                            )
                             logger.info(f"重试发布成功: rpid={rpid}")
                         else:
                             # 再次失败 → retry_wait（attempts 自动递增，超限转 failed）
@@ -917,11 +1811,299 @@ class Scheduler:
                             self.reply_state_store.mark_retry_wait(
                                 ct, rpid, reason="retry_publish_failed", error_code="RETRY_PUBLISH_FAILED",
                             )
+                            try:
+                                await self._archive_bot_action(
+                                    action_key=(
+                                        f"comment_reply:{ct}:{rpid}:"
+                                        f"retry:{int(item_state.get('attempts') or 0) + 1}"
+                                    ),
+                                    action_type="reply_comment",
+                                    text=reply_text,
+                                    published=False,
+                                    status="failed",
+                                    title=f"回复评论 {rpid}",
+                                    scene="reply_comment",
+                                    metadata={
+                                        "reply_id": rpid,
+                                        "oid": str(oid),
+                                        "reason_code": "RETRY_PUBLISH_FAILED",
+                                    },
+                                )
+                            except Exception:
+                                logger.error(
+                                    "failed retried comment result could not be archived: rpid=%s",
+                                    rpid,
+                                )
                             logger.warning(f"重试发布失败: rpid={rpid}")
                     elif state == "deferred":
-                        # 重新走完整流程：标记为 discovered 让下次 _check_new_comments 拾取
-                        self.reply_state_store.upsert(ct, rpid, "discovered")
-                        logger.info(f"deferred 评论恢复为 discovered: rpid={rpid}")
+                        # BUG A-002：不再转 discovered（is_processed 会去重导致死状态），
+                        # 而是在重试流程内直接走完整重生成→发帖/继续defer流程
+                        logger.info(f"deferred 评论重试生成: rpid={rpid}")
+
+                        # 获取评论上下文（楼中楼对话历史）
+                        comment_context = ""
+                        reply_replies = []
+                        context_root = root_id if root_id else source_id
+                        if root_id or source_id:
+                            try:
+                                replies_data = await self.bili.get_comment_replies(
+                                    oid=oid, root=context_root, comment_type=ct, ps=30,
+                                )
+                                if replies_data and replies_data.get("code") == 0:
+                                    reply_replies = replies_data.get("data", {}).get("replies", [])
+                            except Exception as ctx_err:
+                                logger.warning(f"deferred 重试获取上下文失败: {ctx_err}")
+                        if reply_replies:
+                            try:
+                                context_lines = await self._archive_comment_thread_context(
+                                    reply_replies,
+                                    oid=oid,
+                                    comment_type=ct,
+                                    thread_key=context_root,
+                                )
+                            except Exception:
+                                self.reply_state_store.mark_deferred(
+                                    ct,
+                                    rpid,
+                                    reason="comment_context_archive_failed",
+                                    error_code="MEMORY_ARCHIVE_FAILED",
+                                )
+                                continue
+                            comment_context = "\n".join(context_lines)
+
+                        # 构建 ReplyContext（用于 LLM 生成）
+                        reply_context = None
+                        if self.comment_context_service is not None:
+                            try:
+                                reply_context = await self.comment_context_service.build_context(
+                                    notification=notif,
+                                    current_user_id=user_id,
+                                    persona_id=self._get_current_persona_id(),
+                                    recent_turns=self._bounded_recent_turns(
+                                        comment_context.splitlines()
+                                    ),
+                                )
+                            except Exception as e:
+                                from bilibot.services.comment_context import ContextArchiveError
+
+                                if isinstance(e, ContextArchiveError):
+                                    self._pause_for_memory_failure()
+                                    self.reply_state_store.mark_deferred(
+                                        ct,
+                                        rpid,
+                                        reason="video_context_archive_failed",
+                                        error_code="MEMORY_ARCHIVE_FAILED",
+                                    )
+                                    continue
+                                logger.warning(f"deferred 重试构建上下文失败，降级: {e}")
+
+                        # BUG A-001 配套：直接调用 _generate_reply_impl 获取 GenerationOutcome
+                        try:
+                            outcome = await self.reply_gen._generate_reply_impl(
+                                user_id=user_id,
+                                username=username,
+                                comment=comment_text,
+                                thread_id=str(rpid),
+                                oid=oid,
+                                comment_type=ct,
+                                reply_context=reply_context,
+                                comment_context=comment_context,
+                            )
+                        except Exception as gen_err:
+                            logger.error(f"deferred 重试生成异常: {gen_err}")
+                            self.reply_state_store.mark_deferred(
+                                ct, rpid,
+                                reason=f"retry_gen_exception: {gen_err}",
+                                error_code="RETRY_GEN_EXCEPTION",
+                            )
+                            continue
+
+                        if outcome.is_skip:
+                            # LLM 明确不回复 → ignored
+                            self.reply_state_store.mark_ignored(
+                                ct, rpid, rule="llm_no_reply_retry",
+                            )
+                            continue
+
+                        if not outcome.is_generated:
+                            # retryable/permanent → 继续 defer
+                            self.reply_state_store.mark_deferred(
+                                ct, rpid,
+                                reason=f"retry_gen_{outcome.status}: {outcome.error_code}",
+                                error_code=outcome.error_code or "RETRY_GEN_FAILED",
+                            )
+                            continue
+
+                        reply_text = outcome.text
+                        audit_id = outcome.audit_id
+                        context_meta = outcome.context_meta or {}
+
+                        try:
+                            await self._archive_bot_action(
+                                action_key=(
+                                    f"comment_reply:{ct}:{rpid}:"
+                                    f"generation:{int(item_state.get('attempts') or 0) + 1}"
+                                ),
+                                action_type="reply_comment",
+                                text=reply_text,
+                                published=False,
+                                title=f"回复评论 {rpid}",
+                                scene="reply_comment",
+                                metadata={"reply_id": rpid, "oid": str(oid)},
+                            )
+                        except Exception:
+                            self.reply_state_store.mark_deferred(
+                                ct,
+                                rpid,
+                                reason="memory_intent_archive_failed",
+                                error_code="MEMORY_ARCHIVE_FAILED",
+                            )
+                            continue
+
+                        # 持久化生成结果
+                        self.reply_state_store.save_generation_result(
+                            ct, rpid,
+                            text=reply_text,
+                            persona_id=context_meta.get("persona_id", "") or self._get_current_persona_id() or "",
+                            audit_id=audit_id,
+                        )
+
+                        # 安全检查
+                        if self.safety_checker is not None:
+                            try:
+                                passed, reason = await self.safety_checker.check_content(
+                                    reply_text, scene="reply_comment",
+                                    persona_id=self._get_current_persona_id(),
+                                    account_id=self.account_id,
+                                )
+                                if not passed:
+                                    if audit_id and self.audit_store:
+                                        try:
+                                            self.audit_store.mark_published(
+                                                audit_id, published=False,
+                                                target={"kind": "reply_comment", "rpid": str(rpid)},
+                                                failure_reason=f"safety_check: {reason}",
+                                            )
+                                        except Exception:
+                                            pass
+                                    self.reply_state_store.mark_rejected(
+                                        ct, rpid, reason=f"safety_check: {reason}",
+                                    )
+                                    continue
+                                if not self.safety_checker.check_rate_limit(
+                                    scene="reply_comment", account_id=self.account_id
+                                ):
+                                    self.reply_state_store.mark_deferred(
+                                        ct, rpid,
+                                        reason="rate_limited_retry", error_code="RATE_LIMIT",
+                                    )
+                                    continue
+                                self.safety_checker.record_publish(
+                                    scene="reply_comment", account_id=self.account_id
+                                )
+                            except Exception as safety_err:
+                                self.reply_state_store.mark_deferred(
+                                    ct, rpid,
+                                    reason=f"safety_exception: {safety_err}",
+                                    error_code="SAFETY_ERROR",
+                                )
+                                continue
+
+                        # 发布回复
+                        comment_root = root_id if root_id else source_id
+                        try:
+                            success = await self.bili.post_comment(
+                                oid=oid, content=reply_text, comment_type=ct,
+                                rpid=comment_root, parent=source_id,
+                            )
+                        except Exception as post_err:
+                            self.reply_state_store.mark_retry_wait(
+                                ct,
+                                rpid,
+                                reason=f"deferred_retry_post_exception: {type(post_err).__name__}",
+                                error_code="POST_EXCEPTION",
+                            )
+                            try:
+                                await self._archive_bot_action(
+                                    action_key=(
+                                        f"comment_reply:{ct}:{rpid}:"
+                                        f"retry:{int(item_state.get('attempts') or 0) + 1}"
+                                    ),
+                                    action_type="reply_comment",
+                                    text=reply_text,
+                                    published=False,
+                                    status="failed",
+                                    title=f"回复评论 {rpid}",
+                                    scene="reply_comment",
+                                    metadata={
+                                        "reply_id": rpid,
+                                        "oid": str(oid),
+                                        "reason_code": "POST_EXCEPTION",
+                                    },
+                                )
+                            except Exception:
+                                logger.error(
+                                    "failed deferred comment result could not be archived: rpid=%s",
+                                    rpid,
+                                )
+                            continue
+                        if success:
+                            self.reply_state_store.mark_published(ct, rpid)
+                            await self._archive_bot_action(
+                                action_key=f"comment_reply:{ct}:{rpid}",
+                                action_type="reply_comment",
+                                text=reply_text,
+                                published=True,
+                                title=f"已回复评论 {rpid}",
+                                scene="reply_comment",
+                                metadata={"reply_id": rpid, "oid": str(oid)},
+                            )
+                            if self.safety_checker is not None:
+                                try:
+                                    self.safety_checker.record_content(
+                                        reply_text, account_id=self.account_id
+                                    )
+                                except Exception:
+                                    pass
+                            if audit_id and self.audit_store:
+                                try:
+                                    self.audit_store.mark_published(
+                                        audit_id, published=True,
+                                        target={"kind": "reply_comment", "rpid": str(rpid)},
+                                    )
+                                except Exception:
+                                    pass
+                            logger.info(f"deferred 重试成功: rpid={rpid}")
+                        else:
+                            self.reply_state_store.mark_retry_wait(
+                                ct, rpid,
+                                reason="deferred_retry_publish_failed",
+                                error_code="RETRY_PUBLISH_FAILED",
+                            )
+                            try:
+                                await self._archive_bot_action(
+                                    action_key=(
+                                        f"comment_reply:{ct}:{rpid}:"
+                                        f"retry:{int(item_state.get('attempts') or 0) + 1}"
+                                    ),
+                                    action_type="reply_comment",
+                                    text=reply_text,
+                                    published=False,
+                                    status="failed",
+                                    title=f"回复评论 {rpid}",
+                                    scene="reply_comment",
+                                    metadata={
+                                        "reply_id": rpid,
+                                        "oid": str(oid),
+                                        "reason_code": "RETRY_PUBLISH_FAILED",
+                                    },
+                                )
+                            except Exception:
+                                logger.error(
+                                    "failed deferred comment result could not be archived: rpid=%s",
+                                    rpid,
+                                )
+                            logger.warning(f"deferred 重试发布失败: rpid={rpid}")
                 except Exception as e:
                     logger.error(f"重试评论 {rpid} 失败: {e}")
         except Exception as e:
@@ -941,6 +2123,48 @@ class Scheduler:
             return int(scene_cfg.get("max_attempts", DEFAULT_MAX_ATTEMPTS))
         except Exception:
             return DEFAULT_MAX_ATTEMPTS
+
+    # Task 26：禁用短语默认表（覆盖"看完"类与真实 watch_state 冲突的表达）
+    _DEFAULT_FORBIDDEN_PHRASES: List[str] = [
+        "我完整看完了", "我看完了", "完整看完", "我看过了",
+        "我看过整个视频", "从头看到尾", "全部看完", "整部看完", "一秒不差地看完",
+    ]
+    # Task 26：默认正则变体（覆盖"完整.*看完"、"看完了?"等中间插字/可选字变体）
+    _DEFAULT_FORBIDDEN_PATTERNS: List[str] = [
+        r"完整.{0,4}看完",
+        r"全部.{0,4}看完",
+        r"从头.{0,6}看到尾",
+        r"看完了?",
+        r"一秒不差.{0,4}看完",
+    ]
+
+    def _get_forbidden_phrases(self) -> Tuple[List[str], List["re.Pattern"]]:
+        """读取禁用短语配置（Task 26）
+
+        从 config 的 proactive 段读取：
+        - forbidden_phrases：大小写不敏感子串匹配列表
+        - forbidden_phrase_patterns：正则模式字符串列表（IGNORECASE 编译）
+
+        未配置时回退到 _DEFAULT_FORBIDDEN_PHRASES / _DEFAULT_FORBIDDEN_PATTERNS。
+
+        Returns:
+            (phrases, compiled_patterns)
+        """
+        try:
+            prov = self.config_loader.get_raw_config().get("proactive", {}) or {}
+            phrases = prov.get("forbidden_phrases", self._DEFAULT_FORBIDDEN_PHRASES)
+            pattern_strs = prov.get(
+                "forbidden_phrase_patterns", self._DEFAULT_FORBIDDEN_PATTERNS
+            )
+        except Exception:
+            phrases = self._DEFAULT_FORBIDDEN_PHRASES
+            pattern_strs = self._DEFAULT_FORBIDDEN_PATTERNS
+        try:
+            patterns = [re.compile(p, re.IGNORECASE) for p in pattern_strs]
+        except Exception as e:
+            logger.warning(f"编译 forbidden_phrase_patterns 失败，回退默认: {e}")
+            patterns = [re.compile(p, re.IGNORECASE) for p in self._DEFAULT_FORBIDDEN_PATTERNS]
+        return phrases, patterns
 
     async def _do_proactive_comment_publish(
         self,
@@ -1013,13 +2237,21 @@ class Scheduler:
                 comment_text = ""
 
         # PRD V4 COM-003：禁止生成"我完整看完了"等与真实 watch_state 冲突的表达
+        # Task 26 增强：可配置短语表 + 大小写不敏感 + 正则变体覆盖（如"完整.*看完"、"看完了?"）
         if comment_text:
-            forbidden_phrases = ["我完整看完了", "我看完了", "完整看完"]
-            for phrase in forbidden_phrases:
-                if phrase in comment_text:
-                    logger.warning(f"评论包含与 watch_state 冲突的表达 '{phrase}'，拒绝发布")
-                    comment_text = ""
-                    break
+            forbidden_phrases, forbidden_patterns = self._get_forbidden_phrases()
+            comment_lower = comment_text.lower()
+            hit = next(
+                (p for p in forbidden_phrases if p.lower() in comment_lower), None
+            )
+            if hit is None:
+                hit_pat = next(
+                    (p for p in forbidden_patterns if p.search(comment_text)), None
+                )
+                hit = hit_pat.pattern if hit_pat is not None else None
+            if hit:
+                logger.warning(f"评论包含与 watch_state 冲突的表达 '{hit}'，拒绝发布")
+                comment_text = ""
 
         if not comment_text:
             self.proactive_comment_store.mark_failed(
@@ -1029,6 +2261,7 @@ class Scheduler:
 
         # 保存生成结果（便于 retry 时复用）
         self.proactive_comment_store.save_generation(action_id, comment_text)
+        # PRD V6：不单独记录 intent，仅在最终结果时归档，避免同一行为两条记忆。
 
         # 3. PRD V4 COM-002：CommentPolicy 检查（去重 + 预算 + content_hash）
         allowed, policy_reason, policy_meta = await self.comment_policy.check_async(
@@ -1039,6 +2272,20 @@ class Scheduler:
             logger.warning(f"主动评论策略拒绝: {policy_reason}")
             self.proactive_comment_store.mark_failed(
                 action_id, "POLICY_REJECTED", policy_reason,
+            )
+            await self._archive_bot_action(
+                action_key=f"proactive_comment:{action_id}",
+                action_type="proactive_comment",
+                text=comment_text,
+                published=False,
+                status="rejected",
+                title=title,
+                scene="proactive_video",
+                metadata={
+                    "bvid": bvid,
+                    "oid": str(oid),
+                    "reason_code": "POLICY_REJECTED",
+                },
             )
             return ""
 
@@ -1055,19 +2302,32 @@ class Scheduler:
                     self.proactive_comment_store.mark_failed(
                         action_id, "SAFETY_REJECTED", reason,
                     )
+                    await self._archive_bot_action(
+                        action_key=f"proactive_comment:{action_id}",
+                        action_type="proactive_comment",
+                        text=comment_text,
+                        published=False,
+                        status="rejected",
+                        title=title,
+                        scene="proactive_video",
+                        metadata={
+                            "bvid": bvid,
+                            "oid": str(oid),
+                            "reason_code": "SAFETY_REJECTED",
+                        },
+                    )
                     return ""
-                if not self.safety_checker.check_rate_limit(
+                # Task 21.1：改用 check_and_record_rate_limit 原子方法（避免竞态条件）
+                # Task 21.2：原子方法为预扣减设计，post_comment 失败时需退回配额
+                rate_passed, rate_reason = self.safety_checker.check_and_record_rate_limit(
                     scene="proactive_comment", account_id=self.account_id,
-                ):
-                    logger.warning("主动评论频率限制触发，跳过")
+                )
+                if not rate_passed:
+                    logger.warning(f"主动评论频率限制触发，跳过: {rate_reason}")
                     self.proactive_comment_store.mark_failed(
                         action_id, "RATE_LIMITED", "proactive_comment rate limited",
                     )
                     return ""
-                # PRD 4.4：预占频率配额
-                self.safety_checker.record_publish(
-                    scene="proactive_comment", account_id=self.account_id,
-                )
             except Exception as e:
                 # PRD V4 DYN-003 / §4.2：fail-closed
                 logger.error(f"主动评论安全检查异常（拒绝发布）: {e}", exc_info=True)
@@ -1085,7 +2345,7 @@ class Scheduler:
         audit_id = None
         if self.audit_store is not None:
             try:
-                audit_id = self.audit_store.record(
+                audit_id = await self.audit_store.record_async(
                     scene="proactive_comment",
                     persona_id=persona_id_for_policy or "default",
                     prompt_preview=f"视频: {title} | UP: {owner}",
@@ -1110,6 +2370,26 @@ class Scheduler:
             self.proactive_comment_store.mark_result_unknown(
                 action_id, "PUBLISH_EXCEPTION", str(e),
             )
+            try:
+                await self._archive_bot_action(
+                    action_key=f"proactive_comment:{action_id}",
+                    action_type="proactive_comment",
+                    text=comment_text,
+                    published=False,
+                    status="result_unknown",
+                    title=title,
+                    scene="proactive_video",
+                    metadata={
+                        "bvid": bvid,
+                        "oid": str(oid),
+                        "reason_code": "PUBLISH_EXCEPTION",
+                    },
+                )
+            except Exception:
+                logger.error(
+                    "unknown proactive comment result could not be archived: action=%s",
+                    action_id,
+                )
             # 兼容旧逻辑：仍记录 CommentPolicy / InteractionPolicy
             try:
                 await self.comment_policy.record_async(
@@ -1137,7 +2417,11 @@ class Scheduler:
 
         if success:
             # COM-603：先 mark_published，成功后再记录 policy（避免 mark_published 失败时 policy 已记录）
-            self.proactive_comment_store.mark_published(action_id)
+            # Task 4：检查 mark_published 返回值，失败时告警（可能需人工介入）
+            if not self.proactive_comment_store.mark_published(action_id):
+                logger.warning(
+                    f"Task 4: 主动评论 mark_published 失败 action={action_id}（状态可能已变更）"
+                )
             logger.info(f"主动评论发表: {comment_text[:30]}")
             # 记录 CommentPolicy / InteractionPolicy
             try:
@@ -1163,6 +2447,21 @@ class Scheduler:
                     self.audit_store.mark_published(audit_id, published=True)
                 except Exception:
                     pass
+            try:
+                await self._archive_bot_action(
+                    action_key=f"proactive_comment:{action_id}",
+                    action_type="proactive_comment",
+                    text=comment_text,
+                    published=True,
+                    title=title,
+                    scene="proactive_video",
+                    metadata={"bvid": bvid, "oid": str(oid)},
+                )
+            except Exception:
+                logger.error(
+                    "published proactive comment result could not be archived: action=%s",
+                    action_id,
+                )
             return comment_text
         else:
             # 9. API 返回 False → retry_wait（达 max_attempts 自动转 failed）
@@ -1187,6 +2486,34 @@ class Scheduler:
                 action_id, "BILI_API_FALSE",
                 f"bili.post_comment 返回 False (code={getattr(self.bili, 'last_api_code', None)})",
             )
+            try:
+                await self._archive_bot_action(
+                    action_key=f"proactive_comment:{action_id}",
+                    action_type="proactive_comment",
+                    text=comment_text,
+                    published=False,
+                    status="failed",
+                    title=title,
+                    scene="proactive_video",
+                    metadata={
+                        "bvid": bvid,
+                        "oid": str(oid),
+                        "reason_code": "BILI_API_FALSE",
+                    },
+                )
+            except Exception:
+                logger.error(
+                    "failed proactive comment result could not be archived: action=%s",
+                    action_id,
+                )
+            # Task 21.2：发布失败退回预占的频率配额（原子方法预扣减，失败时退回）
+            if self.safety_checker is not None:
+                try:
+                    self.safety_checker.refund_publish(
+                        scene="proactive_comment", account_id=self.account_id,
+                    )
+                except Exception:
+                    pass
             if audit_id:
                 try:
                     self.audit_store.mark_published(
@@ -1296,7 +2623,7 @@ class Scheduler:
                     audit_id = None
                     if self.audit_store is not None:
                         try:
-                            audit_id = self.audit_store.record(
+                            audit_id = await self.audit_store.record_async(
                                 scene="proactive_comment",
                                 persona_id=action.persona_id or "default",
                                 prompt_preview=f"retry bvid={action.bvid}",
@@ -1314,9 +2641,35 @@ class Scheduler:
                     self.proactive_comment_store.mark_result_unknown(
                         action.action_id, "RETRY_PUBLISH_EXCEPTION", str(e),
                     )
+                    try:
+                        await self._archive_bot_action(
+                            action_key=(
+                                f"proactive_comment:{action.action_id}:"
+                                f"retry:{action.attempt + 1}"
+                            ),
+                            action_type="proactive_comment",
+                            text=reply_text,
+                            published=False,
+                            status="result_unknown",
+                            title=action.bvid,
+                            scene="proactive_video",
+                            metadata={
+                                "bvid": action.bvid,
+                                "reason_code": "RETRY_PUBLISH_EXCEPTION",
+                            },
+                        )
+                    except Exception:
+                        logger.error(
+                            "unknown retried proactive comment result could not be archived: action=%s",
+                            action.action_id,
+                        )
                     continue
                 if success:
-                    self.proactive_comment_store.mark_published(action.action_id)
+                    # Task 4：检查 mark_published 返回值，失败时告警
+                    if not self.proactive_comment_store.mark_published(action.action_id):
+                        logger.warning(
+                            f"Task 4: 重试主动评论 mark_published 失败 action={action.action_id}（状态可能已变更）"
+                        )
                     logger.info(f"主动评论重试成功 action={action.action_id}")
                     # COM-602：记录 policy / interaction / audit（与首次发布一致）
                     try:
@@ -1336,14 +2689,96 @@ class Scheduler:
                             self.audit_store.mark_published(audit_id, published=True)
                         except Exception:
                             pass
+                    try:
+                        await self._archive_bot_action(
+                            action_key=f"proactive_comment:{action.action_id}",
+                            action_type="proactive_comment",
+                            text=reply_text,
+                            published=True,
+                            title=action.bvid,
+                            scene="proactive_video",
+                            metadata={"bvid": action.bvid, "oid": str(oid)},
+                        )
+                    except Exception:
+                        logger.error(
+                            "retried proactive comment result could not be archived: action=%s",
+                            action.action_id,
+                        )
                 else:
                     self.proactive_comment_store.mark_retry_wait(
                         action.action_id, "RETRY_PUBLISH_FAILED",
                         "重试发布失败：bili.post_comment 返回 False",
                     )
+                    try:
+                        await self._archive_bot_action(
+                            action_key=(
+                                f"proactive_comment:{action.action_id}:"
+                                f"retry:{action.attempt + 1}"
+                            ),
+                            action_type="proactive_comment",
+                            text=reply_text,
+                            published=False,
+                            status="failed",
+                            title=action.bvid,
+                            scene="proactive_video",
+                            metadata={
+                                "bvid": action.bvid,
+                                "oid": str(oid),
+                                "reason_code": "RETRY_PUBLISH_FAILED",
+                            },
+                        )
+                    except Exception:
+                        logger.error(
+                            "failed retried proactive comment result could not be archived: action=%s",
+                            action.action_id,
+                        )
                     logger.warning(f"主动评论重试失败 action={action.action_id}")
         except Exception as e:
             logger.error(f"处理重试主动评论失败: {e}", exc_info=True)
+
+    async def _process_retryable_tasks(self):
+        """Task 5：处理 retry_wait 状态的 TaskRun（到期自动重试）
+
+        - 拉取 task_store.list_retryable() 中到期的 retry_wait 任务
+        - 对每个任务 retry() → claim() → 分发到对应的 _do_xxx 方法
+          （start() 由 _do_xxx 方法内部完成，与手动/定时路径一致）
+        - 不支持自动重试的场景标记失败
+        """
+        try:
+            retryable = self.task_store.list_retryable()
+            if not retryable:
+                return
+            logger.info(f"Task 5: 发现 {len(retryable)} 个到期可重试 TaskRun")
+            for task in retryable:
+                # retry_wait → scheduled（not_before=now, trigger_type=retry）
+                if not self.task_store.retry(task.task_id):
+                    logger.warning(f"Task 5: TaskRun {task.task_id} retry 失败")
+                    continue
+                # scheduled → claimed
+                if not self.task_store.claim(task.task_id):
+                    logger.warning(f"Task 5: TaskRun {task.task_id} claim 失败")
+                    continue
+                scene = task.scene
+                if scene == "proactive_video":
+                    self._spawn_memory_task(
+                        self._do_proactive_video(task_id=task.task_id),
+                        tag=f"retry_proactive_video:{task.task_id}",
+                    )
+                elif scene == "dynamic":
+                    self._spawn_memory_task(
+                        self._do_post_dynamic(task_id=task.task_id),
+                        tag=f"retry_dynamic:{task.task_id}",
+                    )
+                else:
+                    logger.warning(
+                        f"Task 5: TaskRun {task.task_id} 场景 {scene} 不支持自动重试，标记失败"
+                    )
+                    self._fail_task(
+                        task.task_id, "UNSUPPORTED_RETRY_SCENE",
+                        f"场景 {scene} 不支持自动重试", retryable=False,
+                    )
+        except Exception as e:
+            logger.error(f"Task 5: 处理可重试 TaskRun 失败: {e}", exc_info=True)
 
     async def _resolve_oid_from_bvid(self, bvid: str) -> Optional[int]:
         """通过 bvid 反查视频 oid（用于主动评论重试）"""
@@ -1385,6 +2820,8 @@ class Scheduler:
         """检查新私信并自动回复"""
         if not self.reply_gen or not self.bili:
             return
+        if not self._authenticated_poll_allowed():
+            return
 
         # 全局暂停或账号风险暂停
         if self.safety_checker is not None and (
@@ -1412,7 +2849,13 @@ class Scheduler:
                 return
 
             my_uid = int(config.get("bilibili", {}).get("dede_user_id", 0) or 0)
-            logger.info(f"检查私信: {len(session_list)} 个会话, my_uid={my_uid}")
+            # PRD V6：会话数变化时才打 INFO，否则降级 DEBUG
+            _sess_count = len(session_list)
+            if _sess_count != self._last_dm_session_count:
+                logger.info("检查私信: %d 个会话", _sess_count)
+                self._last_dm_session_count = _sess_count
+            else:
+                logger.debug("检查私信: %d 个会话（无变化）", _sess_count)
 
             for session in session_list:
                 try:
@@ -1436,6 +2879,14 @@ class Scheduler:
 
                     # 从 last_msg 直接取消息内容（避免额外 API 调用）
                     last_msg = session.get("last_msg") or {}
+                    history_messages = (
+                        session.get("messages")
+                        or session.get("message_list")
+                        or session.get("session_messages")
+                        or []
+                    )
+                    if not isinstance(history_messages, list):
+                        history_messages = []
                     msg_content_raw = last_msg.get("content", "")
                     if not msg_content_raw:
                         # last_msg 没有 content，尝试调用消息 API
@@ -1449,6 +2900,7 @@ class Scheduler:
                         messages = msgs_resp.get("data", {}).get("messages", [])
                         if not messages:
                             continue
+                        history_messages = messages
                         last_msg = messages[-1]
                         msg_content_raw = last_msg.get("content", "")
 
@@ -1479,13 +2931,6 @@ class Scheduler:
                         # 最后一条是自己发的，跳过
                         continue
 
-                    logger.info(f"发现新私信 from {talker_id}: {msg_content[:30]}...")
-
-                    # 黑名单过滤
-                    if self.safety_checker is not None and self.safety_checker.is_blacklisted(str(talker_id)):
-                        logger.info(f"私信用户 {talker_id} 在黑名单中，跳过")
-                        continue
-
                     # 获取对方用户名
                     talker_name = "用户"
                     talker_info = session.get("talker_info") or {}
@@ -1502,7 +2947,7 @@ class Scheduler:
                     platform_msg_id = extract_platform_message_id(last_msg)
                     if not platform_msg_id:
                         # 无法确定平台消息 ID，无法做幂等，跳过（避免重复发送）
-                        logger.warning(f"无法提取私信平台消息 ID，跳过: talker_id={talker_id}")
+                        logger.warning("无法提取私信平台消息 ID，跳过未归档消息")
                         continue
 
                     pm_state = self.pm_state_store.ensure_discovered(
@@ -1511,18 +2956,78 @@ class Scheduler:
                         talker_id=str(talker_id),
                     )
 
+                    # V6 privacy boundary: redact and pseudonymize before brain,
+                    # logs, recall, audit or model prompts.
+                    try:
+                        safe_pm = self._redact_private_message_runtime(
+                            msg_content,
+                            actor_id=str(talker_id),
+                            username=talker_name,
+                        )
+                        brain = getattr(self, "memory_brain", None)
+                        if brain is not None:
+                            safe_pm, archive_result = await brain.archive_private_message(
+                                platform_message_id=platform_msg_id,
+                                text=msg_content,
+                                actor_id=str(talker_id),
+                                username=talker_name,
+                                direction="incoming",
+                                persona_id=self._get_current_persona_id(),
+                                redacted=safe_pm,
+                            )
+                            if (
+                                archive_result is None
+                                or getattr(archive_result, "source_committed", True) is False
+                            ):
+                                raise RuntimeError(
+                                    "PM source commit was not confirmed"
+                                )
+                    except Exception:
+                        self._pause_for_memory_failure()
+                        self.pm_state_store.mark_deferred(
+                            pm_state.id,
+                            reason="memory_archive_failed",
+                            error_code="MEMORY_ARCHIVE_FAILED",
+                        )
+                        continue
+
+                    try:
+                        pm_recent_turns = await self._archive_pm_recent_history(
+                            history_messages,
+                            current_message_id=platform_msg_id,
+                            talker_id=talker_id,
+                            talker_name=talker_name,
+                            my_uid=my_uid,
+                        )
+                    except Exception:
+                        self._pause_for_memory_failure()
+                        self.pm_state_store.mark_deferred(
+                            pm_state.id,
+                            reason="pm_history_archive_failed",
+                            error_code="MEMORY_ARCHIVE_FAILED",
+                        )
+                        continue
+
+                    logger.info("发现新私信: actor=%s", safe_pm.actor_pseudonym)
+
+                    # Ignored/blacklisted messages remain archived observations.
+                    if self.safety_checker is not None and self.safety_checker.is_blacklisted(str(talker_id)):
+                        logger.info("私信 actor=%s 命中黑名单，跳过", safe_pm.actor_pseudonym)
+                        self.pm_state_store.mark_ignored(pm_state.id, rule="blacklist")
+                        continue
+
                     # 幂等：终态或进行中则跳过（由 _process_retryable_pms 处理 retry_wait）
                     if pm_state.status in PM_TERMINAL:
                         logger.debug(
                             f"私信已处于终态 {pm_state.status}，跳过: "
-                            f"talker_id={talker_id} msg_id={platform_msg_id}"
+                            f"actor={safe_pm.actor_pseudonym}"
                         )
                         continue
                     if pm_state.status not in ("discovered",):
                         # retry_wait / deferred 由独立重试循环处理；中间态跳过避免并发
                         logger.debug(
                             f"私信状态 {pm_state.status} 非 discovered，跳过: "
-                            f"msg_id={platform_msg_id}"
+                            f"actor={safe_pm.actor_pseudonym}"
                         )
                         continue
 
@@ -1533,18 +3038,39 @@ class Scheduler:
 
                     # 用 reply_gen 生成回复（复用评论回复逻辑）
                     # PRD-V5 §4.3 SEA-501：私信场景须传 scene=private_message
+                    memory_evidence = ""
+                    try:
+                        from bilibot.memory_brain import RecallQuery
+
+                        brain = getattr(self, "memory_brain", None)
+                        if brain is not None:
+                            recall_result = await brain.recall(
+                                RecallQuery(
+                                    current_message=safe_pm.text,
+                                    recent_turns=tuple(pm_recent_turns),
+                                    account_id=self.account_id,
+                                    speaker_actor_id=safe_pm.actor_pseudonym,
+                                    scene="private_message",
+                                )
+                            )
+                            memory_evidence = recall_result.prompt_evidence
+                    except Exception as exc:
+                        logger.warning("私信记忆召回降级为空: %s", type(exc).__name__)
+
+                    from bilibot.models import ReplyContext
                     reply_result = await self.reply_gen.generate_reply(
-                        user_id=str(talker_id),
-                        username=talker_name,
-                        comment=msg_content,
-                        thread_id=f"pm_{talker_id}",
-                        oid=str(talker_id),
+                        user_id=safe_pm.actor_pseudonym,
+                        username="私信用户",
+                        comment=safe_pm.text,
+                        thread_id=f"pm_{safe_pm.actor_pseudonym}",
+                        oid="",
                         comment_type=0,
+                        reply_context=ReplyContext(memory_evidence=memory_evidence),
                         scene="private_message",
                     )
 
                     if not reply_result or not reply_result.get("reply"):
-                        logger.debug(f"跳过私信回复 to {talker_id}")
+                        logger.debug("跳过私信回复 actor=%s", safe_pm.actor_pseudonym)
                         self.pm_state_store.mark_ignored(
                             pm_state.id, rule="empty_reply",
                         )
@@ -1552,11 +3078,17 @@ class Scheduler:
 
                     reply_text = reply_result["reply"]
                     audit_id = reply_result.get("audit_id")  # PRD 4.16：私信审计
+                    safe_reply = self._redact_private_message_runtime(
+                        reply_text,
+                        actor_id=safe_pm.actor_pseudonym,
+                        username=talker_name,
+                    )
+                    safe_reply_text = safe_reply.text
 
                     # PRD-V5 §6.3 / PM-501：生成文本持久化（安全检查之前）
                     pm_state = self.pm_state_store.save_generation_result(
                         pm_state.id,
-                        text=reply_text,
+                        text=safe_reply_text,
                         persona_id=self._get_current_persona_id(),
                     )
 
@@ -1568,7 +3100,7 @@ class Scheduler:
                     # 安全检查
                     if self.safety_checker is not None:
                         passed, reason = await self.safety_checker.check_content(
-                            reply_text, scene="private_message",
+                            safe_reply_text, scene="private_message",
                             persona_id=self._get_current_persona_id(),
                             account_id=self.account_id,
                         )
@@ -1597,25 +3129,46 @@ class Scheduler:
                     try:
                         success = await self.bili.send_private_message(
                             receiver_id=talker_id,
-                            msg=reply_text,
+                            msg=safe_reply_text,
                         )
                     except Exception as send_exc:
                         # 本地异常：平台结果不确定 → result_unknown（不自动重发）
+                        send_error = type(send_exc).__name__
                         logger.error(
-                            f"私信发送抛异常（平台结果不确定）: {send_exc}",
-                            exc_info=True,
+                            "私信发送抛异常（平台结果不确定）: actor=%s error=%s",
+                            safe_pm.actor_pseudonym,
+                            send_error,
                         )
                         self.pm_state_store.mark_result_unknown(
                             pm_state.id,
                             error_code="PM_SEND_EXCEPTION",
-                            error=str(send_exc),
+                            error=send_error,
                         )
+                        try:
+                            await self._archive_bot_action(
+                                action_key=f"private_message:{platform_msg_id}:send",
+                                action_type="private_message",
+                                text=safe_reply_text,
+                                published=False,
+                                status="result_unknown",
+                                title="私信回复",
+                                scene="private_message",
+                                metadata={
+                                    "actor": safe_pm.actor_pseudonym,
+                                    "reason_code": "PM_SEND_EXCEPTION",
+                                },
+                            )
+                        except Exception:
+                            logger.error(
+                                "unknown PM result could not be archived: actor=%s",
+                                safe_pm.actor_pseudonym,
+                            )
                         # 审计记录失败
                         if audit_id and self.audit_store:
                             try:
                                 self.audit_store.mark_published(
                                     audit_id, published=False,
-                                    failure_reason=f"send_exception: {send_exc}",
+                                    failure_reason=f"send_exception: {send_error}",
                                 )
                             except Exception:
                                 pass
@@ -1627,7 +3180,7 @@ class Scheduler:
                             if success:
                                 self.audit_store.mark_published(
                                     audit_id, published=True,
-                                    target={"kind": "private_message", "talker_id": str(talker_id)},
+                                    target={"kind": "private_message", "actor": safe_pm.actor_pseudonym},
                                 )
                             else:
                                 self.audit_store.mark_published(
@@ -1637,30 +3190,74 @@ class Scheduler:
                             pass
 
                     if success:
-                        logger.info(f"已回复私信 from {talker_id}: {reply_text[:30]}...")
+                        logger.info("已回复私信 actor=%s", safe_pm.actor_pseudonym)
                         # PRD-V5 §6.3 / PM-501：标记已发布（终态）
                         self.pm_state_store.mark_published(pm_state.id)
-                        # PRD-V5 §6.3 / PM-501：私信原文不进入 KnowledgeBaseMemory
-                        # （仅在 pm_state_store 中保留 generation_text 用于审计/重试）
+                        try:
+                            brain = getattr(self, "memory_brain", None)
+                            if brain is not None:
+                                _, archive_result = await brain.archive_private_message(
+                                    platform_message_id=platform_msg_id,
+                                    text=safe_reply_text,
+                                    actor_id=safe_pm.actor_pseudonym,
+                                    username="",
+                                    direction="outgoing",
+                                    persona_id=self._get_current_persona_id(),
+                                    redacted=safe_reply,
+                                )
+                                if (
+                                    archive_result is None
+                                    or getattr(archive_result, "source_committed", True) is False
+                                ):
+                                    raise RuntimeError(
+                                        "PM outgoing source commit was not confirmed"
+                                    )
+                        except Exception:
+                            self._pause_for_memory_failure()
+                            logger.error(
+                                "published PM result could not be archived: actor=%s",
+                                safe_pm.actor_pseudonym,
+                            )
                         if self.safety_checker is not None:
-                            self.safety_checker.record_content(reply_text, account_id=self.account_id)
+                            self.safety_checker.record_content(
+                                safe_reply_text, account_id=self.account_id
+                            )
                         # 标记已读
                         await self.bili.ack_session(talker_id, my_uid)
                     else:
                         # PRD-V5 §6.3 / PM-501：发布失败 → retry_wait（独立退避）
                         # 平台明确返回失败（非本地异常），按 retry_wait 处理
-                        logger.warning(f"私信发送失败 to {talker_id}")
+                        logger.warning("私信发送失败 actor=%s", safe_pm.actor_pseudonym)
                         self.pm_state_store.mark_retry_wait(
                             pm_state.id,
                             error_code="PM_PUBLISH_FAILED",
                             error="send_private_message returned False",
                         )
+                        try:
+                            await self._archive_bot_action(
+                                action_key=f"private_message:{platform_msg_id}:send",
+                                action_type="private_message",
+                                text=safe_reply_text,
+                                published=False,
+                                status="failed",
+                                title="私信回复",
+                                scene="private_message",
+                                metadata={
+                                    "actor": safe_pm.actor_pseudonym,
+                                    "reason_code": "PM_PUBLISH_FAILED",
+                                },
+                            )
+                        except Exception:
+                            logger.error(
+                                "failed PM result could not be archived: actor=%s",
+                                safe_pm.actor_pseudonym,
+                            )
 
                 except Exception as e:
-                    logger.warning(f"处理私信会话异常: {e}")
+                    logger.warning("处理私信会话异常: %s", type(e).__name__)
 
         except Exception as e:
-            logger.error(f"私信检查异常: {e}", exc_info=True)
+            logger.error("私信检查异常: %s", type(e).__name__)
 
     async def _process_retryable_pms(self):
         """PRD-V5 §6.3 / PM-501：重试 retry_wait 状态的私信
@@ -1679,6 +3276,13 @@ class Scheduler:
             logger.info(f"发现 {len(retryable)} 条待重试私信")
             for pm_state in retryable:
                 try:
+                    retry_actor = "actor_unknown"
+                    try:
+                        retry_actor = self._redact_private_message_runtime(
+                            "", actor_id=pm_state.talker_id or "unknown"
+                        ).actor_pseudonym or retry_actor
+                    except Exception:
+                        pass
                     # 校验文本完整性
                     reply_text = pm_state.generation_text or ""
                     gen_hash = pm_state.generation_hash or ""
@@ -1692,18 +3296,12 @@ class Scheduler:
                     if gen_hash:
                         expected = self.pm_state_store.compute_generation_hash(reply_text)
                         if expected != gen_hash:
-                            logger.warning(
-                                f"重试私信文本 hash 不匹配，转 deferred: "
-                                f"msg_id={pm_state.platform_message_id}"
-                            )
+                            logger.warning("重试私信文本 hash 不匹配: actor=%s", retry_actor)
                             self.pm_state_store.mark_deferred(
                                 pm_state.id, reason="hash_mismatch",
                                 error_code="RETRY_HASH_MISMATCH",
                             )
                             continue
-
-                    # 推进：retry_wait → publish_pending
-                    self.pm_state_store.update_status(pm_state.id, "publish_pending")
 
                     # 直接使用原始文本重新发送（不调用 generate_reply）
                     talker_id = 0
@@ -1718,27 +3316,82 @@ class Scheduler:
                         )
                         continue
 
+                    safe_retry = self._redact_private_message_runtime(
+                        reply_text,
+                        actor_id=str(talker_id),
+                    )
+                    safe_retry_text = safe_retry.text
+
+                    # 推进：retry_wait → publish_pending
+                    self.pm_state_store.update_status(pm_state.id, "publish_pending")
+
                     try:
                         success = await self.bili.send_private_message(
                             receiver_id=talker_id, msg=reply_text,
                         )
                     except Exception as send_exc:
                         # 平台结果不确定 → result_unknown（不自动重发）
+                        send_error = type(send_exc).__name__
                         logger.error(
-                            f"重试私信发送抛异常: {send_exc}", exc_info=True,
+                            "重试私信发送抛异常: actor=%s error=%s",
+                            retry_actor,
+                            send_error,
                         )
                         self.pm_state_store.mark_result_unknown(
                             pm_state.id,
                             error_code="PM_RETRY_SEND_EXCEPTION",
-                            error=str(send_exc),
+                            error=send_error,
                         )
+                        try:
+                            await self._archive_bot_action(
+                                action_key=(
+                                    f"private_message:{pm_state.platform_message_id}:"
+                                    f"retry:{pm_state.attempt + 1}"
+                                ),
+                                action_type="private_message",
+                                text=safe_retry_text,
+                                published=False,
+                                status="result_unknown",
+                                title="私信回复重试",
+                                scene="private_message",
+                                metadata={
+                                    "actor": retry_actor,
+                                    "reason_code": "PM_RETRY_SEND_EXCEPTION",
+                                },
+                            )
+                        except Exception:
+                            logger.error(
+                                "unknown retried PM result could not be archived: actor=%s",
+                                retry_actor,
+                            )
                         continue
 
                     if success:
                         self.pm_state_store.mark_published(pm_state.id)
-                        logger.info(
-                            f"重试私信发送成功: msg_id={pm_state.platform_message_id}"
-                        )
+                        logger.info("重试私信发送成功: actor=%s", retry_actor)
+                        try:
+                            brain = getattr(self, "memory_brain", None)
+                            if brain is not None:
+                                _, archive_result = await brain.archive_private_message(
+                                    platform_message_id=pm_state.platform_message_id,
+                                    text=reply_text,
+                                    actor_id=retry_actor,
+                                    direction="outgoing",
+                                    persona_id=self._get_current_persona_id(),
+                                    redacted=safe_retry,
+                                )
+                                if (
+                                    archive_result is None
+                                    or getattr(archive_result, "source_committed", True) is False
+                                ):
+                                    raise RuntimeError(
+                                        "PM retry outgoing source commit was not confirmed"
+                                    )
+                        except Exception:
+                            self._pause_for_memory_failure()
+                            logger.error(
+                                "重试私信结果归档失败: actor=%s", retry_actor
+                            )
                         if self.safety_checker is not None:
                             self.safety_checker.record_content(
                                 reply_text, account_id=self.account_id,
@@ -1754,15 +3407,33 @@ class Scheduler:
                             error_code="PM_RETRY_PUBLISH_FAILED",
                             error="retry send_private_message returned False",
                         )
-                        logger.warning(
-                            f"重试私信发送失败: msg_id={pm_state.platform_message_id}"
-                        )
+                        try:
+                            await self._archive_bot_action(
+                                action_key=(
+                                    f"private_message:{pm_state.platform_message_id}:"
+                                    f"retry:{pm_state.attempt + 1}"
+                                ),
+                                action_type="private_message",
+                                text=safe_retry_text,
+                                published=False,
+                                status="failed",
+                                title="私信回复重试",
+                                scene="private_message",
+                                metadata={
+                                    "actor": retry_actor,
+                                    "reason_code": "PM_RETRY_PUBLISH_FAILED",
+                                },
+                            )
+                        except Exception:
+                            logger.error(
+                                "failed retried PM result could not be archived: actor=%s",
+                                retry_actor,
+                            )
+                        logger.warning("重试私信发送失败: actor=%s", retry_actor)
                 except Exception as e:
-                    logger.error(
-                        f"重试私信 {pm_state.platform_message_id} 失败: {e}"
-                    )
+                    logger.error("重试私信失败: actor=%s error=%s", retry_actor, type(e).__name__)
         except Exception as e:
-            logger.error(f"处理重试私信失败: {e}")
+            logger.error("处理重试私信失败: %s", type(e).__name__)
 
     # ══════════════════════════════════════════
     #  主动行为
@@ -1784,7 +3455,11 @@ class Scheduler:
         if features.get("proactive_video", True):
             for trigger_time in self._proactive_times:
                 time_str = f"{trigger_time[0]:02d}:{trigger_time[1]:02d}"
-                if time_str == current_time and current_time not in self._proactive_triggered:
+                # Task 23 修复：范围匹配（slot ≤ 当前时间且当日未触发）
+                # 主循环每 60s 一轮，若某轮耗时 >60s 跳过某一分钟，原精确匹配（== current_time）
+                # 会导致该 slot 永远不再匹配。改为范围匹配 + _proactive_triggered 幂等保护，
+                # 既不漏槽也不重复触发（_proactive_times 按 hour 去重排序，break 保证每轮至多触发一个）。
+                if time_str <= current_time and time_str not in self._proactive_triggered:
                     # PRD-V5 §7：原子 claim（事务性条件更新，避免重复触发）
                     task_id = self._claim_task_for_slot("proactive_video", time_str)
                     if task_id:
@@ -1793,12 +3468,21 @@ class Scheduler:
                             self._do_proactive_video(task_id=task_id),
                             tag="_do_proactive_video",
                         )
-                        self._proactive_triggered.add(current_time)
+                        self._proactive_triggered.add(time_str)
                         self._save_schedule_state()
                     else:
-                        # claim 失败（已被处理或不存在）→ 仅记录内存标记避免反复尝试
-                        self._proactive_triggered.add(current_time)
-                        self._save_schedule_state()
+                        # Task 25 修复：区分"claim 失败（已被处理）"与"任务不存在（创建缺失）"
+                        # - task 存在但 claim 失败 → 已被其他 worker claim/完成，标记 triggered 避免反复尝试
+                        # - task 不存在 → TaskRun 持久化缺失，告警但不标记 triggered，
+                        #   等待下次 _generate_daily_schedule 重建（避免吞掉本该执行的槽位）
+                        if self._task_exists_for_slot("proactive_video", time_str):
+                            self._proactive_triggered.add(time_str)
+                            self._save_schedule_state()
+                        else:
+                            logger.error(
+                                f"proactive_video slot={time_str} 的 TaskRun 不存在，"
+                                f"调度持久化可能缺失，等待下次调度重建（不标记 triggered）"
+                            )
                     break
 
         # 发布动态
@@ -1841,6 +3525,224 @@ class Scheduler:
             logger.warning(f"claim TaskRun 失败 scene={scene} slot={slot}: {e}")
             return None
 
+    def _task_exists_for_slot(self, scene: str, slot: str) -> bool:
+        """检查 scene+slot 对应的 TaskRun 是否存在（Task 25：区分 claim 失败原因）
+
+        用于 _claim_task_for_slot 返回 None 时区分：
+        - task 不存在（持久化缺失）→ 不应标记 triggered，等待调度重建
+        - task 存在但 claim 失败（已被其他 worker 处理）→ 可标记 triggered
+        """
+        try:
+            today_str = datetime.now().strftime("%Y-%m-%d")
+            idem_key = f"{self.account_id or '_default'}:{scene}:{today_str}:{slot}"
+            return self.task_store.get_by_idempotency_key(idem_key) is not None
+        except Exception as e:
+            logger.warning(f"查询 TaskRun 存在性失败 scene={scene} slot={slot}: {e}")
+            return False
+
+    async def _watch_video_for_reply(self, bvid: str, oid) -> bool:
+        """为 @我 的视频评论预先观看并归档视频
+
+        被用户 @ 后，回复前先完整看一遍视频（下载+视听分析+归档到 memory_brain），
+        这样后续 comment_context_service.build_context 能从 V6 缓存命中完整视频上下文，
+        让回复基于真实观看内容而非仅元数据。
+
+        bvid 可为空，此时从 video_info.bvid 补齐。
+
+        Returns:
+            True 表示已观看并归档成功（或已存在缓存），False 表示失败（调用方降级为元数据回复）
+        """
+        if not self.bili:
+            return False
+        # 视频理解服务不可用时直接降级
+        if not (self.video_understanding and self.video_understanding.is_available()):
+            logger.info("@回复：视频理解服务不可用，跳过预观看，降级为元数据回复")
+            return False
+
+        try:
+            oid_int = int(oid) if oid else 0
+            if not oid_int and bvid:
+                oid_int = await self.bili.get_video_oid_by_bvid(bvid)
+            if not oid_int:
+                logger.warning(f"@回复：获取 oid 失败 bvid={bvid}")
+                return False
+
+            # 检查 memory_brain 是否已有完整视频观察缓存（含视听分析，非仅元数据）
+            brain = getattr(self, "memory_brain", None)
+            if brain is not None and self.comment_context_service is not None:
+                try:
+                    # find_by_identifiers 返回所有匹配 oid 的 event，
+                    # 需要检查是否有完整 video_observation（含 audiovisual 视听分析）
+                    hits = await asyncio.to_thread(
+                        brain.find_by_identifiers, [str(oid_int)], 20
+                    )
+                    has_full_observation = False
+                    for hit in hits:
+                        event_id = str(hit.get("event_id") or hit.get("id") or "")
+                        if not event_id:
+                            continue
+                        event = await asyncio.to_thread(brain.get_event, event_id, None)
+                        if not event:
+                            continue
+                        event_meta = event.get("metadata") or {}
+                        if str(event_meta.get("oid", "")) != str(oid_int):
+                            continue
+                        # 检查是否为完整 video_observation（含视听分析，非仅元数据）
+                        # event_type 为 video_observation 且存在 asr/visual_description/behavior_log 来源
+                        if event.get("event_type") == "video_observation":
+                            for source in event.get("sources") or []:
+                                if source.get("source_type") in (
+                                    "asr", "subtitle", "visual_description", "behavior_log",
+                                ):
+                                    has_full_observation = True
+                                    break
+                        if has_full_observation:
+                            break
+                    if has_full_observation:
+                        logger.info(f"@回复：视频已完整观看过 oid={oid_int}，复用缓存")
+                        return True
+                    logger.info(f"@回复：视频 oid={oid_int} 仅有元数据缓存，需完整观看")
+                except Exception:
+                    pass
+
+            video_info = await self.bili.get_video_info(oid_int)
+            if not video_info:
+                logger.warning(f"@回复：获取视频详情失败 oid={oid_int}")
+                return False
+
+            # bvid 补齐
+            if not bvid:
+                bvid = video_info.get("bvid", "") or ""
+            if not bvid:
+                logger.warning(f"@回复：视频缺少 bvid oid={oid_int}")
+                return False
+
+            title = video_info.get("title", "未知视频")
+            owner = video_info.get("owner", {}).get("name", "未知UP")
+            desc = video_info.get("desc", "")
+            tags_list = await self.bili.get_video_tags(bvid, video_info=video_info) or []
+            if isinstance(tags_list, str):
+                tags_list = [t.strip() for t in tags_list.split(",") if t.strip()]
+
+            logger.info(f"@回复：预观看视频 《{title}》 by {owner}")
+
+            ctx = ProactiveVideoContext(bvid=bvid)
+            ctx.metadata = video_info
+            hot_comments = await self.bili.get_hot_comments(oid_int, limit=5) or []
+            ctx.hot_comments = hot_comments if hot_comments else None
+
+            # 联网搜索参考
+            if self.web_search and self.web_search.is_available():
+                try:
+                    search_query = await self.web_search.should_search_for_video(
+                        video_info={"title": title, "desc": desc,
+                                    "tname": tags_list[0] if tags_list else "",
+                                    "owner_name": owner},
+                        scene="proactive_video",
+                    )
+                    if search_query:
+                        search_result = await self.web_search.search(
+                            search_query, scene="proactive_video",
+                        )
+                        if search_result:
+                            ctx.search_reference = search_result
+                except Exception as e:
+                    ctx.degradation_reasons.append(f"search_failed: {e}")
+
+            # 视频内容理解（视听双轨分析）
+            video_file_to_cleanup = None
+            work_dir_to_cleanup = None
+            try:
+                cid = video_info.get("cid", 0)
+                if not cid:
+                    pages = video_info.get("pages", [])
+                    if pages:
+                        cid = pages[0].get("cid", 0)
+                if not cid:
+                    raise RuntimeError("视频缺少 CID")
+
+                import os as _os
+                video_temp_dir = _os.path.join(self._get_data_dir(), "video_temp")
+                save_path = _os.path.join(video_temp_dir, f"{bvid}")
+                video_file = await self.bili.download_video(bvid, cid, save_path, quality=32)
+                if not video_file or not _os.path.exists(video_file):
+                    raise RuntimeError(f"视频下载失败: {bvid}")
+
+                logger.info(f"@回复：视频已下载，开始视听分析: {video_file}")
+                video_file_to_cleanup = video_file
+                vu_result = await self.video_understanding.understand(
+                    video_file, defer_cleanup=True,
+                    require_complete_audio=True, require_complete_visual=True,
+                )
+                if not isinstance(vu_result, dict):
+                    raise RuntimeError("视频理解返回了无效结果")
+
+                work_dir_to_cleanup = vu_result.get("work_dir") or None
+                degradation = str(vu_result.get("degradation_reason") or "")
+                audio_status = vu_result.get("audio_status") or {}
+                audio_failed = (
+                    isinstance(audio_status, dict)
+                    and audio_status.get("status") == "failed"
+                )
+                if audio_failed:
+                    reason = str(audio_status.get("error_code") or "audio_track_failed")
+                    raise RuntimeError(f"视频提取未完成: {reason}")
+                if degradation:
+                    ctx.degradation_reasons.append(f"video_understanding: {degradation}")
+                    logger.info(f"@回复：视频理解降级，继续归档: {degradation}")
+
+                ctx.audiovisual = vu_result
+                av_log = ctx.audiovisual_log
+                if av_log:
+                    logger.info(f"@回复：视频理解完成，行为日志 {len(av_log)} 字")
+                elif not degradation:
+                    logger.warning("@回复：视频理解未生成行为日志")
+            except ASRTranscriptionError as e:
+                logger.warning("@回复：视频 ASR 失败 code=%s retryable=%s，降级为元数据回复",
+                               e.code, e.retryable)
+                return False
+            except Exception as e:
+                logger.warning("@回复：视频理解失败，降级为元数据回复: %s: %s",
+                               type(e).__name__, e)
+                return False
+
+            # 归档到 memory_brain（让后续 build_context 命中缓存）
+            try:
+                from bilibot.memory_brain.ingestion import video_observation
+
+                await self._archive_required(
+                    video_observation(
+                        account_id=self.account_id or "default",
+                        observation_key=f"at_reply:{bvid}:{oid_int}",
+                        bvid=bvid,
+                        oid=str(oid_int),
+                        title=title,
+                        owner=owner,
+                        context=ctx.to_dict(),
+                        tags=tags_list,
+                        persona_id=self._get_current_persona_id(),
+                    )
+                )
+                logger.info(f"@回复：视频已归档 bvid={bvid} oid={oid_int}")
+            except Exception as archive_exc:
+                logger.warning(f"@回复：视频归档失败: {archive_exc}")
+                return False
+            finally:
+                import os as _os
+                import shutil as _shutil
+                if video_file_to_cleanup:
+                    try:
+                        _os.remove(video_file_to_cleanup)
+                    except OSError:
+                        pass
+                if work_dir_to_cleanup:
+                    _shutil.rmtree(work_dir_to_cleanup, ignore_errors=True)
+
+            return True
+        except Exception as e:
+            logger.warning(f"@回复：预观看视频异常: {e}")
+            return False
+
     async def _do_proactive_video(self, task_id: Optional[str] = None):
         """主动看视频（参考 chenluQwQ 方案）
 
@@ -1874,35 +3776,62 @@ class Scheduler:
             return
 
         # PRD-V5 §7：claim → start
-        if task_id and not self.task_store.start(task_id):
-            logger.warning(f"TaskRun {task_id} start 失败（可能已被处理）")
-            return
+        # Task 2 修复：手动触发任务未经 _claim_task_for_slot，状态仍为 scheduled，
+        # 需先 claim 再 start；定时任务已由 _claim_task_for_slot claim 过（状态为 claimed）
+        if task_id:
+            from bilibot.services.task_store import TRIGGER_MANUAL, STATUS_SCHEDULED
+            _task = self.task_store.get(task_id)
+            if _task is None:
+                logger.warning(f"TaskRun {task_id} 不存在")
+                return
+            if _task.trigger_type == TRIGGER_MANUAL and _task.status == STATUS_SCHEDULED:
+                if not self.task_store.claim(task_id):
+                    logger.warning(f"TaskRun {task_id} claim 失败（可能已被处理）")
+                    return
+            if not self.task_store.start(task_id):
+                logger.warning(f"TaskRun {task_id} start 失败（可能已被处理）")
+                return
 
         # PRD V4 COM-001：features 在方法内独立读取（与 _check_proactive_tasks 解耦）
         features = self.config_loader.get_raw_config().get("features", {})
 
         try:
-            # 1. 获取热门视频
-            data = await self.bili.get_hot_videos()
+            # 1. 获取视频（C: 推荐流 / D: 分区热门随机翻页，各 50% 概率）
+            source = random.choice(["recommend", "region"])
+            if source == "recommend":
+                data = await self.bili.get_recommend_videos()
+                logger.info("视频来源: 推荐流")
+            else:
+                page = random.randint(1, 5)
+                data = await self.bili.get_region_hot_videos(rid=0, page=page)
+                logger.info(f"视频来源: 分区热门 (page={page})")
+            if not data or not data.get("data"):
+                # 推荐流/分区失败时回退到热门视频
+                logger.warning("推荐流/分区热门获取失败，回退到热门视频")
+                data = await self.bili.get_hot_videos()
             if not data or not data.get("data"):
                 if task_id:
-                    self._fail_task(task_id, "NO_HOT_VIDEOS", "获取热门视频失败", retryable=False)
+                    self._fail_task(task_id, "NO_HOT_VIDEOS", "获取视频失败", retryable=False)
                 return
             videos = data["data"].get("list", [])
             if not videos:
                 if task_id:
-                    self._fail_task(task_id, "NO_HOT_VIDEOS", "热门视频列表为空", retryable=False)
+                    self._fail_task(task_id, "NO_HOT_VIDEOS", "视频列表为空", retryable=False)
                 return
 
-            # PRD 4.11：过滤已看过的视频，避免重复观看
-            watched_bvids: set = set()
-            if self.ds:
-                try:
-                    watch_log = self.ds.load_json("watch_log.json", [])
-                    watched_bvids = {item.get("bvid") for item in watch_log if item.get("bvid")}
-                except Exception:
-                    pass
-            available_videos = [v for v in videos if v.get("bvid") not in watched_bvids]
+            # V6 dedupe is derived from permanent account-brain events, never JSON.
+            async def _not_observed(candidate):
+                bvid_value = str(candidate.get("bvid") or "")
+                brain = getattr(self, "memory_brain", None)
+                if not bvid_value or brain is None:
+                    return bool(bvid_value)
+                seen = await asyncio.to_thread(brain.has_identifier, bvid_value)
+                return not seen
+
+            available_videos = []
+            for candidate in videos:
+                if await _not_observed(candidate):
+                    available_videos.append(candidate)
             if not available_videos:
                 logger.info("所有热门视频均已看过，跳过主动看视频")
                 if task_id:
@@ -1910,6 +3839,8 @@ class Scheduler:
                 return
 
             # 随机选一个视频
+            # Task 24：视频选择目前为简单随机采样（已删除未启用的 StrategyEngine 死代码，
+            # 若未来需要基于热度/相关度/疲劳的多因子加权选片，需重新实现并接入此处 + 充分测试）
             video = random.choice(available_videos)
             bvid = video.get("bvid", "")
             if not bvid:
@@ -1935,8 +3866,12 @@ class Scheduler:
             owner_mid = str(video_info.get("owner", {}).get("mid", ""))
             desc = video_info.get("desc", "")
 
-            # 获取标签
-            tags_list = await self.bili.get_video_tags(bvid) or []
+            # 获取标签；标签接口异常时复用已拿到的详情/热门分区元数据。
+            tag_metadata = dict(video_info)
+            for field in ("tags", "tag", "tname", "tname_v2", "tnamev2", "pid_name_v2"):
+                if not tag_metadata.get(field) and video.get(field):
+                    tag_metadata[field] = video[field]
+            tags_list = await self.bili.get_video_tags(bvid, video_info=tag_metadata) or []
             if isinstance(tags_list, str):
                 tags_list = [t.strip() for t in tags_list.split(",") if t.strip()]
 
@@ -1950,6 +3885,8 @@ class Scheduler:
             ctx = ProactiveVideoContext(bvid=bvid)
             ctx.metadata = video_info
             ctx.hot_comments = hot_comments if hot_comments else None
+            video_file_to_cleanup = None
+            work_dir_to_cleanup = None
 
             # 来源 1：联网搜索（UNTRUSTED Reference Block）— 失败不清空其他来源
             if self.web_search and self.web_search.is_available():
@@ -1981,43 +3918,105 @@ class Scheduler:
                         pages = video_info.get("pages", [])
                         if pages:
                             cid = pages[0].get("cid", 0)
-                    if cid and bvid:
-                        import os as _os
-                        video_temp_dir = _os.path.join(self._get_data_dir(), "video_temp")
-                        save_path = _os.path.join(video_temp_dir, f"{bvid}")
-                        video_file = await self.bili.download_video(bvid, cid, save_path, quality=32)
-                        if video_file and _os.path.exists(video_file):
-                            logger.info(f"视频已下载，开始视听分析: {video_file}")
-                            # PRD 3.9：用 try/finally 确保视频文件被清理
-                            try:
-                                vu_result = await self.video_understanding.understand(video_file)
-                                ctx.audiovisual = vu_result
-                                av_log = ctx.audiovisual_log
-                                if av_log:
-                                    logger.info(f"视频理解完成，行为日志 {len(av_log)} 字")
-                                else:
-                                    logger.warning("视频理解未生成行为日志")
-                                    deg = vu_result.get("degradation_reason", "") if isinstance(vu_result, dict) else ""
-                                    if deg:
-                                        ctx.degradation_reasons.append(f"audiovisual_degraded: {deg}")
-                            finally:
-                                # 无论成功或异常都清理下载的视频文件
-                                try:
-                                    _os.remove(video_file)
-                                except Exception:
-                                    pass
-                        else:
-                            logger.warning(f"视频下载失败: {bvid}")
-                            ctx.degradation_reasons.append("audiovisual_failed: 视频下载失败")
+                    if not cid or not bvid:
+                        raise RuntimeError("视频缺少可用于完整提取的 CID/BVID")
+
+                    import os as _os
+                    video_temp_dir = _os.path.join(self._get_data_dir(), "video_temp")
+                    save_path = _os.path.join(video_temp_dir, f"{bvid}")
+                    video_file = await self.bili.download_video(
+                        bvid, cid, save_path, quality=32
+                    )
+                    if not video_file or not _os.path.exists(video_file):
+                        raise RuntimeError(f"视频下载失败: {bvid}")
+
+                    logger.info(f"视频已下载，开始视听分析: {video_file}")
+                    video_file_to_cleanup = video_file
+                    vu_result = await self.video_understanding.understand(
+                        video_file,
+                        defer_cleanup=True,
+                        require_complete_audio=True,
+                        require_complete_visual=True,
+                    )
+                    if not isinstance(vu_result, dict):
+                        raise RuntimeError("视频理解返回了无效结果")
+
+                    work_dir_to_cleanup = vu_result.get("work_dir") or None
+                    degradation = str(vu_result.get("degradation_reason") or "")
+                    audio_status = vu_result.get("audio_status") or {}
+                    # PRD V6：区分"降级"与"真失败"。
+                    # - degradation 非空（如 duration_exceeds_limit）是预期降级，
+                    #   应记录原因并继续走元数据归档，而不是抛错。
+                    # - 仅当音轨 ASR 真正失败时才视为未完成，抛错等待重试。
+                    audio_failed = (
+                        isinstance(audio_status, dict)
+                        and audio_status.get("status") == "failed"
+                    )
+                    if audio_failed:
+                        reason = str(
+                            audio_status.get("error_code") or "audio_track_failed"
+                        )
+                        raise RuntimeError(f"视频提取未完成: {reason}")
+
+                    if degradation:
+                        ctx.degradation_reasons.append(f"video_understanding: {degradation}")
+                        logger.info(f"视频理解降级，继续元数据归档: {degradation}")
+
+                    ctx.audiovisual = vu_result
+                    av_log = ctx.audiovisual_log
+                    if av_log:
+                        logger.info(f"视频理解完成，行为日志 {len(av_log)} 字")
+                    elif not degradation:
+                        logger.warning("视频理解未生成行为日志")
+                except ASRTranscriptionError as e:
+                    logger.warning(
+                        "视频 ASR 提取未完成，保留媒体并等待任务重试: code=%s retryable=%s",
+                        e.code,
+                        e.retryable,
+                    )
+                    raise
                 except Exception as e:
-                    logger.warning(f"视频理解失败（降级为元数据评价）: {e}")
-                    ctx.degradation_reasons.append(f"audiovisual_failed: {e}")
+                    logger.warning(
+                        "视频提取未完成，保留媒体并等待任务重试: %s",
+                        type(e).__name__,
+                    )
+                    raise
 
             # VID-502：统一截断并标记来源；metadata/hot_comments 已由 evaluate_video 单独渲染，
             # 此处只传搜索参考 + 视听分析 + 降级说明，避免重复段落
             video_content = ctx.to_prompt_sections(
                 include_metadata=False, include_hot_comments=False,
             )
+
+            # Full extracted source archive is the commit boundary. No evaluation,
+            # interaction or temporary cleanup happens before this succeeds.
+            from bilibot.memory_brain.ingestion import video_observation
+
+            observation_key = task_id or f"{bvid}:{oid}"
+            await self._archive_required(
+                video_observation(
+                    account_id=self.account_id or "default",
+                    observation_key=observation_key,
+                    bvid=bvid,
+                    oid=str(oid),
+                    title=title,
+                    owner=owner,
+                    context=ctx.to_dict(),
+                    tags=tags_list,
+                    persona_id=self._get_current_persona_id(),
+                )
+            )
+
+            # The complete extracted text is durable; media/keyframes can now go.
+            import os as _os
+            import shutil as _shutil
+            if video_file_to_cleanup:
+                try:
+                    _os.remove(video_file_to_cleanup)
+                except OSError:
+                    pass
+            if work_dir_to_cleanup:
+                _shutil.rmtree(work_dir_to_cleanup, ignore_errors=True)
 
             # 3. LLM 评价视频
             evaluation = None
@@ -2072,12 +4071,36 @@ class Scheduler:
                 bvid=bvid,
                 oid=str(oid),
             )
+            action_outcomes: Dict[str, str] = {}
 
             # 执行点赞
             like_result = decisions.get("like", {})
             if like_result.get("planned"):
+                # PRD V6：不单独记录 intent，仅在结果时归档
                 try:
                     ok = await self.bili.like_video(oid)
+                except Exception as e:
+                    action_outcomes["like"] = f"error:{type(e).__name__}"
+                    logger.debug(f"点赞失败: {e}")
+                    await self.interaction_policy.record_result_async(
+                        "like", bvid, str(oid), "failed", failure_reason=str(e)
+                    )
+                    await self._archive_bot_action(
+                        action_key=f"video:{observation_key}:like",
+                        action_type="like_video",
+                        text=f"点赞视频《{title}》失败",
+                        published=False,
+                        status="failed",
+                        title=title,
+                        scene="proactive_video",
+                        metadata={
+                            "bvid": bvid,
+                            "oid": str(oid),
+                            "reason_code": type(e).__name__,
+                        },
+                    )
+                else:
+                    action_outcomes["like"] = "success" if ok else "failed"
                     await self.interaction_policy.record_result_async(
                         "like", bvid, str(oid), "success" if ok else "failed",
                         api_code=getattr(self.bili, "last_api_code", None),
@@ -2085,21 +4108,62 @@ class Scheduler:
                     )
                     if ok:
                         logger.info("视频点赞成功")
+                        await self._archive_bot_action(
+                            action_key=f"video:{observation_key}:like",
+                            action_type="like_video",
+                            text=f"已点赞视频《{title}》",
+                            published=True,
+                            title=title,
+                            scene="proactive_video",
+                            metadata={"bvid": bvid, "oid": str(oid)},
+                        )
                     else:
                         self._check_bili_risk_control("proactive_like")
-                except Exception as e:
-                    logger.debug(f"点赞失败: {e}")
-                    await self.interaction_policy.record_result_async(
-                        "like", bvid, str(oid), "failed", failure_reason=str(e)
-                    )
+                        await self._archive_bot_action(
+                            action_key=f"video:{observation_key}:like",
+                            action_type="like_video",
+                            text=f"点赞视频《{title}》失败",
+                            published=False,
+                            status="failed",
+                            title=title,
+                            scene="proactive_video",
+                            metadata={
+                                "bvid": bvid,
+                                "oid": str(oid),
+                                "reason_code": "BILI_API_FALSE",
+                            },
+                        )
             else:
                 logger.debug(f"点赞未执行: {like_result.get('reason')}")
 
             # 执行投币
             coin_result = decisions.get("coin", {})
             if coin_result.get("planned"):
+                # PRD V6：不单独记录 intent，仅在结果时归档
                 try:
                     ok = await self.bili.coin_video(oid, num=1)
+                except Exception as e:
+                    action_outcomes["coin"] = f"error:{type(e).__name__}"
+                    logger.debug(f"投币失败: {e}")
+                    await self.interaction_policy.record_result_async(
+                        "coin", bvid, str(oid), "failed", failure_reason=str(e)
+                    )
+                    await self._archive_bot_action(
+                        action_key=f"video:{observation_key}:coin",
+                        action_type="coin_video",
+                        text=f"给视频《{title}》投币失败",
+                        published=False,
+                        status="failed",
+                        title=title,
+                        scene="proactive_video",
+                        metadata={
+                            "bvid": bvid,
+                            "oid": str(oid),
+                            "reason_code": type(e).__name__,
+                        },
+                    )
+                else:
+                    action_outcomes["coin"] = "success" if ok else "failed"
                     await self.interaction_policy.record_result_async(
                         "coin", bvid, str(oid), "success" if ok else "failed",
                         api_code=getattr(self.bili, "last_api_code", None),
@@ -2107,21 +4171,62 @@ class Scheduler:
                     )
                     if ok:
                         logger.info("视频投币成功")
+                        await self._archive_bot_action(
+                            action_key=f"video:{observation_key}:coin",
+                            action_type="coin_video",
+                            text=f"已给视频《{title}》投币",
+                            published=True,
+                            title=title,
+                            scene="proactive_video",
+                            metadata={"bvid": bvid, "oid": str(oid)},
+                        )
                     else:
                         self._check_bili_risk_control("proactive_coin")
-                except Exception as e:
-                    logger.debug(f"投币失败: {e}")
-                    await self.interaction_policy.record_result_async(
-                        "coin", bvid, str(oid), "failed", failure_reason=str(e)
-                    )
+                        await self._archive_bot_action(
+                            action_key=f"video:{observation_key}:coin",
+                            action_type="coin_video",
+                            text=f"给视频《{title}》投币失败",
+                            published=False,
+                            status="failed",
+                            title=title,
+                            scene="proactive_video",
+                            metadata={
+                                "bvid": bvid,
+                                "oid": str(oid),
+                                "reason_code": "BILI_API_FALSE",
+                            },
+                        )
             else:
                 logger.debug(f"投币未执行: {coin_result.get('reason')}")
 
             # 执行收藏
             fav_result = decisions.get("favorite", {})
             if fav_result.get("planned"):
+                # PRD V6：不单独记录 intent，仅在结果时归档
                 try:
                     ok = await self.bili.fav_video(oid)
+                except Exception as e:
+                    action_outcomes["favorite"] = f"error:{type(e).__name__}"
+                    logger.debug(f"收藏失败: {e}")
+                    await self.interaction_policy.record_result_async(
+                        "favorite", bvid, str(oid), "failed", failure_reason=str(e)
+                    )
+                    await self._archive_bot_action(
+                        action_key=f"video:{observation_key}:favorite",
+                        action_type="favorite_video",
+                        text=f"收藏视频《{title}》失败",
+                        published=False,
+                        status="failed",
+                        title=title,
+                        scene="proactive_video",
+                        metadata={
+                            "bvid": bvid,
+                            "oid": str(oid),
+                            "reason_code": type(e).__name__,
+                        },
+                    )
+                else:
+                    action_outcomes["favorite"] = "success" if ok else "failed"
                     await self.interaction_policy.record_result_async(
                         "favorite", bvid, str(oid), "success" if ok else "failed",
                         api_code=getattr(self.bili, "last_api_code", None),
@@ -2129,13 +4234,31 @@ class Scheduler:
                     )
                     if ok:
                         logger.info("视频收藏成功")
+                        await self._archive_bot_action(
+                            action_key=f"video:{observation_key}:favorite",
+                            action_type="favorite_video",
+                            text=f"已收藏视频《{title}》",
+                            published=True,
+                            title=title,
+                            scene="proactive_video",
+                            metadata={"bvid": bvid, "oid": str(oid)},
+                        )
                     else:
                         self._check_bili_risk_control("proactive_fav")
-                except Exception as e:
-                    logger.debug(f"收藏失败: {e}")
-                    await self.interaction_policy.record_result_async(
-                        "favorite", bvid, str(oid), "failed", failure_reason=str(e)
-                    )
+                        await self._archive_bot_action(
+                            action_key=f"video:{observation_key}:favorite",
+                            action_type="favorite_video",
+                            text=f"收藏视频《{title}》失败",
+                            published=False,
+                            status="failed",
+                            title=title,
+                            scene="proactive_video",
+                            metadata={
+                                "bvid": bvid,
+                                "oid": str(oid),
+                                "reason_code": "BILI_API_FALSE",
+                            },
+                        )
             else:
                 logger.debug(f"收藏未执行: {fav_result.get('reason')}")
 
@@ -2167,105 +4290,47 @@ class Scheduler:
             elif not comment_decision.get("planned"):
                 logger.debug(f"主动评论策略未批准: {comment_decision.get('reason')}")
 
-            # 6. 保存记忆
-            data_dir = self._get_data_dir()
-            persona_id = self._get_current_persona_id()
-
-            # PRD V4 VID-006：记录每个动作的真实结果（只有 API 成功才记 true）
+            # 6. Archive the complete evaluation and real outcomes. Source text is
+            # never truncated; raw audiovisual observations are already in the
+            # preceding video_observation event.
+            if comment_decision.get("planned"):
+                action_outcomes["comment"] = "success" if comment_text else "failed_or_skipped"
             interaction_summary = self.interaction_policy.get_today_summary()
+            experience_lines = [
+                f"观察了视频《{title}》，UP主 {owner}",
+                f"评分: {score}",
+                f"心情: {mood}",
+            ]
+            if review:
+                experience_lines.append(f"评价: {review}")
+            if comment_text:
+                experience_lines.append(f"实际发布评论: {comment_text}")
+            experience_lines.append(
+                "评价结构化结果: " + json.dumps(evaluation, ensure_ascii=False, default=str)
+            )
+            from bilibot.memory_brain.ingestion import text_observation
 
-            # MEM-501：通过 MemoryWriteQueue 写入（不再直接 import memory_writer）
-            try:
-                if self.memory_write_queue and self.knowledge_memory:
-                    # PRD V4 VID-003：watch_state 区分 inspected/watched，记忆不得把 inspected 写成"完整看过"
-                    content_parts = [f"浏览了视频《{title}》，UP主 {owner}"]
-                    if review:
-                        content_parts.append(f"评价: {review}")
-                    if mood:
-                        content_parts.append(f"心情: {mood}")
-                    if comment_text:
-                        content_parts.append(f"评论: {comment_text}")
-                    if video_content:
-                        # VID-502：记忆摘要取视听行为日志（最相关），无则取 prompt 段落前 500 字
-                        av_log = ctx.audiovisual_log
-                        mem_summary = av_log if av_log else video_content
-                        content_parts.append(f"视频内容: {mem_summary[:500]}")
-                    content_text = "，".join(content_parts)
-
-                    _km = self.knowledge_memory
-                    _meta = {
-                        "kind": "video_memory",
+            await self._archive_required(
+                text_observation(
+                    account_id=self.account_id or "default",
+                    idempotency_key=observation_key,
+                    source_type="video_experience",
+                    event_type="bot_experience",
+                    text="\n".join(experience_lines),
+                    title=title,
+                    persona_id=self._get_current_persona_id(),
+                    scene="proactive_video",
+                    metadata={
                         "bvid": bvid,
                         "oid": str(oid),
-                        "title": title,
-                        "owner_name": owner,
-                        "owner_mid": owner_mid,
-                        "score": score,
-                        "mood": mood,
-                        "review": review,
-                        "comment": comment_text,
-                        "tags": tags_list,
-                        "video_content": video_content[:2000] if video_content else "",
-                        # VID-502：结构化上下文快照（各来源独立保留，便于审计）
-                        "video_context": ctx.to_dict(),
-                        "degradation_reasons": list(ctx.degradation_reasons),
-                        # PRD V4 VID-003：真实观看语义
                         "watch_state": watch_state,
                         "watched": watched_flag,
-                        # PRD V4 VID-006：互动决策审计
-                        "interactions": {
-                            "like": {"planned": like_result.get("planned", False),
-                                     "reason": like_result.get("reason", "")},
-                            "coin": {"planned": coin_result.get("planned", False),
-                                     "reason": coin_result.get("reason", "")},
-                            "favorite": {"planned": fav_result.get("planned", False),
-                                         "reason": fav_result.get("reason", "")},
-                            "comment": {"planned": comment_decision.get("planned", False),
-                                        "reason": comment_decision.get("reason", "")},
-                        },
+                        "action_outcomes": action_outcomes,
                         "interaction_budget": interaction_summary,
-                    }
-                    _imp = "medium" if score >= 7 else "low"
-                    await self.memory_write_queue.enqueue(
-                        idempotency_key=f"video:{self.account_id}:{bvid}:{oid}",
-                        write_callable=lambda: _km.write_atom(
-                            content=content_text,
-                            category="content_video",
-                            metadata=_meta,
-                            persona_id=persona_id,
-                            importance=_imp,
-                            importance_score=score / 10.0,
-                        ),
-                    )
-            except Exception as e:
-                logger.debug(f"记忆入队失败: {e}")
-
-            # PRD V3 §2.2.3：旧 MemorySystem.save_self_memory 已删除，记忆只写 KnowledgeBaseMemory
-
-            # JSON 备份
-            if self.ds:
-                try:
-                    log = self.ds.load_json("watch_log.json", [])
-                    log.append({
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                        "title": title,
-                        "bvid": bvid,
-                        "up_name": owner,
-                        "score": score,
-                        "mood": mood,
-                        "comment": comment_text,
-                        # PRD V4 VID-003：记录真实观看状态
-                        "watch_state": watch_state,
-                        "watched": watched_flag,
-                        # PRD V4 VID-006：记录决策结果而非 LLM 建议
-                        "liked_planned": like_result.get("planned", False),
-                        "coined_planned": coin_result.get("planned", False),
-                        "faved_planned": fav_result.get("planned", False),
-                        "comment_planned": comment_decision.get("planned", False),
-                    })
-                    self.ds.save_json("watch_log.json", log[-100:])
-                except Exception:
-                    pass
+                    },
+                    importance=max(0.1, min(1.0, score / 10.0)),
+                )
+            )
 
             # 更新情绪
             if self.behavior_sim:
@@ -2292,19 +4357,51 @@ class Scheduler:
                 self._fail_task(task_id, "PROACTIVE_VIDEO_ERROR", str(e), retryable=True)
 
     async def _generate_image_prompt(self, content: str) -> Optional[str]:
-        """让 LLM 根据动态内容生成英文图片描述 prompt"""
+        """让 LLM 根据动态内容生成英文图片描述 prompt
+
+        PRD V6：若当前人格配置了 appearance（外貌描述），将其作为画面主角注入 prompt，
+        确保动态配图始终符合 bot 自身形象，而不是生成无关人物。
+        """
         if not self.llm:
             return None
         try:
+            # 取当前人格外貌（账号绑定优先，回退 current）
+            appearance_desc = ""
+            if self.persona_store is not None:
+                persona = None
+                try:
+                    if self.account_id:
+                        persona = self.persona_store.get_persona_for_account(self.account_id)
+                except Exception:
+                    persona = None
+                if persona is None:
+                    try:
+                        persona = self.persona_store.get_current()
+                    except Exception:
+                        persona = None
+                if persona is not None:
+                    appearance_desc = (getattr(persona, "appearance", "") or "").strip()
+
+            if appearance_desc:
+                persona_block = (
+                    "画面主角必须固定为以下形象，不可替换为其他人物：\n"
+                    f"主角外貌: {appearance_desc}\n\n"
+                    "如果动态内容与人物无关（如风景/物品），则主角不一定要入镜，"
+                    "但只要出现人物就必须是上述主角形象。\n\n"
+                )
+            else:
+                persona_block = ""
+
             prompt = (
                 "根据以下动态内容，生成一个适合配图的英文图片描述 prompt（1-2 句话）。\n"
                 "要求：\n"
                 "- 只输出 prompt 本身，不要任何解释或前缀\n"
                 "- 风格关键词：cinematic, high quality, detailed, no text, no watermark\n"
-                "- 画面应与动态内容相关但不重复文字\n\n"
-                f"动态内容: {content}\n\nImage prompt:"
+                "- 画面应与动态内容相关但不重复文字\n"
+                f"{persona_block}"
+                f"\n动态内容: {content}\n\nImage prompt:"
             )
-            result = await self.llm.generate(prompt, max_tokens=100, temperature=0.7)
+            result = await self.llm.generate(prompt, max_tokens=120, temperature=0.7)
             return result.strip() if result else None
         except Exception as e:
             logger.warning(f"生成图片 prompt 失败: {e}")
@@ -2343,20 +4440,37 @@ class Scheduler:
             return
 
         # PRD-V5 §7：claim → start
-        if task_id and not self.task_store.start(task_id):
-            logger.warning(f"TaskRun {task_id} start 失败（可能已被处理）")
-            return
+        # Task 2 修复：手动触发任务未经 _claim_task_for_slot，状态仍为 scheduled，
+        # 需先 claim 再 start；定时任务已由 _claim_task_for_slot claim 过（状态为 claimed）
+        if task_id:
+            from bilibot.services.task_store import TRIGGER_MANUAL, STATUS_SCHEDULED
+            _task = self.task_store.get(task_id)
+            if _task is None:
+                logger.warning(f"TaskRun {task_id} 不存在")
+                return
+            if _task.trigger_type == TRIGGER_MANUAL and _task.status == STATUS_SCHEDULED:
+                if not self.task_store.claim(task_id):
+                    logger.warning(f"TaskRun {task_id} claim 失败（可能已被处理）")
+                    return
+            if not self.task_store.start(task_id):
+                logger.warning(f"TaskRun {task_id} start 失败（可能已被处理）")
+                return
 
         try:
-            # 1. 收集主题池（最近看过的视频标题作为参考）
+            # 1. 收集主题池（来自 V6 brain，不再读取 watch_log.json）
             related_videos: List[str] = []
-            if self.ds:
+            brain = getattr(self, "memory_brain", None)
+            if brain:
                 try:
-                    watch_log = self.ds.load_json("watch_log.json", [])
+                    recent_video_events = await asyncio.to_thread(
+                        brain.list_events,
+                        limit=20,
+                        source_type="video_experience",
+                    )
                     related_videos = [
-                        f"《{v.get('title', '')}》by {v.get('up_name', '')}"
-                        for v in watch_log[-3:]
-                        if v.get("title")
+                        f"《{event.get('title', '')}》"
+                        for event in recent_video_events[:3]
+                        if event.get("title")
                     ]
                 except Exception:
                     pass
@@ -2388,6 +4502,27 @@ class Scheduler:
                     selected_topic = None
             # selected_topic 为 None 表示 topics 为空，允许自由发挥
 
+            # 召回近期经历（视频观察、评论互动、反思等），让动态内容有据可依
+            memory_evidence = ""
+            if brain:
+                try:
+                    from bilibot.memory_brain import RecallQuery
+                    recall_query_text = (
+                        f"最近看的视频、心情、想法{': ' + selected_topic if selected_topic else ''}"
+                    )
+                    recall_result = await brain.recall(
+                        RecallQuery(
+                            current_message=recall_query_text,
+                            account_id=self.account_id,
+                            scene="dynamic_post",
+                        )
+                    )
+                    if recall_result and recall_result.prompt_evidence:
+                        memory_evidence = recall_result.prompt_evidence
+                        logger.info(f"动态发布召回记忆: {len(recall_result.events)} 条事件")
+                except Exception as recall_exc:
+                    logger.debug(f"动态发布记忆召回失败: {recall_exc}")
+
             # 2. 通过 orchestrator 构建 prompt
             system_prompt = ""
             user_prompt = ""
@@ -2407,6 +4542,7 @@ class Scheduler:
                         topic=selected_topic,
                         related_videos=related_videos,
                         persona=persona,
+                        memory_evidence=memory_evidence,
                     )
                     system_prompt = prompt_dict.get("system", "")
                     user_prompt = prompt_dict.get("user", "")
@@ -2443,11 +4579,15 @@ class Scheduler:
             if len(content) > 200:
                 content = content[:200]
 
+            dynamic_key = task_id or hashlib.sha256(content.encode("utf-8")).hexdigest()
+            # PRD V6：动态发布作为内部任务，不单独记录 intent；
+            # 仅在最终结果（成功/失败/拒绝/异常）时归档一次，避免同一动态出现两条记忆。
+
             # 4. 写入 audit（含 persona_id，PRD V3 §8.6）
             audit_id = None
             if self.audit_store:
                 try:
-                    audit_id = self.audit_store.record(
+                    audit_id = await self.audit_store.record_async(
                         scene="dynamic_post",
                         persona_id=persona_id or "unknown",
                         input_summary=user_prompt[:200],
@@ -2467,6 +4607,7 @@ class Scheduler:
             if review_before_publish:
                 await self._handle_dynamic_review_mode(
                     task_id=task_id,
+                    action_key=dynamic_key,
                     content=content,
                     persona_id=persona_id or "unknown",
                     audit_id=audit_id,
@@ -2488,6 +4629,16 @@ class Scheduler:
                         pass
                 if task_id:
                     self._fail_task(task_id, "NO_SAFETY_CHECKER", "safety_checker 未初始化", retryable=False)
+                await self._archive_bot_action(
+                    action_key=f"dynamic:{dynamic_key}",
+                    action_type="dynamic_post",
+                    text=content,
+                    published=False,
+                    status="rejected",
+                    title=selected_topic or "动态",
+                    scene="dynamic_post",
+                    metadata={"reason_code": "NO_SAFETY_CHECKER"},
+                )
                 return
             try:
                 passed, reason = await self.safety_checker.check_content(
@@ -2495,31 +4646,6 @@ class Scheduler:
                     persona_id=persona_id or "unknown",
                     account_id=self.account_id,
                 )
-                if not passed:
-                    logger.warning(f"动态内容安全检查未通过: {reason}")
-                    if audit_id and self.audit_store:
-                        try:
-                            self.audit_store.mark_published(
-                                audit_id, published=False,
-                                target={"kind": "dynamic"},
-                                failure_reason=f"safety_check: {reason}",
-                            )
-                        except Exception:
-                            pass
-                    return
-                if not self.safety_checker.check_rate_limit(scene="dynamic_post", account_id=self.account_id):
-                    logger.warning("动态发布频率限制触发，跳过本次")
-                    # PRD 4.18：审计记录失败原因
-                    if audit_id and self.audit_store:
-                        try:
-                            self.audit_store.mark_published(
-                                audit_id, published=False, failure_reason="rate_limited",
-                            )
-                        except Exception:
-                            pass
-                    return
-                # PRD 4.4：预占频率配额
-                self.safety_checker.record_publish(scene="dynamic_post", account_id=self.account_id)
             except Exception as e:
                 # PRD V4 DYN-003 / §4.2：安全检查异常必须拒绝发布，不得降级放行
                 logger.error(f"动态安全检查异常（拒绝发布，DYN-003）: {e}", exc_info=True)
@@ -2532,7 +4658,66 @@ class Scheduler:
                         )
                     except Exception:
                         pass
+                await self._archive_bot_action(
+                    action_key=f"dynamic:{dynamic_key}",
+                    action_type="dynamic_post",
+                    text=content,
+                    published=False,
+                    status="rejected",
+                    title=selected_topic or "动态",
+                    scene="dynamic_post",
+                    metadata={"reason_code": "SAFETY_CHECK_ERROR"},
+                )
                 return
+
+            if not passed:
+                logger.warning(f"动态内容安全检查未通过: {reason}")
+                if audit_id and self.audit_store:
+                    try:
+                        self.audit_store.mark_published(
+                            audit_id, published=False,
+                            target={"kind": "dynamic"},
+                            failure_reason=f"safety_check: {reason}",
+                        )
+                    except Exception:
+                        pass
+                await self._archive_bot_action(
+                    action_key=f"dynamic:{dynamic_key}",
+                    action_type="dynamic_post",
+                    text=content,
+                    published=False,
+                    status="rejected",
+                    title=selected_topic or "动态",
+                    scene="dynamic_post",
+                    metadata={"reason_code": "SAFETY_REJECTED"},
+                )
+                return
+            if not self.safety_checker.check_rate_limit(
+                scene="dynamic_post", account_id=self.account_id
+            ):
+                logger.warning("动态发布频率限制触发，跳过本次")
+                if audit_id and self.audit_store:
+                    try:
+                        self.audit_store.mark_published(
+                            audit_id, published=False, failure_reason="rate_limited",
+                        )
+                    except Exception:
+                        pass
+                await self._archive_bot_action(
+                    action_key=f"dynamic:{dynamic_key}",
+                    action_type="dynamic_post",
+                    text=content,
+                    published=False,
+                    status="deferred",
+                    title=selected_topic or "动态",
+                    scene="dynamic_post",
+                    metadata={"reason_code": "RATE_LIMITED"},
+                )
+                return
+            # PRD 4.4：预占频率配额
+            self.safety_checker.record_publish(
+                scene="dynamic_post", account_id=self.account_id
+            )
 
             # 4.5 生成配图（如果配置了 with_image 且 image_provider 可用）
             image_list = []
@@ -2564,9 +4749,32 @@ class Scheduler:
                         logger.warning(f"配图生成失败（降级为纯文字动态）: {e}")
 
             # 5. 发布（根据配置）
-            success = await self.bili.post_dynamic_text(
-                content, images=image_list if image_list else None
-            )
+            try:
+                success = await self.bili.post_dynamic_text(
+                    content, images=image_list if image_list else None
+                )
+            except Exception as publish_exc:
+                if task_id:
+                    self._mark_task_result_unknown(
+                        task_id, f"dynamic publish exception: {type(publish_exc).__name__}"
+                    )
+                try:
+                    await self._archive_bot_action(
+                        action_key=f"dynamic:{dynamic_key}",
+                        action_type="dynamic_post",
+                        text=content,
+                        published=False,
+                        status="result_unknown",
+                        title=selected_topic or "动态",
+                        scene="dynamic_post",
+                        metadata={
+                            "topic": selected_topic or "",
+                            "reason_code": type(publish_exc).__name__,
+                        },
+                    )
+                except Exception:
+                    logger.error("unknown dynamic publish result could not be archived")
+                return
             if not success:
                 self._check_bili_risk_control("dynamic_post")
 
@@ -2599,47 +4807,23 @@ class Scheduler:
                     logger.debug(f"audit mark_published 失败: {e}")
 
             if success:
-                data_dir = self._get_data_dir()
-
-                # MEM-501：通过 MemoryWriteQueue 写入（不再直接 import memory_writer）
                 try:
-                    if self.memory_write_queue and self.knowledge_memory:
-                        _km = self.knowledge_memory
-                        _dyn_content = f"Bot 发了一条动态：{content}"
-                        _dyn_meta = {
-                            "kind": "dynamic_post",
-                            "content": content,
-                            "audit_id": audit_id,
-                        }
-                        await self.memory_write_queue.enqueue(
-                            idempotency_key=f"dynamic:{audit_id}",
-                            write_callable=lambda: _km.write_atom(
-                                content=_dyn_content,
-                                category="bot_action",
-                                metadata=_dyn_meta,
-                                persona_id=persona_id,
-                                importance="medium",
-                                importance_score=0.6,
-                            ),
+                    await self._archive_bot_action(
+                        action_key=f"dynamic:{dynamic_key}",
+                        action_type="dynamic_post",
+                        text=content,
+                        published=True,
+                        title=selected_topic or "动态",
+                        scene="dynamic_post",
+                        metadata={"topic": selected_topic or "", "has_image": has_image},
+                    )
+                except Exception:
+                    logger.error("published dynamic result could not be archived")
+                    if task_id:
+                        self._mark_task_result_unknown(
+                            task_id, "dynamic published but V6 result archive failed"
                         )
-                except Exception as e:
-                    logger.debug(f"记忆入队失败: {e}")
-
-                # JSON 备份（保留）
-                if self.ds:
-                    try:
-                        log = self.ds.load_json("dynamic_log.json", [])
-                        log.append({
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "text": content,
-                            "has_image": has_image,
-                            "generated_by": "llm",
-                        })
-                        self.ds.save_json("dynamic_log.json", log[-100:])
-                    except Exception:
-                        pass
-
-                # PRD V3 §2.2.3：旧 MemorySystem.save_self_memory 已删除，记忆只写 KnowledgeBaseMemory
+                    return
 
                 logger.info(f"动态发布成功: {content[:50]}...")
                 # PRD-V5 §7：只有真正成功才 succeed
@@ -2653,6 +4837,19 @@ class Scheduler:
                     })
             else:
                 logger.error("动态发布失败")
+                await self._archive_bot_action(
+                    action_key=f"dynamic:{dynamic_key}",
+                    action_type="dynamic_post",
+                    text=content,
+                    published=False,
+                    status="failed",
+                    title=selected_topic or "动态",
+                    scene="dynamic_post",
+                    metadata={
+                        "topic": selected_topic or "",
+                        "reason_code": "BILI_API_FALSE",
+                    },
+                )
                 # PRD-V5 §7：发布失败 → retry_wait/failed
                 if task_id:
                     self._fail_task(task_id, "DYNAMIC_PUBLISH_FAILED",
@@ -2681,6 +4878,7 @@ class Scheduler:
     async def _handle_dynamic_review_mode(
         self,
         task_id: Optional[str],
+        action_key: str,
         content: str,
         persona_id: str,
         audit_id: Optional[str],
@@ -2745,7 +4943,24 @@ class Scheduler:
                     if image_bytes:
                         import base64 as _b64
                         image_refs = [_b64.b64encode(image_bytes).decode("ascii")]
+                    else:
+                        # Task 13：配图生成返回 None，记录失败信息（不静默降级为纯文字）
+                        safety_snapshot["image_generation_failed"] = True
+                        safety_snapshot["image_failure_reason"] = (
+                            "image_provider.generate returned None"
+                        )
+                        logger.warning("审核模式配图生成返回 None（with_image=True）")
+                else:
+                    # Task 13：image_prompt 生成失败，记录失败信息
+                    safety_snapshot["image_generation_failed"] = True
+                    safety_snapshot["image_failure_reason"] = (
+                        "image_prompt generation returned empty"
+                    )
+                    logger.warning("审核模式 image_prompt 生成返回空（with_image=True）")
             except Exception as e:
+                # Task 13：配图生成异常，记录失败信息（不静默降级）
+                safety_snapshot["image_generation_failed"] = True
+                safety_snapshot["image_failure_reason"] = f"image_generation_exception: {e}"
                 logger.warning(f"审核模式配图生成失败: {e}")
 
         # 计算过期时间
@@ -2766,6 +4981,21 @@ class Scheduler:
             created_by="scheduler",
             status=draft_status,
             expires_at=expires_at,
+        )
+
+        await self._archive_bot_action(
+            action_key=f"dynamic:{action_key}",
+            action_type="dynamic_post",
+            text=content,
+            published=False,
+            status="drafted" if safety_passed else "rejected",
+            title="动态草稿",
+            scene="dynamic_post",
+            metadata={
+                "draft_id": draft_id,
+                "draft_status": draft_status,
+                "reason_code": "" if safety_passed else "SAFETY_REJECTED",
+            },
         )
 
         # 同步 audit 状态（OBS-501 语义化状态）
@@ -2808,9 +5038,23 @@ class Scheduler:
             # DYN-602：暂停检查（fail-closed，与 _do_post_dynamic 一致）
             if self.safety_checker is not None:
                 if self.safety_checker.is_paused():
+                    # Task 11.1：暂停时回退草稿状态为 retry_wait，避免卡死在 publishing
+                    try:
+                        self._get_draft_store().mark_retry_wait(
+                            draft_id, "dynamic_post paused"
+                        )
+                    except Exception as _e:
+                        logger.warning(f"Task 11.1: 暂停回退草稿状态失败: {_e}")
                     self._fail_task(task_id, "GLOBAL_PAUSED", "全局暂停状态", retryable=True)
                     return
                 if self.safety_checker.is_account_paused(self.account_id):
+                    # Task 11.1：账号暂停时回退草稿状态为 retry_wait
+                    try:
+                        self._get_draft_store().mark_retry_wait(
+                            draft_id, "dynamic_post paused"
+                        )
+                    except Exception as _e:
+                        logger.warning(f"Task 11.1: 账号暂停回退草稿状态失败: {_e}")
                     self._fail_task(task_id, "ACCOUNT_PAUSED", "账号暂停状态", retryable=True)
                     return
 
@@ -2829,6 +5073,7 @@ class Scheduler:
 
             content = draft.content
             image_refs = draft.image_refs
+            # PRD V6：不单独记录 intent，仅在最终结果时归档，避免同一动态两条记忆。
 
             # 上传图片（如有 base64 引用）
             image_list = []
@@ -2852,6 +5097,19 @@ class Scheduler:
                     store.mark_retry_wait(
                         draft_id, "草稿配图上传失败，等待重试"
                     )
+                    await self._archive_bot_action(
+                        action_key=f"dynamic_draft:{draft_id}:image_upload",
+                        action_type="dynamic_post",
+                        text=content,
+                        published=False,
+                        status="deferred",
+                        title="已审核动态草稿",
+                        scene="dynamic_post",
+                        metadata={
+                            "draft_id": draft_id,
+                            "reason_code": "IMAGE_UPLOAD_FAILED",
+                        },
+                    )
                     self._fail_task(task_id, "IMAGE_UPLOAD_FAILED",
                                     "草稿配图上传失败", retryable=True)
                     return
@@ -2861,14 +5119,60 @@ class Scheduler:
                 if not self.safety_checker.check_rate_limit(
                     scene="dynamic_post", account_id=self.account_id
                 ):
+                    # Task 11.2：限流时回退草稿状态为 retry_wait，避免卡死在 publishing
+                    try:
+                        store.mark_retry_wait(
+                            draft_id, "dynamic_post rate limited"
+                        )
+                    except Exception as _e:
+                        logger.warning(f"Task 11.2: 限流回退草稿状态失败: {_e}")
                     self._fail_task(task_id, "RATE_LIMITED",
                                     "dynamic_post rate limited", retryable=True)
+                    await self._archive_bot_action(
+                        action_key=f"dynamic_draft:{draft_id}:publish_rate",
+                        action_type="dynamic_post",
+                        text=content,
+                        published=False,
+                        status="deferred",
+                        title="已审核动态草稿",
+                        scene="dynamic_post",
+                        metadata={
+                            "draft_id": draft_id,
+                            "reason_code": "RATE_LIMITED",
+                        },
+                    )
                     return
 
             # 发布
-            success = await self.bili.post_dynamic_text(
-                content, images=image_list if image_list else None
-            )
+            try:
+                success = await self.bili.post_dynamic_text(
+                    content, images=image_list if image_list else None
+                )
+            except Exception as publish_exc:
+                error_name = type(publish_exc).__name__
+                store.mark_result_unknown(draft_id, error_name)
+                self._mark_task_result_unknown(
+                    task_id, f"dynamic draft publish exception: {error_name}"
+                )
+                try:
+                    await self._archive_bot_action(
+                        action_key=f"dynamic_draft:{draft_id}",
+                        action_type="dynamic_post",
+                        text=content,
+                        published=False,
+                        status="result_unknown",
+                        title="已审核动态草稿",
+                        scene="dynamic_post",
+                        metadata={
+                            "draft_id": draft_id,
+                            "reason_code": error_name,
+                        },
+                    )
+                except Exception:
+                    logger.error(
+                        "unknown dynamic draft publish result could not be archived"
+                    )
+                return
             if not success:
                 self._check_bili_risk_control("dynamic_post")
 
@@ -2884,43 +5188,22 @@ class Scheduler:
                         self.safety_checker.record_content(content, account_id=self.account_id)
                     except Exception:
                         pass
-                # DYN-603：记忆写入（copy from _do_post_dynamic）
                 try:
-                    if self.memory_write_queue and self.knowledge_memory:
-                        _km = self.knowledge_memory
-                        _dyn_content = f"Bot 发了一条动态：{content}"
-                        _dyn_meta = {
-                            "kind": "dynamic_post",
-                            "content": content,
-                            "draft_id": draft_id,
-                        }
-                        await self.memory_write_queue.enqueue(
-                            idempotency_key=f"dynamic_draft:{draft_id}",
-                            write_callable=lambda: _km.write_atom(
-                                content=_dyn_content,
-                                category="bot_action",
-                                metadata=_dyn_meta,
-                                persona_id=getattr(draft, "persona_id", "") or "",
-                                importance="medium",
-                                importance_score=0.6,
-                            ),
-                        )
-                except Exception as e:
-                    logger.debug(f"记忆入队失败: {e}")
-                # DYN-603：dynamic_log.json 备份（copy from _do_post_dynamic）
-                if self.ds:
-                    try:
-                        log = self.ds.load_json("dynamic_log.json", [])
-                        log.append({
-                            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                            "text": content,
-                            "has_image": bool(image_list),
-                            "generated_by": "approved_draft",
-                            "draft_id": draft_id,
-                        })
-                        self.ds.save_json("dynamic_log.json", log[-100:])
-                    except Exception:
-                        pass
+                    await self._archive_bot_action(
+                        action_key=f"dynamic_draft:{draft_id}",
+                        action_type="dynamic_post",
+                        text=content,
+                        published=True,
+                        title="已发布动态草稿",
+                        scene="dynamic_post",
+                        metadata={"draft_id": draft_id, "has_image": bool(image_list)},
+                    )
+                except Exception:
+                    logger.error("published dynamic draft result could not be archived")
+                    self._mark_task_result_unknown(
+                        task_id, "dynamic draft published but V6 result archive failed"
+                    )
+                    return
                 self._succeed_task(task_id, {
                     "success": True,
                     "summary": f"动态草稿发布成功: {draft_id}",
@@ -2932,6 +5215,19 @@ class Scheduler:
             else:
                 store.mark_retry_wait(
                     draft_id, "bili.post_dynamic_text 返回 False"
+                )
+                await self._archive_bot_action(
+                    action_key=f"dynamic_draft:{draft_id}",
+                    action_type="dynamic_post",
+                    text=content,
+                    published=False,
+                    status="failed",
+                    title="已审核动态草稿",
+                    scene="dynamic_post",
+                    metadata={
+                        "draft_id": draft_id,
+                        "reason_code": "BILI_API_FALSE",
+                    },
                 )
                 self._fail_task(task_id, "DYNAMIC_PUBLISH_FAILED",
                                 "bili.post_dynamic_text 返回 False", retryable=True)
@@ -2967,6 +5263,29 @@ class Scheduler:
             logger.error(f"创建草稿发布 TaskRun 失败 draft={draft_id}: {e}")
             return None
 
+    def get_draft_store(self):
+        """公开接口：获取动态草稿存储（懒加载，与 TaskRunStore 同目录）
+
+        供 API 层调用，避免直接访问私有 _get_draft_store。
+        """
+        return self._get_draft_store()
+
+    def spawn_publish_task(self, task_id: str, draft_id: str, tag: str = ""):
+        """公开接口：异步触发已审核通过草稿的发布任务
+
+        供 API approve / retry 端点调用，避免直接访问私有
+        _spawn_memory_task / _do_publish_approved_draft。
+
+        Args:
+            task_id: 已创建的 TaskRun id
+            draft_id: 关联的草稿 id
+            tag: 后台任务标签（用于日志）
+        """
+        self._spawn_memory_task(
+            self._do_publish_approved_draft(task_id, draft_id),
+            tag=tag or f"publish_draft:{draft_id}",
+        )
+
     # ══════════════════════════════════════════
     #  周总结
     # ══════════════════════════════════════════
@@ -2994,14 +5313,11 @@ class Scheduler:
         # DYN-605：task_id 在 try 块外初始化，便于 except 中 fail
         task_id = None
         try:
-            if self.ds:
-                records = self.ds.load_json("weekly_summary.json", [])
-            else:
-                records = []
-
             this_week = datetime.now().strftime("%G-W%V")
-
-            if any(r.get("week") == this_week for r in records):
+            brain = getattr(self, "memory_brain", None)
+            if brain and await asyncio.to_thread(
+                brain.has_identifier, this_week
+            ):
                 return
 
             logger.info("生成周总结...")
@@ -3026,24 +5342,9 @@ class Scheduler:
             except Exception as e:
                 logger.warning(f"创建周总结 TaskRun 失败: {e}")
 
-            # 1. 从 SQLite 读取本周活动（fallback 到 JSON）
+            # 1. 从 V6 account brain 读取本周活动。
             data_dir = self._get_data_dir()
             week_summary_text = self._build_week_summary_from_sqlite(data_dir)
-
-            if not week_summary_text.strip():
-                # fallback：JSON
-                videos = self.ds.load_json("watch_log.json", []) if self.ds else []
-                dynamics = self.ds.load_json("dynamic_log.json", []) if self.ds else []
-                lines = []
-                if videos:
-                    lines.append(f"【看过的视频】共 {len(videos)} 个：")
-                    for v in videos[-10:]:
-                        lines.append(f"- 《{v.get('title', '')[:30]}》by {v.get('up_name', '')}")
-                if dynamics:
-                    lines.append(f"【发过的动态】共 {len(dynamics)} 条：")
-                    for d in dynamics[-5:]:
-                        lines.append(f"- {d.get('text', '')[:40]}")
-                week_summary_text = "\n".join(lines) if lines else "无活动记录"
 
             if not week_summary_text.strip() or week_summary_text == "无活动记录":
                 logger.info("本周无活动记录，跳过周总结")
@@ -3104,7 +5405,7 @@ class Scheduler:
             audit_id = None
             if self.audit_store:
                 try:
-                    audit_id = self.audit_store.record(
+                    audit_id = await self.audit_store.record_async(
                         scene="weekly_summary",
                         persona_id=persona_id or "unknown",
                         input_summary=user_prompt[:200],
@@ -3117,38 +5418,23 @@ class Scheduler:
                 except Exception:
                     audit_id = None
 
-            # 5. MEM-501：通过 MemoryWriteQueue 写入（不再直接 import memory_writer）
-            try:
-                if self.memory_write_queue and self.knowledge_memory:
-                    _km = self.knowledge_memory
-                    _week_content = f"周总结（{this_week}）：{summary}"
-                    _week_meta = {
-                        "kind": "weekly_summary",
-                        "week": this_week,
-                        "audit_id": audit_id,
-                    }
-                    await self.memory_write_queue.enqueue(
-                        idempotency_key=f"weekly:{this_week}",
-                        write_callable=lambda: _km.write_atom(
-                            content=_week_content,
-                            category="summary",
-                            metadata=_week_meta,
-                            persona_id=persona_id,
-                            importance="high",
-                            importance_score=0.8,
-                        ),
-                    )
-            except Exception as e:
-                logger.debug(f"记忆入队失败: {e}")
+            # 5. 新增反思事件，不覆盖或压缩底层经历。
+            from bilibot.memory_brain.ingestion import text_observation
 
-            # JSON 备份（保留）
-            records.append({
-                "week": this_week,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "summary": summary,
-            })
-            if self.ds:
-                self.ds.save_json("weekly_summary.json", records[-20:])
+            await self._archive_required(
+                text_observation(
+                    account_id=self.account_id or "default",
+                    idempotency_key=this_week,
+                    source_type="weekly_summary",
+                    event_type="reflection",
+                    text=summary,
+                    title=f"周总结 {this_week}",
+                    persona_id=persona_id,
+                    scene="weekly_summary",
+                    metadata={"week": this_week, "audit_id": audit_id},
+                    importance=0.8,
+                )
+            )
             logger.info("周总结已生成")
             # DYN-605：标记 TaskRun 成功
             if task_id:
@@ -3165,59 +5451,32 @@ class Scheduler:
                 self._fail_task(task_id, "WEEKLY_SUMMARY_ERROR", str(e), retryable=True)
 
     def _build_week_summary_from_sqlite(self, data_dir: str) -> str:
-        """从 SQLite memory_atoms 读取本周活动"""
+        """Build a bounded weekly prompt input from validated V6 events."""
         try:
-            import sqlite3
-            from pathlib import Path
-            db_path = Path(data_dir) / "knowledge_base.db"
-            if not db_path.exists():
+            brain = getattr(self, "memory_brain", None)
+            if not brain:
                 return ""
-            # MISC-604：使用 try/finally 确保连接关闭（避免异常时泄漏）
-            conn = sqlite3.connect(str(db_path))
-            try:
-                conn.row_factory = sqlite3.Row
-                # 取近 7 天的活动
-                cutoff = time.time() - 7 * 86400
-                rows = conn.execute(
-                    "SELECT category, content, created_at FROM memory_atoms "
-                    "WHERE is_active = 1 AND created_at >= ? "
-                    "ORDER BY created_at DESC LIMIT 50",
-                    (cutoff,),
-                ).fetchall()
-            finally:
-                conn.close()
-
-            if not rows:
-                return ""
-
-            videos = []
-            dynamics = []
-            others = []
-            for r in rows:
-                cat = r["category"]
-                text = r["content"] or ""
-                if cat == "content_video":
-                    videos.append(text)
-                elif cat == "bot_action":
-                    dynamics.append(text)
-                else:
-                    others.append(text)
-
+            cutoff = time.time() - 7 * 86400
+            events = brain.list_events(limit=500)
             lines = []
-            if videos:
-                lines.append(f"【看过的视频】共 {len(videos)} 条记忆：")
-                for v in videos[:10]:
-                    lines.append(f"- {v[:80]}")
-            if dynamics:
-                lines.append(f"【发过的动态】共 {len(dynamics)} 条记忆：")
-                for d in dynamics[:5]:
-                    lines.append(f"- {d[:80]}")
-            if others:
-                lines.append(f"【其他活动】共 {len(others)} 条：")
-                for o in others[:5]:
-                    lines.append(f"- {o[:80]}")
+            total_chars = 0
+            for event in reversed(events):
+                if float(event.get("created_at") or 0) < cutoff:
+                    continue
+                if event.get("source_type") == "weekly_summary":
+                    continue
+                label = event.get("source_type") or event.get("event_type") or "经历"
+                text = event.get("summary") or event.get("title") or ""
+                if not text:
+                    continue
+                line = f"- [{label}] {text}"
+                if total_chars + len(line) > 12000:
+                    break
+                lines.append(line)
+                total_chars += len(line)
             return "\n".join(lines)
-        except Exception:
+        except Exception as exc:
+            logger.debug("从 V6 brain 读取周活动失败: %s", type(exc).__name__)
             return ""
 
     # ══════════════════════════════════════════
@@ -3260,8 +5519,11 @@ class Scheduler:
         n_videos = prov.get("video_count", 0)
         self._proactive_times = []
         if n_videos > 0:
-            hours = sorted(random.sample(range(10, 23), min(n_videos, 13)))
-            self._proactive_times = [(h, random.randint(0, 59)) for h in hours]
+            # 24 小时 × 60 分钟 = 1440 个分钟点，随机抽取，全天任意时间均可触发
+            total_minutes = 24 * 60
+            n_videos = min(n_videos, total_minutes)
+            slots = sorted(random.sample(range(total_minutes), n_videos))
+            self._proactive_times = [(s // 60, s % 60) for s in slots]
             # 持久化 TaskRun（幂等键：account + scene + date + slot）
             self._persist_schedule("proactive_video", self._proactive_times,
                                   pv_grace, pv_max_att, today_str)
@@ -3312,12 +5574,12 @@ class Scheduler:
         now = datetime.now()
 
         self._proactive_triggered = {
-            f"{h}:{m:02d}" for h, m in self._proactive_times
+            f"{h:02d}:{m:02d}" for h, m in self._proactive_times
             if now.hour > h or (now.hour == h and now.minute > m)
         }
 
         self._dynamic_triggered = {
-            f"{h}:{m:02d}" for h, m in self._dynamic_times
+            f"{h:02d}:{m:02d}" for h, m in self._dynamic_times
             if now.hour > h or (now.hour == h and now.minute > m)
         }
 
@@ -3406,6 +5668,18 @@ class Scheduler:
             self.task_store.fail(task_id, error_code, error, retryable=retryable)
         except Exception as e:
             logger.warning(f"TaskRun {task_id} fail 失败: {e}")
+        # Task 11.3：永久失败时，若是动态草稿发布任务，同步草稿状态为 failed
+        if not retryable:
+            try:
+                task = self.task_store.get(task_id)
+                if task and task.scene == "dynamic":
+                    input_data = json.loads(task.input_json) if task.input_json else {}
+                    if input_data.get("kind") == "publish_draft":
+                        draft_id = input_data.get("draft_id", "")
+                        if draft_id:
+                            self._get_draft_store().mark_failed(draft_id, error)
+            except Exception as e:
+                logger.warning(f"Task 11.3: 同步草稿 failed 状态失败 task={task_id}: {e}")
 
     def _mark_task_result_unknown(self, task_id: str, error: str = "") -> None:
         """PRD-V5 §7.2：平台成功 + 本地失败 → result_unknown（不自动重发）"""

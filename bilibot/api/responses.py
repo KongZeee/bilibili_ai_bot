@@ -67,8 +67,12 @@ def fail_not_found(message: str = "资源不存在") -> JSONResponse:
     return fail("NOT_FOUND", message, status_code=404)
 
 
-def fail_internal(message: str) -> JSONResponse:
-    return fail("INTERNAL_ERROR", message, status_code=500)
+def fail_internal(
+    message: str = "内部服务器错误",
+    code: str = "INTERNAL_ERROR",
+    details: Optional[Dict[str, Any]] = None,
+) -> JSONResponse:
+    return fail(code, message, details=details, status_code=500)
 
 
 def fail_invalid_input(message: str = "输入无效") -> JSONResponse:

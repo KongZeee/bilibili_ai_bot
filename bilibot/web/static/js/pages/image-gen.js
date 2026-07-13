@@ -14,6 +14,10 @@ export const ImageGenPage = {
         const savingWithImage = ref(false);
         const provider = ref(null);        // 路由到的 image provider
         const testResult = ref(null);      // {success, message}
+        const genPrompt = ref('一只可爱的猫坐在窗台上，阳光明媚');
+        const generating = ref(false);
+        const generatedImage = ref(null);  // {b64, prompt, model, size}
+        const genError = ref('');
 
         async function loadData() {
             loading.value = true;
@@ -60,6 +64,38 @@ export const ImageGenPage = {
                 testResult.value = { success: false, message: e.message || String(e) };
             } finally {
                 testing.value = false;
+            }
+        }
+
+        async function generateImage() {
+            const p = genPrompt.value.trim();
+            if (!p) {
+                genError.value = '请输入 prompt 提示词';
+                return;
+            }
+            if (!provider.value?.id) {
+                genError.value = '未路由文生图 Provider，请先到模型分配页配置';
+                return;
+            }
+            generating.value = true;
+            generatedImage.value = null;
+            genError.value = '';
+            try {
+                const res = await api.imageGen.test({ prompt: p });
+                if (res && res.image_b64) {
+                    generatedImage.value = {
+                        src: 'data:image/png;base64,' + res.image_b64,
+                        prompt: res.prompt || p,
+                        model: res.model || '',
+                        size: res.size || 0,
+                    };
+                } else {
+                    genError.value = '生成失败：返回空结果';
+                }
+            } catch (e) {
+                genError.value = '生成失败：' + (e.message || String(e));
+            } finally {
+                generating.value = false;
             }
         }
 
@@ -210,6 +246,63 @@ export const ImageGenPage = {
                             !provider.value && withImage.value && h('div', {
                                 style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.82rem;',
                             }, '已启用动态配图但未路由 Provider，动态发布时将跳过配图'),
+                        ]),
+                    ]),
+                ]),
+
+                // ═══ 图片生成测试 ═══
+                h('section', {
+                    class: 'grid gap-3',
+                    style: 'grid-template-columns: minmax(0, 1fr);',
+                }, [
+                    h('article', {
+                        class: 'grid gap-3',
+                        style: cardStyle,
+                    }, [
+                        h('div', { class: 'card-header' }, [
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'eyebrow' }, '生成测试'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '用自定义 Prompt 生成图片'),
+                            ]),
+                        ]),
+                        h('div', { class: 'card-body grid gap-3' }, [
+                            h(FormTextarea, {
+                                modelValue: genPrompt.value,
+                                'onUpdate:modelValue': (v) => genPrompt.value = v,
+                                placeholder: '输入图片描述，如：一只橘猫坐在窗台上，窗外是夕阳...',
+                                rows: 3,
+                                disabled: generating.value,
+                            }),
+                            h('div', { class: 'flex items-center gap-2 flex-wrap' }, [
+                                h(Button, {
+                                    type: 'primary',
+                                    onClick: generateImage,
+                                    loading: generating.value,
+                                    disabled: !provider.value || !genPrompt.value.trim(),
+                                }, () => '生成图片'),
+                                h('span', { class: 'muted', style: 'font-size:0.82rem;' },
+                                    provider.value ? `模型: ${provider.value.model || '-'}` : '未路由 Provider'),
+                            ]),
+                            genError.value && h('div', {
+                                style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.88rem;',
+                            }, genError.value),
+                            generatedImage.value && h('div', {
+                                class: 'grid gap-2',
+                                style: 'padding: calc(var(--spacing) * 3); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--card)); border: 1px solid hsl(var(--border));',
+                            }, [
+                                h('img', {
+                                    src: generatedImage.value.src,
+                                    alt: generatedImage.value.prompt,
+                                    style: 'width: 100%; max-width: 512px; height: auto; border-radius: calc(var(--radius) * 0.5); display: block; margin: 0 auto;',
+                                }),
+                                h('div', {
+                                    class: 'flex items-center justify-between gap-2 flex-wrap',
+                                    style: 'font-size:0.82rem; color: hsl(var(--muted-foreground));',
+                                }, [
+                                    h('span', `Prompt: ${generatedImage.value.prompt}`),
+                                    h('span', `${generatedImage.value.size ? (generatedImage.value.size / 1024).toFixed(1) + ' KB' : ''} · ${generatedImage.value.model || ''}`),
+                                ]),
+                            ]),
                         ]),
                     ]),
                 ]),

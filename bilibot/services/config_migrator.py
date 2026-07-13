@@ -5,7 +5,7 @@
 1. 备份原 config.yaml（带时间戳）
 2. 将重复开关迁移到规范字段
 3. 保留未知字段
-4. 写入 config_version: 4
+4. 写入 config_version: 5，并补齐 V6 记忆大脑参数
 5. 输出迁移报告，不输出敏感值
 
 迁移规则（CFG-003 单一开关迁移）：
@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Tuple
 
 logger = logging.getLogger("bilibot.migrator")
 
-TARGET_CONFIG_VERSION = 4
+TARGET_CONFIG_VERSION = 5
 
 
 def migrate_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
@@ -90,6 +90,35 @@ def migrate_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         }
         report.append("proactive.{like,coin,favorite,comment} → interactions.* (旧字段保留兼容)")
         changed = True
+
+    # ── 迁移 5: V6 记忆大脑参数 ──
+    # 旧容量/遗忘字段保留，便于配置回滚和审计，但 V6 运行时不再消费。
+    memory_cfg = migrated.setdefault("memory", {})
+    v6_memory_defaults = {
+        "recall_candidate_limit": 20,
+        "recall_inject_limit": 5,
+        "recall_association_limit": 2,
+        "rerank_relevance_baseline": 0.65,
+        "prompt_char_budget": 5000,
+        "chunk_target_chars": 600,
+        "chunk_hard_chars": 900,
+        "chunk_target_tokens": 450,
+        "chunk_hard_tokens": 700,
+        "chunk_overlap_chars": 100,
+        "job_max_attempts": 8,
+        "vector_cache_limit": 50000,
+        "vector_batch_size": 2048,
+    }
+    added_memory_fields = []
+    for key, value in v6_memory_defaults.items():
+        if key not in memory_cfg:
+            memory_cfg[key] = value
+            added_memory_fields.append(key)
+            changed = True
+    if added_memory_fields:
+        report.append(
+            "memory: 已补齐 V6 账号级记忆大脑参数（旧容量/遗忘字段仅保留兼容）"
+        )
 
     # ── 写入 config_version ──
     old_version = migrated.get("config_version", 0)

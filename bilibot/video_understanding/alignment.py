@@ -140,7 +140,10 @@ def build_behavior_log(
             continue
 
         for ae in block.audio:
-            lines.append(f"  - 【听到声音】：{ae.text}")
+            if getattr(ae, "source", "asr") == "subtitle":
+                lines.append(f"  - 【字幕】{ae.text}")
+            else:
+                lines.append(f"  - 【听到声音】：{ae.text}")
 
         for ve in block.visuals:
             lines.append(f"  - 【看到画面】：{ve.description}")

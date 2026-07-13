@@ -44,8 +44,11 @@ def create_replies_routes(audit_store) -> list[Route]:
 
     async def list_replies(request: Request) -> JSONResponse:
         try:
-            page = int(request.query_params.get("page", 1))
-            page_size = int(request.query_params.get("page_size", 20))
+            try:
+                page = max(1, int(request.query_params.get("page", 1)))
+                page_size = max(1, min(int(request.query_params.get("page_size", 20)), 100))
+            except (ValueError, TypeError):
+                return fail("INVALID_INPUT", "page/page_size 必须是正整数", status_code=400)
             status = request.query_params.get("status", "")
 
             # UI-606：将状态筛选下推到 SQL 层（AuditStore.list_by_status），
@@ -65,7 +68,7 @@ def create_replies_routes(audit_store) -> list[Route]:
             })
         except Exception as e:
             logger.exception("list_replies 失败")
-            return fail_internal(str(e))
+            return fail_internal()
 
     async def get_reply_context(request: Request) -> JSONResponse:
         try:
@@ -80,7 +83,7 @@ def create_replies_routes(audit_store) -> list[Route]:
             })
         except Exception as e:
             logger.exception("get_reply_context 失败")
-            return fail_internal(str(e))
+            return fail_internal()
 
     return [
         Route("/api/replies", list_replies, methods=["GET"]),

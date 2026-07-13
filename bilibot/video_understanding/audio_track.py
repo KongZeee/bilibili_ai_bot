@@ -14,7 +14,9 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Union
+
+from bilibot.llm.provider import ASRResponseError, extract_asr_transcript
 
 logger = logging.getLogger("bilibot.video_u.audio")
 
@@ -25,11 +27,41 @@ _whisper_executor_workers: int = 0
 
 @dataclass
 class AudioEvent:
-    """音频事件"""
+    """音频事件
+
+    source: 文本来源。
+        - "asr"：音频转写（声音轨）
+        - "subtitle"：番剧字幕识别（替代声音轨，番剧一般都有字幕）
+    """
 
     start: float
     end: float
     text: str
+    source: str = "asr"
+
+
+@dataclass
+class ASRTranscriptionResult:
+    """Structured ASR outcome used by completeness-sensitive callers."""
+
+    events: List[AudioEvent]
+    status: str
+    error_code: str = ""
+    error_reason: str = ""
+    retryable: bool = False
+    duration_seconds: float = 0.0
+    timestamp_clamped_count: int = 0
+
+
+class ASRTranscriptionError(RuntimeError):
+    """Retryable ASR failure that must not be archived as complete extraction."""
+
+    def __init__(self, code: str, reason: str, *, retryable: bool = True):
+        self.code = code
+        self.reason = reason
+        self.retryable = retryable
+        self.work_dir = ""
+        super().__init__(f"{code}: {reason}")
 
 
 def _estimate_audio_duration(audio_path: str) -> float:
@@ -50,6 +82,33 @@ def _estimate_audio_duration(audio_path: str) -> float:
     except Exception as e:
         logger.warning(f"估算音频时长失败: {e}")
     return 0.0
+
+
+def _normalize_audio_timestamps(
+    events: List[AudioEvent], duration_seconds: float
+) -> tuple[List[AudioEvent], int]:
+    """Clamp provider timestamps to the measured track without discarding text."""
+
+    if duration_seconds <= 0:
+        return events, 0
+
+    normalized: List[AudioEvent] = []
+    clamped = 0
+    for event in events:
+        start = min(duration_seconds, max(0.0, float(event.start)))
+        end = min(duration_seconds, max(0.0, float(event.end)))
+        end = max(start, end)
+        if start != event.start or end != event.end:
+            clamped += 1
+        normalized.append(
+            AudioEvent(
+                start=round(start, 2),
+                end=round(end, 2),
+                text=event.text,
+                source=event.source,
+            )
+        )
+    return normalized, clamped
 
 
 def _split_segment(start: float, end: float, text: str, max_span: float = 8.0) -> List[AudioEvent]:
@@ -145,16 +204,18 @@ def _transcribe_with_api(audio_path: str, asr_model: str, asr_api_key: str, asr_
     response = asyncio.run(_request())
     events: List[AudioEvent] = []
 
-    if not response.choices:
-        logger.warning("ASR API 返回空 choices")
-        return events
-
-    message = response.choices[0].message
-    text = getattr(message, "content", None) or getattr(message, "audio", {}).get("transcript", "")
-    text = (text or "").strip()
+    try:
+        text = extract_asr_transcript(response)
+    except ASRResponseError as response_error:
+        logger.warning(
+            "ASR API 响应无可用转写: code=%s reason=%s",
+            response_error.code,
+            response_error.reason,
+        )
+        raise
 
     if not text:
-        logger.warning("ASR API 返回空文本")
+        logger.info("ASR API 明确返回无语音: status=no_speech")
         return events
 
     duration = _estimate_audio_duration(audio_path)
@@ -230,7 +291,9 @@ def transcribe_audio(
     local_whisper_enabled: bool = False,
     max_local_whisper_workers: int = 1,
     whisper_timeout: int = 600,
-) -> List[AudioEvent]:
+    return_result: bool = False,
+    raise_on_error: bool = False,
+) -> Union[List[AudioEvent], ASRTranscriptionResult]:
     """
     音频轨入口
 
@@ -244,32 +307,100 @@ def transcribe_audio(
     Returns:
         音频事件列表，识别失败或无对白返回空列表
     """
+    mode = "skipped"
+
+    def _return(result: ASRTranscriptionResult):
+        return result if return_result else result.events
+
+    def _run_local_whisper() -> List[AudioEvent]:
+        logger.info("使用本地 faster-whisper ASR（独立工作池+超时）")
+        executor = _get_whisper_executor(max_local_whisper_workers)
+        future = executor.submit(
+            _transcribe_with_whisper,
+            audio_path,
+            whisper_model_size,
+            whisper_device,
+            whisper_compute_type,
+        )
+        try:
+            return future.result(timeout=whisper_timeout)
+        except FutureTimeoutError as exc:
+            logger.warning(f"本地 Whisper 超时（{whisper_timeout}s）")
+            future.cancel()
+            raise ASRTranscriptionError(
+                "ASR_LOCAL_TIMEOUT",
+                f"local Whisper exceeded {whisper_timeout}s",
+            ) from exc
+
     try:
         if asr_model:
+            mode = "api"
             logger.info(f"使用 API ASR 模型: {asr_model}")
-            events = _transcribe_with_api(audio_path, asr_model, asr_api_key, asr_base_url)
-        elif local_whisper_enabled:
-            logger.info("使用本地 faster-whisper ASR（独立工作池+超时）")
-            executor = _get_whisper_executor(max_local_whisper_workers)
-            future = executor.submit(
-                _transcribe_with_whisper,
-                audio_path,
-                whisper_model_size,
-                whisper_device,
-                whisper_compute_type,
-            )
             try:
-                events = future.result(timeout=whisper_timeout)
-            except FutureTimeoutError:
-                logger.warning(f"本地 Whisper 超时（{whisper_timeout}s），跳过 ASR")
-                future.cancel()
-                return []
+                events = _transcribe_with_api(
+                    audio_path, asr_model, asr_api_key, asr_base_url
+                )
+            except Exception as api_error:
+                if not local_whisper_enabled:
+                    raise
+                logger.warning(
+                    "API ASR 未完成，回退本地 Whisper: error=%s code=%s",
+                    type(api_error).__name__,
+                    getattr(api_error, "code", ""),
+                )
+                mode = "local_fallback"
+                events = _run_local_whisper()
+        elif local_whisper_enabled:
+            mode = "local"
+            events = _run_local_whisper()
         else:
             # PRD-V5 §8.2 VID-503：本地 Whisper 默认关闭，未开启时跳过 ASR
             logger.info("本地 Whisper 未启用（local_whisper_enabled=false），跳过 ASR")
-            return []
+            return _return(ASRTranscriptionResult([], "skipped"))
         logger.info(f"ASR 完成: {len(events)} 段")
-        return events
+        duration_seconds = _estimate_audio_duration(audio_path)
+        events, timestamp_clamped_count = _normalize_audio_timestamps(
+            events, duration_seconds
+        )
+        if timestamp_clamped_count:
+            logger.warning(
+                "ASR timestamps clamped to measured audio duration: segments=%s duration=%.2fs",
+                timestamp_clamped_count,
+                duration_seconds,
+            )
+        return _return(
+            ASRTranscriptionResult(
+                events,
+                "ok" if events else "no_speech",
+                duration_seconds=duration_seconds,
+                timestamp_clamped_count=timestamp_clamped_count,
+            )
+        )
     except Exception as e:
-        logger.error(f"ASR 失败: {e}")
-        return []
+        if isinstance(e, ASRTranscriptionError):
+            error = e
+        elif isinstance(e, ASRResponseError):
+            error = ASRTranscriptionError(e.code, e.reason)
+        else:
+            if mode == "api":
+                code = "ASR_API_REQUEST_FAILED"
+            elif mode == "local_fallback":
+                code = "ASR_LOCAL_FALLBACK_FAILED"
+            else:
+                code = "ASR_LOCAL_FAILED"
+            error = ASRTranscriptionError(code, f"{type(e).__name__}: {e}")
+        logger.error(
+            "ASR 失败: code=%s retryable=%s reason=%s",
+            error.code,
+            error.retryable,
+            error.reason,
+        )
+        if raise_on_error:
+            if error is e:
+                raise
+            raise error from e
+        return _return(
+            ASRTranscriptionResult(
+                [], "failed", error.code, error.reason, error.retryable
+            )
+        )

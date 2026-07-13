@@ -91,8 +91,7 @@ bilibot/
 │   ├── audit_store.py       # 审计存储（mark_published）
 │   ├── comment_context.py   # 评论上下文构建服务
 │   ├── memory_writer.py     # 记忆写入服务
-│   ├── persona_store.py     # 人格库
-│   └── strategy_engine.py   # 策略引擎
+│   └── persona_store.py     # 人格库
 ├── web/
 │   ├── __init__.py
 │   ├── panel.py             # Web 面板（create_web_app）

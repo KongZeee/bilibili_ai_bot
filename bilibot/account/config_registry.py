@@ -18,6 +18,8 @@ import logging
 import uuid
 from typing import Dict, List, Optional, Any
 
+from bilibot.app.config_loader import is_sensitive_placeholder as is_redaction_marker
+
 logger = logging.getLogger("bilibot.account")
 
 # 敏感字段：PATCH 时若值为占位符 / None / 空字符串则保留原值
@@ -31,7 +33,7 @@ def is_sensitive_placeholder(value: Any) -> bool:
     """判断值是否为敏感字段占位符（应保留原值）"""
     if value is None:
         return True
-    if isinstance(value, str) and (value == REDACTED_PLACEHOLDER or value == ""):
+    if isinstance(value, str) and (is_redaction_marker(value) or value == ""):
         return True
     return False
 

@@ -18,6 +18,7 @@ export const SchemaForm = {
         const localModel = reactive({ ...props.modelValue });
 
         watch(() => props.modelValue, (v) => {
+            Object.keys(localModel).forEach(k => delete localModel[k]);
             Object.assign(localModel, v);
         }, { deep: true });
 
@@ -43,8 +44,26 @@ export const SchemaForm = {
             const fieldId = field.id || `sf-${field.key.replace(/\./g, '-')}`;
             const autocomplete = field.sensitive ? 'off' : (field.autocomplete || undefined);
             const spellcheck = field.sensitive ? false : (field.spellcheck);
+            const arrayText = Array.isArray(value) ? value.join(', ') : (value ?? '');
 
             switch (field.type) {
+                case 'array':
+                    return h(FormInput, {
+                        modelValue: arrayText,
+                        'onUpdate:modelValue': (v) => {
+                            if (field.itemType === 'object') {
+                                onInput(value || []);
+                                return;
+                            }
+                            onInput(String(v).replace(/，/g, ',').split(',').map(item => item.trim()).filter(Boolean));
+                        },
+                        id: fieldId,
+                        name: fieldId,
+                        type: 'text',
+                        autocomplete,
+                        spellcheck,
+                        placeholder: field.placeholder || '用逗号分隔',
+                    });
                 case 'boolean':
                     return h('div', { class: 'flex items-center gap-2' }, [
                         h(Toggle, {
@@ -89,7 +108,14 @@ export const SchemaForm = {
                 case 'number':
                     return h(FormInput, {
                         modelValue: value != null ? String(value) : '',
-                        'onUpdate:modelValue': (v) => onInput(field.type === 'integer' ? parseInt(v) || 0 : parseFloat(v) || 0),
+                        'onUpdate:modelValue': (v) => {
+                            if (v === '' || v === null || v === undefined) {
+                                onInput(null);
+                            } else {
+                                const n = field.type === 'integer' ? parseInt(v) : parseFloat(v);
+                                onInput(isNaN(n) ? null : n);
+                            }
+                        },
                         id: fieldId,
                         name: fieldId,
                         type: 'number',
@@ -114,20 +140,20 @@ export const SchemaForm = {
 
         return () => h('div', { class: 'schema-form' },
             groupedFields.value.map(group => h('div', {
-                class: 'card',
+                class: 'schema-form-group',
                 style: { marginBottom: 'calc(var(--spacing) * 4)' },
             }, [
-                h('div', { class: 'card-header' }, [
-                    h('div', { class: 'grid gap-1' }, [
-                        h('span', { class: 'eyebrow' }, '配置分组'),
-                        h('h3', {
-                            style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500; text-wrap:balance; word-break:keep-all;',
-                        }, group.name),
-                    ]),
-                ]),
-                h('div', { class: 'card-body' }, [
-                    h('div', { class: 'form-grid-2col' },
-                        group.fields.map(field => {
+                groupedFields.value.length > 1 ? h('div', {
+                    class: 'grid gap-1',
+                    style: { marginBottom: 'calc(var(--spacing) * 3)' },
+                }, [
+                    h('span', { class: 'eyebrow' }, '配置分组'),
+                    h('h3', {
+                        style: 'margin:0; font-size:1.1rem; line-height:1.2; font-weight:500;',
+                    }, group.name),
+                ]) : null,
+                h('div', { class: 'form-grid-2col' },
+                    group.fields.map(field => {
                             const fieldId = field.id || `sf-${field.key.replace(/\./g, '-')}`;
                             return h('div', {
                                 class: ['form-group', field.span === 2 ? 'span-2' : ''].filter(Boolean).join(' '),
@@ -141,9 +167,8 @@ export const SchemaForm = {
                                 renderField(field),
                                 field.hint && h(FormHint, field.hint),
                             ]);
-                        }),
-                    ),
-                ]),
+                    }),
+                ),
             ])),
         );
     },

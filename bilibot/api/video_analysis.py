@@ -7,9 +7,16 @@
 - POST  /api/video-analysis/test   - 测试视频理解（下载并分析）
 """
 import asyncio
+import hashlib
+import inspect
+import json
 import logging
 import os
 import re
+import shutil
+from collections.abc import Mapping
+from dataclasses import replace
+from pathlib import Path
 from starlette.routing import Route
 from starlette.responses import JSONResponse
 from starlette.requests import Request
@@ -40,7 +47,8 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
 
     # 顶层标量字段
     for key in ("enabled", "frame_extractor", "scenedetect_threshold",
-                "image_max_size", "vision_window_size", "temp_dir",
+                "image_max_size", "vision_window_size",
+                "vision_requests_per_minute", "temp_dir",
                 # CFG-604：VID-503 资源边界配置
                 "max_duration_seconds", "max_download_bytes",
                 "max_concurrent_global", "max_concurrent_per_account",
@@ -54,11 +62,12 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
             elif key in ("scenedetect_threshold",):
                 val = float(val)
             elif key in ("image_max_size", "vision_window_size",
-                         "max_duration_seconds", "max_download_bytes",
-                         "max_concurrent_global", "max_concurrent_per_account",
-                         "download_timeout_seconds", "preprocess_timeout_seconds",
-                         "analysis_timeout_seconds", "max_local_whisper_workers",
-                         "temp_disk_quota_bytes"):
+                          "vision_requests_per_minute",
+                          "max_duration_seconds", "max_download_bytes",
+                          "max_concurrent_global", "max_concurrent_per_account",
+                          "download_timeout_seconds", "preprocess_timeout_seconds",
+                          "analysis_timeout_seconds", "max_local_whisper_workers",
+                          "temp_disk_quota_bytes"):
                 val = int(val)
             va[key] = val
 
@@ -78,6 +87,41 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
                 asr[key] = val
         va["asr"] = asr
 
+    # Task 28：local_whisper 子段 — 更新 asr_providers 列表中的 local_whisper 项
+    if "local_whisper" in updates and isinstance(updates["local_whisper"], dict):
+        lw_updates = updates["local_whisper"]
+        asr_providers = raw.get("asr_providers", [])
+        if not isinstance(asr_providers, list):
+            asr_providers = []
+        # 查找现有 local_whisper 项（含 model_size 或 whisper_device 键的 dict）
+        lw_index = None
+        for i, item in enumerate(asr_providers):
+            if isinstance(item, dict) and ("model_size" in item or "whisper_device" in item):
+                lw_index = i
+                break
+        if lw_index is not None:
+            # 合并更新到现有项
+            merged_lw = dict(asr_providers[lw_index])
+            for k in ("enabled", "model_size", "device", "compute_type"):
+                if k in lw_updates:
+                    val = lw_updates[k]
+                    if k == "enabled":
+                        val = bool(val)
+                    merged_lw[k] = val
+            asr_providers[lw_index] = merged_lw
+        else:
+            # 新建 local_whisper 项
+            new_lw = {}
+            for k in ("enabled", "model_size", "device", "compute_type"):
+                if k in lw_updates:
+                    val = lw_updates[k]
+                    if k == "enabled":
+                        val = bool(val)
+                    new_lw[k] = val
+            if new_lw:
+                asr_providers = list(asr_providers) + [new_lw]
+        raw["asr_providers"] = asr_providers
+
     raw["video_analysis"] = va
     return raw
 
@@ -92,6 +136,80 @@ def _extract_bvid(text: str) -> str:
     if m:
         return m.group(1)
     return ""
+
+
+async def _archive_test_analysis(acc, *, bvid: str, vinfo: dict, result: dict) -> None:
+    """Persist complete manual-test extraction before its artifacts are removed."""
+    brain = getattr(acc, "memory_brain", None)
+    archive = getattr(brain, "archive_observation_async", None)
+    if not callable(archive):
+        raise RuntimeError("V6 memory brain is unavailable for video test archival")
+
+    from bilibot.memory_brain.ingestion import video_observation
+
+    raw_tags = vinfo.get("tags") or []
+    if isinstance(raw_tags, str):
+        tags = [item.strip() for item in raw_tags.split(",") if item.strip()]
+    elif isinstance(raw_tags, list):
+        tags = [str(item) for item in raw_tags if item]
+    else:
+        tags = []
+    account_id = str(getattr(acc, "account_id", "") or "default")
+    envelope = video_observation(
+        account_id=account_id,
+        observation_key=f"manual-test:{bvid}:draft",
+        bvid=bvid,
+        oid=str(vinfo.get("aid") or bvid),
+        title=str(vinfo.get("title") or ""),
+        owner=str((vinfo.get("owner") or {}).get("name") or ""),
+        context={"metadata": vinfo, "audiovisual": result},
+        tags=tags,
+        persona_id=str(getattr(acc, "persona_id", "") or ""),
+    )
+    canonical = {
+        "metadata": envelope.metadata,
+        "sources": [
+            {
+                "source_type": source.source_type,
+                "external_id": source.external_id,
+                "full_text": source.full_text,
+                "data": source.data,
+            }
+            for source in envelope.sources
+        ],
+    }
+    serialized = json.dumps(canonical, ensure_ascii=False, sort_keys=True, default=str)
+    content_hash = hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:20]
+    envelope = replace(
+        envelope,
+        idempotency_key=f"video:{account_id}:manual-test:{bvid}:{content_hash}",
+    )
+    archive_result = archive(envelope)
+    if inspect.isawaitable(archive_result):
+        archive_result = await archive_result
+    committed = (
+        archive_result.get("source_committed", False)
+        if isinstance(archive_result, Mapping)
+        else getattr(archive_result, "source_committed", False)
+    )
+    if committed is not True:
+        raise RuntimeError("V6 memory source archive did not commit")
+
+
+def _cleanup_test_analysis_artifacts(video_file: str, result: dict) -> None:
+    """Remove only the exact media/work paths returned by a committed analysis."""
+    paths = [Path(video_file)]
+    work_dir = result.get("work_dir") if isinstance(result, dict) else None
+    if work_dir:
+        paths.append(Path(str(work_dir)))
+    for path in sorted(dict.fromkeys(paths), key=lambda item: len(item.parts), reverse=True):
+        try:
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+        except OSError as exc:
+            logger.warning("[test] 清理已归档视频临时文件失败 %s: %s", path, type(exc).__name__)
 
 
 def create_video_analysis_routes(config_loader, config_path: str, account_manager=None):
@@ -112,7 +230,8 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
                 va = {}
             return ok(_mask_config(va))
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"获取视频理解配置失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def update_video_analysis(request: Request) -> JSONResponse:
         """更新视频理解配置"""
@@ -127,7 +246,7 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             return ok(_mask_config(va))
         except Exception as e:
             logger.error(f"更新视频理解配置失败: {e}", exc_info=True)
-            return fail_internal(str(e))
+            return fail_internal()
 
     async def test_video_analysis(request: Request) -> JSONResponse:
         """测试视频理解：下载视频并执行视听双轨分析
@@ -194,22 +313,26 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             logger.info(f"[test] 视频已下载: {video_file}, 开始分析...")
 
             # 3. 执行视频理解
-            try:
-                result = await asyncio.wait_for(
-                    vu.understand(video_file),
-                    timeout=600,
+            result = await asyncio.wait_for(
+                vu.understand(
+                    video_file,
+                    defer_cleanup=True,
+                    require_complete_audio=True,
+                    require_complete_visual=True,
+                ),
+                timeout=600,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("视频理解返回了无效结果")
+
+            behavior_log = result.get("behavior_log", "")
+            degradation = result.get("degradation_reason", "")
+
+            if degradation:
+                logger.warning(
+                    "[test] 视频提取未完成，保留媒体与处理目录: %s",
+                    degradation,
                 )
-            finally:
-                # 清理临时文件
-                try:
-                    os.remove(video_file)
-                except Exception:
-                    pass
-
-            behavior_log = result.get("behavior_log", "") if isinstance(result, dict) else ""
-            degradation = result.get("degradation_reason", "") if isinstance(result, dict) else ""
-
-            if not behavior_log and degradation:
                 return ok({
                     "title": title,
                     "owner": owner,
@@ -219,6 +342,15 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
                     "description": f"视频因资源限制降级为元数据分析: {degradation}",
                     "frames": [],
                 })
+
+            # 4. 完整提取内容提交到账号脑库后，才允许清理媒体与处理目录。
+            await _archive_test_analysis(
+                acc,
+                bvid=bvid,
+                vinfo=vinfo,
+                result=result,
+            )
+            _cleanup_test_analysis_artifacts(video_file, result)
 
             # 截取行为日志前 2000 字作为描述
             desc = behavior_log[:2000] if behavior_log else "（未生成行为日志）"
@@ -238,7 +370,7 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             return fail("ANALYSIS_TIMEOUT", "视频分析超时（超过 10 分钟）")
         except Exception as e:
             logger.error(f"[test] 视频理解测试失败: {e}", exc_info=True)
-            return fail_internal(str(e))
+            return fail_internal()
 
     return [
         Route("/api/video-analysis", get_video_analysis, methods=["GET"]),

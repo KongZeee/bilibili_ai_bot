@@ -1,9 +1,10 @@
 // components/memory/list-page.js - 记忆列表页（Golden Time 设计稿）
 const { defineComponent, h, ref, reactive, computed, onMounted, watch } = window.Vue;
 import { api } from '../../api.js';
-import { Card, Button, Badge, FormInput, Loading, EmptyState, Icon, HeroPanel, ActionList, ProgressBar, Pagination } from '../common.js';
+import { Button, Loading, EmptyState, Icon, ProgressBar, Pagination, Modal, ConfirmModal, createConfirmHelper } from '../common.js';
 import { appState, showToast } from '../../state.js';
 import { navigate } from '../../router.js';
+import { formatTime } from '../../utils.js';
 
 // 分类标签映射
 const CATEGORY_LABELS = {
@@ -24,11 +25,36 @@ function categoryLabel(cat) {
     return CATEGORY_LABELS[cat] || cat || '未分类';
 }
 
-// 时间格式化
-function formatTime(ts) {
-    if (!ts) return '-';
-    const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
-    return d.toLocaleString('zh-CN', { hour12: false });
+const STATUS_LABELS = {
+    ready: '索引就绪',
+    pending: '处理中',
+    processing: '执行中',
+    retry: '等待重试',
+    fts_only: '仅全文索引',
+    enrichment_blocked: '增强待配置',
+    degraded: '索引降级',
+    blocked: '已阻塞',
+    completed: '已完成',
+    dead: '死信',
+};
+
+const JOB_TYPE_LABELS = {
+    summarize_event: '事件摘要',
+    extract_entities: '实体提取',
+    link_associations: '关联构建',
+    embed_event: '事件向量',
+    embed_chunks: '分块向量',
+};
+
+function statusLabel(status) {
+    return STATUS_LABELS[status] || status || '处理中';
+}
+
+function jobBadgeClass(status) {
+    if (status === 'completed') return 'badge-success';
+    if (status === 'dead') return 'badge-danger';
+    if (status === 'blocked' || status === 'retry') return 'badge-warning';
+    return 'badge-info';
 }
 
 export const MemoryListPage = defineComponent({
@@ -47,6 +73,16 @@ export const MemoryListPage = defineComponent({
         const recallQuery = ref('');
         const recallResult = ref(null);
         const recalling = ref(false);
+        const selectedMemory = ref(null);
+        const detailVisible = ref(false);
+        const detailLoading = ref(false);
+        const jobs = ref([]);
+        const jobFilter = ref('');
+        const jobsLoading = ref(false);
+        const reindexing = ref(false);
+        const retryingJobId = ref('');
+
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
 
         // 分类统计列表（按数量降序）
         const categoryStats = computed(() => {
@@ -72,18 +108,23 @@ export const MemoryListPage = defineComponent({
             }
             loading.value = true;
             try {
-                const [statsData, listData] = await Promise.all([
-                    api.memory.stats(accountId.value).catch(() => ({ total: 0, categories: {} })),
+                const [statsData, listData, jobsData] = await Promise.all([
+                    api.memory.stats(accountId.value).catch(() => ({ total: 0, categories: {}, health: {} })),
                     api.memory.list(accountId.value, {
                         page: page.value,
                         page_size: pageSize.value,
                         ...(filterCategory.value ? { category: filterCategory.value } : {}),
-                        ...(filterStatus.value ? { active: filterStatus.value } : {}),
+                        ...(filterStatus.value ? { status: filterStatus.value } : {}),
                     }).catch(() => ({ items: [], total: 0 })),
+                    api.memory.jobs(accountId.value, {
+                        limit: 50,
+                        ...(jobFilter.value ? { status: jobFilter.value } : {}),
+                    }).catch(() => ({ items: [] })),
                 ]);
                 stats.value = statsData || { total: 0, categories: {} };
                 memories.value = listData?.items || [];
                 total.value = listData?.total || 0;
+                jobs.value = jobsData?.items || [];
             } catch (e) {
                 showToast('加载失败: ' + e.message, 'error');
             } finally {
@@ -110,14 +151,91 @@ export const MemoryListPage = defineComponent({
             }
         }
 
-        async function deleteMemory(id) {
-            if (!confirm('确定删除此记忆？')) return;
+        function deleteMemory(id) {
+            showConfirm({
+                title: '确认删除',
+                message: '确定删除此记忆？',
+                confirmText: '删除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.memory.delete(accountId.value, id);
+                        showToast('已删除', 'success');
+                        await loadData();
+                    } catch (e) {
+                        showToast('删除失败: ' + e.message, 'error');
+                    }
+                },
+            });
+        }
+
+        async function openDetail(id) {
+            detailVisible.value = true;
+            detailLoading.value = true;
+            selectedMemory.value = null;
             try {
-                await api.memory.delete(accountId.value, id);
-                showToast('已删除', 'success');
+                selectedMemory.value = await api.memory.detail(accountId.value, id);
+            } catch (e) {
+                detailVisible.value = false;
+                showToast('读取详情失败: ' + e.message, 'error');
+            } finally {
+                detailLoading.value = false;
+            }
+        }
+
+        async function loadJobs() {
+            if (!accountId.value) return;
+            jobsLoading.value = true;
+            try {
+                const data = await api.memory.jobs(accountId.value, {
+                    limit: 50,
+                    ...(jobFilter.value ? { status: jobFilter.value } : {}),
+                });
+                jobs.value = data?.items || [];
+            } catch (e) {
+                showToast('读取索引任务失败: ' + e.message, 'error');
+            } finally {
+                jobsLoading.value = false;
+            }
+        }
+
+        function requestReindex(eventId = '') {
+            showConfirm({
+                title: eventId ? '重建此记忆索引' : '重建全部记忆索引',
+                message: eventId
+                    ? '将重新生成该记忆的派生索引与增强任务，原始来源不会改变。'
+                    : '将重建全文索引，并重新排队全部派生索引与增强任务。原始来源不会改变。',
+                confirmText: '开始重建',
+                action: async () => {
+                    reindexing.value = true;
+                    try {
+                        const report = await api.memory.reindex(accountId.value, eventId
+                            ? { event_id: eventId }
+                            : { clear_enrichment: true });
+                        const count = report?.events_requeued ?? report?.events ?? 0;
+                        showToast(`索引重建已排队，共 ${count} 个事件`, 'success');
+                        await loadData();
+                        if (eventId && detailVisible.value) await openDetail(eventId);
+                    } catch (e) {
+                        showToast('索引重建失败: ' + e.message, 'error');
+                    } finally {
+                        reindexing.value = false;
+                    }
+                },
+            });
+        }
+
+        async function retryJob(jobId) {
+            if (!jobId) return;
+            retryingJobId.value = jobId;
+            try {
+                await api.memory.retryJob(accountId.value, jobId);
+                showToast('死信任务已重新排队', 'success');
                 await loadData();
             } catch (e) {
-                showToast('删除失败: ' + e.message, 'error');
+                showToast('任务重试失败: ' + e.message, 'error');
+            } finally {
+                retryingJobId.value = '';
             }
         }
 
@@ -125,10 +243,11 @@ export const MemoryListPage = defineComponent({
             if (!recallQuery.value.trim() || !accountId.value) return;
             recalling.value = true;
             try {
-                const data = await api.memory.search(accountId.value, { query: recallQuery.value });
-                const items = data?.items || data || [];
+                const data = await api.memory.recall(accountId.value, { query: recallQuery.value, scene: 'memory_list_quick_test' });
+                const items = data?.events || data?.memories || [];
                 recallResult.value = {
                     count: items.length,
+                    mode: data?.trace?.mode || 'empty',
                     time: new Date().toLocaleTimeString('zh-CN', { hour12: false }),
                 };
             } catch (e) {
@@ -168,7 +287,7 @@ export const MemoryListPage = defineComponent({
         }
 
         function cycleStatus() {
-            const opts = ['', '1', '0'];
+            const opts = ['', 'ready', 'pending', 'fts_only', 'enrichment_blocked', 'degraded'];
             const idx = opts.indexOf(filterStatus.value);
             filterStatus.value = opts[(idx + 1) % opts.length];
             page.value = 1;
@@ -212,11 +331,11 @@ export const MemoryListPage = defineComponent({
                 // ═══ Section 1: Hero band — 记忆统计 + 搜索 ═══
                 h('section', {
                     class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
+                    style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));',
                 }, [
                     // 左：记忆统计面板（accent 背景）
                     h('article', {
-                        class: 'grid gap-3',
+                        class: 'grid gap-3 memory-panel',
                         style: 'background: hsl(var(--accent) / 0.22); border: 1px solid hsl(var(--accent)); color: hsl(var(--card-foreground)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
                     }, [
                         h('div', { class: 'flex items-start justify-between gap-2' }, [
@@ -232,7 +351,7 @@ export const MemoryListPage = defineComponent({
                                 style: 'padding: calc(var(--spacing) * 0.8) calc(var(--spacing) * 1.6); border-radius: 999px; background: hsl(var(--accent) / 0.34); color: hsl(var(--accent-foreground)); font-size: 0.82rem;',
                             }, [
                                 h(Icon, { name: 'circle-check', size: '0.9rem' }),
-                                '已就绪',
+                                stats.value.health?.ok === false ? '健康检查异常' : '脑库健康',
                             ]),
                         ]),
                         h('div', {
@@ -283,7 +402,7 @@ export const MemoryListPage = defineComponent({
                                 h(Icon, { name: 'chevron-down', size: '0.75rem' }),
                             ]),
                             h(Button, { type: 'ghost', onClick: cycleStatus }, () => [
-                                filterStatus.value === '1' ? '活跃' : filterStatus.value === '0' ? '归档' : '全部状态',
+                                filterStatus.value ? statusLabel(filterStatus.value) : '全部索引状态',
                                 h(Icon, { name: 'chevron-down', size: '0.75rem' }),
                             ]),
                             h(Button, { type: 'ghost', onClick: () => { page.value = 1; loadData(); } }, () => [
@@ -326,7 +445,7 @@ export const MemoryListPage = defineComponent({
                         ]),
 
                         // 表格容器
-                        h('div', { style: 'overflow-x: auto;' }, [
+                        h('div', { class: 'memory-table-scroll' }, [
                             h('div', {
                                 class: 'grid gap-0',
                                 style: `min-width: 860px;`,
@@ -364,9 +483,12 @@ export const MemoryListPage = defineComponent({
                                             categoryLabel(mem.category),
                                         ]),
                                         // 内容预览
-                                        h('span', {
-                                            style: 'font-size: 0.96rem; color: hsl(var(--foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
+                                        h('button', {
+                                            type: 'button',
+                                            class: 'btn btn-ghost',
+                                            style: 'justify-content: flex-start; min-width: 0; padding: 0; font-size: 0.96rem; color: hsl(var(--foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; box-shadow: none;',
                                             title: mem.content || '',
+                                            onClick: () => openDetail(mem.id),
                                         }, (mem.content && mem.content.length > 60)
                                             ? mem.content.slice(0, 60) + '...'
                                             : (mem.content || '-')),
@@ -381,12 +503,20 @@ export const MemoryListPage = defineComponent({
                                         // 状态
                                         h('span', {
                                             class: 'inline-flex items-center whitespace-nowrap w-fit',
-                                            style: `padding: calc(var(--spacing) * 0.4) calc(var(--spacing) * 1); border-radius: 999px; font-size: 0.78rem; ${(mem.active === 0 || mem.status === 'archived')
-                                                ? 'background: hsl(var(--muted)); color: hsl(var(--muted-foreground));'
-                                                : 'background: hsl(var(--accent) / 0.34); color: hsl(var(--accent-foreground));'}`,
-                                        }, (mem.active === 0 || mem.status === 'archived') ? '归档' : '活跃'),
+                                            style: `padding: calc(var(--spacing) * 0.4) calc(var(--spacing) * 1); border-radius: 999px; font-size: 0.78rem; ${mem.index_health?.healthy
+                                                ? 'background: hsl(var(--accent) / 0.34); color: hsl(var(--accent-foreground));'
+                                                : 'background: hsl(var(--muted)); color: hsl(var(--muted-foreground));'}`,
+                                            title: `FTS: ${mem.index_health?.fts || '-'} / Embedding: ${mem.index_health?.embedding || '-'}`,
+                                        }, statusLabel(mem.index_status || mem.status)),
                                         // 操作
                                         h('div', { class: 'flex items-center gap-1' }, [
+                                            h('button', {
+                                                type: 'button',
+                                                'aria-label': '查看完整记忆详情',
+                                                title: '查看详情',
+                                                class: 'icon-btn',
+                                                onClick: () => openDetail(mem.id),
+                                            }, [h(Icon, { name: 'external-link', size: '1.05rem' })]),
                                             h('button', {
                                                 type: 'button',
                                                 'aria-label': '删除记忆',
@@ -417,10 +547,103 @@ export const MemoryListPage = defineComponent({
                     ]),
                 ]),
 
-                // ═══ Section 3: Split grid — 分类统计 + 召回测试 ═══
+                // ═══ Section 3: 持久索引任务 ═══
+                h('section', {}, [
+                    h('article', {
+                        class: 'grid gap-3 memory-panel',
+                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
+                    }, [
+                        h('div', { class: 'flex items-end justify-between gap-3', style: 'flex-wrap: wrap;' }, [
+                            h('div', { class: 'grid gap-1 min-w-0' }, [
+                                h('span', { class: 'eyebrow' }, '持久任务'),
+                                h('h2', { class: 'm-0', style: 'font-size: 1.35rem; line-height: 1.08;' }, '索引与增强队列'),
+                            ]),
+                            h('div', { class: 'flex items-center gap-2', style: 'flex-wrap: wrap;' }, [
+                                h('select', {
+                                    class: 'form-input',
+                                    value: jobFilter.value,
+                                    'aria-label': '筛选任务状态',
+                                    style: 'width: auto; min-width: 9rem;',
+                                    onChange: (event) => {
+                                        jobFilter.value = event.target.value;
+                                        loadJobs();
+                                    },
+                                }, [
+                                    h('option', { value: '' }, '全部任务'),
+                                    h('option', { value: 'pending' }, '等待执行'),
+                                    h('option', { value: 'processing' }, '执行中'),
+                                    h('option', { value: 'retry' }, '等待重试'),
+                                    h('option', { value: 'blocked' }, '已阻塞'),
+                                    h('option', { value: 'dead' }, '死信'),
+                                    h('option', { value: 'completed' }, '已完成'),
+                                ]),
+                                h(Button, { type: 'ghost', size: 'sm', loading: jobsLoading.value, onClick: loadJobs }, () => '刷新'),
+                                h(Button, { type: 'primary', size: 'sm', loading: reindexing.value, onClick: () => requestReindex() }, () => '重建全部索引'),
+                            ]),
+                        ]),
+                        h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' },
+                            Object.entries(stats.value.jobs || {}).map(([status, count]) =>
+                                h('span', { key: status, class: `badge ${jobBadgeClass(status)}` }, `${statusLabel(status)} ${count}`)
+                            )
+                        ),
+                        jobsLoading.value && jobs.value.length === 0
+                            ? h(Loading)
+                            : jobs.value.length === 0
+                                ? h(EmptyState, { icon: 'circle-check', title: '当前没有任务', desc: jobFilter.value ? '该状态下没有索引任务。' : '索引任务队列为空。' })
+                                : h('div', { class: 'memory-table-scroll' }, [
+                                    h('div', { class: 'grid gap-0', style: 'min-width: 860px;' }, [
+                                        h('div', {
+                                            class: 'grid items-center gap-2',
+                                            style: 'grid-template-columns: minmax(10rem, .9fr) minmax(13rem, 1.25fr) 7rem 6rem 10rem 6rem; padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border));',
+                                        }, [
+                                            h('span', { style: headerStyle }, '任务'),
+                                            h('span', { style: headerStyle }, '事件'),
+                                            h('span', { style: headerStyle }, '状态'),
+                                            h('span', { style: headerStyle }, '尝试'),
+                                            h('span', { style: headerStyle }, '更新时间'),
+                                            h('span', { style: headerStyle }, '操作'),
+                                        ]),
+                                        ...jobs.value.map(job => h('div', {
+                                            key: job.id,
+                                            class: 'grid items-center gap-2',
+                                            style: 'grid-template-columns: minmax(10rem, .9fr) minmax(13rem, 1.25fr) 7rem 6rem 10rem 6rem; padding: calc(var(--spacing) * 2.2) 0; border-bottom: 1px solid hsl(var(--border));',
+                                        }, [
+                                            h('div', { class: 'grid gap-1 min-w-0' }, [
+                                                h('span', { style: 'font-size: .9rem;' }, JOB_TYPE_LABELS[job.job_type] || job.job_type || '-'),
+                                                job.last_error
+                                                    ? h('span', { class: 'muted memory-break', style: 'font-size: .74rem;', title: job.last_error }, job.last_error)
+                                                    : null,
+                                            ]),
+                                            job.event_id
+                                                ? h('button', {
+                                                    type: 'button',
+                                                    class: 'btn btn-ghost',
+                                                    title: job.event_id,
+                                                    style: 'min-width: 0; justify-content: flex-start; padding: 0; border: 0; box-shadow: none; overflow: hidden; text-overflow: ellipsis;',
+                                                    onClick: () => openDetail(job.event_id),
+                                                }, job.event_id)
+                                                : h('span', { class: 'muted' }, '-'),
+                                            h('span', { class: `badge ${jobBadgeClass(job.status)} w-fit` }, statusLabel(job.status)),
+                                            h('code', `${job.attempts || 0}/${job.max_attempts || 8}`),
+                                            h('span', { class: 'muted', style: 'font-size: .84rem; white-space: nowrap;' }, formatTime(job.updated_at)),
+                                            job.status === 'dead'
+                                                ? h(Button, {
+                                                    type: 'ghost',
+                                                    size: 'sm',
+                                                    loading: retryingJobId.value === job.id,
+                                                    onClick: () => retryJob(job.id),
+                                                }, () => '重试')
+                                                : h('span', { class: 'muted' }, '-'),
+                                        ])),
+                                    ]),
+                                ]),
+                    ]),
+                ]),
+
+                // ═══ Section 4: Split grid — 分类统计 + 召回测试 ═══
                 h('section', {
                     class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1.15fr) minmax(18rem, 0.85fr);',
+                    style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));',
                 }, [
                     // 左：分类统计 Card
                     h('article', {
@@ -498,11 +721,11 @@ export const MemoryListPage = defineComponent({
                         // 最近测试结果
                         recallResult.value
                             ? h('div', {
-                                class: 'inline-flex items-center gap-2 w-fit',
-                                style: 'padding: calc(var(--spacing) * 1.1) calc(var(--spacing) * 2); border-radius: 999px; background: hsl(var(--muted)); color: hsl(var(--accent-foreground)); font-size: 0.86rem; white-space: nowrap;',
+                                class: 'inline-flex items-center gap-2 w-fit memory-break',
+                                style: 'padding: calc(var(--spacing) * 1.1) calc(var(--spacing) * 2); border-radius: 999px; background: hsl(var(--muted)); color: hsl(var(--accent-foreground)); font-size: 0.86rem;',
                             }, [
                                 h(Icon, { name: 'circle-check', size: '0.9rem' }),
-                                `命中 ${recallResult.value.count} 条 · ${recallResult.value.time}`,
+                                `命中 ${recallResult.value.count} 条 · ${recallResult.value.mode} · ${recallResult.value.time}`,
                             ])
                             : h('p', {
                                 class: 'muted m-0',
@@ -527,6 +750,106 @@ export const MemoryListPage = defineComponent({
                         ]),
                     ]),
                 ]),
+
+                h(Modal, {
+                    modelValue: detailVisible.value,
+                    title: selectedMemory.value?.title || selectedMemory.value?.summary || '记忆详情',
+                    width: 'min(920px, 94vw)',
+                    'onUpdate:modelValue': (value) => detailVisible.value = value,
+                }, {
+                    default: () => detailLoading.value
+                        ? h(Loading)
+                        : selectedMemory.value
+                            ? h('div', { class: 'grid gap-4 memory-detail-scroll' }, [
+                                h('section', { class: 'grid gap-2' }, [
+                                    h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, [
+                                        h('span', { class: 'badge badge-info' }, selectedMemory.value.source_type || 'unknown'),
+                                        h('span', { class: `badge ${selectedMemory.value.index_health?.healthy ? 'badge-success' : 'badge-warning'}` }, statusLabel(selectedMemory.value.index_status)),
+                                        h('span', { class: 'badge badge-info' }, `${selectedMemory.value.chunk_count || 0} 分块`),
+                                        h('span', { class: 'badge badge-info' }, `${selectedMemory.value.entity_count || 0} 实体`),
+                                    ]),
+                                    h('p', { class: 'm-0', style: 'line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere;' }, selectedMemory.value.summary || selectedMemory.value.content || '-'),
+                                    h('div', { class: 'grid gap-1', style: 'grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); font-size: 0.84rem; color: hsl(var(--muted-foreground));' }, [
+                                        h('span', `事件 ID: ${selectedMemory.value.id}`),
+                                        h('span', `FTS: ${selectedMemory.value.index_health?.fts || '-'}`),
+                                        h('span', `Embedding: ${selectedMemory.value.index_health?.embedding || '-'}`),
+                                        h('span', `召回次数: ${selectedMemory.value.recall_count || 0}`),
+                                    ]),
+                                    h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' },
+                                        Object.entries(selectedMemory.value.index_health?.jobs || {}).map(([jobType, jobStatus]) =>
+                                            h('span', { key: jobType, class: `badge ${jobBadgeClass(jobStatus)}` }, `${JOB_TYPE_LABELS[jobType] || jobType}: ${statusLabel(jobStatus)}`)
+                                        )
+                                    ),
+                                    h('div', { class: 'flex justify-end' }, [
+                                        h(Button, {
+                                            type: 'ghost',
+                                            size: 'sm',
+                                            loading: reindexing.value,
+                                            onClick: () => requestReindex(selectedMemory.value.id),
+                                        }, () => '重建此记忆索引'),
+                                    ]),
+                                ]),
+                                h('section', { class: 'grid gap-2', style: 'padding-top: calc(var(--spacing) * 3); border-top: 1px solid hsl(var(--border));' }, [
+                                    h('h3', { class: 'm-0', style: 'font-size: 1rem;' }, '完整脱敏来源'),
+                                    ...(selectedMemory.value.sources || []).length
+                                        ? selectedMemory.value.sources.map((source, index) => h('article', {
+                                            key: source.id || index,
+                                            class: 'grid gap-2',
+                                            style: 'padding: calc(var(--spacing) * 3); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .6); min-width: 0;',
+                                        }, [
+                                            h('div', { class: 'flex justify-between gap-2', style: 'font-size: .82rem; color: hsl(var(--muted-foreground)); flex-wrap: wrap;' }, [
+                                                h('span', `${source.source_type || 'source'} · ${source.external_id || '无外部 ID'}`),
+                                                h('span', `来源 ${index + 1}`),
+                                            ]),
+                                            h('pre', { class: 'memory-source-text' }, source.full_text || '-'),
+                                            source.structured_data && Object.keys(source.structured_data).length
+                                                ? h('details', { class: 'grid gap-1' }, [
+                                                    h('summary', { style: 'cursor: pointer; font-size: .82rem; color: hsl(var(--muted-foreground));' }, '结构化数据'),
+                                                    h('pre', { class: 'memory-source-json' }, JSON.stringify(source.structured_data, null, 2)),
+                                                ])
+                                                : null,
+                                        ]))
+                                        : [h('p', { class: 'muted m-0' }, '该事件没有可显示的来源。')],
+                                ]),
+                                h('section', { class: 'grid gap-2', style: 'padding-top: calc(var(--spacing) * 3); border-top: 1px solid hsl(var(--border));' }, [
+                                    h('h3', { class: 'm-0', style: 'font-size: 1rem;' }, '证据分块'),
+                                    ...(selectedMemory.value.chunks || []).length
+                                        ? selectedMemory.value.chunks.map((chunk, index) => h('article', {
+                                            key: chunk.id || index,
+                                            class: 'grid gap-1',
+                                            style: 'padding: calc(var(--spacing) * 3); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .6); min-width: 0;',
+                                        }, [
+                                            h('span', { class: 'memory-break', style: 'font-size: .8rem; color: hsl(var(--muted-foreground));' }, `#${index + 1} · ${chunk.id || '-'} · ${chunk.char_count || 0} 字 · ${chunk.token_count || 0} tokens · overlap ${chunk.overlap_chars || 0}`),
+                                            h('p', { class: 'm-0 memory-break', style: 'white-space: pre-wrap; line-height: 1.65;' }, chunk.text || '-'),
+                                        ]))
+                                        : [h('p', { class: 'muted m-0' }, '该事件尚无证据分块。')],
+                                ]),
+                                h('section', { class: 'grid gap-2', style: 'padding-top: calc(var(--spacing) * 3); border-top: 1px solid hsl(var(--border));' }, [
+                                    h('h3', { class: 'm-0', style: 'font-size: 1rem;' }, '实体与关联'),
+                                    h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, (selectedMemory.value.entities || []).map((entity, index) =>
+                                        h('span', { key: entity.entity_id || index, class: 'badge badge-info' }, `${entity.canonical_name || entity.surface_text} · ${entity.entity_type || 'topic'}`)
+                                    )),
+                                    (selectedMemory.value.links || []).length
+                                        ? h('div', { class: 'grid gap-1' }, selectedMemory.value.links.map((link, index) => h('code', { key: link.id || index, style: 'font-size: .82rem; overflow-wrap: anywhere;' }, `${link.source_event_id} --${link.relation_type}--> ${link.target_event_id}`)))
+                                        : h('p', { class: 'muted m-0' }, '暂无事件关系'),
+                                ]),
+                            ])
+                            : h(EmptyState, { title: '详情不可用', desc: '该记忆可能已被删除。' }),
+                }),
+
+                // ═══ 确认对话框 ═══
+                h(ConfirmModal, {
+                    modelValue: confirmState.visible,
+                    title: confirmState.title,
+                    message: confirmState.message,
+                    confirmText: confirmState.confirmText,
+                    cancelText: confirmState.cancelText,
+                    danger: confirmState.danger,
+                    prompt: confirmState.prompt,
+                    promptPlaceholder: confirmState.promptPlaceholder,
+                    'onUpdate:modelValue': (v) => confirmState.visible = v,
+                    onConfirm: handleConfirm,
+                }),
             ]);
         };
     },

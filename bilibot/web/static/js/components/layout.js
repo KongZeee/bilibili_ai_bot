@@ -1,5 +1,5 @@
-// components/layout.js - Golden Time 双栏布局外壳
-const { defineComponent, computed, h } = window.Vue;
+// components/layout.js - Golden Time 双栏布局外壳（含移动端抽屉式侧边栏）
+const { defineComponent, computed, h, ref, watch, onMounted, onBeforeUnmount } = window.Vue;
 import { navigate } from '../router.js';
 import { api } from '../api.js';
 
@@ -34,8 +34,7 @@ export const NAV_GROUPS = [
     {
         label: '记忆与知识',
         items: [
-            { path: '/memory/graph', label: '记忆图谱', icon: 'map-pin', meta: '关系' },
-            { path: '/memory/graph-3d', label: '图谱 3D', icon: 'map-pin', meta: '3D' },
+            { path: '/memory/graph', label: '记忆图谱', icon: 'map-pin', meta: '3D' },
             { path: '/memory/list', label: '记忆列表', icon: 'folder', meta: '全部' },
             { path: '/memory/recall', label: '召回测试', icon: 'circle-check', meta: '验证' },
         ],
@@ -54,9 +53,8 @@ const PAGE_SUBTITLES = {
     '/': 'BiliBot 运营全景一览，实时掌握账号状态、互动表现与系统健康度。',
     '/accounts': '管理 B站账号接入、Cookie 凭证、人格绑定与 LLM 通道配置。',
     '/personas': '为不同账号配置专属 AI 人格，定义性格、语气与交互边界。',
+    '/memory/graph': '以三维可旋转视角探索记忆节点间的关联关系。',
     '/memory/list': '浏览与管理 Bot 记忆库中的所有记忆条目，支持分类筛选与召回测试。',
-    '/memory/graph': '以图谱视角探索记忆节点间的关联关系，悬停查看节点概况。',
-    '/memory/graph-3d': '以三维可旋转视角探索记忆节点间的关联关系。',
     '/memory/recall': '测试 Bot 记忆库的召回能力，验证记忆检索效果。',
     '/config': '配置 B站账号、LLM 服务、回复策略与主动行为等全局参数。',
     '/comments': '查看与管理评论回复记录，跟踪互动状态。',
@@ -120,56 +118,76 @@ function iconSpan(name) {
     });
 }
 
-// SideBar 组件 — 渲染全部导航分组
+// SideBar 组件 — 渲染全部导航分组（移动端为抽屉式）
 export const Sidebar = defineComponent({
     name: 'Sidebar',
     props: {
         currentPath: String,
+        open: { type: Boolean, default: false },
         onNavigate: { type: Function, default: null },
     },
-    emits: ['navigate'],
+    emits: ['navigate', 'close'],
     setup(props, { emit }) {
-        return () => h('aside', { class: 'sidebar' }, [
-            h('div', { class: 'brand-lockup' }, [
-                h('span', { class: 'brand-kicker' }, 'BiliBot 控制台'),
-                h('div', { class: 'brand-name' }, 'BiliBot'),
-                h('div', { class: 'workspace-note' }, '面向 B站 AI 机器人的多账号运营工作台，统一调度人格、记忆与内容创作。'),
+        const paused = ref(false);
+        onMounted(async () => {
+            try {
+                const data = await api.safety.pauseStatus();
+                paused.value = !!data?.paused;
+            } catch (_) { /* 读取暂停状态失败，保持默认 */ }
+        });
+        return () => [
+            // 遮罩层 — 仅移动端可见（CSS 控制），点击关闭抽屉
+            h('div', {
+                class: 'sidebar-overlay',
+                'data-open': props.open ? 'true' : 'false',
+                onClick: () => emit('close'),
+            }),
+            h('aside', {
+                class: 'sidebar',
+                id: 'app-sidebar',
+                'data-open': props.open ? 'true' : 'false',
+            }, [
+                h('div', { class: 'brand-lockup' }, [
+                    h('span', { class: 'brand-kicker' }, 'BiliBot 控制台'),
+                    h('div', { class: 'brand-name' }, 'BiliBot'),
+                    h('div', { class: 'workspace-note' }, '面向 B站 AI 机器人的多账号运营工作台，统一调度人格、记忆与内容创作。'),
+                ]),
+                ...NAV_GROUPS.map(group =>
+                    h('nav', { class: 'nav-group', 'aria-label': group.label }, [
+                        h('div', { class: 'nav-label' }, group.label),
+                        ...group.items.map(item => {
+                            const active = isActive(props.currentPath, item.path);
+                            return h('a', {
+                                class: 'nav-item',
+                                href: '#' + item.path,
+                                'data-active': active ? 'true' : 'false',
+                                'aria-current': active ? 'page' : undefined,
+                                onClick: (e) => {
+                                    e.preventDefault();
+                                    emit('navigate', item.path);
+                                },
+                            }, [
+                                h('span', { class: 'nav-copy' }, [
+                                    h('span', { class: 'nav-icon' }, [iconSpan(item.icon)]),
+                                    h('span', item.label),
+                                ]),
+                                h('span', { class: 'nav-meta' }, item.meta),
+                            ]);
+                        }),
+                    ])
+                ),
+                h('div', { class: 'sidebar-footer' }, [
+                    h('span', { class: 'eyebrow' }, '当前状态'),
+                    h('strong', paused.value ? '已暂停' : 'Bot 运行中'),
+                    h('span', { class: 'muted' }, '多账号运营工作台已就绪。'),
+                    h('button', {
+                        class: 'btn ghost',
+                        type: 'button',
+                        onClick: handleLogout,
+                    }, '退出登录'),
+                ]),
             ]),
-            ...NAV_GROUPS.map(group =>
-                h('nav', { class: 'nav-group', 'aria-label': group.label }, [
-                    h('div', { class: 'nav-label' }, group.label),
-                    ...group.items.map(item => {
-                        const active = isActive(props.currentPath, item.path);
-                        return h('a', {
-                            class: 'nav-item',
-                            href: '#' + item.path,
-                            'data-active': active ? 'true' : 'false',
-                            'aria-current': active ? 'page' : undefined,
-                            onClick: (e) => {
-                                e.preventDefault();
-                                emit('navigate', item.path);
-                            },
-                        }, [
-                            h('span', { class: 'nav-copy' }, [
-                                h('span', { class: 'nav-icon' }, [iconSpan(item.icon)]),
-                                h('span', item.label),
-                            ]),
-                            h('span', { class: 'nav-meta' }, item.meta),
-                        ]);
-                    }),
-                ])
-            ),
-            h('div', { class: 'sidebar-footer' }, [
-                h('span', { class: 'eyebrow' }, '当前状态'),
-                h('strong', 'Bot 运行中'),
-                h('span', { class: 'muted' }, '多账号运营工作台已就绪。'),
-                h('button', {
-                    class: 'btn ghost',
-                    type: 'button',
-                    onClick: handleLogout,
-                }, '退出登录'),
-            ]),
-        ]);
+        ];
     },
 });
 
@@ -179,29 +197,32 @@ export const Topbar = defineComponent({
     props: {
         pageTitle: String,
         pageSubtitle: String,
+        sidebarOpen: { type: Boolean, default: false },
         onNavigate: { type: Function, default: null },
+        onToggleSidebar: { type: Function, default: null },
     },
     setup(props) {
         return () => h('header', { class: 'topbar' }, [
             h('div', { class: 'topbar-copy' }, [
-                h('h1', { class: 'page-title' }, props.pageTitle),
-                h('div', { class: 'page-subtitle' }, props.pageSubtitle),
+                // 汉堡菜单按钮 — 桌面隐藏，移动端显示（CSS 控制）
+                h('button', {
+                    class: 'menu-toggle',
+                    type: 'button',
+                    'aria-label': props.sidebarOpen ? '关闭导航菜单' : '打开导航菜单',
+                    'aria-expanded': props.sidebarOpen ? 'true' : 'false',
+                    'aria-controls': 'app-sidebar',
+                    onClick: () => props.onToggleSidebar && props.onToggleSidebar(),
+                }, [
+                    h('span', { class: 'menu-toggle-bar', 'aria-hidden': 'true' }),
+                    h('span', { class: 'menu-toggle-bar', 'aria-hidden': 'true' }),
+                    h('span', { class: 'menu-toggle-bar', 'aria-hidden': 'true' }),
+                ]),
+                h('div', { class: 'topbar-titles' }, [
+                    h('h1', { class: 'page-title' }, props.pageTitle),
+                    h('div', { class: 'page-subtitle' }, props.pageSubtitle),
+                ]),
             ]),
             h('div', { class: 'topbar-actions' }, [
-                h('label', { class: 'field-wrap', 'aria-label': '搜索' }, [
-                    iconSpan('funnel'),
-                    h('input', {
-                        class: 'field',
-                        type: 'text',
-                        placeholder: '搜索账号、人格或记忆',
-                    }),
-                ]),
-                h('button', {
-                    class: 'icon-btn',
-                    type: 'button',
-                    'aria-label': '通知',
-                }, [iconSpan('mail')]),
-                h('button', { class: 'btn ghost', type: 'button' }, '刷新状态'),
                 h('button', {
                     class: 'btn primary',
                     type: 'button',
@@ -212,7 +233,7 @@ export const Topbar = defineComponent({
     },
 });
 
-// AppShell 组件（双栏布局外壳）
+// AppShell 组件（双栏布局外壳 + 移动端抽屉状态管理）
 export const AppShell = defineComponent({
     name: 'AppShell',
     props: {
@@ -222,6 +243,8 @@ export const AppShell = defineComponent({
     },
     emits: ['navigate'],
     setup(props, { emit, slots }) {
+        const sidebarOpen = ref(false);
+
         const subtitle = computed(() => {
             if (props.pageSubtitle) return props.pageSubtitle;
             if (PAGE_SUBTITLES[props.currentPath]) return PAGE_SUBTITLES[props.currentPath];
@@ -233,15 +256,36 @@ export const AppShell = defineComponent({
             return '';
         });
 
+        // 路由变化时自动关闭抽屉
+        watch(() => props.currentPath, () => { sidebarOpen.value = false; });
+
+        // ESC 键关闭抽屉
+        const onKeydown = (e) => {
+            if (e.key === 'Escape' && sidebarOpen.value) {
+                sidebarOpen.value = false;
+            }
+        };
+        onMounted(() => document.addEventListener('keydown', onKeydown));
+        onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown));
+
+        const toggleSidebar = () => { sidebarOpen.value = !sidebarOpen.value; };
+
         return () => h('div', { class: 'app-shell' }, [
             h(Sidebar, {
                 currentPath: props.currentPath,
-                onNavigate: (path) => emit('navigate', path),
+                open: sidebarOpen.value,
+                onClose: () => { sidebarOpen.value = false; },
+                onNavigate: (path) => {
+                    emit('navigate', path);
+                    sidebarOpen.value = false;
+                },
             }),
             h('main', { class: 'main-area' }, [
                 h(Topbar, {
                     pageTitle: props.pageTitle,
                     pageSubtitle: subtitle.value,
+                    sidebarOpen: sidebarOpen.value,
+                    onToggleSidebar: toggleSidebar,
                     onNavigate: (path) => emit('navigate', path),
                 }),
                 h('div', { class: 'view-frame' }, slots.default?.()),

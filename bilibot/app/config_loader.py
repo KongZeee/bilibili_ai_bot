@@ -8,10 +8,11 @@
 - 热重载
 """
 import os
+import math
 import yaml
 import copy
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Mapping
 
 
 # 敏感字段列表（V1 精确路径）
@@ -37,9 +38,30 @@ SENSITIVE_LEAF_NAMES = {
     "api_key",
     "secret_key",
     "admin_password",
+    "admin_username",
 }
 
 SENSITIVE_PLACEHOLDER = "***已配置***"
+LEGACY_SENSITIVE_PLACEHOLDER = "__REDACTED__"
+SENSITIVE_PLACEHOLDERS = frozenset({
+    SENSITIVE_PLACEHOLDER,
+    LEGACY_SENSITIVE_PLACEHOLDER,
+})
+
+
+def is_sensitive_placeholder(value: Any) -> bool:
+    """Return whether *value* is one of the supported redaction markers."""
+    return isinstance(value, str) and value in SENSITIVE_PLACEHOLDERS
+
+
+def bili_credentials_are_configured(sessdata: Any, bili_jct: Any) -> bool:
+    """Return whether both required Bilibili credentials are real values."""
+    return bool(
+        sessdata
+        and bili_jct
+        and not is_sensitive_placeholder(sessdata)
+        and not is_sensitive_placeholder(bili_jct)
+    )
 
 
 @dataclass
@@ -53,7 +75,7 @@ class BiliConfig:
     
     @property
     def is_authenticated(self) -> bool:
-        return bool(self.sessdata and self.bili_jct)
+        return bili_credentials_are_configured(self.sessdata, self.bili_jct)
 
 
 @dataclass
@@ -89,7 +111,10 @@ class WebConfig:
     admin_password: str = "admin123"
     session_ttl_seconds: int = 3600
     cors_origins: list = field(default_factory=list)
-    secure_cookies: bool = False
+    # BUG F-009：生产环境默认 secure=True，HTTP 下明文传输 cookie 有被窃取风险
+    secure_cookies: bool = True
+    # Task 5：可信代理列表，仅当直连 IP 在此列表中时才信任 X-Forwarded-For
+    trusted_proxies: list = field(default_factory=list)
 
 
 @dataclass
@@ -121,8 +146,12 @@ class ReplyConfig:
 
 @dataclass
 class MemoryConfig:
-    """记忆系统配置"""
-    # PRD V5 Task 16：容量与遗忘策略（由 KnowledgeBaseMemory 消费）
+    """V6 账号级统一记忆大脑配置。
+
+    V5 的容量、TTL 和遗忘字段只保留用于读取旧配置；V6 不消费这些
+    字段，也不会自动停用、裁剪或删除任何记忆。
+    """
+    # V5 deprecated compatibility fields
     max_today: int = 50            # today 级别上限
     max_recent: int = 200          # recent 级别上限
     max_long_term: int = 1000      # long_term 级别上限
@@ -138,6 +167,84 @@ class MemoryConfig:
     consolidation_discard_threshold: int = 3  # 日终清算丢弃阈值
     recent_promote_days: int = 14  # recent → long_term 升级阈值
     long_term_age_days: int = 180  # MEM-606：长期记忆最大保留天数（过期清理阈值）
+    # V6 archive and recall contract
+    recall_candidate_limit: int = 20
+    recall_inject_limit: int = 5
+    recall_association_limit: int = 2
+    rerank_relevance_baseline: float = 0.65
+    prompt_char_budget: int = 5000
+    chunk_target_chars: int = 600
+    chunk_hard_chars: int = 900
+    chunk_target_tokens: int = 450
+    chunk_hard_tokens: int = 700
+    chunk_overlap_chars: int = 100
+    job_max_attempts: int = 8
+    vector_cache_limit: int = 50000
+    vector_batch_size: int = 2048
+
+
+def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> None:
+    """Reject V6 memory settings that cannot satisfy the runtime contract."""
+
+    def value(name: str, default: Any) -> Any:
+        if isinstance(config, Mapping):
+            return config.get(name, default)
+        return getattr(config, name, default)
+
+    defaults = MemoryConfig()
+
+    def integer(name: str, *, minimum: int, maximum: int | None = None) -> int:
+        raw = value(name, getattr(defaults, name))
+        if isinstance(raw, bool):
+            raise ValueError(f"memory.{name} must be an integer")
+        try:
+            number = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"memory.{name} must be an integer") from exc
+        if not math.isfinite(number) or not number.is_integer():
+            raise ValueError(f"memory.{name} must be an integer")
+        result = int(number)
+        if result < minimum or (maximum is not None and result > maximum):
+            suffix = f"..{maximum}" if maximum is not None else " or greater"
+            raise ValueError(f"memory.{name} must be {minimum}{suffix}")
+        return result
+
+    candidate_limit = integer("recall_candidate_limit", minimum=1, maximum=20)
+    inject_limit = integer("recall_inject_limit", minimum=1, maximum=5)
+    association_limit = integer("recall_association_limit", minimum=0, maximum=2)
+    if inject_limit > candidate_limit:
+        raise ValueError("memory.recall_inject_limit cannot exceed recall_candidate_limit")
+    if association_limit > inject_limit:
+        raise ValueError("memory.recall_association_limit cannot exceed recall_inject_limit")
+
+    baseline = value("rerank_relevance_baseline", defaults.rerank_relevance_baseline)
+    if isinstance(baseline, bool):
+        raise ValueError("memory.rerank_relevance_baseline must be a number from 0 to 1")
+    try:
+        baseline = float(baseline)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "memory.rerank_relevance_baseline must be a number from 0 to 1"
+        ) from exc
+    if not math.isfinite(baseline) or not 0 <= baseline <= 1:
+        raise ValueError("memory.rerank_relevance_baseline must be a number from 0 to 1")
+
+    integer("prompt_char_budget", minimum=512, maximum=5000)
+    target_chars = integer("chunk_target_chars", minimum=1)
+    hard_chars = integer("chunk_hard_chars", minimum=1)
+    target_tokens = integer("chunk_target_tokens", minimum=1)
+    hard_tokens = integer("chunk_hard_tokens", minimum=1)
+    overlap_chars = integer("chunk_overlap_chars", minimum=0)
+    if hard_chars < target_chars:
+        raise ValueError("memory.chunk_hard_chars cannot be smaller than chunk_target_chars")
+    if hard_tokens < target_tokens:
+        raise ValueError("memory.chunk_hard_tokens cannot be smaller than chunk_target_tokens")
+    if overlap_chars * 5 > target_chars:
+        raise ValueError("memory.chunk_overlap_chars cannot exceed 20% of chunk_target_chars")
+
+    integer("job_max_attempts", minimum=1)
+    integer("vector_cache_limit", minimum=0)
+    integer("vector_batch_size", minimum=1)
 
 
 @dataclass
@@ -186,9 +293,11 @@ class SafetyConfig:
 class ConfigLoader:
     """配置管理器"""
     
-    def __init__(self, config_dict: dict = None):
+    def __init__(self, config_dict: dict = None, filepath: str = None):
         self._raw_config: Dict[str, Any] = config_dict or {}
         self._original_config: Dict[str, Any] = copy.deepcopy(self._raw_config)
+        # Task 23：记录配置文件路径，供 reload() 无参时从磁盘重新读取
+        self.filepath = filepath
         self._apply_config()
     
     def _apply_config(self):
@@ -232,7 +341,10 @@ class ConfigLoader:
             admin_password=web.get("admin_password", "admin123"),
             session_ttl_seconds=web.get("session_ttl_seconds", 3600),
             cors_origins=web.get("cors_origins", []),
-            secure_cookies=web.get("secure_cookies", False),
+            # BUG F-009：默认 secure=True（生产应 HTTPS），但允许显式关闭
+            secure_cookies=web.get("secure_cookies", True),
+            # Task 5：可信代理列表
+            trusted_proxies=web.get("trusted_proxies", []),
         )
         
         prov = self._raw_config.get("proactive", {})
@@ -274,7 +386,21 @@ class ConfigLoader:
             consolidation_discard_threshold=mem.get("consolidation_discard_threshold", consol.get("discard_threshold", 3)),
             recent_promote_days=mem.get("recent_promote_days", consol.get("recent_promote_days", 14)),
             long_term_age_days=mem.get("long_term_age_days", consol.get("long_term_age_days", 180)),
+            recall_candidate_limit=mem.get("recall_candidate_limit", 20),
+            recall_inject_limit=mem.get("recall_inject_limit", 5),
+            recall_association_limit=mem.get("recall_association_limit", 2),
+            rerank_relevance_baseline=mem.get("rerank_relevance_baseline", 0.65),
+            prompt_char_budget=mem.get("prompt_char_budget", 5000),
+            chunk_target_chars=mem.get("chunk_target_chars", 600),
+            chunk_hard_chars=mem.get("chunk_hard_chars", 900),
+            chunk_target_tokens=mem.get("chunk_target_tokens", 450),
+            chunk_hard_tokens=mem.get("chunk_hard_tokens", 700),
+            chunk_overlap_chars=mem.get("chunk_overlap_chars", 100),
+            job_max_attempts=mem.get("job_max_attempts", 8),
+            vector_cache_limit=mem.get("vector_cache_limit", 50000),
+            vector_batch_size=mem.get("vector_batch_size", 2048),
         )
+        validate_memory_config_values(self.memory)
 
         pers = self._raw_config.get("personality", {})
         self.personality = PersonalityConfig(
@@ -355,15 +481,31 @@ class ConfigLoader:
             yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
         # 原子替换（Windows 下 os.replace 同样可用）
         os.replace(tmp_path, filepath)
+        # BUG A-003：限制配置文件权限，防止凭证泄露给同主机其他用户
+        try:
+            os.chmod(filepath, 0o600)
+        except Exception:
+            logger.warning("无法设置配置文件权限为 0o600，凭证可能被其他用户读取")
         self._raw_config = config
         self._original_config = copy.deepcopy(config)
+        # Task 23：同步记录配置文件路径，供后续 reload() 无参时从磁盘重新读取
+        self.filepath = filepath
         self._apply_config()
-    
+
     def reload(self, config: Dict[str, Any] = None):
-        """热重载配置"""
+        """热重载配置
+
+        Task 23：无参时从 self.filepath 重新读取 YAML 文件，
+        使 /api/config/reload 真正从磁盘加载最新配置，而非仅重新应用内存配置。
+        """
         if config:
             self._raw_config = config
             self._original_config = copy.deepcopy(config)
+        else:
+            # 无参时从磁盘重新加载
+            with open(self.filepath, "r", encoding="utf-8") as f:
+                self._raw_config = yaml.safe_load(f) or {}
+            self._original_config = copy.deepcopy(self._raw_config)
         self._apply_config()
         logging.getLogger("bilibot").info("配置已热重载")
     

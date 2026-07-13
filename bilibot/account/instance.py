@@ -20,6 +20,7 @@
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from typing import Optional, Dict, Any, TYPE_CHECKING
 
 logger = logging.getLogger("bilibot.account")
@@ -91,6 +92,7 @@ class AccountInstance:
         self.llm = None
         self.user_state = None
         self.knowledge_memory = None
+        self.memory_brain = None
         # MEM-501：每账号记忆写入队列（与 knowledge_memory 同生命周期）
         self.memory_write_queue = None
         self.personality = None
@@ -118,6 +120,8 @@ class AccountInstance:
 
         # 取应用级原始配置
         app_raw = self.app_config_loader.get_raw_config()
+        if not isinstance(app_raw, Mapping):
+            app_raw = {}
         # 账号凭据覆盖 bilibili 段
         account_bili = {
             "sessdata": self.account_config.get("sessdata", ""),
@@ -195,26 +199,29 @@ class AccountInstance:
         from bilibot.personality import PersonalitySystem
         self.personality = PersonalitySystem(self.account_config_loader)
 
-        # 9. 知识库记忆
-        if self.llm and self.data_store:
-            try:
-                from bilibot.knowledge_memory import KnowledgeBaseMemory
-                # PRD V5 Task 16：注入记忆容量与遗忘配置（ConfigLoader.memory）
-                self.knowledge_memory = KnowledgeBaseMemory(
-                    self.account_data_dir, self.llm, self.personality,
-                    memory_config=self.account_config_loader.memory,
-                )
-            except Exception as e:
-                logger.warning(f"[{self.account_id}] 知识库初始化失败: {e}")
+        # 9. V6 account-scoped memory brain. Archival/FTS remain available even
+        # when model providers are not configured; enrichment jobs become blocked.
+        try:
+            from bilibot.memory_brain import MemoryBrainService
 
-        # 9.1 MEM-501：每账号记忆写入队列（与 knowledge_memory 绑定）
-        if self.knowledge_memory is not None:
-            from bilibot.services.memory_write_queue import MemoryWriteQueue
-            self.memory_write_queue = MemoryWriteQueue(
-                max_length=1000, max_retries=3
+            embedding_provider = (
+                self.llm_manager.resolve_embedding() if self.llm_manager else None
             )
-            await self.memory_write_queue.start()
-            logger.info(f"[{self.account_id}] 记忆写入队列已启动")
+            self.memory_brain = MemoryBrainService(
+                self.account_id,
+                self.account_data_dir,
+                chat_provider=self.llm,
+                embedding_provider=embedding_provider,
+                memory_config=self.account_config_loader.memory,
+            )
+            await self.memory_brain.start()
+            # Narrow compatibility alias. It points to V6 and never opens legacy files.
+            self.knowledge_memory = self.memory_brain
+            self.memory_write_queue = None
+            logger.info(f"[{self.account_id}] V6 记忆大脑已启动")
+        except Exception as e:
+            logger.error(f"[{self.account_id}] V6 记忆大脑初始化失败: {e}", exc_info=True)
+            raise
 
         # 9.5 PRD-V5 §5.1 ACC-502：账号级 ContextBuilder
         # 注入本账号的 DataStore / UserState / BiliClient / KnowledgeMemory / persona_store，
@@ -239,6 +246,7 @@ class AccountInstance:
             persona_store=self.persona_store,
             config_loader=self.account_config_loader,
             knowledge_memory=self.knowledge_memory,
+            memory_brain=self.memory_brain,
         )
 
         # 10.5 视频理解服务（视听双轨分析，可选）— 通过 ModelRouter 解析 vision/asr
@@ -294,6 +302,7 @@ class AccountInstance:
             video_understanding_service=self.video_understanding,
             image_provider=self.image_provider,
             knowledge_memory=self.knowledge_memory,
+            memory_brain=self.memory_brain,
             memory_write_queue=self.memory_write_queue,
             proactive_comment_store=self.proactive_comment_store,
         )
@@ -363,31 +372,29 @@ class AccountInstance:
         # 等待后台任务结束
         if self._scheduler_task is not None:
             try:
-                await asyncio.wait_for(self._scheduler_task, timeout=5.0)
-            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
-                pass
+                # M10：超时从 5 秒增加到 10 秒，给调度任务更多优雅退出时间
+                await asyncio.wait_for(self._scheduler_task, timeout=10.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError) as e:
+                # M10：不再静默吞掉异常，记录 warning 便于排查
+                logger.warning(f"[{self.account_id}] 等待调度任务结束超时/取消: {e}")
+            except Exception as e:
+                logger.warning(f"[{self.account_id}] 等待调度任务结束异常: {e}")
             self._scheduler_task = None
-        # MEM-501：drain 记忆写入队列 → flush 向量索引 → close 记忆系统
-        if self.memory_write_queue is not None:
+        # V6 jobs are durable. Stop the worker; uncompleted leases recover on restart.
+        if self.memory_brain is not None:
             try:
-                await self.memory_write_queue.drain(timeout=10.0)
+                await asyncio.wait_for(self.memory_brain.close(), timeout=8.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{self.account_id}] 关闭 V6 记忆大脑超时")
             except Exception as e:
-                logger.warning(f"[{self.account_id}] 记忆队列 drain 失败: {e}")
-        if self.knowledge_memory is not None:
-            try:
-                self.knowledge_memory.flush()
-            except Exception as e:
-                logger.warning(f"[{self.account_id}] flush 记忆系统失败: {e}")
-            try:
-                self.knowledge_memory.close()
-            except Exception as e:
-                logger.warning(f"[{self.account_id}] 关闭记忆系统失败: {e}")
+                logger.warning(f"[{self.account_id}] 关闭 V6 记忆大脑失败: {e}")
         # 关闭 B站 session
         if self.bili is not None:
             try:
                 await self.bili.close()
-            except Exception:
-                pass
+            except Exception as e:
+                # M10：记录关闭 session 异常，不再静默
+                logger.warning(f"[{self.account_id}] 关闭 B站 session 失败: {e}")
         logger.info(f"[{self.account_id}] 账号已关闭")
 
     # ══════════════════════════════════════
@@ -405,6 +412,8 @@ class AccountInstance:
 
     def get_status(self) -> dict:
         """获取账号运行状态"""
+        from bilibot.app.config_loader import bili_credentials_are_configured
+
         # PRD V3 §7：返回 profile_id 和当前激活人格（而非静态 persona_id）
         persona_status = {}
         if self.persona_store:
@@ -439,9 +448,13 @@ class AccountInstance:
             "effective_llm_id": self._effective_llm_id,
             "fallback_reason": self._fallback_reason,
             "uid": self.account_config.get("dede_user_id", ""),
-            "authenticated": bool(self.account_config.get("sessdata") and self.account_config.get("bili_jct")),
+            "authenticated": bili_credentials_are_configured(
+                self.account_config.get("sessdata"),
+                self.account_config.get("bili_jct"),
+            ),
             "has_llm": self.llm is not None,
             "has_bili": self.bili is not None,
+            "memory_brain": str(self.memory_brain.db_path) if self.memory_brain else "",
         }
 
     def update_config(self, account_config: Dict[str, Any]):
@@ -461,6 +474,47 @@ class AccountInstance:
         # PRD-V5 §5.3 LLM-501：同步 configured_llm_id（effective 需 re-initialize 才更新）
         self._configured_llm_id = self.llm_id
 
+    def _rebuild_bili_dependents(self):
+        """凭据补齐后重建依赖 bili 的下游组件（不重置记忆/状态）
+
+        当 bili 从 None 变为非 None 时，initialize() 期间绑定了 None 的
+        ContextBuilder / CommentContextService / Scheduler 需要重建/刷新以注入
+        新的 bili 引用。保留 data_store / user_state / personality /
+        knowledge_memory / memory_write_queue 等已有状态。
+        """
+        # 重建 ContextBuilder（注入新 bili）
+        from bilibot.context_builder import ContextBuilder
+        self.context_builder = ContextBuilder(
+            data_store=self.data_store,
+            user_state=self.user_state,
+            persona_store=self.persona_store,
+            bili=self.bili,
+            config=self.account_config_loader.get_raw_config(),
+            knowledge_memory=self.knowledge_memory,
+            account_id=self.account_id,
+        )
+
+        # 重建 CommentContextService（注入新 bili）
+        from bilibot.services.comment_context import CommentContextService
+        self.comment_context_service = CommentContextService(
+            bili=self.bili,
+            user_state=self.user_state,
+            data_store=self.data_store,
+            persona_store=self.persona_store,
+            config_loader=self.account_config_loader,
+            knowledge_memory=self.knowledge_memory,
+            memory_brain=self.memory_brain,
+        )
+
+        # 更新 Scheduler 的 bili / context_builder / comment_context_service 引用
+        # （不重建 Scheduler，避免丢失正在运行的调度任务）
+        if self.scheduler is not None:
+            self.scheduler.bili = self.bili
+            self.scheduler.context_builder = self.context_builder
+            self.scheduler.comment_context_service = self.comment_context_service
+
+        logger.info(f"[{self.account_id}] 已重建依赖 bili 的下游组件")
+
     async def reload(self):
         """PRD V3 §3.3：热重载账号配置（凭据级别，不重启调度器）
 
@@ -475,6 +529,7 @@ class AccountInstance:
             self.account_config_loader = self._build_account_config_loader()
 
             # 更新 BilibiliAPI 凭据（不重建 session）
+            bili_was_none = self.bili is None
             if self.bili is not None:
                 self.bili.reload_credentials(self.account_config_loader)
                 logger.info(f"[{self.account_id}] BilibiliAPI 凭据已热重载")
@@ -483,6 +538,16 @@ class AccountInstance:
                 from bilibot.bilibili_api import BilibiliAPI
                 self.bili = BilibiliAPI(self.account_config_loader)
                 logger.info(f"[{self.account_id}] BilibiliAPI 已创建（凭据补齐）")
+
+            if self.scheduler is not None:
+                self.scheduler.config_loader = self.account_config_loader
+            if self.comment_context_service is not None:
+                self.comment_context_service.config_loader = self.account_config_loader
+
+            # 凭据从 None 补齐时，下游组件（ContextBuilder/CommentContextService/
+            # Scheduler）在 initialize() 时已绑定旧引用（None），需重建以注入新 bili
+            if bili_was_none and self.bili is not None:
+                self._rebuild_bili_dependents()
 
             return {"reloaded": True, "message": "凭据已热重载"}
         except Exception as e:

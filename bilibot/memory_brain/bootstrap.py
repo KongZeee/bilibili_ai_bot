@@ -1,0 +1,483 @@
+"""Account database bootstrap, health-gated cutover, and legacy cleanup."""
+
+from __future__ import annotations
+
+from dataclasses import replace
+import math
+from pathlib import Path
+import sqlite3
+import stat
+import struct
+import time
+from typing import Iterable, Sequence
+import uuid
+
+from .models import BootstrapResult, CleanupRecord, HealthReport
+from .store import (
+    MemoryBrainStore,
+    build_fts_text,
+    decode_vector,
+    encode_vector,
+    normalize_search_text,
+    normalize_vector,
+)
+
+
+LEGACY_MEMORY_FILENAMES = (
+    "knowledge_base.db",
+    "knowledge_base.db-wal",
+    "knowledge_base.db-shm",
+    "knowledge_base.db-journal",
+    "vector_index.json",
+    "vector_index.json.tmp",
+    "memory.json",
+    "permanent_memory.json",
+    "chat_memory.json",
+    "bangumi_memory.json",
+    "bangumi_watch_log.json",
+    "watch_log.json",
+    "dynamic_log.json",
+    "weekly_summary.json",
+)
+
+_CUTOVER_AUDIT_FILENAME = "memory_v6_cutover_audit.db"
+
+
+def _is_link_or_junction(path: Path) -> bool:
+    """Return true for filesystem indirections that cleanup must not traverse."""
+
+    if path.is_symlink():
+        return True
+    is_junction = getattr(path, "is_junction", None)
+    if is_junction and is_junction():
+        return True
+    try:
+        attributes = path.lstat().st_file_attributes
+    except (AttributeError, FileNotFoundError, OSError):
+        return False
+    return bool(attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _validate_account_id(account_id: str) -> str:
+    value = str(account_id).strip()
+    if not value or value in {".", ".."}:
+        raise ValueError("account_id must be a non-empty path component")
+    if any(character in value for character in ("/", "\\", "\x00", ":")):
+        raise ValueError("account_id cannot contain path separators or a drive prefix")
+    return value
+
+
+def account_db_path(data_root: str | Path, account_id: str) -> Path:
+    raw_root = Path(data_root)
+    if _is_link_or_junction(raw_root):
+        raise ValueError("data_root cannot be a symlink or junction")
+    root = raw_root.resolve()
+    value = _validate_account_id(account_id)
+    accounts_root = root / "accounts"
+    account_dir = accounts_root / value
+    if _is_link_or_junction(accounts_root) or _is_link_or_junction(account_dir):
+        raise ValueError("account database path cannot traverse a symlink or junction")
+    if account_dir.parent != accounts_root:
+        raise ValueError("account database escaped the accounts directory")
+    return account_dir / "memory_brain.db"
+
+
+class _CutoverAuditLog:
+    """Fallback audit for disk account directories without a configured brain."""
+
+    def __init__(self, data_root: Path) -> None:
+        self.path = data_root / _CUTOVER_AUDIT_FILENAME
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS legacy_cleanup_log (
+                    id TEXT PRIMARY KEY,
+                    path TEXT NOT NULL UNIQUE,
+                    filename TEXT NOT NULL,
+                    target_account_id TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL CHECK(status IN ('deleted','missing','failed')),
+                    error TEXT NOT NULL DEFAULT '',
+                    attempts INTEGER NOT NULL DEFAULT 1,
+                    last_attempted_at REAL NOT NULL
+                )"""
+            )
+
+    def log(
+        self,
+        record: CleanupRecord,
+        *,
+        filename: str,
+        target_account_id: str,
+    ) -> None:
+        now = time.time()
+        with sqlite3.connect(self.path) as conn:
+            conn.execute(
+                """INSERT INTO legacy_cleanup_log(
+                    id,path,filename,target_account_id,status,error,attempts,last_attempted_at
+                ) VALUES(?,?,?,?,?,?,1,?)
+                ON CONFLICT(path) DO UPDATE SET
+                    filename=excluded.filename,
+                    target_account_id=excluded.target_account_id,
+                    status=excluded.status,
+                    error=excluded.error,
+                    attempts=legacy_cleanup_log.attempts+1,
+                    last_attempted_at=excluded.last_attempted_at""",
+                (
+                    f"cleanup_{uuid.uuid4().hex}",
+                    record.path,
+                    filename,
+                    target_account_id,
+                    record.status,
+                    record.error[:4000],
+                    now,
+                ),
+            )
+
+
+def _base_health_failure(exc: Exception) -> HealthReport:
+    return HealthReport(
+        ok=False,
+        quick_check="error",
+        foreign_key_errors=(),
+        fts_ok=False,
+        vector_ok=False,
+        schema_version=0,
+        errors=(f"{type(exc).__name__}: {exc}",),
+    )
+
+
+def _cutover_health_check(
+    store: MemoryBrainStore,
+    *,
+    expected_db_path: Path,
+    expected_account_id: str,
+) -> HealthReport:
+    """Run the destructive-cutover probes in addition to the store health check."""
+
+    try:
+        base = store.health_check()
+    except Exception as exc:  # pragma: no cover - defensive provider boundary
+        base = _base_health_failure(exc)
+
+    errors = list(base.errors)
+    enhanced_fts_ok = False
+    enhanced_vector_ok = False
+    conn: sqlite3.Connection | None = None
+    token = uuid.uuid4().hex
+    fts_event_id = f"health_fts_{token}"
+    archive_event_id = f"health_archive_{token}"
+    try:
+        if store.db_path.resolve() != expected_db_path.resolve():
+            errors.append(
+                f"database path is {store.db_path.resolve()}, expected {expected_db_path.resolve()}"
+            )
+        if store.account_id != expected_account_id:
+            errors.append(
+                f"store account is {store.account_id!r}, expected {expected_account_id!r}"
+            )
+
+        conn = store._connect()
+        brain_account = conn.execute(
+            "SELECT value FROM brain_info WHERE key='account_id'"
+        ).fetchone()
+        if not brain_account or brain_account["value"] != expected_account_id:
+            actual = brain_account["value"] if brain_account else ""
+            errors.append(
+                f"brain_info account is {actual!r}, expected {expected_account_id!r}"
+            )
+
+        bvid = f"bv1v6{token[:12]}"
+        search_text = build_fts_text(
+            f"统一联想健康探针 {bvid}", stable_ids=(bvid,)
+        )
+        conn.execute("SAVEPOINT cutover_fts")
+        try:
+            conn.execute(
+                "INSERT INTO memory_event_fts(event_id,search_text) VALUES(?,?)",
+                (fts_event_id, search_text),
+            )
+            chinese_hit = conn.execute(
+                "SELECT event_id FROM memory_event_fts WHERE memory_event_fts MATCH ?",
+                ('"联想"',),
+            ).fetchone()
+            bvid_hit = conn.execute(
+                "SELECT event_id FROM memory_event_fts WHERE memory_event_fts MATCH ?",
+                (f'"{normalize_search_text(bvid)}"',),
+            ).fetchone()
+            conn.execute("DELETE FROM memory_event_fts WHERE event_id=?", (fts_event_id,))
+            deleted = conn.execute(
+                "SELECT 1 FROM memory_event_fts WHERE event_id=?", (fts_event_id,)
+            ).fetchone()
+            enhanced_fts_ok = bool(
+                chinese_hit
+                and chinese_hit["event_id"] == fts_event_id
+                and bvid_hit
+                and bvid_hit["event_id"] == fts_event_id
+                and deleted is None
+            )
+        finally:
+            conn.execute("ROLLBACK TO cutover_fts")
+            conn.execute("RELEASE cutover_fts")
+        if not enhanced_fts_ok:
+            errors.append("Chinese/BVID FTS insert-query-delete probe failed")
+
+        vector = [3.0, 4.0, 0.0]
+        blob, dimension = encode_vector(vector)
+        decoded = decode_vector(blob, dimension)
+        expected = normalize_vector(vector)
+        dot = sum(left * right for left, right in zip(decoded, decoded))
+        norm = math.sqrt(dot)
+        enhanced_vector_ok = (
+            dimension == 3
+            and len(blob) == dimension * 4
+            and blob == struct.pack("<3f", *expected)
+            and abs(norm - 1.0) <= 1e-6
+            and abs(dot - 1.0) <= 1e-6
+        )
+        if not enhanced_vector_ok:
+            errors.append("little-endian normalized float32 BLOB/dot-product probe failed")
+
+        now = time.time()
+        source_id = f"health_source_{token}"
+        observation_id = f"health_observation_{token}"
+        chunk_id = f"health_chunk_{token}"
+        job_id = f"health_job_{token}"
+        probe_text = f"V6归档回滚健康探针 {token}"
+        conn.execute("SAVEPOINT cutover_archive")
+        try:
+            conn.execute(
+                """INSERT INTO memory_events(
+                    id,idempotency_key,content_hash,event_type,source_type,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    archive_event_id,
+                    f"health:{token}",
+                    token,
+                    "health_probe",
+                    "health_probe",
+                    now,
+                    now,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO memory_sources(
+                    id,event_id,source_type,full_text,content_hash,created_at
+                ) VALUES(?,?,?,?,?,?)""",
+                (source_id, archive_event_id, "health_probe", probe_text, token, now),
+            )
+            conn.execute(
+                """INSERT INTO memory_observations(
+                    id,event_id,source_id,ordinal,modality,text,content_hash,created_at
+                ) VALUES(?,?,?,?,?,?,?,?)""",
+                (
+                    observation_id,
+                    archive_event_id,
+                    source_id,
+                    0,
+                    "text",
+                    probe_text,
+                    token,
+                    now,
+                ),
+            )
+            conn.execute(
+                """INSERT INTO memory_chunks(
+                    id,event_id,source_id,observation_id,ordinal,observation_ordinal,text,
+                    content_hash,start_char,end_char,char_count,token_count,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    chunk_id,
+                    archive_event_id,
+                    source_id,
+                    observation_id,
+                    0,
+                    0,
+                    probe_text,
+                    token,
+                    0,
+                    len(probe_text),
+                    len(probe_text),
+                    len(probe_text),
+                    now,
+                ),
+            )
+            conn.execute(
+                "INSERT INTO memory_event_fts(event_id,search_text) VALUES(?,?)",
+                (archive_event_id, build_fts_text(probe_text)),
+            )
+            conn.execute(
+                "INSERT INTO memory_chunk_fts(chunk_id,event_id,search_text) VALUES(?,?,?)",
+                (chunk_id, archive_event_id, build_fts_text(probe_text)),
+            )
+            conn.execute(
+                """INSERT INTO brain_jobs(
+                    id,dedupe_key,job_type,event_id,available_at,created_at,updated_at
+                ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    job_id,
+                    f"health:{token}",
+                    "health_probe",
+                    archive_event_id,
+                    now,
+                    now,
+                    now,
+                ),
+            )
+        finally:
+            conn.execute("ROLLBACK TO cutover_archive")
+            conn.execute("RELEASE cutover_archive")
+
+        residue = any(
+            conn.execute(query, params).fetchone() is not None
+            for query, params in (
+                ("SELECT 1 FROM memory_events WHERE id=?", (archive_event_id,)),
+                ("SELECT 1 FROM memory_sources WHERE id=?", (source_id,)),
+                ("SELECT 1 FROM memory_observations WHERE id=?", (observation_id,)),
+                ("SELECT 1 FROM memory_chunks WHERE id=?", (chunk_id,)),
+                ("SELECT 1 FROM memory_event_fts WHERE event_id=?", (archive_event_id,)),
+                ("SELECT 1 FROM memory_chunk_fts WHERE chunk_id=?", (chunk_id,)),
+                ("SELECT 1 FROM brain_jobs WHERE id=?", (job_id,)),
+            )
+        )
+        if residue:
+            errors.append("archive transaction rollback left probe content behind")
+    except Exception as exc:
+        errors.append(f"cutover probe {type(exc).__name__}: {exc}")
+    finally:
+        if conn is not None:
+            conn.close()
+
+    return replace(
+        base,
+        ok=not errors,
+        fts_ok=base.fts_ok and enhanced_fts_ok,
+        vector_ok=base.vector_ok and enhanced_vector_ok,
+        errors=tuple(errors),
+    )
+
+
+def cleanup_legacy_memory_files(
+    data_root: str | Path,
+    stores: Iterable[MemoryBrainStore] = (),
+    *,
+    default_account_id: str | None = None,
+) -> tuple[CleanupRecord, ...]:
+    """Delete exact legacy names from root and immediate, non-linked account dirs."""
+
+    raw_root = Path(data_root)
+    if _is_link_or_junction(raw_root):
+        raise ValueError("data_root cannot be a symlink or junction")
+    root = raw_root.resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    store_by_account = {
+        str(store.account_id): store for store in tuple(stores) if str(store.account_id)
+    }
+    if default_account_id is not None:
+        default_id = _validate_account_id(default_account_id)
+        if default_id not in store_by_account:
+            raise ValueError("default_account_id must name one of the supplied stores")
+    else:
+        default_id = next(iter(store_by_account), "")
+    default_store = store_by_account.get(default_id)
+
+    directories: list[tuple[Path, str]] = [(root, "")]
+    accounts_root = root / "accounts"
+    if not _is_link_or_junction(accounts_root) and accounts_root.is_dir():
+        directories.extend(
+            (entry, entry.name)
+            for entry in sorted(accounts_root.iterdir(), key=lambda item: item.name)
+            if not _is_link_or_junction(entry) and entry.is_dir()
+        )
+
+    records: list[CleanupRecord] = []
+    fallback_audit: _CutoverAuditLog | None = None
+    for directory, target_account_id in directories:
+        owner = (
+            default_store
+            if directory == root
+            else store_by_account.get(target_account_id)
+        )
+        for filename in LEGACY_MEMORY_FILENAMES:
+            candidate = directory / filename
+            normalized_path = str(candidate.absolute())
+            if _is_link_or_junction(candidate):
+                record = CleanupRecord(
+                    normalized_path,
+                    "failed",
+                    "refused to delete symlink or junction",
+                )
+            else:
+                try:
+                    candidate.unlink()
+                except FileNotFoundError:
+                    record = CleanupRecord(normalized_path, "missing", "")
+                except OSError as exc:
+                    record = CleanupRecord(
+                        normalized_path,
+                        "failed",
+                        f"{type(exc).__name__}: {exc}",
+                    )
+                else:
+                    record = CleanupRecord(normalized_path, "deleted", "")
+            records.append(record)
+            if owner is not None:
+                owner.log_legacy_cleanup(record.path, record.status, record.error)
+            else:
+                if fallback_audit is None:
+                    fallback_audit = _CutoverAuditLog(root)
+                fallback_audit.log(
+                    record,
+                    filename=filename,
+                    target_account_id=target_account_id,
+                )
+    return tuple(records)
+
+
+def bootstrap_accounts(
+    data_root: str | Path,
+    account_ids: Sequence[str],
+    *,
+    cleanup_legacy: bool = True,
+    default_account_id: str | None = None,
+) -> BootstrapResult:
+    """Create and health-check every configured brain before irreversible cleanup."""
+
+    unique_ids = list(dict.fromkeys(_validate_account_id(value) for value in account_ids))
+    if not unique_ids:
+        raise ValueError("at least one configured account is required")
+    if default_account_id is not None:
+        default_id = _validate_account_id(default_account_id)
+        if default_id not in unique_ids:
+            raise ValueError("default_account_id must be a configured account")
+    else:
+        default_id = unique_ids[0]
+
+    stores: dict[str, MemoryBrainStore] = {
+        account_id: MemoryBrainStore(
+            account_db_path(data_root, account_id), account_id=account_id
+        )
+        for account_id in unique_ids
+    }
+    health = {
+        account_id: _cutover_health_check(
+            store,
+            expected_db_path=account_db_path(data_root, account_id),
+            expected_account_id=account_id,
+        )
+        for account_id, store in stores.items()
+    }
+    failed = {account_id: report for account_id, report in health.items() if not report.ok}
+    if failed:
+        details = "; ".join(
+            f"{account_id}: {', '.join(report.errors)}" for account_id, report in failed.items()
+        )
+        raise RuntimeError(f"memory brain health gate failed; legacy files were preserved: {details}")
+    cleanup = (
+        cleanup_legacy_memory_files(
+            data_root,
+            stores.values(),
+            default_account_id=default_id,
+        )
+        if cleanup_legacy
+        else ()
+    )
+    return BootstrapResult(stores=stores, health=health, cleanup=tuple(cleanup))

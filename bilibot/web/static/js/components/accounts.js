@@ -2,22 +2,9 @@
 const { defineComponent, h, ref, reactive, computed, onMounted, watch, onUnmounted } = window.Vue;
 import { api } from '../api.js';
 import { appState, refreshAccounts, showToast } from '../state.js';
-import { Card, Button, Badge, Modal, FormInput, FormSelect, Toggle, EmptyState, Loading, Icon, KpiCard, HeroPanel, ActionList, ProgressBar, StatusDot } from './common.js';
+import { Card, Button, Badge, Modal, ConfirmModal, createConfirmHelper, FormInput, FormSelect, Toggle, EmptyState, Loading, Icon, KpiCard, HeroPanel, ActionList, ProgressBar, StatusDot } from './common.js';
 import { navigate } from '../router.js';
-
-// formatTime 辅助函数 - 格式化时间戳为相对时间
-function formatTime(ts) {
-    if (!ts) return '-';
-    const d = new Date(ts);
-    if (isNaN(d.getTime())) return '-';
-    const now = Date.now();
-    const diff = now - d.getTime();
-    if (diff < 0) return '刚刚';
-    if (diff < 60000) return '刚刚';
-    if (diff < 3600000) return `${Math.floor(diff / 60000)} 分钟前`;
-    if (diff < 86400000) return `${Math.floor(diff / 3600000)} 小时前`;
-    return `${Math.floor(diff / 86400000)} 天前`;
-}
+import { formatRelative } from '../utils.js';
 
 export const AccountListPage = defineComponent({
     name: 'AccountListPage',
@@ -57,15 +44,23 @@ export const AccountListPage = defineComponent({
         }
 
         // ── 删除账号 ──
-        async function deleteAccount(id) {
-            if (!confirm('确定删除该账号？')) return;
-            try {
-                await api.accounts.delete(id);
-                showToast('账号已删除', 'success');
-                await refreshAccounts();
-            } catch (e) {
-                showToast('删除失败: ' + e.message, 'error');
-            }
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
+        function deleteAccount(id) {
+            showConfirm({
+                title: '删除账号',
+                message: '确定删除该账号？此操作不可撤销。',
+                confirmText: '删除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.accounts.delete(id);
+                        showToast('账号已删除', 'success');
+                        await refreshAccounts();
+                    } catch (e) {
+                        showToast('删除失败: ' + e.message, 'error');
+                    }
+                },
+            });
         }
 
         // ── 编辑账号（跳转详情页）──
@@ -88,8 +83,8 @@ export const AccountListPage = defineComponent({
             }
             try {
                 const resp = await api.accounts.qrLogin(qrAccountId.value);
-                qrUrl.value = resp.qrcode_url || resp.qr_url || '';
-                qrSessionId.value = resp.session_id;
+                qrUrl.value = resp.qrcode_data_url || resp.qrcode_url || resp.qr_url || '';
+                qrSessionId.value = resp.qr_session_id;
                 qrPolling.value = true;
                 qrStatus.value = '等待扫码...';
                 startQrPolling();
@@ -98,13 +93,25 @@ export const AccountListPage = defineComponent({
             }
         }
 
+        let qrPollCount = 0;
+        const QR_MAX_POLL = 90;
+
         function startQrPolling() {
             if (qrTimer) clearInterval(qrTimer);
+            qrPollCount = 0;
             qrTimer = setInterval(async () => {
                 if (!qrPolling.value || !qrSessionId.value) return;
+                qrPollCount++;
+                if (qrPollCount > QR_MAX_POLL) {
+                    qrPolling.value = false;
+                    if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+                    qrStatus.value = '二维码已过期';
+                    showToast('二维码超时，请重新生成', 'warning');
+                    return;
+                }
                 try {
                     const resp = await api.accounts.qrPoll(qrAccountId.value, qrSessionId.value);
-                    if (resp.code === 0) {
+                    if (resp.status === 'confirmed') {
                         qrStatus.value = '登录成功';
                         showToast('B站登录成功', 'success');
                         qrPolling.value = false;
@@ -115,9 +122,9 @@ export const AccountListPage = defineComponent({
                             qrStatus.value = '';
                             refreshAccounts();
                         }, 1500);
-                    } else if (resp.code === 86090) {
-                        qrStatus.value = '等待扫码...';
-                    } else if (resp.code === 86038) {
+                    } else if (resp.status === 'scanned') {
+                        qrStatus.value = '已扫码，等待确认...';
+                    } else if (resp.status === 'expired') {
                         qrStatus.value = '二维码已过期';
                         showToast('二维码过期，请重新生成', 'warning');
                         qrPolling.value = false;
@@ -263,7 +270,7 @@ export const AccountListPage = defineComponent({
                                         }, acc.llm_name || acc.llm_id || '-'),
                                         h('span', {
                                             style: cellTruncateStyle + 'font-size:0.875rem;color:hsl(var(--muted-foreground));',
-                                        }, formatTime(acc.last_active_at)),
+                                        }, formatRelative(acc.last_active_at)),
                                         h('div', {
                                             style: 'display:flex;align-items:center;justify-content:flex-end;gap:0.375rem;',
                                         }, [
@@ -405,6 +412,20 @@ export const AccountListPage = defineComponent({
                     h(Button, { type: 'primary', loading: adding.value, onClick: submitAdd }, () => '添加'),
                 ],
             }),
+
+            // ═══ 统一确认对话框 ═══
+            h(ConfirmModal, {
+                modelValue: confirmState.visible,
+                title: confirmState.title,
+                message: confirmState.message,
+                confirmText: confirmState.confirmText,
+                cancelText: confirmState.cancelText,
+                danger: confirmState.danger,
+                prompt: confirmState.prompt,
+                promptPlaceholder: confirmState.promptPlaceholder,
+                'onUpdate:modelValue': (v) => confirmState.visible = v,
+                onConfirm: handleConfirm,
+            }),
         ]);
     },
 });
@@ -517,8 +538,8 @@ const AccountLoginTab = defineComponent({
         async function startQrLogin() {
             try {
                 const resp = await api.accounts.qrLogin(props.account.id);
-                qrUrl.value = resp.qrcode_url || resp.qr_url || '';
-                sessionId.value = resp.session_id;
+                qrUrl.value = resp.qrcode_data_url || resp.qrcode_url || resp.qr_url || '';
+                sessionId.value = resp.qr_session_id;
                 polling.value = true;
                 status.value = '等待扫描';
                 startPolling();
@@ -527,13 +548,25 @@ const AccountLoginTab = defineComponent({
             }
         }
 
+        let pollCount = 0;
+        const MAX_POLL = 90;
+
         function startPolling() {
             if (qrTimer) clearInterval(qrTimer);
+            pollCount = 0;
             qrTimer = setInterval(async () => {
                 if (!polling.value || !sessionId.value) return;
+                pollCount++;
+                if (pollCount > MAX_POLL) {
+                    polling.value = false;
+                    if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+                    status.value = '登录失败';
+                    showToast('二维码超时，请重新生成', 'warning');
+                    return;
+                }
                 try {
                     const resp = await api.accounts.qrPoll(props.account.id, sessionId.value);
-                    if (resp.code === 0) {
+                    if (resp.status === 'confirmed') {
                         status.value = '登录成功';
                         showToast('B站登录成功', 'success');
                         polling.value = false;
@@ -544,9 +577,9 @@ const AccountLoginTab = defineComponent({
                             status.value = '';
                             refreshAccounts();
                         }, 1500);
-                    } else if (resp.code === 86090) {
-                        status.value = '已扫描';
-                    } else if (resp.code === 86038) {
+                    } else if (resp.status === 'scanned') {
+                        status.value = '已扫描，等待确认';
+                    } else if (resp.status === 'expired') {
                         status.value = '登录失败';
                         showToast('二维码过期，请重新生成', 'warning');
                         polling.value = false;
@@ -963,16 +996,24 @@ export const AccountDetailPage = defineComponent({
             }
         }
 
-        async function deleteAccount() {
-            if (!confirm(`确定删除账号 ${accountId.value}？`)) return;
-            try {
-                await api.accounts.delete(accountId.value);
-                showToast('账号已删除', 'success');
-                navigate('/accounts');
-                await refreshAccounts();
-            } catch (e) {
-                showToast('删除失败: ' + e.message, 'error');
-            }
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
+        function deleteAccount() {
+            showConfirm({
+                title: '删除账号',
+                message: `确定删除账号 ${accountId.value}？此操作不可撤销。`,
+                confirmText: '删除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.accounts.delete(accountId.value);
+                        showToast('账号已删除', 'success');
+                        navigate('/accounts');
+                        await refreshAccounts();
+                    } catch (e) {
+                        showToast('删除失败: ' + e.message, 'error');
+                    }
+                },
+            });
         }
 
         onMounted(() => { if (!appState.accountsLoaded) refreshAccounts(); });
@@ -1020,6 +1061,20 @@ export const AccountDetailPage = defineComponent({
                 activeTab.value === 'llm' ? h(AccountLlmTab, { account: account.value }) : null,
                 activeTab.value === 'persona' ? h(AccountPersonaTab, { account: account.value }) : null,
                 activeTab.value === 'status' ? h(AccountStatusTab, { account: account.value }) : null,
+
+                // ═══ 统一确认对话框 ═══
+                h(ConfirmModal, {
+                    modelValue: confirmState.visible,
+                    title: confirmState.title,
+                    message: confirmState.message,
+                    confirmText: confirmState.confirmText,
+                    cancelText: confirmState.cancelText,
+                    danger: confirmState.danger,
+                    prompt: confirmState.prompt,
+                    promptPlaceholder: confirmState.promptPlaceholder,
+                    'onUpdate:modelValue': (v) => confirmState.visible = v,
+                    onConfirm: handleConfirm,
+                }),
             ]);
     },
 });

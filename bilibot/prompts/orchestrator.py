@@ -285,13 +285,16 @@ class PromptOrchestrator:
         self,
         topic: Optional[str] = None,
         related_videos: Optional[List[str]] = None,
-        persona: Optional[Persona] = None
+        persona: Optional[Persona] = None,
+        memory_evidence: str = ""
     ) -> Dict[str, str]:
         """构建动态发布 Prompt"""
         content = topic or "请发布一条动态，内容可以关于你最近看的视频、心情或想法。"
         if related_videos:
             content += f"\n\n相关视频：\n" + "\n".join(f"- {v}" for v in related_videos[:3])
-        
+        if memory_evidence:
+            content += f"\n\n{memory_evidence}"
+
         return self.build(
             scene=SceneType.DYNAMIC_POST,
             content=content,

@@ -5,6 +5,8 @@
 # 参考 AstrBot 设计：每种能力独立 Provider 列表 + model_routing 路由
 # 功能与模型解耦：换模型只改 routing，不碰功能配置
 #
+config_version: 5
+
 # ── 对话模型（主动回复 / 动态文本 / 记忆提取） ──
 chat_providers:
   - id: siliconflow
@@ -48,8 +50,8 @@ asr_providers:
     base_url: "https://api.siliconflow.cn/v1"
     model: ""                      # 例如 mimo-v2.5-asr
     enabled: false
-  # 本地 Whisper 配置
-  local_whisper:
+  # 本地 Whisper 配置；云端 ASR 失败时可作为后备。
+  - id: local-whisper
     enabled: false
     model_size: "base"             # tiny/base/small/medium/large-v3
     device: "cpu"                  # cpu/cuda/directml
@@ -76,6 +78,10 @@ model_routing:
 
 # PRD-V5 §5.3 LLM-501：生产模式不允许 LLM 静默回退
 allow_llm_fallback: false
+
+# Chat and Vision providers sharing one endpoint and credential share this gate.
+model_request_limits:
+  chat_completion_max_concurrency_per_endpoint: 2
 
 # ── V2: 多账号 ──
 
@@ -249,6 +255,12 @@ proactive:
   # PRD 6.2：兴趣关键词（用于主动视频推荐筛选）
   interest_keywords: ["科技", "AI", "编程", "游戏", "音乐"]
 
+  # Task 26：禁用短语（主动评论中禁止出现，避免与真实 watch_state 冲突）
+  # 大小写不敏感子串匹配；未配置时使用内置默认表
+  # forbidden_phrases: ["我完整看完了", "我看完了", "完整看完"]
+  # 正则变体（IGNORECASE 编译，覆盖"完整.*看完"、"看完了?"等中间插字/可选字变体）
+  # forbidden_phrase_patterns: ["完整.{0,4}看完", "看完了?"]
+
   # PRD 4.17：bangumi/special_follow 在 config_loader 中为 bool 类型，
   # V2 未实现番剧追更/特别关注，保持 false（旧版对象式配置已清理）
   bangumi: false
@@ -303,37 +315,28 @@ video_analysis:
   frame_extractor: "ffmpeg"
   scenedetect_threshold: 27.0
   image_max_size: 768
-  vision_window_size: 5
+  # Vision frames remain one observation each, but request starts are paced.
+  vision_window_size: 2
+  vision_requests_per_minute: 10
   # 临时目录（留空则用 {data_dir}/video_temp）
   temp_dir: ""
 
 # ── 记忆系统 ──
 memory:
-  # PRD 6.1：记忆容量上限
-  max_today: 50           # today 级别上限
-  max_recent: 200          # recent 级别上限
-  max_long_term: 1000      # long_term 级别上限
-  enable_forgetting: true  # 启用遗忘
-  forgetting_score: 3     # 遗忘阈值
-  # 评论线压缩阈值
-  thread_compress_threshold: 8
-  # 评论区压缩阈值
-  oid_compress_threshold: 20
-  # OID保留最近条数
-  oid_keep_recent: 8
-  # 用户记忆压缩阈值
-  user_compress_threshold: 20
-  # 用户记忆保留条数
-  user_keep_recent: 5
-  # 语义搜索最大结果数
-  max_semantic_results: 3
-  # 记忆分级
-  consolidation:
-    discard_threshold: 3
-    batch_size: 20
-    recent_promote_days: 14
-    long_term_age_days: 180
-    hour: 3  # 日终清算时间
+  # V6 账号级统一联想记忆大脑
+  recall_candidate_limit: 20
+  recall_inject_limit: 5
+  recall_association_limit: 2
+  rerank_relevance_baseline: 0.65
+  prompt_char_budget: 5000
+  chunk_target_chars: 600
+  chunk_hard_chars: 900
+  chunk_target_tokens: 450
+  chunk_hard_tokens: 700
+  chunk_overlap_chars: 100
+  job_max_attempts: 8
+  vector_cache_limit: 50000
+  vector_batch_size: 2048
 
 # ── Web 管理面板 ──
 web:
@@ -348,8 +351,12 @@ web:
   # CORS 允许来源，留空表示不开放任意跨域（生产建议保持空）
   # 如需前端独立部署可填具体来源，如 ["http://localhost:3000"]
   cors_origins: []
-  # 是否启用 Secure Cookie（仅 HTTPS 下生效）
-  secure_cookies: false
+  # 是否启用 Secure Cookie（仅 HTTPS 下生效；HTTP 本地开发可设 false）
+  secure_cookies: true
+  # 可信代理列表：仅当请求直连 IP 在此列表中时才信任 X-Forwarded-For 首段作为客户端 IP
+  # 用于防止登录限流被伪造 X-Forwarded-For 绕过。留空表示不信任任何代理，始终使用直连 IP
+  # 示例: ["127.0.0.1", "10.0.0.2"]
+  trusted_proxies: []
 
 # ── CLI ──
 # PRD 5.1：cli.enabled 无代码引用，已删除（CLI 入口由 __main__.py 直接判断 --quickstart 参数）

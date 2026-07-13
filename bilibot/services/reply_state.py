@@ -221,23 +221,21 @@ class ReplyStateStore:
         attempts = (existing["attempts"] if existing else 0)
         max_att = (existing["max_attempts"] if existing else self.max_attempts)
 
-        # 状态递增 attempts（仅对 retry_wait → publish_pending 转换）
-        if state == "retry_wait":
+        # 状态递增 attempts（retry_wait 和 deferred 都递增，防止无限重试）
+        if state in ("retry_wait", "deferred"):
             attempts += 1
-            # 超过重试上限 → failed
+            # 超过重试上限 → failed（终态）
             if attempts >= max_att:
                 state = "failed"
 
-        # 计算 next_retry_at（指数退避 + 抖动）
+        # BUG A-005：计算 next_retry_at（指数退避 + 抖动）
+        # retry_wait 和 deferred 均使用 attempts 计算退避，避免每 60s 固定间隔立即重发
         next_retry_at = None
-        if state == "retry_wait":
+        if state in ("retry_wait", "deferred"):
             import random
-            base = min(2 ** attempts, 300)  # 2, 4, 8... 最大 300 秒
+            base = min(2 ** max(attempts, 1), 300)  # 2, 4, 8... 最大 300 秒
             jitter = random.uniform(0, base * 0.1)
             next_retry_at = now + base + jitter
-        elif state == "deferred":
-            # deferred 下次轮询自然恢复
-            next_retry_at = now + 60  # 60 秒后可恢复
 
         conn = self._get_conn()
         try:

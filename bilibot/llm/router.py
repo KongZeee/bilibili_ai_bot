@@ -17,7 +17,11 @@ import logging
 import uuid
 from typing import Dict, List, Optional, Any
 
-from bilibot.llm.provider import LLMProvider
+from bilibot.llm.provider import (
+    CompletionConcurrencyGate,
+    LLMProvider,
+    completion_endpoint_identity,
+)
 
 logger = logging.getLogger("bilibot.llm.router")
 
@@ -52,6 +56,8 @@ class ModelRouter:
         # 本地 Whisper 配置
         self._local_whisper: dict = {}
         self._allow_llm_fallback: bool = False
+        self._completion_max_concurrency: int = 2
+        self._completion_gates = {}
 
     # ══════════════════════════════════════
     #  初始化（含 V2→V3 迁移）
@@ -69,6 +75,14 @@ class ModelRouter:
 
         raw = self._config_loader.get_raw_config()
         self._allow_llm_fallback = bool(raw.get("allow_llm_fallback", False))
+        limits = raw.get("model_request_limits", {}) or {}
+        try:
+            configured_concurrency = int(
+                limits.get("chat_completion_max_concurrency_per_endpoint", 2)
+            )
+        except (TypeError, ValueError):
+            configured_concurrency = 2
+        self._completion_max_concurrency = max(1, min(configured_concurrency, 16))
 
         # 读取 model_routing
         routing = raw.get("model_routing", {}) or {}
@@ -92,11 +106,48 @@ class ModelRouter:
                 if not self._routing[t] and self._pools[t]:
                     self._routing[t] = next(iter(self._pools[t]))
 
+        self._configure_completion_gates()
+
         # 汇总日志
         for t in PROVIDER_TYPES:
             count = len(self._pools[t])
             routed = self._routing[t] or "(无)"
             logger.info(f"[router] {t}: {count} 个 Provider, 路由 → {routed}")
+
+    def _configure_completion_gates(self) -> None:
+        """Share one gate when chat and vision consume the same endpoint quota."""
+
+        previous = self._completion_gates
+        current = {}
+
+        def resolve_gate(base_url: str, api_key: str):
+            identity = completion_endpoint_identity(base_url, api_key)
+            if identity is None:
+                return None
+            gate = current.get(identity)
+            if gate is None:
+                gate = previous.get(identity)
+                if (
+                    gate is None
+                    or gate.max_concurrency != self._completion_max_concurrency
+                ):
+                    gate = CompletionConcurrencyGate(self._completion_max_concurrency)
+                current[identity] = gate
+            return gate
+
+        providers = list(self._pools[CHAT].values()) + list(
+            self._pools[VISION].values()
+        )
+        for provider in providers:
+            provider.set_completion_gates(
+                chat=resolve_gate(provider.base_url, provider.api_key),
+                vision=resolve_gate(
+                    provider.vision_base_url, provider.vision_api_key
+                )
+                if provider.vision_enabled
+                else None,
+            )
+        self._completion_gates = current
 
     def _load_chat_providers(self, raw: dict):
         """加载对话模型 Provider"""
@@ -107,7 +158,9 @@ class ModelRouter:
                     continue
                 pid = cfg.get("id") or f"chat_{i}"
                 try:
-                    self._pools[CHAT][pid] = LLMProvider(pid, cfg)
+                    provider_cfg = dict(cfg)
+                    provider_cfg.setdefault("max_retries", 0)
+                    self._pools[CHAT][pid] = LLMProvider(pid, provider_cfg)
                     logger.info(f"[router] 已加载对话 Provider: {pid} ({cfg.get('model', '')})")
                 except Exception as e:
                     logger.error(f"[router] 加载对话 Provider {pid} 失败: {e}")
@@ -125,7 +178,9 @@ class ModelRouter:
                 if not cfg.get("api_key") and v1_llm.get("api_key"):
                     cfg = {**cfg, "api_key": v1_llm["api_key"]}
                 try:
-                    self._pools[CHAT][pid] = LLMProvider(pid, cfg)
+                    provider_cfg = dict(cfg)
+                    provider_cfg.setdefault("max_retries", 0)
+                    self._pools[CHAT][pid] = LLMProvider(pid, provider_cfg)
                     logger.info(f"[router] V2迁移对话 Provider: {pid}")
                 except Exception as e:
                     logger.error(f"[router] V2迁移对话 Provider {pid} 失败: {e}")
@@ -148,6 +203,7 @@ class ModelRouter:
                 "enabled": True,
             }
             try:
+                cfg["max_retries"] = 0
                 self._pools[CHAT]["default"] = LLMProvider("default", cfg)
                 self._routing[CHAT] = "default"
                 logger.info("[router] V1迁移对话 Provider: default")
@@ -164,6 +220,16 @@ class ModelRouter:
                 pid = cfg.get("id") or f"vision_{i}"
                 # api_key 留空回退到默认对话 Provider
                 cfg = self._fallback_api_key(raw, cfg)
+                # BUG B-003：LLMProvider 从 vision.model 子段读取 vision_model，
+                # 需要把 model/base_url/api_key 包装到 vision 子段里
+                cfg = dict(cfg)  # shallow copy
+                cfg.setdefault("max_retries", 0)
+                cfg["vision"] = {
+                    "model": cfg.get("model", ""),
+                    "api_key": cfg.get("api_key", ""),
+                    "base_url": cfg.get("base_url", ""),
+                    "enabled": True,
+                }
                 try:
                     self._pools[VISION][pid] = LLMProvider(pid, cfg)
                     logger.info(f"[router] 已加载视觉 Provider: {pid} ({cfg.get('model', '')})")
@@ -180,13 +246,19 @@ class ModelRouter:
             vcfg = pcfg.get("vision", {}) or {}
             if vcfg.get("enabled") and (vcfg.get("model") or vcfg.get("api_key")):
                 pid = f"{pcfg.get('id', f'chat_{i}')}-vision"
+                _vkey = vcfg.get("api_key", "") or pcfg.get("api_key", "") or v1_llm.get("api_key", "")
+                _vurl = vcfg.get("base_url", "") or pcfg.get("base_url", "")
+                _vmodel = vcfg.get("model", "")
                 merged = {
                     "id": pid,
                     "name": f"{pcfg.get('name', pid)} 视觉",
-                    "api_key": vcfg.get("api_key", "") or pcfg.get("api_key", "") or v1_llm.get("api_key", ""),
-                    "base_url": vcfg.get("base_url", "") or pcfg.get("base_url", ""),
-                    "model": vcfg.get("model", ""),
+                    "api_key": _vkey,
+                    "base_url": _vurl,
+                    "model": _vmodel,
                     "enabled": True,
+                    "max_retries": 0,
+                    # 包装为 vision 子段（LLMProvider 从 vision.* 读取）
+                    "vision": {"model": _vmodel, "api_key": _vkey, "base_url": _vurl, "enabled": True},
                 }
                 try:
                     self._pools[VISION][pid] = LLMProvider(pid, merged)
@@ -200,13 +272,19 @@ class ModelRouter:
             v1_v = v1_llm.get("vision", {}) or {}
             if v1_v.get("enabled") and (v1_v.get("model") or v1_v.get("api_key")):
                 pid = "default-vision"
+                _vkey = v1_v.get("api_key", "") or v1_llm.get("api_key", "")
+                _vurl = v1_v.get("base_url", "") or v1_llm.get("base_url", "")
+                _vmodel = v1_v.get("model", "")
                 merged = {
                     "id": pid,
                     "name": "默认视觉",
-                    "api_key": v1_v.get("api_key", "") or v1_llm.get("api_key", ""),
-                    "base_url": v1_v.get("base_url", "") or v1_llm.get("base_url", ""),
-                    "model": v1_v.get("model", ""),
+                    "api_key": _vkey,
+                    "base_url": _vurl,
+                    "model": _vmodel,
                     "enabled": True,
+                    "max_retries": 0,
+                    # 包装为 vision 子段（LLMProvider 从 vision.* 读取）
+                    "vision": {"model": _vmodel, "api_key": _vkey, "base_url": _vurl, "enabled": True},
                 }
                 try:
                     self._pools[VISION][pid] = LLMProvider(pid, merged)
@@ -224,6 +302,14 @@ class ModelRouter:
                     continue
                 pid = cfg.get("id") or f"embedding_{i}"
                 cfg = self._fallback_api_key(raw, cfg)
+                # BUG B-003：包装 embedding 子段
+                cfg = dict(cfg)
+                cfg["embedding"] = {
+                    "model": cfg.get("model", ""),
+                    "api_key": cfg.get("api_key", ""),
+                    "base_url": cfg.get("base_url", ""),
+                    "enabled": True,
+                }
                 try:
                     self._pools[EMBEDDING][pid] = LLMProvider(pid, cfg)
                     logger.info(f"[router] 已加载 Embedding Provider: {pid} ({cfg.get('model', '')})")
@@ -240,13 +326,18 @@ class ModelRouter:
             ecfg = pcfg.get("embedding", {}) or {}
             if ecfg.get("enabled") and (ecfg.get("model") or ecfg.get("api_key")):
                 pid = f"{pcfg.get('id', f'chat_{i}')}-embed"
+                _ekey = ecfg.get("api_key", "") or pcfg.get("api_key", "") or v1_llm.get("api_key", "")
+                _eurl = ecfg.get("base_url", "") or pcfg.get("base_url", "")
+                _emodel = ecfg.get("model", "BAAI/bge-m3")
                 merged = {
                     "id": pid,
                     "name": f"{pcfg.get('name', pid)} Embedding",
-                    "api_key": ecfg.get("api_key", "") or pcfg.get("api_key", "") or v1_llm.get("api_key", ""),
-                    "base_url": ecfg.get("base_url", "") or pcfg.get("base_url", ""),
-                    "model": ecfg.get("model", "BAAI/bge-m3"),
+                    "api_key": _ekey,
+                    "base_url": _eurl,
+                    "model": _emodel,
                     "enabled": True,
+                    # 包装为 embedding 子段（LLMProvider 从 embedding.* 读取）
+                    "embedding": {"model": _emodel, "api_key": _ekey, "base_url": _eurl, "enabled": True},
                 }
                 try:
                     self._pools[EMBEDDING][pid] = LLMProvider(pid, merged)
@@ -259,13 +350,18 @@ class ModelRouter:
             v1_e = v1_llm.get("embedding", {}) or {}
             if v1_e.get("enabled") and (v1_e.get("model") or v1_e.get("api_key")):
                 pid = "default-embed"
+                _ekey = v1_e.get("api_key", "") or v1_llm.get("api_key", "")
+                _eurl = v1_e.get("base_url", "") or v1_llm.get("base_url", "")
+                _emodel = v1_e.get("model", "BAAI/bge-m3")
                 merged = {
                     "id": pid,
                     "name": "默认 Embedding",
-                    "api_key": v1_e.get("api_key", "") or v1_llm.get("api_key", ""),
-                    "base_url": v1_e.get("base_url", "") or v1_llm.get("base_url", ""),
-                    "model": v1_e.get("model", "BAAI/bge-m3"),
+                    "api_key": _ekey,
+                    "base_url": _eurl,
+                    "model": _emodel,
                     "enabled": True,
+                    # 包装为 embedding 子段（LLMProvider 从 embedding.* 读取）
+                    "embedding": {"model": _emodel, "api_key": _ekey, "base_url": _eurl, "enabled": True},
                 }
                 try:
                     self._pools[EMBEDDING][pid] = LLMProvider(pid, merged)
@@ -465,6 +561,10 @@ class ModelRouter:
         pool = self._pools.get(ptype, {})
         return [p.get_info() for p in pool.values()]
 
+    def count_providers(self, ptype: str) -> int:
+        """返回指定类型的 Provider 数量"""
+        return len(self._pools.get(ptype, {}))
+
     def get_provider_by_type(self, ptype: str, pid: str) -> Optional[LLMProvider]:
         """获取指定类型的指定 Provider"""
         return self._pools.get(ptype, {}).get(pid)
@@ -475,9 +575,13 @@ class ModelRouter:
         pid = config.get("id") or f"{ptype}_{uuid.uuid4().hex[:8]}"
         if pid in self._pools[ptype]:
             raise ValueError(f"Provider ID 已存在: {pid}")
-        self._pools[ptype][pid] = LLMProvider(pid, config)
+        provider_config = dict(config)
+        if ptype in (CHAT, VISION):
+            provider_config.setdefault("max_retries", 0)
+        self._pools[ptype][pid] = LLMProvider(pid, provider_config)
         if not self._routing[ptype]:
             self._routing[ptype] = pid
+        self._configure_completion_gates()
         logger.info(f"[router] 已添加 {ptype} Provider: {pid}")
         return pid
 
@@ -492,7 +596,10 @@ class ModelRouter:
             new_config["api_key"] = old.api_key
         if not new_config.get("base_url"):
             new_config["base_url"] = old.base_url
+        if ptype in (CHAT, VISION):
+            new_config.setdefault("max_retries", 0)
         pool[pid] = LLMProvider(pid, new_config)
+        self._configure_completion_gates()
         logger.info(f"[router] 已更新 {ptype} Provider: {pid}")
         return True
 
@@ -503,6 +610,7 @@ class ModelRouter:
         del pool[pid]
         if self._routing[ptype] == pid:
             self._routing[ptype] = next(iter(pool), "")
+        self._configure_completion_gates()
         logger.info(f"[router] 已删除 {ptype} Provider: {pid}")
         return True
 

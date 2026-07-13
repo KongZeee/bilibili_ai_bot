@@ -16,12 +16,10 @@ logger = logging.getLogger("bilibot.bilibili")
 class BilibiliQRLogin:
     """B站扫码登录封装"""
 
-    def __init__(self, config):
+    def __init__(self, config, config_path: str = "config.yaml"):
         self.config = config
+        self.config_path = config_path
         self.session: Optional[aiohttp.ClientSession] = None
-        self._qr_key: Optional[str] = None
-        self._qr_url: Optional[str] = None
-        self._qr_data_url: Optional[str] = None
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建aiohttp会话"""
@@ -55,7 +53,8 @@ class BilibiliQRLogin:
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Referer": "https://www.bilibili.com/",
                     "Origin": "https://www.bilibili.com",
-                }
+                },
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
                     return {"error": f"HTTP {resp.status}"}
@@ -65,10 +64,10 @@ class BilibiliQRLogin:
                     return {"error": data.get("message", "获取二维码失败")}
 
                 result = data.get("data", {})
-                self._qr_key = result.get("qrcode_key")
-                self._qr_url = result.get("url")
+                qr_key = result.get("qrcode_key")
+                qr_url = result.get("url")
 
-                if not self._qr_key or not self._qr_url:
+                if not qr_key or not qr_url:
                     return {"error": "未获取到二维码key或URL"}
 
                 # 生成二维码图片
@@ -78,7 +77,7 @@ class BilibiliQRLogin:
                     box_size=10,
                     border=4,
                 )
-                qr.add_data(self._qr_url)
+                qr.add_data(qr_url)
                 qr.make(fit=True)
 
                 img = qr.make_image(fill_color="black", back_color="white")
@@ -87,15 +86,15 @@ class BilibiliQRLogin:
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
                 img_b64 = base64.b64encode(buf.getvalue()).decode()
-                self._qr_data_url = f"data:image/png;base64,{img_b64}"
+                qr_data_url = f"data:image/png;base64,{img_b64}"
 
                 # 3分钟后过期（新版 API 有效期 180 秒）
                 expire_ts = int(time.time()) + 180
 
                 return {
-                    "key": self._qr_key,
-                    "url": self._qr_url,
-                    "data_url": self._qr_data_url,
+                    "key": qr_key,
+                    "url": qr_url,
+                    "data_url": qr_data_url,
                     "expire_ts": expire_ts,
                 }
 
@@ -126,7 +125,8 @@ class BilibiliQRLogin:
                     "Referer": "https://www.bilibili.com/",
                     "Origin": "https://www.bilibili.com",
                 },
-                params={"qrcode_key": qr_key}
+                params={"qrcode_key": qr_key},
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 if resp.status != 200:
                     return {"status": "error", "message": f"HTTP {resp.status}"}
@@ -218,7 +218,7 @@ class BilibiliQRLogin:
                     bili["buvid3"] = buvid3
 
             # 用 save_config 保存到文件并热重载（更新属性对象 + _raw_config）
-            self.config.save_config(raw, "config.yaml")
+            self.config.save_config(raw, self.config_path)
 
             return {
                 "success": True,
@@ -226,7 +226,7 @@ class BilibiliQRLogin:
                 "info": {
                     "uid": dede_user_id,
                     "account_id": account_id or None,
-                    "sessdata": sessdata[:16] + "***" if len(sessdata) > 16 else sessdata,
+                    "has_sessdata": True,
                 }
             }
         except Exception as e:

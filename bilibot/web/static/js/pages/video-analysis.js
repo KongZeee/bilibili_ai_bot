@@ -22,18 +22,49 @@ export const VideoAnalysisPage = {
             max_concurrent_per_account: 1,
             download_timeout_seconds: 90,
             preprocess_timeout_seconds: 180,
+            // Task 28：补全缺失的 4 个资源边界字段
+            max_download_bytes: 209715200,
+            max_local_whisper_workers: 1,
+            temp_disk_quota_bytes: 1073741824,
+            temp_dir: '',
         });
         // 只读：从 model-routing 获取
         const visionProvider = ref(null);
         const asrProvider = ref(null);
         const localWhisper = ref(null);
+        // Task 28：local_whisper 编辑能力
+        const localWhisperEdit = reactive({
+            enabled: false,
+            model_size: 'base',
+            device: 'cpu',
+            compute_type: 'int8',
+        });
         const testResult = ref(null);
         const testUrl = ref('');
+
+        const whisperModelOptions = [
+            { value: 'tiny', label: 'tiny（最快，最不准确）' },
+            { value: 'base', label: 'base（推荐入门）' },
+            { value: 'small', label: 'small（平衡）' },
+            { value: 'medium', label: 'medium（较慢，更准确）' },
+            { value: 'large-v3', label: 'large-v3（最慢，最准确）' },
+        ];
+        const whisperDeviceOptions = [
+            { value: 'cpu', label: 'CPU' },
+            { value: 'cuda', label: 'CUDA（NVIDIA GPU）' },
+            { value: 'directml', label: 'DirectML（Windows GPU）' },
+        ];
+        const whisperComputeOptions = [
+            { value: 'int8', label: 'int8（最快，CPU 推荐）' },
+            { value: 'int8_float16', label: 'int8_float16（GPU 平衡）' },
+            { value: 'float16', label: 'float16（GPU 推荐）' },
+            { value: 'float32', label: 'float32（最准确，最慢）' },
+        ];
 
         const extractorOptions = [
             { value: 'ffmpeg', label: 'FFmpeg（无依赖，兼容性好）' },
             { value: 'katna', label: 'Katna（关键帧提取，需 pip install katna）' },
-            { value: 'scenedetect', label: 'PySceneDetect（场景检测，需 pip install scenedetect[video]）' },
+            { value: 'scenedetect', label: 'PySceneDetect（场景检测，需 pip install scenedetect）' },
         ];
 
         async function loadData() {
@@ -55,10 +86,21 @@ export const VideoAnalysisPage = {
                 config.max_concurrent_per_account = data.max_concurrent_per_account ?? 1;
                 config.download_timeout_seconds = data.download_timeout_seconds ?? 90;
                 config.preprocess_timeout_seconds = data.preprocess_timeout_seconds ?? 180;
+                // Task 28：补全 4 个缺失字段
+                config.max_download_bytes = data.max_download_bytes ?? 209715200;
+                config.max_local_whisper_workers = data.max_local_whisper_workers ?? 1;
+                config.temp_disk_quota_bytes = data.temp_disk_quota_bytes ?? 1073741824;
+                config.temp_dir = data.temp_dir ?? '';
                 // 只读 provider 信息
                 visionProvider.value = overview.features?.vision?.routed_provider || null;
                 asrProvider.value = overview.features?.asr?.routed_provider || null;
                 localWhisper.value = overview.local_whisper || null;
+                // Task 28：同步 local_whisper 编辑字段
+                const lw = overview.local_whisper || {};
+                localWhisperEdit.enabled = lw.enabled ?? false;
+                localWhisperEdit.model_size = lw.model_size || 'base';
+                localWhisperEdit.device = lw.device || 'cpu';
+                localWhisperEdit.compute_type = lw.compute_type || 'int8';
             } catch (e) {
                 appState.notify('加载配置失败：' + (e.message || e), 'danger');
             } finally {
@@ -69,8 +111,13 @@ export const VideoAnalysisPage = {
         async function saveConfig() {
             loading.value = true;
             try {
-                await api.videoAnalysis.updateConfig({ ...config });
+                // Task 28：包含 4 个新字段 + local_whisper 子段
+                await api.videoAnalysis.updateConfig({
+                    ...config,
+                    local_whisper: { ...localWhisperEdit },
+                });
                 appState.notify('配置已保存', 'success');
+                await loadData();
             } catch (e) {
                 appState.notify('保存失败：' + (e.message || e), 'danger');
             } finally {
@@ -273,6 +320,43 @@ export const VideoAnalysisPage = {
                                     type: 'number',
                                 }),
                             ]),
+                            // Task 28：补全 4 个缺失的资源边界字段
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '下载体积上限（字节）'),
+                                h(FormInput, {
+                                    modelValue: String(config.max_download_bytes),
+                                    'onUpdate:modelValue': (v) => config.max_download_bytes = parseInt(v) || 209715200,
+                                    type: 'number',
+                                }),
+                                h(FormHint, 'VID-503：单次视频下载的最大字节数（默认 200MB）'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '本地 Whisper 最大并发'),
+                                h(FormInput, {
+                                    modelValue: String(config.max_local_whisper_workers),
+                                    'onUpdate:modelValue': (v) => config.max_local_whisper_workers = parseInt(v) || 1,
+                                    type: 'number',
+                                }),
+                                h(FormHint, '本地 Whisper 转写的最大并发 worker 数'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '临时目录磁盘配额（字节）'),
+                                h(FormInput, {
+                                    modelValue: String(config.temp_disk_quota_bytes),
+                                    'onUpdate:modelValue': (v) => config.temp_disk_quota_bytes = parseInt(v) || 1073741824,
+                                    type: 'number',
+                                }),
+                                h(FormHint, '视频临时文件的磁盘配额上限（默认 1GB）'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '临时目录'),
+                                h(FormInput, {
+                                    modelValue: config.temp_dir,
+                                    'onUpdate:modelValue': (v) => config.temp_dir = v,
+                                    placeholder: '留空则使用 {data_dir}/video_temp',
+                                }),
+                                h(FormHint, '视频下载与处理的临时目录路径'),
+                            ]),
                         ]),
                     ]),
 
@@ -410,6 +494,67 @@ export const VideoAnalysisPage = {
                                 type: 'ghost',
                                 onClick: () => { window.location.hash = '/model-routing'; },
                             }, () => '去模型分配页'),
+                        ]),
+                    ]),
+                ]),
+
+                // ═══ Task 28：本地 Whisper 编辑 Card ═══
+                h('article', {
+                    class: 'grid gap-3',
+                    style: cardStyle,
+                }, [
+                    h('div', { class: 'card-header' }, [
+                        h('div', { class: 'grid gap-1' }, [
+                            h('span', { class: 'eyebrow' }, 'ASR 配置'),
+                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '本地 Whisper'),
+                        ]),
+                    ]),
+                    h('div', { class: 'card-body grid gap-3' }, [
+                        h('div', { class: 'form-grid-2col' }, [
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '启用本地 Whisper'),
+                                h('div', { class: 'flex items-center gap-2' }, [
+                                    h(Toggle, {
+                                        modelValue: localWhisperEdit.enabled,
+                                        'onUpdate:modelValue': (v) => localWhisperEdit.enabled = v,
+                                    }),
+                                    h('span', { class: 'form-hint' }, localWhisperEdit.enabled ? '已启用' : '已禁用'),
+                                ]),
+                                h(FormHint, '启用后可在无云端 ASR 时使用本地 Whisper 转写'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '模型大小'),
+                                h(FormSelect, {
+                                    modelValue: localWhisperEdit.model_size,
+                                    'onUpdate:modelValue': (v) => localWhisperEdit.model_size = v,
+                                    options: whisperModelOptions,
+                                }),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '设备'),
+                                h(FormSelect, {
+                                    modelValue: localWhisperEdit.device,
+                                    'onUpdate:modelValue': (v) => localWhisperEdit.device = v,
+                                    options: whisperDeviceOptions,
+                                }),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '计算类型'),
+                                h(FormSelect, {
+                                    modelValue: localWhisperEdit.compute_type,
+                                    'onUpdate:modelValue': (v) => localWhisperEdit.compute_type = v,
+                                    options: whisperComputeOptions,
+                                }),
+                            ]),
+                        ]),
+                        h('div', {
+                            class: 'grid gap-2',
+                            style: 'padding: calc(var(--spacing) * 3); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--chart-5) / 0.08); border: 1px solid hsl(var(--chart-5) / 0.2);',
+                        }, [
+                            h('p', {
+                                class: 'muted m-0',
+                                style: 'font-size:0.88rem; line-height:1.6;',
+                            }, '本地 Whisper 需安装 faster-whisper（pip install faster-whisper）。GPU 设备需对应驱动与 CUDA/cuDNN 支持。修改后保存即生效，下次视频分析任务将使用新配置。'),
                         ]),
                     ]),
                 ]),

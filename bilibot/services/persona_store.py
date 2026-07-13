@@ -70,14 +70,28 @@ class PersonaStore:
         import os
         os.makedirs(self.data_dir, exist_ok=True)
         personas_file = os.path.join(self.data_dir, "personas.json")
-        
+
         data = {
             "current_persona_id": self._current_id,
             "personas": [p.to_dict() for p in self._personas.values()]
         }
-        
-        with open(personas_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+
+        # L9：原子写入——先写临时文件，再 os.replace 替换原文件，
+        # 避免写入过程中崩溃导致 personas.json 损坏
+        tmp_file = personas_file + ".tmp"
+        try:
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, personas_file)
+        except Exception as e:
+            # 清理残留临时文件
+            try:
+                if os.path.exists(tmp_file):
+                    os.remove(tmp_file)
+            except Exception:
+                pass
+            logger.error(f"保存人格数据失败: {e}")
+            raise
     
     def _create_default_persona(self):
         """创建默认人格"""
@@ -182,6 +196,7 @@ class PersonaStore:
             enabled=data.get("enabled", True),
             created_at=now,
             updated_at=now,
+            appearance=data.get("appearance", ""),
         )
         
         self._personas[pid] = persona
@@ -197,10 +212,10 @@ class PersonaStore:
         p = self._personas[persona_id]
         
         # 更新字段
-        for field in ["name", "description", "base_prompt", "speaking_style", 
+        for field in ["name", "description", "base_prompt", "speaking_style",
                       "boundaries", "relationship_rules", "reply_rules",
                       "proactive_comment_rules", "dynamic_rules", "weekly_rules",
-                      "enabled"]:
+                      "enabled", "appearance"]:
             if field in data:
                 setattr(p, field, data[field])
         
@@ -252,6 +267,7 @@ class PersonaStore:
             enabled=True,
             created_at=now,
             updated_at=now,
+            appearance=p.appearance,
         )
         
         self._personas[new_id] = copied

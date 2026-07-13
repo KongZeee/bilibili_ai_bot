@@ -15,6 +15,7 @@ import argparse
 import logging
 import logging.handlers
 import os
+import secrets
 import signal
 import sys
 import time
@@ -80,7 +81,7 @@ class BiliBotApp:
 
         # 配置加载器（应用级）
         from bilibot.app.config_loader import ConfigLoader
-        self.config_loader = ConfigLoader(config)
+        self.config_loader = ConfigLoader(config, filepath=config_path)
 
         # 数据根目录
         self.data_root = config.get("data_dir", "./data")
@@ -208,8 +209,44 @@ class BiliBotApp:
         # 初始化
         await self.initialize()
 
+        # ── 启动时安全检查：默认密码 / secret_key ──
+        # secret_key 仍为默认值时，随机生成并写回配置文件
+        if self.config_loader.web.secret_key == "change-this-to-a-random-string":
+            new_secret = secrets.token_hex(32)
+            logger.warning(
+                "检测到 web.secret_key 仍为默认值，已自动随机生成并写回配置文件"
+            )
+            raw = self.config_loader.get_raw_config()
+            raw.setdefault("web", {})["secret_key"] = new_secret
+            self.config_loader.save_config(raw, self.config_path)
+            # 同步 self.config 供后续 start() 读取
+            self.config = self.config_loader.get_raw_config()
+
+        # admin_password 仍为默认值时告警；非本地监听则拒绝启动 Web 面板
+        if self.config_loader.web.admin_password == "admin123":
+            logger.warning(
+                "⚠️ 检测到 web.admin_password 仍为默认值 'admin123'，"
+                "存在被接管风险，请尽快修改！"
+            )
+            if (self.config_loader.web.enabled
+                    and self.config_loader.web.host not in ("127.0.0.1", "localhost")):
+                logger.error(
+                    "拒绝启动 Web 面板：admin_password 为默认值且监听非本地地址 "
+                    f"({self.config_loader.web.host})，请修改 config.yaml 中 "
+                    "web.admin_password 后重试"
+                )
+                raise RuntimeError(
+                    "Refusing to start Web panel: default admin_password on non-localhost host"
+                )
+
         # 启动所有账号调度器（始终启动，即使 Web 禁用也允许 Scheduler 运行）
         scheduler_task = asyncio.create_task(self._run_accounts_safe())
+
+        # Task 19：secure_cookies 关闭且监听非 localhost 时，Cookie 将明文传输
+        if self.config_loader.web.enabled and not self.config_loader.web.secure_cookies:
+            host = self.config_loader.web.host
+            if host not in ("127.0.0.1", "localhost", "::1"):
+                logger.warning("web.secure_cookies=false 且 host 非 localhost，Cookie 将明文传输")
 
         # Web 服务
         web_config = self.config.get("web", {})
@@ -273,13 +310,22 @@ class BiliBotApp:
         self._install_signal_handlers(stop_event)
 
         # 等待「停止信号」或「Web 异常退出」任一先发生
+        # M6：把 stop_event.wait() 任务存为变量，结束后 cancel 避免孤儿任务
+        stop_task = asyncio.create_task(stop_event.wait())
         try:
             done, pending = await asyncio.wait(
-                [server_task, asyncio.create_task(stop_event.wait())],
+                [server_task, stop_task],
                 return_when=asyncio.FIRST_COMPLETED,
             )
         except (KeyboardInterrupt, asyncio.CancelledError):
             pass
+        finally:
+            if not stop_task.done():
+                stop_task.cancel()
+                try:
+                    await stop_task
+                except (asyncio.CancelledError, Exception):
+                    pass
 
         # 优雅关闭
         server.should_exit = True
@@ -310,7 +356,14 @@ class BiliBotApp:
                 try:
                     loop.add_signal_handler(sig, lambda: stop_event.set())
                 except NotImplementedError:
-                    # Windows 不支持 add_signal_handler，依赖 KeyboardInterrupt 即可
+                    # M9：Windows 不支持 add_signal_handler，改用 signal.signal 注册回调
+                    # 仅对 SIGINT 注册（SIGTERM 在 Windows 上语义不同，交给默认处理）
+                    if sig == signal.SIGINT:
+                        try:
+                            signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+                        except (ValueError, OSError) as e:
+                            # 非主线程时 signal.signal 也会抛 ValueError，此时退回依赖 KeyboardInterrupt
+                            logger.warning(f"Windows 信号注册失败，将依赖 KeyboardInterrupt: {e}")
                     pass
         except Exception:
             pass
@@ -438,9 +491,16 @@ def main():
     # 设置日志
     setup_logging(config)
 
-    # 快速配置向导
+    # 快速配置向导（BUG SYS-001：bilibot/cli/setup.py 缺失，延迟导入 + 友好降级）
     if args.quickstart:
-        from bilibot.cli.setup import run_quickstart
+        try:
+            from bilibot.cli.setup import run_quickstart
+        except ImportError:
+            console.print(
+                "[yellow]快速配置向导尚未实现，请直接编辑 config.yaml 后运行：[/]\n"
+                f"  python -m bilibot --config {config_path}"
+            )
+            sys.exit(1)
         run_quickstart(config, config_path)
         return
 

@@ -63,6 +63,9 @@ TERMINAL_STATUSES = frozenset({
 # 可编辑状态（PATCH 接口允许）
 EDITABLE_STATUSES = frozenset({STATUS_AWAITING_REVIEW})
 
+# publishing 状态卡住恢复阈值（秒）：超过该时长无法确认发布结果
+DEFAULT_PUBLISH_STUCK_MINUTES = 30
+
 
 @dataclass
 class DynamicDraft:
@@ -350,10 +353,6 @@ class DynamicDraftStore:
         if safety_snapshot is not None:
             sets.append("safety_snapshot_json=?")
             params.append(json.dumps(safety_snapshot, ensure_ascii=False))
-        if not sets:
-            # 没有字段需要更新，但仍校验 revision
-            sets.append("updated_at=?")
-            params.append(now)
         sets.append("revision=revision+1")
         sets.append("updated_at=?")
         params.append(now)
@@ -574,6 +573,69 @@ class DynamicDraftStore:
             return cur.rowcount
         finally:
             conn.close()
+
+    def recover_stuck_drafts(
+        self,
+        stuck_minutes: int = DEFAULT_PUBLISH_STUCK_MINUTES,
+        now: Optional[float] = None,
+    ) -> Dict[str, int]:
+        """恢复卡住的草稿（approved 超期 / publishing 超阈值）
+
+        与 expire_overdue 互补：expire_overdue 仅处理 awaiting_review，
+        本方法处理 approved 和 publishing 两种卡住场景：
+
+        - approved 状态超过 expires_at → expired
+          （已审核通过但未在有效期内进入发布流程，作废需重新审核）
+        - publishing 状态超过 stuck_minutes → result_unknown
+          （发布流程卡住，无法确认是否已发布，转为 result_unknown
+           等待人工对账，不自动重发以避免重复发布）
+
+        应在调度器主循环中定期调用（例如每次轮询前）。
+
+        Args:
+            stuck_minutes: publishing 状态卡住阈值（分钟），默认 30。
+            now: 当前时间戳，None 则使用 time.time()。
+
+        Returns:
+            {"approved_expired": int, "publishing_stuck": int}
+            分别表示两类恢复影响的行数。
+        """
+        now = now or time.time()
+        stuck_threshold = now - stuck_minutes * 60
+        approved_expired = 0
+        publishing_stuck = 0
+        conn = self._get_conn()
+        try:
+            # approved 超过 expires_at → expired
+            cur = conn.execute(
+                "UPDATE dynamic_drafts SET status=?, updated_at=? "
+                "WHERE status=? AND expires_at IS NOT NULL AND expires_at < ?",
+                (STATUS_EXPIRED, now, STATUS_APPROVED, now),
+            )
+            approved_expired = cur.rowcount
+
+            # publishing 超过阈值 → result_unknown（无法确认是否已发布）
+            cur = conn.execute(
+                "UPDATE dynamic_drafts SET status=?, updated_at=?, "
+                "last_publish_error=? "
+                "WHERE status=? AND updated_at < ?",
+                (STATUS_RESULT_UNKNOWN, now, "stuck_publishing_recovery",
+                 STATUS_PUBLISHING, stuck_threshold),
+            )
+            publishing_stuck = cur.rowcount
+            conn.commit()
+        finally:
+            conn.close()
+
+        if approved_expired or publishing_stuck:
+            logger.info(
+                f"recover_stuck_drafts: approved_expired={approved_expired} "
+                f"publishing_stuck={publishing_stuck}"
+            )
+        return {
+            "approved_expired": approved_expired,
+            "publishing_stuck": publishing_stuck,
+        }
 
     def reconcile(
         self,

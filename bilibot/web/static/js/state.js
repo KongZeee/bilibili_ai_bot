@@ -19,10 +19,11 @@ export const appState = reactive({
 export function showToast(message, type = 'info') {
     const id = Date.now() + Math.random();
     appState.toasts.push({ id, message, type });
+    const duration = (type === 'error' || type === 'warning') ? 7000 : 3000;
     setTimeout(() => {
         const idx = appState.toasts.findIndex(t => t.id === id);
         if (idx >= 0) appState.toasts.splice(idx, 1);
-    }, 3000);
+    }, duration);
 }
 
 export async function refreshAccounts() {

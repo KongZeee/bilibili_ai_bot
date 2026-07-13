@@ -308,22 +308,44 @@ class KnowledgeBaseStore:
             finally:
                 conn.close()
 
-    def purge_expired(self, max_age_days: int = 180) -> int:
-        """清理过期记忆"""
-        cutoff = time.time() - (max_age_days * 86400)
+    def purge_expired(self, max_age_days: int = 180) -> Tuple[int, List[int]]:
+        """清理过期记忆，返回 (受影响数量, 被标记的 ID 列表)
+
+        Task 14.1: 改用 last_accessed + ttl_days 判断过期（per-record TTL）。
+        - last_accessed 为 NULL 时 fallback 到 created_at
+        - ttl_days 为 NULL/<=0 时 fallback 到 max_age_days
+        Task 14.3: 软删除时同步清理 FTS5 索引。
+        """
+        now = time.time()
         with self._lock:
             conn = self._get_conn()
             try:
+                # 过期条件：COALESCE(last_accessed, created_at) + 有效 ttl_days 天 < now
                 cursor = conn.execute(
-                    "UPDATE memory_atoms SET is_active = 0 WHERE created_at < ? AND is_active = 1",
-                    (cutoff,)
+                    "SELECT id FROM memory_atoms WHERE is_active = 1 AND "
+                    "(COALESCE(last_accessed, created_at) + "
+                    "COALESCE(NULLIF(ttl_days, 0), ?) * 86400.0) < ?",
+                    (float(max_age_days), now)
                 )
-                conn.commit()
-                return cursor.rowcount
+                ids = [row[0] for row in cursor.fetchall()]
+                if ids:
+                    placeholders = ",".join("?" * len(ids))
+                    conn.execute(
+                        f"UPDATE memory_atoms SET is_active = 0 WHERE id IN ({placeholders})",
+                        ids
+                    )
+                    # Task 14.3: 同步清理 FTS5 索引
+                    for mid in ids:
+                        try:
+                            conn.execute("DELETE FROM memory_fts WHERE rowid = ?", (mid,))
+                        except Exception:
+                            pass
+                    conn.commit()
+                return len(ids), ids
             finally:
                 conn.close()
 
-    def prune_low_importance(self, max_count: int, forgetting_threshold: float) -> int:
+    def prune_low_importance(self, max_count: int, forgetting_threshold: float) -> Tuple[int, List[int]]:
         """PRD V5 Task 16：当记忆数量超过 max_count 时，遗忘 importance_score 低于阈值的记忆。
 
         遗忘策略（简单重要性裁剪）：
@@ -333,23 +355,28 @@ class KnowledgeBaseStore:
            importance_score 升序、last_accessed 升序（先遗忘最不重要且最久未访问的）
            标记为 is_active=0，直到总数降至 max_count
 
+        Task 15: 将 get_stats 的计数查询移入 with self._lock 块内，
+        避免 get_stats() 在未持锁的情况下查询 total 导致 TOCTOU 竞态。
+
         Args:
             max_count: 长期记忆上限（memory.max_long_term）
             forgetting_threshold: 遗忘重要性阈值（0-1，由 forgetting_score/10 换算）
 
         Returns:
-            被遗忘的记忆数量
+            (被遗忘的记忆数量, 被标记为 is_active=0 的记忆 ID 列表)
         """
         if max_count <= 0:
-            return 0
-        stats = self.get_stats()
-        total = stats.get("total", 0)
-        if total <= max_count:
-            return 0
-        excess = total - max_count
+            return 0, []
         with self._lock:
             conn = self._get_conn()
             try:
+                # Task 15: 在锁内查询总数，避免 TOCTOU 竞态
+                total = conn.execute(
+                    "SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1"
+                ).fetchone()[0]
+                if total <= max_count:
+                    return 0, []
+                excess = total - max_count
                 # 先按 importance_score 升序、last_accessed 升序选择候选（仅低于阈值的）
                 cursor = conn.execute(
                     "SELECT id FROM memory_atoms "
@@ -359,7 +386,7 @@ class KnowledgeBaseStore:
                 )
                 ids = [row[0] for row in cursor.fetchall()]
                 if not ids:
-                    return 0
+                    return 0, []
                 placeholders = ",".join("?" * len(ids))
                 conn.execute(
                     f"UPDATE memory_atoms SET is_active = 0 WHERE id IN ({placeholders})",
@@ -372,12 +399,15 @@ class KnowledgeBaseStore:
                     except Exception:
                         pass
                 conn.commit()
-                return len(ids)
+                return len(ids), ids
             finally:
                 conn.close()
 
     def reinforce_memories_batch(self, memory_ids: List[int]):
-        """批量强化记忆（单次事务）"""
+        """批量强化记忆（单次事务）
+
+        Task 14.2：同步更新 ttl_days（每次强化延长 5%，上限 365 天）。
+        """
         if not memory_ids:
             return
         now = time.time()
@@ -386,7 +416,9 @@ class KnowledgeBaseStore:
             conn = self._get_conn()
             try:
                 conn.execute(
-                    f"UPDATE memory_atoms SET last_accessed = ?, access_count = access_count + 1 "
+                    f"UPDATE memory_atoms SET last_accessed = ?, "
+                    f"access_count = access_count + 1, "
+                    f"ttl_days = MIN(ttl_days * 1.05, 365) "
                     f"WHERE id IN ({placeholders})",
                     [now] + memory_ids
                 )
@@ -440,7 +472,11 @@ class KnowledgeBaseStore:
 
         # 3. 对每个分词分别搜索
         all_results: Dict[int, Dict] = {}
-        total_count = self.get_stats().get("total", 1) or 1
+        # Task 38.1：专用 COUNT 查询替代 get_stats（避免多余的 GROUP BY 查询）
+        total_count = (
+            self.query("SELECT COUNT(*) as cnt FROM memory_atoms WHERE is_active = 1")[0]["cnt"]
+            or 1
+        )
 
         for token, weight in tfidf_keywords[:5]:
             if len(token) < 2:
@@ -575,6 +611,8 @@ class VectorIndex:
         self._persist_batch_size = 10
         # PRD V4 MIG-004：若历史索引缺少维度元数据，标记需重建
         self.rebuild_required: bool = False
+        # Task 38.5：保护写操作（add/remove/persist）的线程锁
+        self._lock = threading.Lock()
 
     def add(self, doc_id: int, vector: List[float], content: str):
         """添加向量
@@ -607,20 +645,94 @@ class VectorIndex:
             self.rebuild_required = True
             return
 
-        self._vectors[doc_id] = vector
-        self._contents[doc_id] = content
+        # Task 38.5：写操作加锁，防止与工作线程的 search 并发修改
+        with self._lock:
+            self._vectors[doc_id] = vector
+            self._contents[doc_id] = content
 
-        # PRD 4.14：批量持久化（每 _persist_batch_size 次才写一次磁盘）
-        self._dirty_count += 1
-        if self._persist_path and self._dirty_count >= self._persist_batch_size:
+            # PRD 4.14：批量持久化（每 _persist_batch_size 次才写一次磁盘）
+            self._dirty_count += 1
+            if self._persist_path and self._dirty_count >= self._persist_batch_size:
+                self._persist()
+                self._dirty_count = 0
+
+    # BUG B-005: 从向量索引中移除指定文档，同步清理 _vectors 和 _contents
+    def remove(self, doc_id: int):
+        """从向量索引中移除指定文档"""
+        # Task 38.5：写操作加锁
+        with self._lock:
+            self._vectors.pop(doc_id, None)
+            self._contents.pop(doc_id, None)
+            # Task 38.3：remove 也检查 _dirty_count 并触发批量持久化
+            self._dirty_count += 1
+            if self._persist_path and self._dirty_count >= self._persist_batch_size:
+                self._persist()
+                self._dirty_count = 0
+
+    # BUG B-005: 从 store 的 memory_atoms 重建向量索引
+    # 遍历 is_active=1 的记录，对每条重新生成 embedding 并写回索引
+    # 完成后设置 rebuild_required=False 并 flush()
+    def rebuild(self, store: "KnowledgeBaseStore", embed_fn=None) -> int:
+        """从 store 的 memory_atoms 重建向量索引
+
+        Args:
+            store: KnowledgeBaseStore 实例，用于查询 memory_atoms
+            embed_fn: 可选的 embedding 函数，签名为 (text: str) -> List[float]。
+                      若为 None 则尝试 store.embed(text)。
+                      若 embed_fn 不可用，跳过并记录 warning。
+
+        Returns:
+            成功重建的向量数量
+        """
+        if embed_fn is None:
+            # 尝试从 store 获取 embedding 方法
+            embed_fn = getattr(store, "embed", None)
+        if embed_fn is None:
+            logger.warning("rebuild: 没有可用的 embedding 函数，跳过向量索引重建")
+            return 0
+
+        # 清空现有向量数据
+        self._vectors.clear()
+        self._contents.clear()
+
+        # 查询所有 is_active=1 的记忆原子
+        rows = store.query(
+            "SELECT id, content FROM memory_atoms WHERE is_active = 1"
+        )
+        if not rows:
+            logger.info("rebuild: 没有活跃记忆需要重建")
+            self.rebuild_required = False
             self._persist()
-            self._dirty_count = 0
+            return 0
+
+        count = 0
+        for row in rows:
+            doc_id = int(row.get("id", 0))
+            content = row.get("content", "")
+            if not doc_id or not content:
+                continue
+            try:
+                vector = embed_fn(content)
+                if vector:
+                    self._vectors[doc_id] = vector
+                    self._contents[doc_id] = content
+                    count += 1
+            except Exception as e:
+                logger.warning(f"rebuild: embedding 失败 (id={doc_id}): {e}")
+                continue
+
+        self.rebuild_required = False
+        self.flush()
+        logger.info(f"rebuild: 向量索引重建完成，共 {count} 条")
+        return count
 
     def flush(self):
         """显式持久化所有待写数据"""
-        if self._persist_path and self._dirty_count > 0:
-            self._persist()
-            self._dirty_count = 0
+        # Task 38.5：写操作加锁
+        with self._lock:
+            if self._persist_path and self._dirty_count > 0:
+                self._persist()
+                self._dirty_count = 0
     
     def search(self, query_vector: List[float], top_k: int = 10) -> List[Tuple[int, float]]:
         """向量相似度搜索，返回 (doc_id, similarity)"""
@@ -953,11 +1065,17 @@ class HybridRetriever:
             return []
 
         # 1. BM25 / 用户 / 实体 搜索（硬过滤在 SQL WHERE 子句中，放线程执行）
-        results = await asyncio.to_thread(
-            self._sync_keyword_search, query, limit, user_id, persona_id, categories
-        )
+        # BUG B-004：关键词检索异常降级为空，避免击穿整条回复/记忆召回链路
+        try:
+            results = await asyncio.to_thread(
+                self._sync_keyword_search, query, limit, user_id, persona_id, categories
+            )
+        except Exception as e:
+            logger.warning(f"关键词检索失败（降级为空）: {e}")
+            results = []
 
         # 2. 向量语义搜索（embedding 获取是 async，向量计算+get_by_id 是 sync）
+        # BUG B-005: rebuild_required 时 VectorIndex.search 会短路返回空，此处记录 warning 而非静默
         try:
             if self.llm and self.vector_index and len(self.vector_index._vectors) > 0:
                 embedding = await self.llm.get_embedding(query)
@@ -967,6 +1085,13 @@ class HybridRetriever:
                         user_id, persona_id, categories
                     )
                     results.extend(vector_rows)
+            # BUG B-005: rebuild_required 且语义检索返回空时记录 warning
+            if self.vector_index and self.vector_index.rebuild_required:
+                logger.warning(
+                    "向量索引标记为 rebuild_required，语义检索已跳过。"
+                    "请调用 vector_index.rebuild(store) 重建索引。"
+                    "当前仅使用关键词搜索结果。"
+                )
         except Exception as e:
             logger.debug(f"向量搜索跳过: {e}")
 
@@ -1026,8 +1151,18 @@ class HybridRetriever:
         """同步执行向量搜索 + get_by_id（MEM-003：get_by_id 后内存硬过滤）"""
         out: List[Dict] = []
         vector_results = self.vector_index.search(embedding, limit=limit * 2)
+        if not vector_results:
+            return out
+        # Task 38.2：批量获取记忆，替代逐条 get_by_id（避免每条新建连接）
+        doc_ids = [int(doc_id) for doc_id, _ in vector_results]
+        placeholders = ",".join("?" * len(doc_ids))
+        rows = self.store.query(
+            f"SELECT * FROM memory_atoms WHERE id IN ({placeholders}) AND is_active = 1",
+            tuple(doc_ids),
+        )
+        row_map = {int(r["id"]): r for r in rows}
         for i, (doc_id, score) in enumerate(vector_results):
-            row = self.store.get_by_id(int(doc_id))
+            row = row_map.get(int(doc_id))
             if not row:
                 continue
             # MEM-003：向量召回后立即硬过滤
@@ -1154,6 +1289,11 @@ class KnowledgeBaseMemory:
         # 旧配置（保留兼容）
         self.compress_threshold = 20
 
+        # Task 18: 待对账的向量 ID 列表（启动时检查发现少量缺失，异步增量补 embedding）
+        self._pending_reconcile_ids: List[int] = []
+        # 启动对账检查：比较 SQLite 活跃记忆与向量索引的 ID 集合
+        self._reconcile_vector_index_check()
+
         logger.info(f"知识库记忆系统初始化完成 (向量维度={self.embedding_dimension or '未确定'})")
 
     def apply_memory_config(self, memory_config) -> None:
@@ -1176,6 +1316,164 @@ class KnowledgeBaseMemory:
             f"max_long_term={self.max_long_term} enable_forgetting={self.enable_forgetting} "
             f"forgetting_score={self.forgetting_score} max_memory_age_days={self.max_memory_age_days}"
         )
+
+    # ═══════════════════════════════════════════
+    #  Task 18: 向量索引与 SQLite 崩溃后自动对账
+    # ═══════════════════════════════════════════
+
+    def _reconcile_vector_index_check(self):
+        """Task 18: 启动对账检查 — 比较 SQLite 活跃记忆与向量索引的 ID 集合
+
+        - 大量差异（超过阈值）：标记 rebuild_required，等待异步 rebuild
+        - 少量差异：记录缺失 ID 到 _pending_reconcile_ids，等待异步增量补 embedding
+        - 向量索引中有但 SQLite 中已不活跃的条目：立即清理
+        """
+        try:
+            # 如果 load() 已标记 rebuild_required（文件损坏/维度缺失），跳过对账
+            if self.vector_index.rebuild_required:
+                logger.warning(
+                    "向量索引已标记 rebuild_required（加载阶段），跳过启动对账检查，"
+                    "请调用 reconcile_vector_index_async() 重建"
+                )
+                return
+
+            sqlite_ids: set = set()
+            rows = self.store.query("SELECT id FROM memory_atoms WHERE is_active = 1")
+            for row in rows:
+                try:
+                    sqlite_ids.add(int(row.get("id", 0)))
+                except (ValueError, TypeError):
+                    continue
+
+            vector_ids: set = set(self.vector_index._vectors.keys())
+
+            missing_in_vector = sqlite_ids - vector_ids
+            stale_in_vector = vector_ids - sqlite_ids
+
+            total_active = len(sqlite_ids)
+
+            # 阈值：缺失超过 20% 或超过 50 条 → 重建
+            rebuild_threshold = max(50, int(total_active * 0.2))
+
+            if total_active > 0 and len(missing_in_vector) > rebuild_threshold:
+                logger.warning(
+                    f"向量索引与 SQLite 差异过大 (missing={len(missing_in_vector)}, "
+                    f"active={total_active}, threshold={rebuild_threshold})，标记 rebuild_required"
+                )
+                self.vector_index.rebuild_required = True
+                self._pending_reconcile_ids = []
+            elif missing_in_vector:
+                # 少量差异：记录缺失 ID（限制数量避免一次补太多），等待异步增量补 embedding
+                self._pending_reconcile_ids = sorted(missing_in_vector)[:100]
+                logger.info(
+                    f"向量索引少量缺失 (missing={len(missing_in_vector)}, "
+                    f"active={total_active})，将异步增量补 embedding"
+                )
+            else:
+                self._pending_reconcile_ids = []
+
+            # 清理向量索引中的过期条目（SQLite 已 is_active=0 或不存在）
+            if stale_in_vector:
+                for stale_id in stale_in_vector:
+                    self.vector_index.remove(stale_id)
+                logger.info(f"清理向量索引中 {len(stale_in_vector)} 条过期条目")
+                self.vector_index.flush()
+        except Exception as e:
+            logger.warning(f"向量索引对账检查失败: {e}")
+            self._pending_reconcile_ids = []
+
+    async def reconcile_vector_index_async(self) -> int:
+        """Task 18: 异步对账 — 增量补 embedding 或全量 rebuild
+
+        在系统启动后（LLM 已就绪时）调用此方法完成向量索引对账。
+        若启动检查时标记了 rebuild_required，执行全量重建；
+        否则对 _pending_reconcile_ids 中的缺失 ID 增量补 embedding。
+
+        Returns:
+            修复的向量数量
+        """
+        # 场景 1：标记了 rebuild_required → 全量重建
+        if self.vector_index.rebuild_required:
+            if not self.llm:
+                logger.warning("rebuild_required 但 LLM 未初始化，跳过向量索引对账")
+                return 0
+            return await self._async_rebuild_vector_index()
+
+        # 场景 2：少量缺失 → 增量补 embedding
+        pending = self._pending_reconcile_ids
+        if not pending:
+            return 0
+        if not self.llm:
+            logger.warning("增量对账待处理但 LLM 未初始化，跳过")
+            return 0
+
+        fixed = 0
+        for mid in pending:
+            try:
+                row = await asyncio.to_thread(self.store.get_by_id, mid)
+                if not row:
+                    continue
+                content = row.get("content", "")
+                if not content:
+                    continue
+                embedding = await self.llm.get_embedding(content)
+                if embedding:
+                    self.vector_index.add(mid, embedding, content)
+                    fixed += 1
+            except Exception as e:
+                logger.debug(f"增量补 embedding 失败 (id={mid}): {e}")
+                continue
+
+        self._pending_reconcile_ids = []
+        if fixed > 0:
+            self.vector_index.flush()
+            logger.info(f"向量索引增量对账完成，补充 {fixed} 条向量")
+        return fixed
+
+    async def _async_rebuild_vector_index(self) -> int:
+        """Task 18: 异步全量重建向量索引
+
+        VectorIndex.rebuild 需要 sync embed_fn，而 LLM 的 get_embedding 是 async，
+        因此手动实现 async 版本的 rebuild。
+        """
+        if not self.llm:
+            logger.warning("全量重建跳过：LLM 未初始化")
+            return 0
+
+        # 清空现有向量数据
+        self.vector_index._vectors.clear()
+        self.vector_index._contents.clear()
+
+        rows = await asyncio.to_thread(
+            self.store.query,
+            "SELECT id, content FROM memory_atoms WHERE is_active = 1"
+        )
+        if not rows:
+            self.vector_index.rebuild_required = False
+            self.vector_index.flush()
+            logger.info("异步重建：没有活跃记忆需要重建")
+            return 0
+
+        count = 0
+        for row in rows:
+            doc_id = int(row.get("id", 0))
+            content = row.get("content", "")
+            if not doc_id or not content:
+                continue
+            try:
+                embedding = await self.llm.get_embedding(content)
+                if embedding:
+                    self.vector_index._vectors[doc_id] = embedding
+                    self.vector_index._contents[doc_id] = content
+                    count += 1
+            except Exception as e:
+                logger.warning(f"异步重建: embedding 失败 (id={doc_id}): {e}")
+                continue
+
+        self.vector_index.rebuild_required = False
+        self.vector_index.flush()
+        logger.info(f"向量索引异步重建完成，共 {count} 条")
+        return count
     
     async def save_memory(self, content: str, category: MemoryCategory = MemoryCategory.EPISODIC,
                           importance: MemoryImportance = MemoryImportance.MEDIUM,
@@ -1396,7 +1694,11 @@ class KnowledgeBaseMemory:
 
     def cleanup_expired(self) -> int:
         """清理过期记忆"""
-        purged = self.store.purge_expired(self.max_memory_age_days)
+        # BUG B-005: purge_expired 返回 (count, ids)，同步清理向量索引
+        purged, expired_ids = self.store.purge_expired(self.max_memory_age_days)
+        if expired_ids:
+            for mid in expired_ids:
+                self.vector_index.remove(mid)
         if purged > 0:
             logger.info(f"清理了 {purged} 条过期记忆")
         return purged
@@ -1419,7 +1721,11 @@ class KnowledgeBaseMemory:
         # MEM-602：forgetting_score=1.0 属于 1-10 量表，应除以 10；
         # 用 >= 1.0 避免边界值走 else 分支使 threshold=1.0 清空整个记忆库
         threshold = float(self.forgetting_score) / 10.0 if self.forgetting_score >= 1.0 else float(self.forgetting_score)
-        purged = self.store.prune_low_importance(self.max_long_term, threshold)
+        purged, pruned_ids = self.store.prune_low_importance(self.max_long_term, threshold)
+        # BUG B-005: 同步清理向量索引中被标记为 is_active=0 的记忆
+        if pruned_ids:
+            for mid in pruned_ids:
+                self.vector_index.remove(mid)
         if purged > 0:
             logger.info(
                 f"遗忘 {purged} 条低重要性记忆 "

@@ -57,6 +57,17 @@ class LLMManager(ModelRouter):
         """获取指定 LLM Provider（兼容旧接口）"""
         return self.resolve_chat(llm_id or "")
 
+    # ══════════════════════════════════════
+    #  V2 兼容：llm_providers.py API 调用的 1-arg 版本
+    #  ModelRouter 的 V3 方法需要 (ptype, pid)，这里提供默认 ptype=CHAT 的重载
+    # ══════════════════════════════════════
+
+    def remove_provider(self, ptype_or_pid: str, pid: Optional[str] = None) -> bool:
+        """删除 Provider（兼容 V2 1-arg 和 V3 2-arg 调用）"""
+        if pid is None:
+            return super().remove_provider(CHAT, ptype_or_pid)
+        return super().remove_provider(ptype_or_pid, pid)
+
     async def generate(
         self,
         prompt: str,

@@ -16,15 +16,29 @@ function buildQuery(params) {
 }
 
 async function request(url, options = {}) {
-    const resp = await fetch(BASE_URL + url, {
-        ...options,
-        credentials: 'same-origin',
-        headers: {
-            'Content-Type': 'application/json',
-            ...(options.headers || {}),
-        },
-        body: options.body ? JSON.stringify(options.body) : undefined,
-    });
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 30000);
+    let resp;
+    try {
+        resp = await fetch(BASE_URL + url, {
+            ...options,
+            credentials: 'same-origin',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Requested-With': 'XMLHttpRequest',
+                ...(options.headers || {}),
+            },
+            body: options.body ? JSON.stringify(options.body) : undefined,
+            signal: controller.signal,
+        });
+    } catch (fetchErr) {
+        clearTimeout(timeoutId);
+        if (fetchErr.name === 'AbortError') {
+            throw new Error('请求超时，请稍后重试');
+        }
+        throw new Error('网络连接失败，请检查网络');
+    }
+    clearTimeout(timeoutId);
 
     if (resp.status === 401) {
         window.location.href = '/login';
@@ -41,7 +55,7 @@ async function request(url, options = {}) {
         throw err;
     }
 
-    return data.data !== undefined ? data.data : data;
+    return options.returnEnvelope ? data : (data.data !== undefined ? data.data : data);
 }
 
 export const api = {
@@ -67,7 +81,7 @@ export const api = {
         qrPoll: (id, sid) => api.get(`/api/accounts/${id}/qr-login/${sid}`),
         qrCancel: (id, sid) => api.post(`/api/accounts/${id}/qr-login/${sid}/cancel`),
         profiles: () => api.get('/api/accounts/profiles'),
-        tasks: (id) => api.get(`/api/accounts/${id}/tasks`),
+        tasks: (id, params) => api.get(`/api/accounts/${id}/tasks?${buildQuery(params)}`),
     },
 
     // LLM（旧 V2 接口，仍用于账号绑定等场景）
@@ -109,10 +123,17 @@ export const api = {
     memory: {
         stats: (accId) => api.get(`/api/accounts/${accId}/memory/stats`),
         list: (accId, params) => api.get(`/api/accounts/${accId}/memory?${buildQuery(params)}`),
+        detail: (accId, memId) => api.get(`/api/accounts/${accId}/memory/${memId}`),
         search: (accId, data) => api.post(`/api/accounts/${accId}/memory/search`, data),
+        recall: (accId, data) => api.post(`/api/accounts/${accId}/memory/recall`, data),
+        recallTraces: (accId, params) => api.get(`/api/accounts/${accId}/memory/recall?${buildQuery(params)}`),
+        recallTrace: (accId, traceId) => api.get(`/api/accounts/${accId}/memory/recall/${traceId}`),
         delete: (accId, memId) => api.delete(`/api/accounts/${accId}/memory/${memId}`),
         graph: (accId) => api.get(`/api/accounts/${accId}/memory/graph`),
         graphQuery: (accId, data) => api.post(`/api/accounts/${accId}/memory/graph/query`, data),
+        reindex: (accId, data = {}) => api.post(`/api/accounts/${accId}/memory/reindex`, data),
+        jobs: (accId, params) => api.get(`/api/accounts/${accId}/memory/jobs?${buildQuery(params)}`),
+        retryJob: (accId, jobId) => api.post(`/api/accounts/${accId}/memory/jobs/${jobId}/retry`, {}),
         migrate: (accId) => api.post(`/api/accounts/${accId}/memory/migrate`),
     },
 
@@ -120,6 +141,7 @@ export const api = {
     config: {
         schema: () => api.get('/api/config/schema'),
         full: () => api.get('/api/config/full'),
+        fullWithMeta: () => request('/api/config/full', { method: 'GET', returnEnvelope: true }),
         patch: (data) => api.patch('/api/config', data),
         validate: () => api.post('/api/config/validate'),
         reload: () => api.post('/api/config/reload'),
@@ -133,8 +155,6 @@ export const api = {
             return { data: { schema, config, version: 0 } };
         },
         update: (data) => api.patch('/api/config', data),
-        reset: () => api.post('/api/config/reset'),
-        export: () => api.get('/api/config/export'),
     },
 
     // 其他
@@ -167,10 +187,11 @@ export const api = {
         test: (data) => api.post('/api/image-generation/test', data),
     },
     drafts: {
-        list: (accId) => api.get(`/api/accounts/${accId}/dynamic-drafts`),
+        list: (accId, params) => api.get(`/api/accounts/${accId}/dynamic-drafts?${buildQuery(params)}`),
         get: (accId, id) => api.get(`/api/accounts/${accId}/dynamic-drafts/${id}`),
-        approve: (accId, id) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/approve`),
-        reject: (accId, id, reason) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/reject`, { reason }),
+        // BUG F-004/F-006: approve 需 expected_revision；reject 后端读 note
+        approve: (accId, id, body) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/approve`, body || {}),
+        reject: (accId, id, reason) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/reject`, { note: reason }),
         retry: (accId, id) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/retry`),
         update: (accId, id, data) => api.patch(`/api/accounts/${accId}/dynamic-drafts/${id}`, data),
     },
@@ -180,12 +201,33 @@ export const api = {
         restore: (name) => api.post('/api/backup/restore', { name }),
         delete: (name) => api.delete(`/api/backup/${name}`),
         download: async (name) => {
-            const resp = await fetch(`/api/backup/${name}/download`, { credentials: 'same-origin' });
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 60000);
+            let resp;
+            try {
+                resp = await fetch(`/api/backup/${name}/download`, {
+                    credentials: 'same-origin',
+                    signal: controller.signal,
+                });
+            } catch (fetchErr) {
+                clearTimeout(timeoutId);
+                if (fetchErr.name === 'AbortError') {
+                    throw new Error('下载超时，请稍后重试');
+                }
+                throw new Error('网络连接失败，请检查网络');
+            }
+            clearTimeout(timeoutId);
+            if (resp.status === 401) {
+                window.location.href = '/login';
+                throw new Error('未登录');
+            }
             if (!resp.ok) throw new Error(`下载失败: HTTP ${resp.status}`);
             return await resp.blob();
         },
     },
+
+    // dynamicDrafts 别名（Phase 5 页面使用，与 drafts 同义）
+    dynamicDrafts: null,
 };
 
-// dynamicDrafts 别名（Phase 5 页面使用，与 drafts 同义）
 api.dynamicDrafts = api.drafts;

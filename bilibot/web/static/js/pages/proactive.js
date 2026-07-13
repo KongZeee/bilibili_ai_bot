@@ -17,10 +17,10 @@ export const ProactivePage = defineComponent({
             if (!selectedAccount.value) return;
             loading.value = true;
             try {
-                const data = await api.accounts.tasks(selectedAccount.value);
+                const data = await api.accounts.tasks(selectedAccount.value, { page_size: 100 });
                 tasks.value = data.items || data || [];
             } catch (e) {
-                // 后端无 GET /api/accounts/{id}/tasks 列表路由（404），显示空状态而非报错
+                showToast('加载任务列表失败: ' + e.message, 'error');
                 tasks.value = [];
             } finally { loading.value = false; }
         }
@@ -149,30 +149,30 @@ export const ProactivePage = defineComponent({
                             ]),
                             // 数据行
                             ...tasks.value.map(t => h('div', {
-                                key: t.id,
+                                key: t.task_id,
                                 class: 'grid items-center',
                                 style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;`,
                             }, [
-                                h('span', { class: 'truncate' }, t.task_name || t.name || t.id || '-'),
+                                h('span', { class: 'truncate' }, t.scene || t.task_id || '-'),
                                 h('span', {
                                     class: 'badge badge-info',
-                                }, t.task_type || t.type || '-'),
+                                }, t.trigger_type || t.scene || '-'),
                                 h('span', {
                                     class: ['badge',
-                                        t.state === 'done' ? 'badge-success'
-                                        : t.state === 'failed' ? 'badge-danger'
-                                        : t.state === 'running' ? 'badge-info'
+                                        t.status === 'succeeded' ? 'badge-success'
+                                        : (t.status === 'failed' || t.status === 'expired' || t.status === 'result_unknown') ? 'badge-danger'
+                                        : t.status === 'running' ? 'badge-info'
                                         : 'badge-warning'].join(' '),
-                                }, t.state || 'pending'),
+                                }, t.status || 'pending'),
                                 h('span', {
                                     class: 'whitespace-nowrap truncate',
                                     style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; font-size:0.85rem;',
-                                }, t.next_run ? formatTime(t.next_run) : (t.created_at ? formatTime(t.created_at) : '-')),
+                                }, t.scheduled_at ? formatTime(t.scheduled_at) : (t.created_at ? formatTime(t.created_at) : '-')),
                                 h('div', { class: 'flex items-center gap-1' }, [
                                     h('button', {
                                         class: 'btn btn-sm primary',
                                         onClick: () => {
-                                            if (t.task_type === 'dynamic' || t.type === 'dynamic') triggerDynamic();
+                                            if (t.scene === 'dynamic') triggerDynamic();
                                             else triggerVideo();
                                         },
                                     }, '触发'),

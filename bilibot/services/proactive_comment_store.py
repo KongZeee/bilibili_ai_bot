@@ -57,6 +57,9 @@ DEFAULT_MAX_ATTEMPTS = 3
 # 默认退避基数上限（秒）
 DEFAULT_BACKOFF_CAP = 300
 
+# Task 4：publishing 状态租约时长（秒），超时视为崩溃
+DEFAULT_LEASE_SECONDS = 600
+
 
 def default_idempotency_key(account_id: str, bvid: str) -> str:
     """COM-501 幂等键：account_id:bvid:proactive_comment"""
@@ -89,6 +92,7 @@ class ProactiveCommentAction:
     updated_at: float = 0.0
     published_at: Optional[float] = None
     next_retry_at: Optional[float] = None
+    lease_until: Optional[float] = None
 
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
@@ -119,6 +123,7 @@ class ProactiveCommentAction:
             updated_at=row["updated_at"] or 0.0,
             published_at=row["published_at"],
             next_retry_at=row["next_retry_at"],
+            lease_until=row["lease_until"] if "lease_until" in row.keys() else None,
         )
 
 
@@ -167,9 +172,18 @@ class ProactiveCommentStore:
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     published_at REAL,
-                    next_retry_at REAL
+                    next_retry_at REAL,
+                    lease_until REAL
                 )
             """)
+            # Task 4：为旧库补 lease_until 列（publishing 状态租约，崩溃恢复用）
+            cols = {row[1] for row in conn.execute(
+                "PRAGMA table_info(proactive_comment_actions)"
+            ).fetchall()}
+            if "lease_until" not in cols:
+                conn.execute(
+                    "ALTER TABLE proactive_comment_actions ADD COLUMN lease_until REAL"
+                )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_pca_account_bvid "
                 "ON proactive_comment_actions(account_id, bvid)"
@@ -346,15 +360,20 @@ class ProactiveCommentStore:
             conn.close()
 
     def mark_publishing(self, action_id: str, now: Optional[float] = None) -> bool:
-        """claimed/retry_wait → publishing（API 调用前）"""
+        """claimed/retry_wait → publishing（API 调用前）
+
+        Task 4：写入 lease_until（now + DEFAULT_LEASE_SECONDS），
+        若进程在此之后崩溃，recover_stuck_publishing 会将其转为 result_unknown。
+        """
         now = now or time.time()
+        lease_until = now + DEFAULT_LEASE_SECONDS
         conn = self._get_conn()
         try:
             cur = conn.execute(
                 "UPDATE proactive_comment_actions "
-                "SET status=?, updated_at=?, next_retry_at=NULL "
+                "SET status=?, updated_at=?, next_retry_at=NULL, lease_until=? "
                 "WHERE action_id=? AND status IN (?, ?)",
-                (STATUS_PUBLISHING, now, action_id,
+                (STATUS_PUBLISHING, now, lease_until, action_id,
                  STATUS_CLAIMED, STATUS_RETRY_WAIT),
             )
             conn.commit()
@@ -374,7 +393,7 @@ class ProactiveCommentStore:
             cur = conn.execute(
                 "UPDATE proactive_comment_actions "
                 "SET status=?, published_at=?, updated_at=?, "
-                "last_error_code='', last_error='', next_retry_at=NULL "
+                "last_error_code='', last_error='', next_retry_at=NULL, lease_until=NULL "
                 "WHERE action_id=? AND status=?",
                 (STATUS_PUBLISHED, published_at, now, action_id,
                  STATUS_PUBLISHING),
@@ -410,7 +429,7 @@ class ProactiveCommentStore:
                 conn.execute(
                     "UPDATE proactive_comment_actions "
                     "SET status=?, attempt=?, last_error_code=?, last_error=?, "
-                    "updated_at=?, next_retry_at=NULL "
+                    "updated_at=?, next_retry_at=NULL, lease_until=NULL "
                     "WHERE action_id=?",
                     (STATUS_FAILED, attempt + 1, error_code, error,
                      now, action_id),
@@ -425,7 +444,7 @@ class ProactiveCommentStore:
             conn.execute(
                 "UPDATE proactive_comment_actions "
                 "SET status=?, attempt=?, last_error_code=?, last_error=?, "
-                "next_retry_at=?, updated_at=? "
+                "next_retry_at=?, updated_at=?, lease_until=NULL "
                 "WHERE action_id=?",
                 (STATUS_RETRY_WAIT, new_attempt, error_code, error,
                  next_retry_at, now, action_id),
@@ -450,7 +469,7 @@ class ProactiveCommentStore:
             cur = conn.execute(
                 "UPDATE proactive_comment_actions "
                 "SET status=?, last_error_code=?, last_error=?, "
-                "updated_at=?, next_retry_at=NULL "
+                "updated_at=?, next_retry_at=NULL, lease_until=NULL "
                 "WHERE action_id=? AND status=?",
                 (STATUS_RESULT_UNKNOWN, error_code, error,
                  now, action_id, STATUS_PUBLISHING),
@@ -471,12 +490,43 @@ class ProactiveCommentStore:
             cur = conn.execute(
                 "UPDATE proactive_comment_actions "
                 "SET status=?, last_error_code=?, last_error=?, "
-                "updated_at=?, next_retry_at=NULL "
+                "updated_at=?, next_retry_at=NULL, lease_until=NULL "
                 "WHERE action_id=?",
                 (STATUS_FAILED, error_code, error, now, action_id),
             )
             conn.commit()
             return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def recover_stuck_publishing(self, now: Optional[float] = None) -> int:
+        """Task 4：恢复卡在 publishing 状态的动作
+
+        若进程在 publishing 阶段崩溃（mark_publishing 后、mark_published 前），
+        该动作会永久卡在 publishing，导致同账号同视频再也收不到主动评论
+        （部分唯一索引 ux_pca_active 阻止新 claim）。
+
+        本方法将 lease_until 已过期的 publishing 动作转为 result_unknown
+        （不自动重发，与"平台结果不确定"语义一致 —— 无法判断评论是否已发出）。
+
+        应在调度器启动时 + 主循环中周期性调用。
+
+        Returns:
+            被恢复的行数
+        """
+        now = now or time.time()
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE proactive_comment_actions "
+                "SET status=?, last_error_code='STUCK_PUBLISHING', "
+                "last_error='publishing 超过 lease_until，疑似崩溃', "
+                "updated_at=?, next_retry_at=NULL, lease_until=NULL "
+                "WHERE status=? AND lease_until IS NOT NULL AND lease_until < ?",
+                (STATUS_RESULT_UNKNOWN, now, STATUS_PUBLISHING, now),
+            )
+            conn.commit()
+            return cur.rowcount
         finally:
             conn.close()
 

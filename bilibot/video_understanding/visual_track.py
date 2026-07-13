@@ -17,12 +17,29 @@ import os
 import re
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Awaitable, Callable, List, Optional, Tuple
 
 from PIL import Image
 
 logger = logging.getLogger("bilibot.video_u.visual")
+
+# 默认视觉描述 prompt（与 service.VISION_SYSTEM_PROMPT 保持一致，避免循环 import）
+DEFAULT_VISION_PROMPT = (
+    "你是一个视频帧视觉描述专家。请用 1-2 句话客观、凝练地描述这张图片。"
+    "重点关注：当前场景、核心主体的动作、画面中的显眼文字(OCR)或图表。"
+    "不要添加任何主观推测或修辞手法。"
+)
+
+# 番剧字幕识别模式：要求 Vision LLM 在描述画面的同时转写画面里的硬字幕
+SUBTITLE_VISION_PROMPT = (
+    "你是一个视频帧视觉描述专家。请用 1-2 句话客观、凝练地描述这张图片。"
+    "重点关注：当前场景、核心主体的动作、画面中的显眼文字(OCR)或图表。"
+    "番剧的中文字幕通常压在画面底部（硬字幕）。如果画面中有字幕/台词文字，"
+    "请在描述末尾另起一行，以「【字幕】」开头原样转写字幕文本；没有字幕则不写该行。"
+    "不要添加任何主观推测或修辞手法。"
+)
 
 
 @dataclass
@@ -33,6 +50,70 @@ class VisualEvent:
     frame_number: int
     image_path: str
     description: str
+
+
+class VisionTrackIncompleteError(RuntimeError):
+    """A retryable visual extraction failure in completeness-sensitive flows."""
+
+    def __init__(self, code: str, reason: str, *, expected: int = 0, completed: int = 0):
+        self.code = code
+        self.reason = reason
+        self.expected = max(0, int(expected))
+        self.completed = max(0, int(completed))
+        self.retryable = True
+        self.work_dir = ""
+        super().__init__(f"{code}: {reason}")
+
+
+class VisionRequestPacer:
+    """Serialize request starts to a stable per-video rate budget."""
+
+    def __init__(
+        self,
+        requests_per_minute: float,
+        *,
+        clock: Optional[Callable[[], float]] = None,
+        sleep: Optional[Callable[[float], Awaitable[None]]] = None,
+    ) -> None:
+        rate = max(0.0, float(requests_per_minute))
+        self.min_interval = 60.0 / rate if rate else 0.0
+        self._clock = clock or time.monotonic
+        self._sleep = sleep or asyncio.sleep
+        self._next_start = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait_turn(self) -> None:
+        if self.min_interval <= 0:
+            return
+        async with self._lock:
+            now = self._clock()
+            delay = self._next_start - now
+            if delay > 0:
+                await self._sleep(delay)
+                now = self._clock()
+            self._next_start = max(self._next_start, now) + self.min_interval
+
+
+def _select_timeline_frames(frame_numbers: List[int], limit: int) -> List[int]:
+    """Downsample scene midpoints across the full timeline deterministically."""
+
+    values = sorted(set(int(value) for value in frame_numbers))
+    if limit <= 0:
+        return []
+    if len(values) <= limit:
+        return values
+    if limit == 1:
+        return [values[len(values) // 2]]
+
+    remaining = list(values)
+    first, last = values[0], values[-1]
+    selected: List[int] = []
+    for index in range(limit):
+        target = first + (last - first) * index / (limit - 1)
+        choice = min(remaining, key=lambda value: (abs(value - target), value))
+        selected.append(choice)
+        remaining.remove(choice)
+    return sorted(selected)
 
 
 def _calculate_frame_count(duration: float) -> int:
@@ -185,8 +266,14 @@ def _extract_frames_scenedetect(
         scenes = scene_manager.get_scene_list()
         logger.info(f"PySceneDetect 检测到 {len(scenes)} 个镜头")
 
-        for start_frame, end_frame in scenes:
-            mid_frame = (start_frame.frame_num + end_frame.frame_num) // 2
+        scene_midpoints = [
+            (start_frame.frame_num + end_frame.frame_num) // 2
+            for start_frame, end_frame in scenes
+        ]
+        # 镜头全送，不下采样；no_of_frames 仅用于下方"镜头过少时补充等间隔帧"的判断
+        selected_midpoints = scene_midpoints
+
+        for mid_frame in selected_midpoints:
             timestamp = mid_frame / fps if fps else 0.0
             frame_path = os.path.join(output_dir, f"frame_{mid_frame:08d}.jpg")
             _extract_frame_at(video_path, timestamp, frame_path)
@@ -195,16 +282,20 @@ def _extract_frames_scenedetect(
 
         if len(frames) < no_of_frames // 2:
             logger.info("镜头数较少，补充等间隔帧")
-            existing = {p for _, p in frames}
-            for i in range(1, no_of_frames + 1):
-                timestamp = duration * i / (no_of_frames + 1)
+            existing = {frame_number for frame_number, _ in frames}
+            candidate_count = no_of_frames * 2
+            for i in range(1, candidate_count + 1):
+                if len(frames) >= no_of_frames:
+                    break
+                timestamp = duration * i / (candidate_count + 1)
                 frame_number = int(timestamp * fps)
                 frame_path = os.path.join(output_dir, f"frame_{frame_number:08d}.jpg")
-                if frame_path in existing:
+                if frame_number in existing:
                     continue
                 _extract_frame_at(video_path, timestamp, frame_path)
                 if os.path.exists(frame_path):
                     frames.append((frame_number, frame_path))
+                    existing.add(frame_number)
 
         frames.sort(key=lambda x: x[0])
         logger.info(f"PySceneDetect 抽帧完成: {len(frames)} 张")
@@ -280,6 +371,10 @@ async def describe_visual_track(
     scenedetect_threshold: float = 27.0,
     image_max_size: int = 768,
     vision_window_size: int = 5,
+    vision_requests_per_minute: float = 10.0,
+    vision_prompt: str = None,
+    request_pacer: Optional[VisionRequestPacer] = None,
+    require_complete: bool = False,
 ) -> Tuple[List[VisualEvent], bool]:
     """
     视觉轨处理入口
@@ -299,6 +394,13 @@ async def describe_visual_track(
     )
     if not frames:
         logger.warning("未抽到任何关键帧")
+        if require_complete:
+            raise VisionTrackIncompleteError(
+                "VISION_NO_FRAMES",
+                "keyframe extraction produced no frames",
+                expected=no_of_frames,
+                completed=0,
+            )
         return [], False
 
     resized_frames = []
@@ -307,11 +409,22 @@ async def describe_visual_track(
         resized_frames.append((frame_number, resized))
 
     visual_events: List[VisualEvent] = []
-    semaphore = asyncio.Semaphore(vision_window_size)
+    effective_window = max(1, min(int(vision_window_size), 2))
+    if effective_window != vision_window_size:
+        logger.warning(
+            f"Vision concurrency capped: {vision_window_size} -> {effective_window}"
+        )
+    semaphore = asyncio.Semaphore(effective_window)
+    pacer = request_pacer or VisionRequestPacer(vision_requests_per_minute)
+    logger.info(
+        f"Vision request budget: {vision_requests_per_minute:g}/min, "
+        f"concurrency={effective_window}, frames={len(resized_frames)}"
+    )
 
     async def _describe_one(index: int, frame_number: int, image_path: str) -> Optional[VisualEvent]:
         async with semaphore:
-            description = await llm.describe_image(image_path)
+            await pacer.wait_turn()
+            description = await llm.describe_image(image_path, prompt=vision_prompt or DEFAULT_VISION_PROMPT)
         if not description:
             return None
         timestamp = round(frame_number / fps, 2) if fps else 0.0
@@ -327,6 +440,16 @@ async def describe_visual_track(
     results = await asyncio.gather(*tasks)
     visual_events = [r for r in results if r is not None]
     visual_events.sort(key=lambda x: x.timestamp)
+    if require_complete and len(visual_events) != len(resized_frames):
+        raise VisionTrackIncompleteError(
+            "VISION_INCOMPLETE_DESCRIPTIONS",
+            (
+                f"described {len(visual_events)} of {len(resized_frames)} "
+                "extracted frames"
+            ),
+            expected=len(resized_frames),
+            completed=len(visual_events),
+        )
 
     is_static = len(frames) == 1
     if is_static:

@@ -10,7 +10,8 @@ document.getElementById('loginForm').onsubmit = async (e) => {
     try {
         const res = await fetch('/api/login', {
             method: 'POST',
-            headers: {'Content-Type': 'application/json'},
+            credentials: 'same-origin',
+            headers: {'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest'},
             body: JSON.stringify({
                 username: document.getElementById('username').value,
                 password: document.getElementById('password').value

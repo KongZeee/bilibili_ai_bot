@@ -63,7 +63,15 @@ def create_llm_providers_routes(
     """
 
     async def list_providers(request: Request) -> JSONResponse:
-        return ok(llm_manager.list_providers())
+        # ModelRouter.list_providers(ptype) 需要类型参数，这里合并所有类型返回扁平列表
+        from bilibot.llm.router import PROVIDER_TYPES
+        all_providers = []
+        for ptype in PROVIDER_TYPES:
+            for info in llm_manager.list_providers(ptype):
+                info = dict(info)
+                info["type"] = ptype
+                all_providers.append(info)
+        return ok(all_providers)
 
     async def add_provider(request: Request) -> JSONResponse:
         try:
@@ -78,7 +86,8 @@ def create_llm_providers_routes(
         except ValueError as e:
             return fail("VALIDATION_ERROR", str(e))
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"添加 LLM Provider 失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def delete_provider(request: Request) -> JSONResponse:
         llm_id = request.path_params.get("id")
@@ -129,7 +138,8 @@ def create_llm_providers_routes(
             _save_llm_to_config(config_loader, llm_manager, config_path)
             return ok(llm_manager.get_provider(llm_id).get_info(), "Provider 已更新")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"更新 LLM Provider 失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def set_default(request: Request) -> JSONResponse:
         llm_id = request.path_params.get("id")

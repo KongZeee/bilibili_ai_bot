@@ -2,7 +2,7 @@
 const { defineComponent, h, ref, computed, onMounted } = window.Vue;
 import { api } from '../api.js';
 import { appState, refreshAccounts, showToast } from '../state.js';
-import { Button, Badge, Modal, FormInput, Toggle, EmptyState, Loading } from './common.js';
+import { Button, Badge, Modal, FormInput, Toggle, EmptyState, Loading, ConfirmModal, createConfirmHelper } from './common.js';
 
 // Tab 配置：type 与后端 PROVIDER_TYPES 对齐
 const TABS = [
@@ -46,6 +46,8 @@ export const LlmListPage = defineComponent({
         const saving = ref(false);
         const editingId = ref('');
         const editForm = ref(defaultForm(activeTab.value));
+
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
 
         // 计算每个 chat Provider 被哪些账号引用（仅 chat tab 显示）
         const llmUsage = computed(() => {
@@ -147,26 +149,31 @@ export const LlmListPage = defineComponent({
             } finally { saving.value = false; }
         }
 
-        async function deleteProvider(p) {
+        function deleteProvider(p) {
+            let message = '确定删除此 Provider？';
             // chat 类型：检查账号引用
             if (activeTab.value === 'chat') {
                 const usage = llmUsage.value[p.id] || [];
                 if (usage.length > 0) {
-                    if (!confirm(`此 Provider 被 ${usage.length} 个账号引用，删除后引用将失效。继续？`)) return;
-                } else {
-                    if (!confirm('确定删除此 Provider？')) return;
+                    message = `此 Provider 被 ${usage.length} 个账号引用，删除后引用将失效。继续？`;
                 }
-            } else {
-                if (!confirm('确定删除此 Provider？')) return;
             }
-            try {
-                await api.modelRouting.deleteProvider(activeTab.value, p.id);
-                showToast('已删除', 'success');
-                await loadOverview();
-                if (activeTab.value === 'chat') await refreshAccounts();
-            } catch (e) {
-                showToast('删除失败: ' + e.message, 'error');
-            }
+            showConfirm({
+                title: '确认删除',
+                message: message,
+                confirmText: '删除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.modelRouting.deleteProvider(activeTab.value, p.id);
+                        showToast('已删除', 'success');
+                        await loadOverview();
+                        if (activeTab.value === 'chat') await refreshAccounts();
+                    } catch (e) {
+                        showToast('删除失败: ' + e.message, 'error');
+                    }
+                },
+            });
         }
 
         async function testProvider(p) {
@@ -486,6 +493,20 @@ export const LlmListPage = defineComponent({
                         h(Button, { onClick: () => showEdit.value = false }, () => '取消'),
                         h(Button, { type: 'primary', loading: saving.value, onClick: saveEdit }, () => '保存'),
                     ],
+                }),
+
+                // ═══ 确认对话框 ═══
+                h(ConfirmModal, {
+                    modelValue: confirmState.visible,
+                    title: confirmState.title,
+                    message: confirmState.message,
+                    confirmText: confirmState.confirmText,
+                    cancelText: confirmState.cancelText,
+                    danger: confirmState.danger,
+                    prompt: confirmState.prompt,
+                    promptPlaceholder: confirmState.promptPlaceholder,
+                    'onUpdate:modelValue': (v) => confirmState.visible = v,
+                    onConfirm: handleConfirm,
                 }),
             ]);
         };

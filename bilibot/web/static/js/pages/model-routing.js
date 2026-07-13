@@ -69,7 +69,7 @@ export const ModelRoutingPage = defineComponent({
             const routed = info.routed_provider;
             const routedId = info.routed_provider_id || '';
             const isSwitching = !!switching[feat.type];
-
+            const selectId = `mr-select-${feat.type}`;
             const cardStyle = 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start; display: grid; gap: calc(var(--spacing) * 3);';
 
             return h('article', {
@@ -119,11 +119,13 @@ export const ModelRoutingPage = defineComponent({
                 h('div', { class: 'grid gap-1' }, [
                     h('label', {
                         class: 'form-label',
+                        for: selectId,
                         style: 'font-size:0.78rem; text-transform: uppercase; letter-spacing: 0.1em;',
                     }, '切换 Provider'),
                     h('div', { class: 'flex items-center gap-2' }, [
                         h('select', {
                             class: 'form-input',
+                            id: selectId,
                             value: pending[feat.type] ?? routedId,
                             disabled: isSwitching || providers.length === 0,
                             onChange: (e) => { pending[feat.type] = e.target.value; },

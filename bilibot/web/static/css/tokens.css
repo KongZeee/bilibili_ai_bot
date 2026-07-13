@@ -47,9 +47,12 @@
   --sidebar-border: 43.3333 23.0769% 84.7059%;
   --sidebar-ring: 37.5000 15.6863% 20%;
 
-  --font-sans: Fraunces, ui-serif, serif;
-  --font-serif: Fraunces, ui-serif, serif;
-  --font-mono: monospace;
+  /* Golden Time 主题：以 Fraunces 衬线字体为视觉特色，全站统一使用。
+     --font-sans 在本主题中刻意使用衬线字体；Georgia 作为 Fraunces 加载失败时的降级。 */
+  --font-sans: Fraunces, ui-serif, Georgia, serif;
+  --font-serif: Fraunces, ui-serif, Georgia, serif;
+  --font-display: Fraunces, ui-serif, Georgia, serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
   --radius: 2rem;
   --shadow-x: 0px;
   --shadow-y: 2px;
@@ -116,9 +119,12 @@
   --sidebar-border: 35 15% 25%;
   --sidebar-ring: 41.5385 18.8406% 86.4706%;
 
-  --font-sans: Fraunces, ui-serif, serif;
-  --font-serif: Fraunces, ui-serif, serif;
-  --font-mono: monospace;
+  /* Golden Time 主题：以 Fraunces 衬线字体为视觉特色，全站统一使用。
+     --font-sans 在本主题中刻意使用衬线字体；Georgia 作为 Fraunces 加载失败时的降级。 */
+  --font-sans: Fraunces, ui-serif, Georgia, serif;
+  --font-serif: Fraunces, ui-serif, Georgia, serif;
+  --font-display: Fraunces, ui-serif, Georgia, serif;
+  --font-mono: ui-monospace, "Cascadia Mono", "Segoe UI Mono", monospace;
   --radius: 2rem;
   --shadow-x: 0px;
   --shadow-y: 2px;

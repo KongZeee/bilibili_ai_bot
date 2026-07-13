@@ -1,5 +1,5 @@
 // components/common.js - 通用 Vue 组件库
-const { defineComponent, h, ref, computed, watch, onMounted, onBeforeUnmount, onUnmounted } = window.Vue;
+const { defineComponent, h, ref, reactive, computed, watch, onMounted, onBeforeUnmount, onUnmounted } = window.Vue;
 
 // ═══════════════════════════════════════════════════
 // Icon 组件 - 基于 CSS mask 的图标系统
@@ -19,7 +19,7 @@ export const Icon = defineComponent({
                 'mask-image': `url('/static/icons/${props.name}.svg')`,
             };
             if (props.size) {
-                const s = typeof props.size === 'number' ? props.size + 'rem' : props.size;
+                const s = typeof props.size === 'number' ? props.size + 'px' : props.size;
                 style.width = s;
                 style.height = s;
             }
@@ -186,6 +186,11 @@ export const FormSelect = defineComponent({
         const hintId = props.id ? `${props.id}-hint` : undefined;
         const errorId = props.id ? `${props.id}-error` : undefined;
         const describedBy = [hintId, props.error ? errorId : null].filter(Boolean).join(' ') || undefined;
+        const normalizedOptions = computed(() => (props.options || []).map(option =>
+            typeof option === 'string' || typeof option === 'number'
+                ? { value: String(option), label: String(option) }
+                : option
+        ));
         return () => h('div', { class: 'form-group' }, [
             props.label ? h('label', { class: 'form-label', for: props.id || undefined }, props.label) : null,
             h('select', {
@@ -198,7 +203,7 @@ export const FormSelect = defineComponent({
                 'aria-invalid': props.error ? 'true' : undefined,
                 'aria-describedby': describedBy,
                 onChange: (e) => emit('update:modelValue', e.target.value),
-            }, (props.options || []).map(opt =>
+            }, normalizedOptions.value.map(opt =>
                 h('option', { value: opt.value }, opt.label)
             )),
             props.hint ? h('div', { class: 'form-hint', id: hintId }, props.hint) : null,
@@ -336,6 +341,99 @@ export const EmptyState = defineComponent({
         ]);
     },
 });
+
+// ConfirmModal 组件 - 统一确认/输入对话框（替代原生 confirm/prompt）
+export const ConfirmModal = defineComponent({
+    name: 'ConfirmModal',
+    props: {
+        modelValue: Boolean,
+        title: { type: String, default: '确认操作' },
+        message: { type: String, default: '' },
+        confirmText: { type: String, default: '确认' },
+        cancelText: { type: String, default: '取消' },
+        danger: { type: Boolean, default: false },
+        prompt: { type: Boolean, default: false },
+        promptPlaceholder: { type: String, default: '' },
+        promptValue: { type: String, default: '' },
+    },
+    emits: ['update:modelValue', 'confirm', 'cancel'],
+    setup(props, { emit }) {
+        const inputValue = ref(props.promptValue);
+        watch(() => props.modelValue, (v) => {
+            if (v) inputValue.value = props.promptValue;
+        });
+        function close() { emit('update:modelValue', false); }
+        function handleConfirm() {
+            emit('confirm', props.prompt ? inputValue.value : undefined);
+            close();
+        }
+        function handleCancel() {
+            emit('cancel');
+            close();
+        }
+        return () => h(Modal, {
+            modelValue: props.modelValue,
+            title: props.title,
+            width: '480px',
+            'onUpdate:modelValue': (v) => emit('update:modelValue', v),
+        }, {
+            default: () => h('div', { style: 'display:grid; gap:calc(var(--spacing) * 2);' }, [
+                props.message
+                    ? h('p', { class: 'm-0', style: 'line-height:1.6; color:hsl(var(--foreground));' }, props.message)
+                    : null,
+                props.prompt
+                    ? h(FormInput, {
+                        modelValue: inputValue.value,
+                        'onUpdate:modelValue': (v) => inputValue.value = v,
+                        placeholder: props.promptPlaceholder,
+                        autocomplete: 'off',
+                        spellcheck: false,
+                    })
+                    : null,
+            ]),
+            footer: () => h('div', { style: 'display:flex; gap:calc(var(--spacing) * 2); justify-content:flex-end;' }, [
+                h(Button, { onClick: handleCancel }, () => props.cancelText),
+                h(Button, {
+                    type: props.danger ? 'danger' : 'primary',
+                    onClick: handleConfirm,
+                }, () => props.confirmText),
+            ]),
+        });
+    },
+});
+
+// createConfirmHelper - 创建确认对话框的响应式状态与控制函数
+// 返回 { state, showConfirm, handleConfirm }，配合 ConfirmModal 组件使用
+export function createConfirmHelper() {
+    const state = reactive({
+        visible: false,
+        title: '确认操作',
+        message: '',
+        confirmText: '确认',
+        cancelText: '取消',
+        danger: false,
+        prompt: false,
+        promptPlaceholder: '',
+        action: null,
+    });
+    function showConfirm(opts) {
+        state.title = opts.title || '确认操作';
+        state.message = opts.message || '';
+        state.confirmText = opts.confirmText || '确认';
+        state.cancelText = opts.cancelText || '取消';
+        state.danger = !!opts.danger;
+        state.prompt = !!opts.prompt;
+        state.promptPlaceholder = opts.promptPlaceholder || '';
+        state.action = opts.action || null;
+        state.visible = true;
+    }
+    function handleConfirm(val) {
+        const action = state.action;
+        state.visible = false;
+        if (action) action(val);
+    }
+    return { state, showConfirm, handleConfirm };
+}
 
 // Loading 组件
 export const Loading = defineComponent({
@@ -512,22 +610,26 @@ export const Pagination = defineComponent({
             return arr;
         });
 
-        return () => h('div', { class: 'pagination flex items-center gap-2' }, [
+        return () => h('nav', { class: 'pagination flex items-center gap-2', 'aria-label': '分页导航' }, [
             h('span', { class: 'text-muted', style: 'font-size:12px' },
                 `共 ${props.total} 条`),
             h('button', {
                 class: 'btn btn-secondary btn-sm',
                 disabled: props.page <= 1,
+                'aria-label': '上一页',
                 onClick: () => go(props.page - 1),
             }, '上一页'),
             pages.value.map(p => h('button', {
                 key: p,
                 class: ['btn', 'btn-sm', p === props.page ? 'btn-primary' : 'btn-secondary'],
+                'aria-label': `第 ${p} 页${p === props.page ? '（当前页）' : ''}`,
+                'aria-current': p === props.page ? 'page' : undefined,
                 onClick: () => go(p),
             }, String(p))),
             h('button', {
                 class: 'btn btn-secondary btn-sm',
                 disabled: props.page >= totalPages.value,
+                'aria-label': '下一页',
                 onClick: () => go(props.page + 1),
             }, '下一页'),
         ]);

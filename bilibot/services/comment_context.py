@@ -1,17 +1,19 @@
 """
 CommentContextService - 评论上下文构建服务
 
-PRD V4 §4.3 / §6.3：
+PRD V6：
 集中处理从 B站通知到完整 ReplyContext 的构建逻辑，
 避免 scheduler 中堆砌散落的上下文拼接代码。
 
 责任：
 1. 从通知中提取 oid / rpid / user_id / username / content
 2. 调用 BilibiliAPI 获取视频信息（失败则降级为 video_context_complete=False）
-3. 复用 SQLite memory_atoms 中的 content_video 记忆（PRD V4 §4.4.3）
+3. 复用当前账号 V6 memory brain 中的视频观察
 4. 调用 UserStateSystem 获取用户画像和心情
 5. 调用 DataStore 获取 Bot 在该评论线/同视频下的历史回复
 6. 组装为 ReplyContext（dataclass）
+
+本服务不会读取 knowledge_base.db、chat_memory.json 或其他旧记忆载体。
 """
 import asyncio
 import logging
@@ -22,6 +24,10 @@ from ..models import (
 )
 
 logger = logging.getLogger("bilibot.comment_context")
+
+
+class ContextArchiveError(RuntimeError):
+    """A model-context source could not be durably committed to V6."""
 
 
 class CommentContextService:
@@ -35,20 +41,29 @@ class CommentContextService:
         persona_store=None,
         config_loader=None,
         knowledge_memory=None,
+        memory_brain=None,
     ):
         self.bili = bili
         self.user_state = user_state
         self.ds = data_store
         self.persona_store = persona_store
         self.config_loader = config_loader
-        # PRD V4 §4.4.3：知识库记忆（SQLite memory_atoms），实际存储记忆的地方
-        self.knowledge_memory = knowledge_memory
+        # ``knowledge_memory`` 只保留为调用签名兼容参数。V6 必须由调用方
+        # 显式注入账号级 brain，避免把旧 KnowledgeBaseMemory 误当成新脑。
+        self.memory_brain = memory_brain
+        self._memory_archive_required = bool(
+            memory_brain is not None
+            and callable(getattr(type(memory_brain), "archive_observation_async", None))
+        )
+        if memory_brain is None and knowledge_memory is not None:
+            logger.debug("忽略已废弃的 knowledge_memory 参数；V6 记忆降级为空")
 
     async def build_context(
         self,
         notification: Dict[str, Any],
         current_user_id: Optional[str] = None,
         persona_id: str = "",
+        recent_turns: Optional[List[Any]] = None,
     ) -> ReplyContext:
         """从 B站通知构建完整 ReplyContext
 
@@ -97,7 +112,19 @@ class CommentContextService:
         bot_thread_replies = self._get_bot_thread_replies(rpid=rpid, oid=oid)
 
         # 6. 同视频下的相关历史互动
-        related_memory = await self._get_related_memory(oid=oid, user_id=user_id, persona_id=persona_id)
+        # 召回 query 拼入视频标题，让向量检索能命中该视频的观察记录（视听分析/评价等），
+        # 而不是只召回与评论文本语义相似的其他评论
+        recall_message = comment_text
+        if video and video.title:
+            recall_message = f"视频《{video.title}》\n{comment_text}".strip()
+        memory_evidence = await self._get_related_memory(
+            message=recall_message,
+            oid=oid,
+            user_id=user_id,
+            persona_id=persona_id,
+            video=video,
+            recent_turns=recent_turns or [],
+        )
 
         # 7. 当前心情
         mood = self._get_current_mood()
@@ -106,7 +133,8 @@ class CommentContextService:
             video=video,
             thread=thread,
             user_profile=user_profile,
-            memory_context=related_memory,
+            memory_context=[],
+            memory_evidence=memory_evidence,
             bot_thread_replies=bot_thread_replies,
             mood=mood,
             video_context_complete=video_complete,
@@ -129,8 +157,7 @@ class CommentContextService:
         if comment_type != 1:
             return None, False
 
-        # PRD V4 §4.4.3：优先复用 SQLite memory_atoms 中的 content_video 记忆
-        # REP-603/REP-604：传入 persona_id 硬过滤 + 异步执行避免阻塞事件循环
+        # 优先复用当前账号 V6 brain 中的完整视频观察。
         cached = await self._get_cached_video_memory(oid, persona_id)
         if cached is not None:
             return cached, True
@@ -150,6 +177,18 @@ class CommentContextService:
             if isinstance(tags, str):
                 tags = [t.strip() for t in tags.split(",") if t.strip()]
 
+            if self._memory_archive_required:
+                from bilibot.memory_brain.ingestion import video_metadata_observation
+
+                await self._archive_context_required(
+                    video_metadata_observation(
+                        account_id=str(getattr(self.memory_brain, "account_id", "") or "default"),
+                        oid=str(oid),
+                        metadata=info,
+                        persona_id=persona_id,
+                    )
+                )
+
             return VideoContext(
                 oid=str(oid),
                 bvid=info.get("bvid", "") or "",
@@ -161,69 +200,64 @@ class CommentContextService:
                 category=str(info.get("tid", "") or ""),
                 publish_time=str(info.get("pubdate", "") or ""),
             ), True
+        except ContextArchiveError:
+            raise
         except Exception as e:
             logger.warning(f"获取视频信息失败 oid={oid}: {e}")
             return VideoContext(oid=oid, title=""), False
 
-    async def _get_cached_video_memory(self, oid: str, persona_id: str = "") -> Optional[VideoContext]:
-        """从 SQLite memory_atoms 复用 content_video 记忆（PRD V4 §4.4.3）
-
-        REP-603：persona_id 作为硬过滤条件进入 SQL WHERE 子句，防止跨人格记忆泄漏。
-        REP-604：sqlite3 同步操作通过 asyncio.to_thread 放入工作线程，避免阻塞事件循环。
-        """
-        if not self.ds or not oid:
-            return None
-        return await asyncio.to_thread(self._get_cached_video_memory_sync, oid, persona_id)
-
-    def _get_cached_video_memory_sync(self, oid: str, persona_id: str = "") -> Optional[VideoContext]:
-        """_get_cached_video_memory 的同步实现（在工作线程内执行）"""
+    async def _archive_context_required(self, envelope):
         try:
-            import sqlite3
-            from pathlib import Path
-            db_path = Path(self.ds.data_dir) / "knowledge_base.db"
-            if not db_path.exists():
-                return None
-            conn = sqlite3.connect(str(db_path))
-            conn.row_factory = sqlite3.Row
-            import json
-            # 查找同 oid 的 content_video 记忆
-            # REP-603：persona_id 硬过滤（参数化查询，防止 SQL 注入）
-            # PRD 5.3：用 try/finally 确保 conn.close()
-            try:
-                if persona_id:
-                    rows = conn.execute(
-                        "SELECT content, metadata FROM memory_atoms "
-                        "WHERE category = 'content_video' AND is_active = 1 "
-                        "AND persona_id = ? "
-                        "ORDER BY created_at DESC LIMIT 5",
-                        (persona_id,),
-                    ).fetchall()
-                else:
-                    rows = conn.execute(
-                        "SELECT content, metadata FROM memory_atoms "
-                        "WHERE category = 'content_video' AND is_active = 1 "
-                        "ORDER BY created_at DESC LIMIT 5"
-                    ).fetchall()
-            finally:
-                conn.close()
-            for r in rows:
-                try:
-                    meta = json.loads(r["metadata"] or "{}")
-                    if str(meta.get("oid", "")) == str(oid):
-                        return VideoContext(
-                            oid=str(oid),
-                            bvid=meta.get("bvid", "") or "",
-                            title=meta.get("title", "") or "",
-                            owner_name=meta.get("owner_name", "") or "",
-                            owner_mid=str(meta.get("owner_mid", "") or ""),
-                            desc=meta.get("desc", "") or "",
-                            tags=meta.get("tags", []) or [],
-                        )
-                except Exception:
+            result = await self.memory_brain.archive_observation_async(envelope)
+            if result is None:
+                raise RuntimeError("V6 context archive returned no commit result")
+            if getattr(result, "source_committed", True) is False:
+                raise RuntimeError("V6 context source commit was not confirmed")
+            return result
+        except Exception as exc:
+            raise ContextArchiveError("required model context archive failed") from exc
+
+    async def _get_cached_video_memory(self, oid: str, persona_id: str = "") -> Optional[VideoContext]:
+        """Reuse a validated V6 video event by OID/BVID within this account."""
+        if not self.memory_brain or not oid:
+            return None
+        try:
+            hits = await asyncio.to_thread(
+                self.memory_brain.find_by_identifiers, [str(oid)], 20
+            )
+            for hit in hits:
+                event_id = str(hit.get("event_id") or hit.get("id") or "")
+                if not event_id:
                     continue
+                event = await asyncio.to_thread(
+                    self.memory_brain.get_event, event_id, None
+                )
+                if not event:
+                    continue
+                event_meta = event.get("metadata") or {}
+                if str(event_meta.get("oid", "")) != str(oid):
+                    continue
+                video_meta = {}
+                for source in event.get("sources") or []:
+                    if source.get("source_type") == "video_metadata":
+                        video_meta = source.get("structured_data") or {}
+                        break
+                owner = video_meta.get("owner") or {}
+                if not isinstance(owner, dict):
+                    owner = {}
+                return VideoContext(
+                    oid=str(oid),
+                    bvid=str(event_meta.get("bvid") or video_meta.get("bvid") or ""),
+                    title=str(event.get("title") or video_meta.get("title") or ""),
+                    owner_name=str(event_meta.get("owner") or owner.get("name") or ""),
+                    owner_mid=str(owner.get("mid") or ""),
+                    desc=str(video_meta.get("desc") or ""),
+                    tags=list(event_meta.get("tags") or []),
+                )
+        except Exception as exc:
+            logger.debug("V6 视频记忆复用失败 oid=%s: %s", oid, type(exc).__name__)
             return None
-        except Exception:
-            return None
+        return None
 
     # ── 私有：评论线 ──
 
@@ -242,48 +276,13 @@ class CommentContextService:
     # ── 私有：用户画像 ──
 
     async def _build_user_profile(self, user_id: str, username: str, persona_id: str = "") -> UserProfile:
-        """从记忆系统获取用户画像
-
-        优先使用 knowledge_memory（SQLite），回退到旧 memory 系统。
-        MEM-603：persona_id 作为硬过滤条件传入记忆检索，防止跨人格记忆泄漏。
-        REP-604：同步 SQLite 调用通过 asyncio.to_thread 放入工作线程。
-        """
+        """从独立 UserStateSystem 获取已验证的用户画像。"""
         profile = UserProfile(user_id=user_id, username=username)
         if not user_id:
             return profile
 
-        # 1. 优先用 knowledge_memory 提取用户画像
-        if self.knowledge_memory:
-            try:
-                # PRD V3 §4.6：用 async 版本避免阻塞事件循环
-                if hasattr(self.knowledge_memory, "get_user_memories_async"):
-                    memories = await self.knowledge_memory.get_user_memories_async(
-                        user_id, limit=20, persona_id=persona_id
-                    )
-                else:
-                    # REP-604：同步 get_user_memories 包装到线程，避免阻塞事件循环
-                    memories = await asyncio.to_thread(
-                        self.knowledge_memory.get_user_memories,
-                        user_id, 20, persona_id
-                    )
-                if memories:
-                    # 从历史记忆中提取事实
-                    facts = []
-                    for m in memories:
-                        content = m.get("content", "")
-                        if content:
-                            facts.append(content)
-                    profile.facts = facts[:5]
-                    profile.last_interactions = [
-                        m.get("content", "")[:100] for m in memories[:3] if m.get("content")
-                    ]
-                    # 有记忆说明互动过，设置基础好感度
-                    profile.affection = min(len(memories) * 5, 50)
-                    return profile
-            except Exception as e:
-                logger.warning(f"knowledge_memory.get_user_memories 失败: {e}")
-
-        # 2. 回退到 UserStateSystem（画像/好感度）
+        # V6 recalled user claims are evidence, not profile facts. The explicit
+        # UserStateSystem remains the sole owner of verified profile/affection state.
         if self.user_state is None:
             return profile
         try:
@@ -307,62 +306,61 @@ class CommentContextService:
     # ── 私有：Bot 历史回复 ──
 
     def _get_bot_thread_replies(self, rpid: str, oid: str) -> List[str]:
-        """获取 Bot 在该评论线/同视频下的历史回复"""
+        """获取结构化互动状态中的 Bot 历史回复。
+
+        长期经历统一由一次 V6 recall 注入。DataStore 没有结构化查询能力时
+        明确降级为空，绝不回读 chat_memory.json。
+        """
         if not self.ds:
             return []
+        getter = getattr(self.ds, "get_bot_replies_for_thread", None)
+        if not callable(getter):
+            return []
         try:
-            # DataStore 优先按 rpid 查询
-            if hasattr(self.ds, "get_bot_replies_for_thread"):
-                return list(self.ds.get_bot_replies_for_thread(rpid=rpid) or [])
-            # fallback：从 chat_memory 读取
-            if hasattr(self.ds, "load_json"):
-                mem = self.ds.load_json("chat_memory.json", {}) or {}
-                replies: List[str] = []
-                # 按 rpid 查
-                rpid_key = f"thread:{rpid}"
-                if rpid_key in mem:
-                    for entry in mem[rpid_key][-3:]:
-                        reply = entry.get("reply_text") if isinstance(entry, dict) else None
-                        if reply:
-                            replies.append(reply)
-                # 按 oid 查
-                oid_key = f"oid:{oid}"
-                if oid_key in mem:
-                    for entry in mem[oid_key][-3:]:
-                        reply = entry.get("reply_text") if isinstance(entry, dict) else None
-                        if reply:
-                            replies.append(reply)
-                return replies[-5:]
-        except Exception:
-            pass
+            return list(getter(rpid=rpid) or [])[-5:]
+        except Exception as exc:
+            logger.debug(
+                "读取结构化评论线回复失败 rpid=%s oid=%s: %s",
+                rpid,
+                oid,
+                type(exc).__name__,
+            )
         return []
 
     # ── 私有：相关长期记忆 ──
 
-    async def _get_related_memory(self, oid: str, user_id: str, persona_id: str = "") -> List[str]:
-        """获取与该用户/视频相关的长期记忆
+    async def _get_related_memory(
+        self,
+        *,
+        message: str,
+        oid: str,
+        user_id: str,
+        persona_id: str = "",
+        video: Optional[VideoContext] = None,
+        recent_turns: Optional[List[Any]] = None,
+    ) -> str:
+        """Run the single account-wide V6 recall contract for this input."""
+        if not self.memory_brain or not callable(getattr(self.memory_brain, "recall", None)):
+            return ""
+        try:
+            from bilibot.memory_brain import RecallQuery
 
-        优先使用 knowledge_memory（SQLite），回退到旧 memory 系统。
-        MEM-603：persona_id 作为硬过滤条件传入 search_by_user，防止跨人格记忆泄漏。
-        REP-604：search_by_user 是同步 SQLite 调用，通过 asyncio.to_thread 放入工作线程。
-        """
-        # 1. 优先用 knowledge_memory（实际存储记忆的地方）
-        if self.knowledge_memory and user_id:
-            try:
-                memories = await asyncio.to_thread(
-                    self.knowledge_memory.get_user_memories,
-                    user_id, 5, persona_id
+            result = await self.memory_brain.recall(
+                RecallQuery(
+                    current_message=message,
+                    recent_turns=tuple(recent_turns or ()),
+                    account_id=getattr(self.memory_brain, "account_id", ""),
+                    speaker_actor_id=str(user_id),
+                    title=video.title if video else "",
+                    bvid=video.bvid if video else "",
+                    oid=str(oid),
+                    scene="reply_comment",
                 )
-                if memories:
-                    results = [m.get("content", "") for m in memories if m.get("content")]
-                    if results:
-                        return results
-            except Exception as e:
-                logger.warning(f"knowledge_memory.search_by_user 失败: {e}")
-
-        # 2. 回退到旧 memory 系统
-        # PRD 4.8：旧 memory 系统没有 search_related 方法，此分支永远 False，已移除
-        return []
+            )
+            return result.prompt_evidence
+        except Exception as exc:
+            logger.warning("V6 记忆召回失败，降级为空: %s", type(exc).__name__)
+            return ""
 
     # ── 私有：当前心情 ──
 

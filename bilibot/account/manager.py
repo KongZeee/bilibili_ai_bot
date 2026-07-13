@@ -80,6 +80,36 @@ class AccountManager:
         self._default_id: str = ""
         # PRD-V5 ACC-501：配置注册表（ALL 账号含 disabled / init-failed），事实来源
         self._config_registry = AccountConfigRegistry()
+        self._memory_brain_bootstrap = None
+
+    def _bootstrap_memory_brains(self) -> None:
+        """Health-gate every configured account before legacy memory cleanup."""
+        account_ids = self._config_registry.list_ids()
+        if not account_ids:
+            return
+        from bilibot.memory_brain.bootstrap import bootstrap_accounts
+
+        configured_default = str(
+            self.app_config_loader.get_raw_config().get("default_account", "") or ""
+        )
+        default_account_id = (
+            configured_default if configured_default in account_ids else account_ids[0]
+        )
+        result = bootstrap_accounts(
+            self.data_root,
+            account_ids,
+            cleanup_legacy=True,
+            default_account_id=default_account_id,
+        )
+        self._memory_brain_bootstrap = result
+        deleted = sum(1 for item in result.cleanup if item.status == "deleted")
+        failed = sum(1 for item in result.cleanup if item.status == "failed")
+        logger.info(
+            "V6 memory brains healthy for %d configured accounts; legacy cleanup deleted=%d failed=%d",
+            len(result.health),
+            deleted,
+            failed,
+        )
 
     # ══════════════════════════════════════
     #  初始化
@@ -102,6 +132,9 @@ class AccountManager:
         if accounts_list:
             # ACC-501：配置注册表加载 ALL 账号（含 disabled / init-failed）
             self._config_registry.load_from_raw(raw)
+            # V6: disabled accounts receive a healthy empty brain too. Cleanup is
+            # irreversible and therefore happens only after every configured DB passes.
+            self._bootstrap_memory_brains()
 
             default_account = raw.get("default_account", "")
             # 运行时实例：仅创建 enabled=true 的账号
@@ -117,10 +150,13 @@ class AccountManager:
                 except Exception as e:
                     logger.error(f"加载账号 {acc_id} 失败: {e}")
 
-            if default_account and default_account in self._accounts:
+            if default_account and self._config_registry.has(default_account):
                 self._default_id = default_account
             elif self._accounts:
                 self._default_id = next(iter(self._accounts))
+            else:
+                configured_ids = self._config_registry.list_ids()
+                self._default_id = configured_ids[0] if configured_ids else ""
             logger.info(f"默认账号: {self._default_id or '(无)'}")
             return
 
@@ -141,6 +177,7 @@ class AccountManager:
             }
             # ACC-501：V1 迁移也注册到配置注册表
             self._config_registry.load_from_raw({"accounts": [acc_config]})
+            self._bootstrap_memory_brains()
             try:
                 inst = self._create_instance("default", acc_config)
                 self._accounts["default"] = inst
@@ -192,6 +229,8 @@ class AccountManager:
 
         PRD-V5 ACC-501：返回配置注册表中 ALL 账号，运行时状态合并。
         """
+        from bilibot.app.config_loader import bili_credentials_are_configured
+
         result = []
         for cfg in self._config_registry.list_all():
             acc_id = cfg.get("id", "")
@@ -214,7 +253,9 @@ class AccountManager:
                     "available_personas": [],
                     "llm_id": cfg.get("llm_id", ""),
                     "uid": cfg.get("dede_user_id", ""),
-                    "authenticated": bool(cfg.get("sessdata") and cfg.get("bili_jct")),
+                    "authenticated": bili_credentials_are_configured(
+                        cfg.get("sessdata"), cfg.get("bili_jct")
+                    ),
                     "has_llm": False,
                     "has_bili": False,
                 })
@@ -242,6 +283,8 @@ class AccountManager:
         """
         # ACC-501：先写入配置注册表（事实来源）
         acc_id = self._config_registry.add(acc_config)
+        # A newly configured account must have a healthy brain before it can run.
+        self._bootstrap_memory_brains()
         # 仅 enabled=true 才创建运行时实例
         if acc_config.get("enabled", True):
             try:
@@ -268,11 +311,31 @@ class AccountManager:
                 acc.stop()
             except Exception:
                 pass
+            # M11：stop() 不会关闭 session/记忆系统等异步资源，
+            # 检测是否有未关闭资源并提示用户
+            unclosed = []
+            bili = getattr(acc, "bili", None)
+            if bili is not None:
+                session = getattr(bili, "session", None)
+                if session is not None and not getattr(session, "closed", True):
+                    unclosed.append("bili_session")
+            if getattr(acc, "knowledge_memory", None) is not None:
+                unclosed.append("knowledge_memory")
+            if unclosed:
+                logger.warning(
+                    f"账号 {account_id} 仍有未关闭的资源 ({', '.join(unclosed)})，"
+                    f"同步删除无法释放，请重启服务或使用 remove_account_async 以完整关闭"
+                )
             del self._accounts[account_id]
         # ACC-501：显式从配置注册表删除
         self._config_registry.delete(account_id)
         if account_id == self._default_id:
-            self._default_id = next(iter(self._accounts), "")
+            # Task 15：优先回退到运行时实例，若为空则回退到配置注册表第一个账号 ID
+            if self._accounts:
+                self._default_id = next(iter(self._accounts))
+            else:
+                registry_ids = self._config_registry.list_ids()
+                self._default_id = registry_ids[0] if registry_ids else ""
             logger.warning(f"默认账号 {account_id} 已删除，新默认: {self._default_id or '(无)'}")
         # ACC-501：写安全审计
         self._audit_delete(account_id)
@@ -288,15 +351,24 @@ class AccountManager:
         if not existed:
             return False
         acc = self._accounts.get(account_id)
-        if acc:
-            await acc.close()
-            del self._accounts[account_id]
-        # ACC-501：显式从配置注册表删除
-        self._config_registry.delete(account_id)
-        if account_id == self._default_id:
-            self._default_id = next(iter(self._accounts), "")
-        # ACC-501：写安全审计
-        self._audit_delete(account_id)
+        try:
+            if acc:
+                await acc.close()
+        finally:
+            # 确保异常时也移除运行时实例和配置注册表项，避免账号卡在中间态
+            self._accounts.pop(account_id, None)
+            # ACC-501：显式从配置注册表删除
+            self._config_registry.delete(account_id)
+            if account_id == self._default_id:
+                # Task 15：优先回退到运行时实例，若为空（剩余账号都是禁用的）
+                # 则回退到配置注册表中的第一个账号 ID，避免 _default_id 变为空字符串。
+                if self._accounts:
+                    self._default_id = next(iter(self._accounts))
+                else:
+                    registry_ids = self._config_registry.list_ids()
+                    self._default_id = registry_ids[0] if registry_ids else ""
+            # ACC-501：写安全审计（Task 25：同步 I/O 卸载到线程）
+            await asyncio.to_thread(self._audit_delete, account_id)
         logger.info(f"已删除账号: {account_id}")
         return True
 
@@ -317,8 +389,12 @@ class AccountManager:
             logger.warning(f"写删除审计失败: {e}")
 
     def set_default(self, account_id: str) -> bool:
-        """设置默认账号"""
-        if account_id not in self._accounts:
+        """设置默认账号
+
+        Task 15：检查配置注册表（含禁用账号）而非仅运行时实例，
+        使禁用账号也能被设为默认（启用后即生效）。
+        """
+        if not self._config_registry.has(account_id):
             return False
         self._default_id = account_id
         logger.info(f"默认账号已设置为: {account_id}")
@@ -362,6 +438,10 @@ class AccountManager:
 
         Web 配置保存后调用，遍历所有 AccountInstance 调用 reload()。
         """
+        # Generic config PATCH and QR login both mutate the application loader.
+        # Refresh the registry/runtime copies before AccountInstance rebuilds its
+        # account-scoped loader, otherwise reload() reuses stale credentials.
+        self.sync_registry_from_config()
         tasks = [acc.reload() for acc in self._accounts.values() if acc.is_running()]
         if tasks:
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -419,6 +499,8 @@ class AccountManager:
 
     def get_account_status(self, acc_id: str) -> Optional[dict]:
         """获取任意账号状态（含禁用账号，无运行时实例时从配置构造）"""
+        from bilibot.app.config_loader import bili_credentials_are_configured
+
         cfg = self._config_registry.get(acc_id)
         if cfg is None:
             return None
@@ -438,7 +520,9 @@ class AccountManager:
             "available_personas": [],
             "llm_id": cfg.get("llm_id", ""),
             "uid": cfg.get("dede_user_id", ""),
-            "authenticated": bool(cfg.get("sessdata") and cfg.get("bili_jct")),
+            "authenticated": bili_credentials_are_configured(
+                cfg.get("sessdata"), cfg.get("bili_jct")
+            ),
             "has_llm": False,
             "has_bili": False,
         }
@@ -471,6 +555,10 @@ class AccountManager:
         """
         raw = self.app_config_loader.get_raw_config()
         self._config_registry.sync_from_raw(raw)
+        for acc_id, acc in self._accounts.items():
+            refreshed = self._config_registry.get(acc_id)
+            if refreshed is not None:
+                acc.update_config(refreshed)
 
     def create_runtime_instance(self, acc_id: str) -> bool:
         """为已存在于配置注册表的账号创建运行时实例

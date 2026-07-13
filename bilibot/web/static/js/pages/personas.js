@@ -1,7 +1,7 @@
 // pages/personas.js - 人格管理（Golden Time 设计稿）
 const { defineComponent, h, ref, reactive, computed, onMounted } = window.Vue;
 import { api } from '../api.js';
-import { Card, Button, Badge, Modal, FormInput, FormTextarea, FormSelect, Loading, EmptyState, Icon, HeroPanel, ActionList, ProgressBar } from '../components/common.js';
+import { Card, Button, Badge, Modal, ConfirmModal, createConfirmHelper, FormInput, FormTextarea, FormSelect, Loading, EmptyState, Icon, HeroPanel, ActionList, ProgressBar } from '../components/common.js';
 import { appState, showToast, refreshPersonas, refreshLlm } from '../state.js';
 import { navigate } from '../router.js';
 
@@ -13,7 +13,7 @@ export const PersonaListPage = defineComponent({
         const activePersonaId = ref(null);
         const showCreateModal = ref(false);
         const editingId = ref(null);
-        const createForm = reactive({ name: '', description: '', system_prompt: '', personality: '' });
+        const createForm = reactive({ name: '', description: '', system_prompt: '', personality: '', appearance: '' });
         const testInput = ref('');
         const testReply = ref('');
         const testing = ref(false);
@@ -155,15 +155,23 @@ export const PersonaListPage = defineComponent({
             }
         }
 
-        async function deletePersona(id) {
-            if (!confirm('确定删除此人格？此操作不可撤销。')) return;
-            try {
-                await api.personas.delete(id);
-                showToast('已删除', 'success');
-                await loadData();
-            } catch (e) {
-                showToast('删除失败: ' + e.message, 'error');
-            }
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
+        function deletePersona(id) {
+            showConfirm({
+                title: '删除人格',
+                message: '确定删除此人格？此操作不可撤销。',
+                confirmText: '删除',
+                danger: true,
+                action: async () => {
+                    try {
+                        await api.personas.delete(id);
+                        showToast('已删除', 'success');
+                        await loadData();
+                    } catch (e) {
+                        showToast('删除失败: ' + e.message, 'error');
+                    }
+                },
+            });
         }
 
         // ── 创建/编辑 Modal ──
@@ -173,6 +181,7 @@ export const PersonaListPage = defineComponent({
             createForm.description = '';
             createForm.system_prompt = '';
             createForm.personality = '';
+            createForm.appearance = '';
             showCreateModal.value = true;
         }
 
@@ -183,6 +192,7 @@ export const PersonaListPage = defineComponent({
             createForm.system_prompt = persona.system_prompt || persona.base_prompt || '';
             const tags = getTags(persona);
             createForm.personality = persona.personality || (tags.length > 0 ? tags.join('，') : '');
+            createForm.appearance = persona.appearance || '';
             showCreateModal.value = true;
         }
 
@@ -228,8 +238,13 @@ export const PersonaListPage = defineComponent({
                 testReply.value = result?.output || result?.reply || result?.response || result?.message || result?.content ||
                     (typeof result === 'string' ? result : (result ? JSON.stringify(result) : '（无回复）'));
             } catch (e) {
-                testReply.value = '测试失败: ' + e.message;
-                showToast('测试失败: ' + e.message, 'error');
+                if (e.code === 'LLM_NOT_FOUND' || e.code === 'LLM_NOT_CONFIGURED') {
+                    testReply.value = '请先在 LLM 管理页面配置并启用一个 LLM Provider';
+                    showToast('请先在 LLM 管理页面配置并启用一个 LLM Provider', 'warning');
+                } else {
+                    testReply.value = '测试失败: ' + e.message;
+                    showToast('测试失败: ' + e.message, 'error');
+                }
             } finally {
                 testing.value = false;
             }
@@ -549,6 +564,14 @@ export const PersonaListPage = defineComponent({
                             modelValue: createForm.personality,
                             'onUpdate:modelValue': (v) => createForm.personality = v,
                         }),
+                        // FormTextarea（外貌描述）— 用于动态配图时作为主角外貌注入图片生成 prompt
+                        h(FormTextarea, {
+                            label: '外貌描述（用于动态配图）',
+                            placeholder: '描述主角外貌，如：粉色长发少女，绿色大眼睛，穿白色连衣裙，温柔气质。留空则配图不固定主角形象。',
+                            rows: 3,
+                            modelValue: createForm.appearance,
+                            'onUpdate:modelValue': (v) => createForm.appearance = v,
+                        }),
                     ]),
                     footer: () => [
                         h(Button, { onClick: () => showCreateModal.value = false }, () => '取消'),
@@ -557,6 +580,20 @@ export const PersonaListPage = defineComponent({
                             onClick: submitCreate,
                         }, [h('span', editingId.value ? '保存' : '创建')]),
                     ],
+                }),
+
+                // ═══ 统一确认对话框 ═══
+                h(ConfirmModal, {
+                    modelValue: confirmState.visible,
+                    title: confirmState.title,
+                    message: confirmState.message,
+                    confirmText: confirmState.confirmText,
+                    cancelText: confirmState.cancelText,
+                    danger: confirmState.danger,
+                    prompt: confirmState.prompt,
+                    promptPlaceholder: confirmState.promptPlaceholder,
+                    'onUpdate:modelValue': (v) => confirmState.visible = v,
+                    onConfirm: handleConfirm,
                 }),
             ]);
     },

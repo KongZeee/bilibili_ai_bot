@@ -30,6 +30,7 @@ export const CommentsPage = defineComponent({
                     page: page.value,
                     page_size: pageSize,
                     status: filter.value === 'all' ? undefined : filter.value,
+                    keyword: keyword.value || undefined,
                 });
                 replies.value = data.items || [];
                 total.value = data.total || 0;

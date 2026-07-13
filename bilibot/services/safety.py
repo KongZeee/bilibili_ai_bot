@@ -19,6 +19,7 @@ SAFE-501：账号级隔离
 import logging
 import re
 import sqlite3
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -71,6 +72,11 @@ class SafetyChecker:
         self._global_bucket: Dict[str, Deque[float]] = {
             "day": deque(),
         }
+
+        # BUG B-002: 为每个 bucket 的 deque 操作添加线程锁，确保 check+record 原子性
+        # _rate_locks 按 key 存储各自的锁，_global_lock 保护全局桶
+        self._rate_locks: Dict[str, threading.Lock] = {}
+        self._global_lock = threading.Lock()
 
         # 账号级风险暂停（内存，运行时触发）
         # 结构: {account_id: {"reason": str, "paused_at": str}}
@@ -136,34 +142,33 @@ class SafetyChecker:
 
     def _init_db(self) -> None:
         """初始化 SQLite 表结构"""
-        conn = sqlite3.connect(str(self.db_path))
-        # 全局暂停状态表（单行记录，key='global'）
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_pause (
-                key TEXT PRIMARY KEY,
-                paused INTEGER NOT NULL DEFAULT 0,
-                reason TEXT DEFAULT '',
-                paused_at TEXT DEFAULT '',
-                updated_at TEXT NOT NULL
+        with sqlite3.connect(str(self.db_path)) as conn:
+            # 全局暂停状态表（单行记录，key='global'）
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_pause (
+                    key TEXT PRIMARY KEY,
+                    paused INTEGER NOT NULL DEFAULT 0,
+                    reason TEXT DEFAULT '',
+                    paused_at TEXT DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            # 确保存在一行默认记录
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_pause (key, paused, reason, paused_at, updated_at) "
+                "VALUES ('global', 0, '', '', ?)",
+                (datetime.now().isoformat(),),
             )
-        """)
-        # 确保存在一行默认记录
-        conn.execute(
-            "INSERT OR IGNORE INTO bot_pause (key, paused, reason, paused_at, updated_at) "
-            "VALUES ('global', 0, '', '', ?)",
-            (datetime.now().isoformat(),),
-        )
 
-        # 用户黑名单表
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS user_blacklist (
-                user_id TEXT PRIMARY KEY,
-                reason TEXT DEFAULT '',
-                created_at TEXT NOT NULL
-            )
-        """)
-        conn.commit()
-        conn.close()
+            # 用户黑名单表
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_blacklist (
+                    user_id TEXT PRIMARY KEY,
+                    reason TEXT DEFAULT '',
+                    created_at TEXT NOT NULL
+                )
+            """)
+            conn.commit()
 
     # ────────────────────── 全局暂停 ──────────────────────
 
@@ -174,11 +179,10 @@ class SafetyChecker:
         自动发布行为失控。
         """
         try:
-            conn = sqlite3.connect(str(self.db_path))
-            row = conn.execute(
-                "SELECT paused FROM bot_pause WHERE key = 'global'"
-            ).fetchone()
-            conn.close()
+            with sqlite3.connect(str(self.db_path)) as conn:
+                row = conn.execute(
+                    "SELECT paused FROM bot_pause WHERE key = 'global'"
+                ).fetchone()
             return bool(row and row[0])
         except Exception as e:
             logger.warning(f"is_paused DB error, fail-closed to True: {e}")
@@ -187,27 +191,25 @@ class SafetyChecker:
     def pause(self, reason: str = "") -> None:
         """暂停 Bot 的所有自动发布行为"""
         now = datetime.now().isoformat()
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            "UPDATE bot_pause SET paused = 1, reason = ?, paused_at = ?, updated_at = ? "
-            "WHERE key = 'global'",
-            (reason, now, now),
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE bot_pause SET paused = 1, reason = ?, paused_at = ?, updated_at = ? "
+                "WHERE key = 'global'",
+                (reason, now, now),
+            )
+            conn.commit()
         logger.warning(f"Bot 已全局暂停 reason={reason!r}")
 
     def resume(self) -> None:
         """恢复 Bot 的自动发布行为"""
         now = datetime.now().isoformat()
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            "UPDATE bot_pause SET paused = 0, reason = '', paused_at = '', updated_at = ? "
-            "WHERE key = 'global'",
-            (now,),
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute(
+                "UPDATE bot_pause SET paused = 0, reason = '', paused_at = '', updated_at = ? "
+                "WHERE key = 'global'",
+                (now,),
+            )
+            conn.commit()
         logger.info("Bot 已恢复运行")
 
     def get_pause_status(self) -> dict:
@@ -216,12 +218,11 @@ class SafetyChecker:
         fail-closed：DB 异常时返回 paused=True（视为已暂停）。
         """
         try:
-            conn = sqlite3.connect(str(self.db_path))
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT paused, reason, paused_at, updated_at FROM bot_pause WHERE key = 'global'"
-            ).fetchone()
-            conn.close()
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                row = conn.execute(
+                    "SELECT paused, reason, paused_at, updated_at FROM bot_pause WHERE key = 'global'"
+                ).fetchone()
             if not row:
                 return {"paused": False, "reason": "", "paused_at": "", "updated_at": ""}
             return {
@@ -318,6 +319,12 @@ class SafetyChecker:
             return False, "内容为空"
         text = str(content)
 
+        # BUG B-001：全局暂停/账号风险暂停必须强制检查（docstring 承诺了但代码没做）
+        if self.is_paused():
+            return False, "global_paused"
+        if account_id and self.is_account_paused(account_id):
+            return False, f"account_paused:{account_id}"
+
         # ── 硬限制（始终执行，不受 content_check_enabled 影响）──
         passed, reason = self._check_hard_limits(text)
         if not passed:
@@ -404,8 +411,79 @@ class SafetyChecker:
             }
         return self._rate_buckets[key]
 
+    # BUG B-002: 原子方法——在同一把锁内完成 trim + 判断 + record，
+    # 避免 check 与 record 之间因 await 产生的竞态条件导致多协程同时通过。
+    def check_and_record_rate_limit(
+        self, scene: str = "", account_id: str = ""
+    ) -> Tuple[bool, str]:
+        """原子检查并记录频率限制（单窗口内 check + trim + record 不可分割）
+
+        SAFE-501：限流键为 account_id:scene，账号间互不抢占配额。
+        同时检查全局日配额（global_quota）。
+
+        Args:
+            scene: 场景标识；为空时使用默认桶 "_global_"
+            account_id: 账号 ID；为空时使用 "_global_"
+
+        Returns:
+            (passed, reason) - passed=True 表示通过；passed=False 时 reason 给出失败原因
+        """
+        if not self.rate_limit_enabled:
+            return True, "rate_limit_disabled"
+
+        now = time.time()
+        key = self._rate_key(scene, account_id)
+
+        # BUG B-002: 获取或创建该 key 的锁
+        if key not in self._rate_locks:
+            self._rate_locks[key] = threading.Lock()
+        bucket_lock = self._rate_locks[key]
+
+        # BUG B-002: 先获取 per-key 锁，检查并记录 per-account-scene 限流
+        bucket = self._get_bucket(scene, account_id)
+        windows = [
+            ("minute", 60, self.rate_limits["per_minute"]),
+            ("hour", 3600, self.rate_limits["per_hour"]),
+            ("day", 86400, self.rate_limits["per_day"]),
+        ]
+
+        with bucket_lock:
+            for name, window_secs, limit in windows:
+                dq = bucket[name]
+                cutoff = now - window_secs
+                while dq and dq[0] < cutoff:
+                    dq.popleft()
+                if len(dq) >= limit:
+                    return False, f"rate_limit:{key}:{name}({len(dq)}/{limit})"
+
+            # BUG B-002: 通过检查后立即记录（仍在锁内）
+            bucket["minute"].append(now)
+            bucket["hour"].append(now)
+            bucket["day"].append(now)
+
+        # BUG B-002: 再获取全局锁，原子检查并记录全局日配额
+        with self._global_lock:
+            global_dq = self._global_bucket["day"]
+            global_cutoff = now - 86400
+            while global_dq and global_dq[0] < global_cutoff:
+                global_dq.popleft()
+            if len(global_dq) >= self.global_quota:
+                # BUG B-002: 全局配额不足时回滚 per-key 记录
+                bucket["minute"].pop()
+                bucket["hour"].pop()
+                bucket["day"].pop()
+                return False, f"global_quota({len(global_dq)}/{self.global_quota})"
+
+            self._global_bucket["day"].append(now)
+
+        return True, "ok"
+
+    # BUG B-002: 标记为 deprecated，委托给 check_and_record_rate_limit
     def check_rate_limit(self, scene: str = "", account_id: str = "") -> bool:
-        """检查当前是否允许发布（未超频）
+        """[DEPRECATED] 检查当前是否允许发布（未超频）
+
+        此方法存在竞态条件：check 与 record_publish 之间隔着 await，
+        多个协程可同时通过检查。请改用 check_and_record_rate_limit。
 
         SAFE-501：限流键为 account_id:scene，账号间互不抢占配额。
         同时检查全局日配额（global_quota）。
@@ -417,46 +495,55 @@ class SafetyChecker:
         Returns:
             True=允许发布，False=已超限
         """
+        # BUG B-002: 委托给新原子方法（仅做检查，不记录——维持旧语义）
         if not self.rate_limit_enabled:
             return True
 
-        bucket = self._get_bucket(scene, account_id)
         now = time.time()
-
-        # 检查 per-account-scene 限流
-        windows = [
-            ("minute", 60, self.rate_limits["per_minute"]),
-            ("hour", 3600, self.rate_limits["per_hour"]),
-            ("day", 86400, self.rate_limits["per_day"]),
-        ]
         key = self._rate_key(scene, account_id)
-        for name, window_secs, limit in windows:
-            dq = bucket[name]
-            cutoff = now - window_secs
-            while dq and dq[0] < cutoff:
-                dq.popleft()
-            if len(dq) >= limit:
+        bucket = self._get_bucket(scene, account_id)
+
+        # BUG B-002: 在 per-key 锁内检查
+        if key not in self._rate_locks:
+            self._rate_locks[key] = threading.Lock()
+        with self._rate_locks[key]:
+            windows = [
+                ("minute", 60, self.rate_limits["per_minute"]),
+                ("hour", 3600, self.rate_limits["per_hour"]),
+                ("day", 86400, self.rate_limits["per_day"]),
+            ]
+            for name, window_secs, limit in windows:
+                dq = bucket[name]
+                cutoff = now - window_secs
+                while dq and dq[0] < cutoff:
+                    dq.popleft()
+                if len(dq) >= limit:
+                    logger.info(
+                        f"频率限制触发 key={key} window={name} "
+                        f"count={len(dq)}/{limit}"
+                    )
+                    return False
+
+        # BUG B-002: 在全局锁内检查
+        with self._global_lock:
+            global_dq = self._global_bucket["day"]
+            global_cutoff = now - 86400
+            while global_dq and global_dq[0] < global_cutoff:
+                global_dq.popleft()
+            if len(global_dq) >= self.global_quota:
                 logger.info(
-                    f"频率限制触发 key={key} window={name} "
-                    f"count={len(dq)}/{limit}"
+                    f"全局配额限制触发 count={len(global_dq)}/{self.global_quota}"
                 )
                 return False
 
-        # 检查全局日配额
-        global_dq = self._global_bucket["day"]
-        global_cutoff = now - 86400
-        while global_dq and global_dq[0] < global_cutoff:
-            global_dq.popleft()
-        if len(global_dq) >= self.global_quota:
-            logger.info(
-                f"全局配额限制触发 count={len(global_dq)}/{self.global_quota}"
-            )
-            return False
-
         return True
 
+    # BUG B-002: 标记为 deprecated，请改用 check_and_record_rate_limit
     def record_publish(self, scene: str = "", account_id: str = "") -> None:
-        """记录一次发布（用于频率统计）
+        """[DEPRECATED] 记录一次发布（用于频率统计）
+
+        此方法与 check_rate_limit 分离，存在竞态条件。
+        请改用 check_and_record_rate_limit 原子方法。
 
         SAFE-501：同时记录到 account_id:scene 桶和全局桶。
         """
@@ -467,6 +554,62 @@ class SafetyChecker:
         bucket["day"].append(now)
         # 全局桶
         self._global_bucket["day"].append(now)
+
+    def refund_publish(self, scene: str = "", account_id: str = "") -> None:
+        """Task 21.2：退回一次频率配额记录
+
+        用于 check_and_record_rate_limit 预占配额后发布失败的场景。
+        check_and_record_rate_limit 是"先扣减后执行"设计，失败时需退回。
+
+        最佳努力退回：从对应桶和全局桶各弹出最近一条记录。
+        并发场景下可能弹出其他 worker 的记录，但失败场景较少，可接受。
+        """
+        if not self.rate_limit_enabled:
+            return
+        key = self._rate_key(scene, account_id)
+        if key not in self._rate_locks:
+            self._rate_locks[key] = threading.Lock()
+        bucket = self._get_bucket(scene, account_id)
+        with self._rate_locks[key]:
+            for name in ("minute", "hour", "day"):
+                dq = bucket[name]
+                if dq:
+                    try:
+                        dq.pop()
+                    except IndexError:
+                        pass
+        with self._global_lock:
+            global_dq = self._global_bucket["day"]
+            if global_dq:
+                try:
+                    global_dq.pop()
+                except IndexError:
+                    pass
+
+    # BUG B-002: 原子方法——在同一把全局锁内完成 trim + 判断 + record，
+    # 避免 check 与 record 之间因 await 产生的竞态条件。
+    def check_and_record_global_quota(self) -> Tuple[bool, str]:
+        """原子检查并记录全局日配额（trim + 判断 + record 不可分割）
+
+        Returns:
+            (passed, reason) - passed=True 表示通过；passed=False 时 reason 给出失败原因
+        """
+        if not self.rate_limit_enabled:
+            return True, "rate_limit_disabled"
+
+        now = time.time()
+
+        # BUG B-002: 全局锁内原子完成 trim + 判断 + record
+        with self._global_lock:
+            global_dq = self._global_bucket["day"]
+            global_cutoff = now - 86400
+            while global_dq and global_dq[0] < global_cutoff:
+                global_dq.popleft()
+            if len(global_dq) >= self.global_quota:
+                return False, f"global_quota({len(global_dq)}/{self.global_quota})"
+            self._global_bucket["day"].append(now)
+
+        return True, "ok"
 
     def record_content(self, text: str, account_id: str = "") -> None:
         """记录已发布内容（用于重复度检测）
@@ -526,24 +669,22 @@ class SafetyChecker:
         if not user_id:
             return
         now = datetime.now().isoformat()
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute(
-            "INSERT INTO user_blacklist (user_id, reason, created_at) VALUES (?, ?, ?) "
-            "ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason, created_at=excluded.created_at",
-            (str(user_id), reason, now),
-        )
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute(
+                "INSERT INTO user_blacklist (user_id, reason, created_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(user_id) DO UPDATE SET reason=excluded.reason, created_at=excluded.created_at",
+                (str(user_id), reason, now),
+            )
+            conn.commit()
         logger.info(f"黑名单添加 user_id={user_id} reason={reason!r}")
 
     def remove_from_blacklist(self, user_id: str) -> None:
         """从黑名单移除用户"""
         if not user_id:
             return
-        conn = sqlite3.connect(str(self.db_path))
-        conn.execute("DELETE FROM user_blacklist WHERE user_id = ?", (str(user_id),))
-        conn.commit()
-        conn.close()
+        with sqlite3.connect(str(self.db_path)) as conn:
+            conn.execute("DELETE FROM user_blacklist WHERE user_id = ?", (str(user_id),))
+            conn.commit()
         logger.info(f"黑名单移除 user_id={user_id}")
 
     def is_blacklisted(self, user_id: str) -> bool:
@@ -555,11 +696,10 @@ class SafetyChecker:
         if not user_id:
             return False
         try:
-            conn = sqlite3.connect(str(self.db_path))
-            row = conn.execute(
-                "SELECT 1 FROM user_blacklist WHERE user_id = ?", (str(user_id),)
-            ).fetchone()
-            conn.close()
+            with sqlite3.connect(str(self.db_path)) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM user_blacklist WHERE user_id = ?", (str(user_id),)
+                ).fetchone()
             return row is not None
         except Exception as e:
             logger.warning(f"is_blacklisted DB error, fail-closed to True: {e}")
@@ -568,12 +708,11 @@ class SafetyChecker:
     def list_blacklist(self) -> List[Dict[str, Any]]:
         """列出黑名单全部记录"""
         try:
-            conn = sqlite3.connect(str(self.db_path))
-            conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT user_id, reason, created_at FROM user_blacklist ORDER BY created_at DESC"
-            ).fetchall()
-            conn.close()
+            with sqlite3.connect(str(self.db_path)) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT user_id, reason, created_at FROM user_blacklist ORDER BY created_at DESC"
+                ).fetchall()
             return [
                 {
                     "user_id": r["user_id"],
@@ -635,14 +774,26 @@ class SafetyChecker:
             return False, ""
         text_str = str(text)
 
-        # 全文子串匹配
+        # BUG B-009：单字中文词加词边界避免误杀（如"死"不匹配"死亡"）；英文词大小写不敏感
         for word in self._sensitive_words:
-            if word and word in text_str:
+            if not word:
+                continue
+            # 单字中文词用词边界：前后不能是汉字
+            if len(word) == 1 and re.search(r'[\u4e00-\u9fff]', word):
+                pattern = re.compile(r'(?<![\u4e00-\u9fff])' + re.escape(word) + r'(?![\u4e00-\u9fff])')
+                if pattern.search(text_str):
+                    return True, word
+            # 英文词用大小写不敏感
+            elif re.search(r'[a-zA-Z]', word):
+                if word.lower() in text_str.lower():
+                    return True, word
+            # 其他（含 2 字及以上中文词）用子串匹配
+            elif word in text_str:
                 return True, word
 
-        # 正则匹配
+        # BUG B-009：正则匹配加 IGNORECASE
         for pattern in self._sensitive_patterns:
-            m = pattern.search(text_str)
+            m = pattern.search(text_str, re.IGNORECASE if not pattern.flags & re.IGNORECASE else 0)
             if m:
                 return True, m.group(0)
 

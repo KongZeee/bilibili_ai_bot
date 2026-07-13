@@ -1,459 +1,365 @@
-// components/memory/recall-page.js - 召回测试页（Golden Time 设计稿）
+// components/memory/recall-page.js - V6 recall debugger
 const { defineComponent, h, ref, computed, onMounted, watch } = window.Vue;
 import { api } from '../../api.js';
-import { Card, Button, Badge, FormTextarea, Loading, EmptyState, Icon, HeroPanel, ProgressBar } from '../common.js';
+import { Button, Badge, EmptyState, Icon, Loading } from '../common.js';
 import { appState, showToast } from '../../state.js';
+import { formatTime } from '../../utils.js';
 
-// 分类标签映射（与 list-page 保持一致）
-const CATEGORY_LABELS = {
-    episodic: '情景记忆',
-    factual: '事实记忆',
-    procedural: '程序记忆',
-    preference: '用户偏好',
-    interaction: '互动历史',
-    tag: '内容标签',
-    emotion: '情感记忆',
-    behavior: '行为模式',
-    fact: '事实',
-    event: '事件',
-    other: '其他',
-};
-
-function categoryLabel(cat) {
-    return CATEGORY_LABELS[cat] || cat || '未分类';
+function score(value) {
+    if (value === null || value === undefined || Number.isNaN(Number(value))) return '-';
+    return Number(value).toFixed(3);
 }
 
-// 时间格式化（兼容 unix 秒 / 毫秒 / ISO 字符串）
-function formatTime(ts) {
-    if (!ts) return '-';
-    const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
-    return d.toLocaleString('zh-CN', { hour12: false });
+function modeLabel(mode) {
+    return mode === 'llm' ? 'LLM 重排' : mode === 'fallback' ? '确定性降级' : '空召回';
+}
+
+function normalizeCandidate(candidate, mode = 'llm') {
+    const kind = candidate.kind || candidate.decision || 'direct';
+    const fallback = mode === 'fallback';
+    return {
+        ...candidate,
+        candidate_id: candidate.candidate_id || candidate.event_id || '',
+        channels: candidate.channels || [],
+        kind,
+        evidence_ids: candidate.evidence_ids || [],
+        D: candidate.D ?? candidate.deterministic_score ?? candidate.d ?? 0,
+        L: candidate.L ?? candidate.llm_score ?? candidate.l ?? null,
+        F: candidate.F ?? candidate.final_score ?? candidate.f ?? 0,
+        injected: Boolean(candidate.injected ?? candidate.accepted),
+        threshold: candidate.threshold ?? (
+            kind === 'association'
+                ? (fallback ? 0.88 : 0.80)
+                : (fallback ? 0.80 : 0.72)
+        ),
+    };
 }
 
 export const MemoryRecallPage = defineComponent({
     name: 'MemoryRecallPage',
     setup() {
         const accountId = ref(null);
-        const stats = ref({ total: 0, categories: {} });
-        const loading = ref(true);
         const query = ref('');
-        const results = ref([]);
-        const searching = ref(false);
-        const hasSearched = ref(false);
+        const title = ref('');
+        const bvid = ref('');
+        const oid = ref('');
+        const scene = ref('memory_debug');
+        const recentTurns = ref('');
+        const loading = ref(false);
+        const historyLoading = ref(false);
+        const result = ref(null);
+        const traces = ref([]);
+        const activeTraceId = ref('');
 
-        // 分类数
-        const categoryCount = computed(() => Object.keys(stats.value.categories || {}).length);
+        const trace = computed(() => result.value?.trace || {});
+        const candidates = computed(() => (trace.value.candidates || result.value?.candidates || [])
+            .map(candidate => normalizeCandidate(candidate, trace.value.mode)));
+        const injected = computed(() => candidates.value.filter(item => item.injected));
+        const finalPrompt = computed(() => result.value?.final_prompt || result.value?.prompt_evidence || '');
+        const channelErrors = computed(() => Object.entries(trace.value.channel_errors || {}));
 
-        // 平均分数：优先使用 stats.avg_score，否则从结果集计算
-        const avgScore = computed(() => {
-            const s = stats.value;
-            if (s && typeof s.avg_score === 'number') return s.avg_score;
-            const items = results.value;
-            if (!Array.isArray(items) || items.length === 0) return null;
-            let sum = 0, n = 0;
-            for (const it of items) {
-                if (it && typeof it.importance_score === 'number') {
-                    sum += it.importance_score;
-                    n++;
-                }
-            }
-            return n > 0 ? sum / n : null;
-        });
-
-        // 顶部分类占比（用于 ProgressBar 可视化）
-        const topCategory = computed(() => {
-            const cats = stats.value.categories || {};
-            const entries = Object.entries(cats);
-            if (entries.length === 0) return null;
-            const total = entries.reduce((a, [, v]) => a + (v || 0), 0) || 1;
-            const [key, count] = entries.reduce((a, b) => (b[1] > a[1] ? b : a), entries[0]);
-            return {
-                key,
-                label: categoryLabel(key),
-                count: count || 0,
-                percent: Math.round(((count || 0) / total) * 100),
-            };
-        });
-
-        async function loadData() {
+        async function loadTraces() {
             accountId.value = appState.currentAccountId || appState.accounts[0]?.id;
-            if (!accountId.value) {
-                loading.value = false;
-                return;
-            }
-            loading.value = true;
+            if (!accountId.value) return;
+            historyLoading.value = true;
             try {
-                const data = await api.memory.stats(accountId.value).catch(() => ({ total: 0, categories: {} }));
-                stats.value = data || { total: 0, categories: {} };
+                const data = await api.memory.recallTraces(accountId.value, { limit: 30 });
+                traces.value = data?.items || [];
             } catch (e) {
-                showToast('加载统计失败: ' + e.message, 'error');
-                stats.value = { total: 0, categories: {} };
+                showToast('读取召回记录失败: ' + e.message, 'error');
             } finally {
-                loading.value = false;
+                historyLoading.value = false;
             }
         }
 
         async function runRecall() {
-            if (!accountId.value) {
-                showToast('请先选择账号', 'warning');
-                return;
-            }
-            const q = query.value.trim();
-            if (!q) {
-                showToast('请输入查询内容', 'warning');
-                return;
-            }
-            searching.value = true;
-            hasSearched.value = true;
+            if (!accountId.value || !query.value.trim()) return;
+            loading.value = true;
+            activeTraceId.value = '';
             try {
-                const data = await api.memory.search(accountId.value, {
-                    query: q,
-                    keyword: q,
-                    limit: 10,
+                const turns = recentTurns.value
+                    .split('\n')
+                    .map(line => line.trim())
+                    .filter(Boolean)
+                    .slice(-6);
+                result.value = await api.memory.recall(accountId.value, {
+                    query: query.value.trim(),
+                    recent_turns: turns,
+                    title: title.value.trim(),
+                    bvid: bvid.value.trim(),
+                    oid: oid.value.trim(),
+                    scene: scene.value || 'memory_debug',
                 });
-                const items = data?.items || data || [];
-                results.value = Array.isArray(items) ? items : [];
-                if (results.value.length === 0) {
-                    showToast('未召回相关记忆', 'info');
-                } else {
-                    showToast(`命中 ${results.value.length} 条记忆`, 'success');
-                }
+                activeTraceId.value = result.value?.trace_id || '';
+                await loadTraces();
             } catch (e) {
                 showToast('召回失败: ' + e.message, 'error');
-                results.value = [];
             } finally {
-                searching.value = false;
+                loading.value = false;
             }
         }
 
-        function clearResults() {
-            query.value = '';
-            results.value = [];
-            hasSearched.value = false;
+        async function openTrace(traceId) {
+            if (!accountId.value || !traceId) return;
+            loading.value = true;
+            try {
+                const data = await api.memory.recallTrace(accountId.value, traceId);
+                result.value = {
+                    trace_id: traceId,
+                    final_prompt: data.final_prompt || '',
+                    events: data.events || [],
+                    trace: {
+                        ...data,
+                        mode: data.mode || (data.used_fallback ? 'fallback' : ((data.candidates || []).length ? 'llm' : 'empty')),
+                        candidates: data.candidates || [],
+                    },
+                };
+                query.value = data.query_text || query.value;
+                activeTraceId.value = traceId;
+            } catch (e) {
+                showToast('读取 trace 失败: ' + e.message, 'error');
+            } finally {
+                loading.value = false;
+            }
         }
 
-        onMounted(loadData);
+        function clearResult() {
+            result.value = null;
+            activeTraceId.value = '';
+        }
+
+        onMounted(loadTraces);
         watch(() => appState.currentAccountId, (newId) => {
-            if (newId) {
-                results.value = [];
-                hasSearched.value = false;
-                query.value = '';
-                loadData();
-            }
+            if (!newId) return;
+            result.value = null;
+            traces.value = [];
+            loadTraces();
         });
 
         return () => {
-            // 无账号
-            if (!loading.value && !accountId.value) {
+            if (!accountId.value && !historyLoading.value) {
                 return h('div', { class: 'view-frame' }, [
-                    h(EmptyState, {
-                        icon: 'folder',
-                        title: '暂无账号',
-                        desc: '请先在账号管理中添加 B站 账号后再进行召回测试。',
-                    }),
+                    h(EmptyState, { icon: 'folder', title: '暂无账号', desc: '请先选择账号。' }),
                 ]);
             }
 
-            if (loading.value) {
-                return h(Loading);
-            }
-
-            const totalCount = stats.value.total ?? 0;
-            const avgScoreText = avgScore.value != null
-                ? avgScore.value.toFixed(2)
-                : '0.00';
+            const candidateColumns = 'minmax(16rem, 1.6fr) minmax(11rem, 1fr) 4.5rem 4.5rem 4.5rem 5rem 8rem';
+            const headerStyle = 'font-size: .74rem; color: hsl(var(--muted-foreground)); text-transform: uppercase; letter-spacing: .08em;';
 
             return h('div', { class: 'view-frame' }, [
-                // ═══════ Section 1: hero-band — 召回测试面板 + 统计 Card ═══════
-                h('section', {
-                    class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
-                }, [
-                    // 左：召回测试面板（hero-panel accent 背景）
-                    h(HeroPanel, {
-                        eyebrow: '召回测试',
-                        title: '测试记忆库检索能力',
-                        badge: '已就绪',
-                        badgeType: 'success',
-                    }, () => h('p', {
-                        class: 'muted m-0',
-                        style: 'font-size: 0.95rem; line-height: 1.6; max-width: 36rem;',
-                    }, '输入一段测试消息，验证语义检索与召回效果。系统将基于向量相似度返回最相关的记忆条目，帮助确认记忆库的可用性。')),
-
-                    // 右：统计 Card
+                h('section', { class: 'grid gap-3', style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));' }, [
                     h('article', {
                         class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
+                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .82); padding: calc(var(--spacing) * 4); align-content: start;',
                     }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '记忆概览'),
-                            h('h2', {
-                                class: 'm-0',
-                                style: 'font-size: 1.35rem; line-height: 1.08;',
-                            }, '数据统计'),
+                        h('div', { class: 'flex items-end justify-between gap-3', style: 'flex-wrap: wrap;' }, [
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'eyebrow' }, 'V6 召回调试'),
+                                h('h2', { class: 'm-0', style: 'font-size: 1.35rem;' }, '查询上下文'),
+                            ]),
+                            result.value ? h(Button, { type: 'ghost', size: 'sm', onClick: clearResult }, () => '清空结果') : null,
                         ]),
-                        // 3 个数据行
-                        h('div', { class: 'grid gap-2' }, [
-                            h('div', {
-                                class: 'flex items-center justify-between gap-2',
-                                style: 'padding: calc(var(--spacing) * 2) 0; border-bottom: 1px solid hsl(var(--border));',
-                            }, [
-                                h('span', { class: 'muted', style: 'font-size: 0.92rem;' }, '总记忆数'),
-                                h('span', {
-                                    style: 'font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums;',
-                                }, totalCount.toLocaleString()),
-                            ]),
-                            h('div', {
-                                class: 'flex items-center justify-between gap-2',
-                                style: 'padding: calc(var(--spacing) * 2) 0; border-bottom: 1px solid hsl(var(--border));',
-                            }, [
-                                h('span', { class: 'muted', style: 'font-size: 0.92rem;' }, '分类数'),
-                                h('span', {
-                                    style: 'font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums;',
-                                }, String(categoryCount.value)),
-                            ]),
-                            h('div', {
-                                class: 'flex items-center justify-between gap-2',
-                                style: 'padding: calc(var(--spacing) * 2) 0;',
-                            }, [
-                                h('span', { class: 'muted', style: 'font-size: 0.92rem;' }, '平均分数'),
-                                h('span', {
-                                    style: 'font-size: 1.15rem; font-weight: 600; font-variant-numeric: tabular-nums;',
-                                }, avgScoreText),
-                            ]),
-                        ]),
-                        // ProgressBar
-                        h('div', { class: 'grid gap-1' }, [
-                            h('div', {
-                                class: 'flex items-center justify-between gap-2',
-                            }, [
-                                h('span', { class: 'muted', style: 'font-size: 0.88rem;' },
-                                    topCategory.value ? `Top 分类 · ${topCategory.value.label}` : '记忆分布'),
-                                h('span', {
-                                    style: 'font-size: 0.82rem; color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums;',
-                                }, topCategory.value ? `${topCategory.value.percent}%` : '-'),
-                            ]),
-                            h(ProgressBar, {
-                                value: topCategory.value ? topCategory.value.percent : 0,
-                                max: 100,
-                                showValue: false,
+                        h('label', { class: 'grid gap-1' }, [
+                            h('span', { class: 'form-label' }, '当前消息'),
+                            h('textarea', {
+                                class: 'form-input',
+                                rows: 4,
+                                id: 'recall-query',
+                                value: query.value,
+                                placeholder: '输入要验证的消息',
+                                onInput: event => query.value = event.target.value,
+                                onKeydown: event => {
+                                    if ((event.ctrlKey || event.metaKey) && event.key === 'Enter') runRecall();
+                                },
                             }),
                         ]),
+                        h('div', { class: 'grid gap-2', style: 'grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));' }, [
+                            h('label', { class: 'grid gap-1' }, [
+                                h('span', { class: 'form-label' }, '标题'),
+                                h('input', { class: 'form-input', value: title.value, onInput: event => title.value = event.target.value }),
+                            ]),
+                            h('label', { class: 'grid gap-1' }, [
+                                h('span', { class: 'form-label' }, 'BVID'),
+                                h('input', { class: 'form-input', value: bvid.value, onInput: event => bvid.value = event.target.value }),
+                            ]),
+                            h('label', { class: 'grid gap-1' }, [
+                                h('span', { class: 'form-label' }, 'OID'),
+                                h('input', { class: 'form-input', value: oid.value, onInput: event => oid.value = event.target.value }),
+                            ]),
+                            h('label', { class: 'grid gap-1' }, [
+                                h('span', { class: 'form-label' }, '场景'),
+                                h('select', { class: 'form-input', value: scene.value, onChange: event => scene.value = event.target.value }, [
+                                    h('option', { value: 'memory_debug' }, '调试'),
+                                    h('option', { value: 'reply_comment' }, '评论回复'),
+                                    h('option', { value: 'private_message' }, '私信'),
+                                    h('option', { value: 'proactive' }, '主动行为'),
+                                ]),
+                            ]),
+                        ]),
+                        h('label', { class: 'grid gap-1' }, [
+                            h('span', { class: 'form-label' }, '最近对话'),
+                            h('textarea', {
+                                class: 'form-input',
+                                rows: 3,
+                                maxlength: 1200,
+                                placeholder: '每行一个 turn，最多采用最近 6 条',
+                                value: recentTurns.value,
+                                onInput: event => recentTurns.value = event.target.value,
+                            }),
+                        ]),
+                        h('div', { class: 'flex justify-end' }, [
+                            h(Button, { type: 'primary', loading: loading.value, disabled: !query.value.trim(), onClick: runRecall }, () => [
+                                h(Icon, { name: 'circle-check', size: '.95rem' }),
+                                '执行召回',
+                            ]),
+                        ]),
+                    ]),
+                    h('aside', {
+                        class: 'grid gap-2',
+                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .82); padding: calc(var(--spacing) * 4); align-content: start; max-height: 34rem; overflow: auto;',
+                    }, [
+                        h('div', { class: 'flex items-center justify-between gap-2' }, [
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'eyebrow' }, 'Trace'),
+                                h('h2', { class: 'm-0', style: 'font-size: 1.15rem;' }, '最近召回'),
+                            ]),
+                            h(Button, { type: 'ghost', size: 'sm', loading: historyLoading.value, onClick: loadTraces }, () => '刷新'),
+                        ]),
+                        historyLoading.value && traces.value.length === 0
+                            ? h(Loading)
+                            : traces.value.length === 0
+                                ? h('p', { class: 'muted m-0' }, '暂无 trace')
+                                : traces.value.map(item => h('button', {
+                                    key: item.id,
+                                    type: 'button',
+                                    class: 'grid gap-1',
+                                    style: `width: 100%; text-align: left; padding: calc(var(--spacing) * 2.5); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .55); background: ${activeTraceId.value === item.id ? 'hsl(var(--accent) / .18)' : 'transparent'}; color: inherit; cursor: pointer;`,
+                                    onClick: () => openTrace(item.id),
+                                }, [
+                                    h('span', { style: 'font-size: .9rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;' }, item.query_text || item.query_hash || item.id),
+                                    h('span', { class: 'muted', style: 'font-size: .78rem;' }, `${formatTime(item.created_at)} · ${item.candidate_count || 0} 候选 · ${item.injected_count || 0} 注入`),
+                                ])),
                     ]),
                 ]),
 
-                // ═══════ Section 2: 测试区 ═══════
-                h('section', {}, [
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
-                    }, [
-                        // 面板头
-                        h('div', {
-                            class: 'flex items-end justify-between gap-3',
-                            style: 'flex-wrap: wrap;',
+                result.value
+                    ? h('section', { class: 'grid gap-3' }, [
+                        h('article', {
+                            class: 'grid gap-3 memory-panel',
+                            style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .82); padding: calc(var(--spacing) * 4);',
                         }, [
-                            h('div', { class: 'grid gap-1 min-w-0' }, [
-                                h('span', { class: 'eyebrow' }, '召回测试'),
-                                h('h2', {
-                                    class: 'm-0',
-                                    style: 'font-size: 1.35rem; line-height: 1.08;',
-                                }, '输入查询'),
+                            h('div', { class: 'flex items-end justify-between gap-3', style: 'flex-wrap: wrap;' }, [
+                                h('div', { class: 'grid gap-1' }, [
+                                    h('span', { class: 'eyebrow' }, '候选决策'),
+                                    h('h2', { class: 'm-0', style: 'font-size: 1.25rem;' }, `${candidates.value.length} 个候选 · ${injected.value.length} 个注入`),
+                                ]),
+                                h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, [
+                                    h(Badge, { type: trace.value.mode === 'fallback' ? 'warning' : 'info' }, () => modeLabel(trace.value.mode)),
+                                    h(Badge, {
+                                        type: (candidates.value.length ? trace.value.rerank_calls === 1 : (trace.value.rerank_calls ?? 0) === 0) ? 'success' : 'warning',
+                                    }, () => `${trace.value.rerank_calls ?? 0} 次重排`),
+                                    trace.value.rerank_status ? h(Badge, { type: trace.value.rerank_status === 'ok' ? 'success' : 'warning' }, () => trace.value.rerank_status) : null,
+                                    h(Badge, { type: 'info' }, () => `${trace.value.latency_ms ?? 0} ms`),
+                                ]),
                             ]),
-                            h('div', { class: 'flex items-center gap-2' }, [
-                                hasSearched.value
-                                    ? h(Button, { size: 'sm', type: 'ghost', onClick: clearResults }, () => '清空')
-                                    : null,
-                            ]),
-                        ]),
-
-                        // 输入区
-                        h(FormTextarea, {
-                            modelValue: query.value,
-                            'onUpdate:modelValue': (v) => query.value = v,
-                            placeholder: '输入测试消息，例如："你还记得我们上次聊的剧情吗？"',
-                            rows: 3,
-                            id: 'recall-query',
-                        }),
-                        h('div', { class: 'flex items-center gap-2', style: 'flex-wrap: wrap;' }, [
-                            h(Button, {
-                                type: 'primary',
-                                loading: searching.value,
-                                onClick: runRecall,
-                            }, () => [
-                                h(Icon, { name: 'funnel', size: '0.95rem' }),
-                                '召回测试',
-                            ]),
-                            searching.value
-                                ? h('span', {
-                                    class: 'inline-flex items-center gap-1',
-                                    style: 'font-size: 0.88rem; color: hsl(var(--muted-foreground));',
+                            channelErrors.value.length
+                                ? h('div', {
+                                    role: 'alert',
+                                    class: 'grid gap-1',
+                                    style: 'padding: calc(var(--spacing) * 2.5); border-left: 3px solid hsl(var(--chart-5)); background: hsl(var(--chart-5) / .08);',
                                 }, [
-                                    h('span', { class: 'spinner spinner-sm', 'aria-hidden': 'true' }),
-                                    '正在检索记忆库...',
+                                    h('strong', { style: 'font-size: .84rem;' }, '候选通道发生降级'),
+                                    ...channelErrors.value.map(([channel, message]) =>
+                                        h('span', { key: channel, class: 'memory-break muted', style: 'font-size: .78rem;' }, `${channel}: ${message}`)
+                                    ),
                                 ])
                                 : null,
-                        ]),
-
-                        // 结果区
-                        searching.value
-                            ? h('div', {
-                                class: 'grid',
-                                style: 'padding: calc(var(--spacing) * 5) 0; justify-items: center;',
-                            }, [h(Loading)])
-                            : hasSearched.value && results.value.length === 0
-                                ? h('div', {
-                                    class: 'grid',
-                                    style: 'padding: calc(var(--spacing) * 4) 0; justify-items: center;',
-                                }, [h(EmptyState, {
-                                    icon: 'folder',
-                                    title: '无召回结果',
-                                    desc: '未找到与查询相关的记忆，尝试调整关键词后重试。',
-                                })])
-                                : results.value.length > 0
-                                    ? h('div', { class: 'grid gap-3' }, [
-                                        // 召回数量 Badge
-                                        h('div', {
-                                            class: 'flex items-center gap-2',
-                                            style: 'flex-wrap: wrap;',
-                                        }, [
-                                            h(Badge, { type: 'success' }, () => `命中 ${results.value.length} 条`),
-                                            h('span', {
-                                                class: 'muted',
-                                                style: 'font-size: 0.85rem;',
-                                            }, '按相关性排序'),
+                            candidates.value.length === 0
+                                ? h(EmptyState, { icon: 'folder', title: '无候选', desc: '本次没有可注入的记忆。' })
+                                : h('div', { class: 'memory-table-scroll' }, [
+                                    h('div', { class: 'grid gap-0', style: 'min-width: 900px;' }, [
+                                        h('div', { class: 'grid gap-2', style: `grid-template-columns: ${candidateColumns}; padding: 0 0 calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border));` }, [
+                                            h('span', { style: headerStyle }, '候选事件'),
+                                            h('span', { style: headerStyle }, '命中通道'),
+                                            h('span', { style: headerStyle }, 'D'),
+                                            h('span', { style: headerStyle }, 'L'),
+                                            h('span', { style: headerStyle }, 'F'),
+                                            h('span', { style: headerStyle }, '阈值'),
+                                            h('span', { style: headerStyle }, '类型 / 决策'),
                                         ]),
-                                        // 每项结果一张小 Card
-                                        ...results.value.map((item, idx) => {
-                                            const score = typeof item.importance_score === 'number'
-                                                ? item.importance_score
-                                                : null;
-                                            const scoreText = score != null ? score.toFixed(2) : null;
-                                            return h('article', {
-                                                key: item.id ?? idx,
-                                                class: 'grid gap-2',
-                                                style: 'background: hsl(var(--muted) / 0.3); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.76); padding: calc(var(--spacing) * 3);',
-                                            }, [
-                                                // 顶栏：分类 + 时间 + 分数
-                                                h('div', {
-                                                    class: 'flex items-center justify-between gap-2',
-                                                    style: 'flex-wrap: wrap;',
-                                                }, [
-                                                    h('div', { class: 'flex items-center gap-2', style: 'flex-wrap: wrap;' }, [
-                                                        h(Badge, { type: 'info', size: 'sm' }, () =>
-                                                            categoryLabel(item.category)),
-                                                        h('span', {
-                                                            class: 'muted',
-                                                            style: 'font-size: 0.82rem; font-variant-numeric: tabular-nums;',
-                                                        }, formatTime(item.created_at)),
-                                                    ]),
-                                                    scoreText != null
-                                                        ? h(Badge, { type: 'warning', size: 'sm' }, () => `分数: ${scoreText}`)
-                                                        : null,
-                                                ]),
-                                                // 内容
-                                                h('p', {
-                                                    class: 'm-0',
-                                                    style: 'font-size: 0.96rem; line-height: 1.65; color: hsl(var(--foreground)); word-break: break-word;',
-                                                }, item.content || item.summary || '-'),
-                                                // 来源（可选）
-                                                item.source
-                                                    ? h('div', {
-                                                        class: 'flex items-center gap-1',
-                                                        style: 'font-size: 0.82rem; color: hsl(var(--muted-foreground));',
-                                                    }, [
-                                                        h(Icon, { name: 'tag', size: '0.75rem' }),
-                                                        h('span', { class: 'truncate' }, item.source),
-                                                    ])
+                                        ...candidates.value.map(item => h('div', {
+                                            key: item.candidate_id,
+                                            class: 'grid items-center gap-2',
+                                            style: `grid-template-columns: ${candidateColumns}; padding: calc(var(--spacing) * 2.4) 0; border-bottom: 1px solid hsl(var(--border)); ${item.injected ? 'background: hsl(var(--accent) / .08);' : ''}`,
+                                        }, [
+                                            h('div', { class: 'grid gap-1 min-w-0' }, [
+                                                h('code', { class: 'memory-break', style: 'font-size: .8rem;' }, item.candidate_id),
+                                                item.reason ? h('span', { class: 'muted memory-break', style: 'font-size: .78rem;' }, item.reason) : null,
+                                                item.evidence_ids.length
+                                                    ? h('span', { class: 'muted memory-break', style: 'font-size: .72rem;' }, `证据: ${item.evidence_ids.join(', ')}`)
                                                     : null,
-                                            ]);
-                                        }),
-                                    ])
-                                    : null,
-                    ]),
-                ]),
+                                            ]),
+                                            h('div', { class: 'flex gap-1', style: 'flex-wrap: wrap;' }, item.channels.map(channel => h('span', { key: channel, class: 'badge badge-info', style: 'font-size: .7rem;' }, channel))),
+                                            h('code', score(item.D)),
+                                            h('code', score(item.L)),
+                                            h('code', score(item.F)),
+                                            h('code', score(item.threshold)),
+                                            h('div', { class: 'flex gap-1', style: 'flex-wrap: wrap;' }, [
+                                                h(Badge, { type: item.kind === 'association' ? 'warning' : 'info' }, () => item.kind === 'association' ? '联想' : '直接'),
+                                                h(Badge, { type: item.injected ? 'success' : 'warning' }, () => item.injected ? '注入' : '拒绝'),
+                                            ]),
+                                        ])),
+                                    ]),
+                                ]),
+                        ]),
 
-                // ═══════ Section 3: 使用提示 ═══════
-                h('section', {}, [
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
-                    }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '使用指南'),
-                            h('h2', {
-                                class: 'm-0',
-                                style: 'font-size: 1.35rem; line-height: 1.08;',
-                            }, '如何测试'),
-                        ]),
-                        h('div', { class: 'grid gap-3' }, [
-                            h('div', {
-                                class: 'flex items-start gap-2',
+                        h('div', { class: 'grid gap-3', style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 24rem), 1fr));' }, [
+                            h('article', {
+                                class: 'grid gap-2',
+                                style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .82); padding: calc(var(--spacing) * 4); align-content: start;',
                             }, [
-                                h('span', {
-                                    style: 'flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 999px; background: hsl(var(--accent) / 0.18); color: hsl(var(--accent-foreground));',
-                                }, [h(Icon, { name: 'circle-check', size: '0.95rem' })]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', {
-                                        style: 'font-size: 0.98rem; font-weight: 500; color: hsl(var(--foreground));',
-                                    }, '输入自然语言'),
-                                    h('span', {
-                                        class: 'muted',
-                                        style: 'font-size: 0.88rem; line-height: 1.6;',
-                                    }, '使用完整的句子或问题进行测试，更接近真实对话场景，能更好反映语义召回效果。'),
-                                ]),
+                                h('span', { class: 'eyebrow' }, '最终注入'),
+                                h('h2', { class: 'm-0', style: 'font-size: 1.15rem;' }, `${(result.value.events || []).length} 个事件`),
+                                ...(result.value.events || []).map(event => h('div', {
+                                    key: event.id,
+                                    class: 'grid gap-1',
+                                    style: 'padding: calc(var(--spacing) * 2.5) 0; border-top: 1px solid hsl(var(--border));',
+                                }, [
+                                    h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, [
+                                        h('span', { class: 'badge badge-info' }, event.source_type || event.source || 'unknown'),
+                                        h('code', { style: 'font-size: .76rem;' }, event.id),
+                                    ]),
+                                    h('p', { class: 'm-0 memory-break', style: 'line-height: 1.55;' }, event.summary || event.content || '-'),
+                                    ...(event.evidence_chunks || event.chunks || []).map((chunk, index) => h('div', {
+                                        key: chunk.id || index,
+                                        class: 'grid gap-1',
+                                        style: 'padding: calc(var(--spacing) * 2); background: hsl(var(--muted) / .28); border-left: 2px solid hsl(var(--accent));',
+                                    }, [
+                                        h('code', { class: 'memory-break', style: 'font-size: .72rem;' }, chunk.id || `chunk-${index + 1}`),
+                                        h('p', { class: 'm-0 memory-break', style: 'font-size: .82rem; line-height: 1.5; white-space: pre-wrap;' }, chunk.text || '-'),
+                                    ])),
+                                ])),
                             ]),
-                            h('div', {
-                                class: 'flex items-start gap-2',
+                            h('article', {
+                                class: 'grid gap-2',
+                                style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .82); padding: calc(var(--spacing) * 4); align-content: start; min-width: 0;',
                             }, [
-                                h('span', {
-                                    style: 'flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 999px; background: hsl(var(--accent) / 0.18); color: hsl(var(--accent-foreground));',
-                                }, [h(Icon, { name: 'circle-check', size: '0.95rem' })]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', {
-                                        style: 'font-size: 0.98rem; font-weight: 500; color: hsl(var(--foreground));',
-                                    }, '关注分数与分类'),
-                                    h('span', {
-                                        class: 'muted',
-                                        style: 'font-size: 0.88rem; line-height: 1.6;',
-                                    }, '重要性分数（0-1）反映记忆的权重，分类标签标识记忆类型，二者结合可判断召回质量。'),
+                                h('div', { class: 'flex justify-between gap-2', style: 'flex-wrap: wrap;' }, [
+                                    h('div', { class: 'grid gap-1' }, [
+                                        h('span', { class: 'eyebrow' }, 'Prompt'),
+                                        h('h2', { class: 'm-0', style: 'font-size: 1.15rem;' }, '最终记忆证据'),
+                                    ]),
+                                    h('span', { class: 'muted', style: 'font-size: .82rem;' }, `${finalPrompt.value.length} / 5000 字`),
                                 ]),
-                            ]),
-                            h('div', {
-                                class: 'flex items-start gap-2',
-                            }, [
-                                h('span', {
-                                    style: 'flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 999px; background: hsl(var(--accent) / 0.18); color: hsl(var(--accent-foreground));',
-                                }, [h(Icon, { name: 'circle-check', size: '0.95rem' })]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', {
-                                        style: 'font-size: 0.98rem; font-weight: 500; color: hsl(var(--foreground));',
-                                    }, '多次对比验证'),
-                                    h('span', {
-                                        class: 'muted',
-                                        style: 'font-size: 0.88rem; line-height: 1.6;',
-                                    }, '尝试不同的表达方式查询同一意图，对比召回结果一致性，评估记忆库的稳定性与鲁棒性。'),
-                                ]),
-                            ]),
-                            h('div', {
-                                class: 'flex items-start gap-2',
-                            }, [
-                                h('span', {
-                                    style: 'flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center; width: 1.5rem; height: 1.5rem; border-radius: 999px; background: hsl(var(--accent) / 0.18); color: hsl(var(--accent-foreground));',
-                                }, [h(Icon, { name: 'circle-check', size: '0.95rem' })]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', {
-                                        style: 'font-size: 0.98rem; font-weight: 500; color: hsl(var(--foreground));',
-                                    }, '结合列表页管理'),
-                                    h('span', {
-                                        class: 'muted',
-                                        style: 'font-size: 0.88rem; line-height: 1.6;',
-                                    }, '若召回结果异常或缺失，可前往记忆列表页检查数据完整性，必要时清理无效条目。'),
-                                ]),
+                                h('pre', {
+                                    style: 'margin: 0; max-height: 30rem; overflow: auto; padding: calc(var(--spacing) * 3); background: hsl(var(--muted) / .38); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * .55); white-space: pre-wrap; overflow-wrap: anywhere; font-size: .82rem; line-height: 1.55;',
+                                }, finalPrompt.value || '<memory_evidence />'),
                             ]),
                         ]),
+                    ])
+                    : h('section', { style: 'padding: calc(var(--spacing) * 5) 0;' }, [
+                        h(EmptyState, { icon: 'circle-question-mark', title: '暂无召回结果', desc: '尚未运行召回。' }),
                     ]),
-                ]),
             ]);
         };
     },

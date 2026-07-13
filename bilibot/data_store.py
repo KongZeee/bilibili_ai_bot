@@ -7,10 +7,31 @@ import json
 import os
 import threading
 import logging
+import weakref
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("bilibot.storage")
+
+
+class _FileLock:
+    """可被弱引用引用的锁包装器。
+
+    threading.Lock 本身不支持 weakref，这里用带 __weakref__ 槽的轻量类包装，
+    配合 WeakValueDictionary 实现“无人使用即自动回收”的按文件锁缓存，
+    避免 _locks 字典随访问过的文件名无限增长。
+    """
+    __slots__ = ("_lock", "__weakref__")
+
+    def __init__(self):
+        self._lock = threading.Lock()
+
+    def __enter__(self):
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, *exc):
+        self._lock.release()
 
 
 class DataStore:
@@ -19,15 +40,23 @@ class DataStore:
     def __init__(self, data_dir: str = "./data"):
         self.data_dir = Path(data_dir)
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        self._locks: Dict[str, threading.Lock] = {}
+        self._locks: weakref.WeakValueDictionary = weakref.WeakValueDictionary()
         self._global_lock = threading.Lock()
-    
-    def _get_lock(self, filename: str) -> threading.Lock:
-        """获取指定文件的锁"""
+
+    def _get_lock(self, filename: str) -> _FileLock:
+        """获取指定文件的锁
+
+        使用 WeakValueDictionary 缓存按文件的锁：只要还有线程持有该锁的强引用
+        （例如处于 ``with lock:`` 块中），字典里的弱引用就保持有效，新调用会复用
+        同一把锁；当所有使用者释放强引用后，锁对象会被自动 GC，字典条目随之消失，
+        避免 _locks 随文件名无限增长。
+        """
         with self._global_lock:
-            if filename not in self._locks:
-                self._locks[filename] = threading.Lock()
-            return self._locks[filename]
+            lock = self._locks.get(filename)
+            if lock is None:
+                lock = _FileLock()
+                self._locks[filename] = lock
+            return lock
     
     def _get_filepath(self, filename: str) -> Path:
         """获取文件完整路径"""

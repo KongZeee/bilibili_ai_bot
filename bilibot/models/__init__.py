@@ -75,6 +75,8 @@ class Persona:
     enabled: bool = True
     created_at: str = ""
     updated_at: str = ""
+    # 外貌描述（中文）：用于动态配图时作为主角外貌注入图片生成 prompt
+    appearance: str = ""
     # P3: 市场元数据
     version: str = "1.0.0"
     author: str = ""
@@ -107,6 +109,7 @@ class Persona:
             enabled=d.get("enabled", True),
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),
+            appearance=d.get("appearance", ""),
             version=d.get("version", "1.0.0"),
             author=d.get("author", ""),
             tags=d.get("tags", []),
@@ -326,6 +329,7 @@ class ReplyContext:
     thread: Optional[CommentThread] = None
     user_profile: Optional[UserProfile] = None
     memory_context: list[str] = field(default_factory=list)
+    memory_evidence: str = ""
     bot_thread_replies: list[str] = field(default_factory=list)
     related_area_history: list[str] = field(default_factory=list)
     recent_bot_actions: list[str] = field(default_factory=list)
@@ -338,6 +342,7 @@ class ReplyContext:
             "thread": self.thread.to_dict() if self.thread else None,
             "user_profile": self.user_profile.to_dict() if self.user_profile else None,
             "memory_context": self.memory_context,
+            "memory_evidence": self.memory_evidence,
             "bot_thread_replies": self.bot_thread_replies,
             "related_area_history": self.related_area_history,
             "recent_bot_actions": self.recent_bot_actions,
@@ -356,6 +361,7 @@ class ReplyContext:
             thread=thread,
             user_profile=user_profile,
             memory_context=d.get("memory_context", []),
+            memory_evidence=d.get("memory_evidence", ""),
             bot_thread_replies=d.get("bot_thread_replies", []),
             related_area_history=d.get("related_area_history", []),
             recent_bot_actions=d.get("recent_bot_actions", []),
@@ -380,6 +386,11 @@ class ReplyContext:
 
         if self.memory_context:
             parts.append("【相关长期记忆】\n" + "\n".join(f"- {m}" for m in self.memory_context))
+
+        if self.memory_evidence:
+            # Already rendered and bounded by the V6 recall layer. Keep the
+            # untrusted-data boundary intact instead of reformatting its text.
+            parts.append(self.memory_evidence)
 
         if self.bot_thread_replies:
             parts.append("【Bot 本线历史回复】\n" + "\n".join(f"- {r}" for r in self.bot_thread_replies))

@@ -1,104 +1,68 @@
-"""
-记忆 API 路由 - 修复版
+"""Account-scoped V6 memory brain management API.
 
-修复：
-- 表字段使用 category / is_active（与 knowledge_memory.py 一致）
-- 路由顺序：stats/search/migrate 在 /api/memory/{id} 前
-- 空数据库自动建表，返回 200
-- DELETE 软删除用 is_active = 0
+The API deliberately has a single persistence boundary: ``MemoryBrainStore``.
+It never opens a legacy memory database and never falls back to legacy JSON.
 """
-import json
+
+from __future__ import annotations
+
+import inspect
 import logging
-import os
-import sqlite3
 import time
-import uuid
-from datetime import datetime
+from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Iterable, Mapping, Sequence
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse
+from starlette.routing import Route
+
+from bilibot.memory_brain import MemoryBrainStore
+from bilibot.memory_brain.prompt import render_memory_evidence
+from bilibot.memory_brain.recall import RecallEngine, RecallQuery
+from bilibot.memory_brain.store import content_hash
+
+from .responses import fail, fail_internal, ok
 
 logger = logging.getLogger("bilibot.api.memory")
 
-
-# ═══════════════════════════════════════════════════════
-#  数据库 Schema
-# ═══════════════════════════════════════════════════════
-
-SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS memory_atoms (
-  id              INTEGER PRIMARY KEY AUTOINCREMENT,
-  content         TEXT    NOT NULL,
-  category        TEXT    NOT NULL DEFAULT 'episodic',
-  importance      TEXT    NOT NULL DEFAULT 'medium',
-  importance_score REAL   DEFAULT 0.5,
-  user_id         TEXT,
-  username        TEXT,
-  session_id      TEXT,
-  persona_id      TEXT,
-  created_at      REAL    NOT NULL,
-  last_accessed   REAL    NOT NULL,
-  access_count    INTEGER DEFAULT 0,
-  ttl_days        REAL    DEFAULT 30.0,
-  decay_type      TEXT    DEFAULT 'exponential',
-  metadata        TEXT    DEFAULT '{}',
-  is_active       INTEGER DEFAULT 1
-)
-"""
-
-INDEXES_SQL = [
-    "CREATE INDEX IF NOT EXISTS idx_mem_category ON memory_atoms(category)",
-    "CREATE INDEX IF NOT EXISTS idx_mem_user     ON memory_atoms(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_mem_created  ON memory_atoms(created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_mem_active   ON memory_atoms(is_active)",
-]
-
-
-def _get_conn(data_dir: str) -> sqlite3.Connection:
-    path = Path(data_dir) / "knowledge_base.db"
-    # MEM-502：账号数据目录可能尚未创建（enabled 账号未启动 / 新建账号），
-    # 自动创建父目录以匹配 SQLite 自动创建 db 文件的行为，避免 500 错误。
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-# PRD 5.2：建表幂等缓存，避免每次请求都 executescript
-_schema_initialized: set = set()
-
-
-def _ensure_schema(conn: sqlite3.Connection, data_dir: str = ""):
-    """建表 + 索引（幂等，首次后跳过）"""
-    key = data_dir or str(conn)
-    if key in _schema_initialized:
-        return
-    conn.executescript(SCHEMA_SQL)
-    for idx_sql in INDEXES_SQL:
-        try:
-            conn.execute(idx_sql)
-        except Exception:
-            pass
-    conn.commit()
-    _schema_initialized.add(key)
-
-
-def _now_ts() -> float:
-    return time.time()
-
-
-# ═══════════════════════════════════════════════════════
-#  PRD-V5 §9.2 MEM-502：DTO 统一 & 根级 API 废弃
-# ═══════════════════════════════════════════════════════
-
-# Sunset 日期（一个过渡版本后移除根级 /api/memory/* 读端点）
 _ROOT_SUNSET_DATE = "Sat, 31 Dec 2026 23:59:59 GMT"
+_MAX_PAGE_SIZE = 100
+_MAX_GRAPH_EVENTS = 500
+_JOB_TYPES = (
+    "summarize_event",
+    "embed_event",
+    "embed_chunks",
+    "extract_entities",
+    "link_associations",
+)
 
 
-def _deprecation_headers() -> Dict[str, str]:
-    """根级 /api/memory/* GET 端点的废弃提示头"""
+# Import-only shims for downstream extensions that still import the V5 helper
+# names. Direct database access is intentionally unavailable in V6.
+def _get_conn(_data_dir: str) -> None:
+    raise RuntimeError("direct memory database access was removed in V6")
+
+
+def _ensure_schema(_connection: Any, _data_dir: str = "") -> None:
+    raise RuntimeError("direct memory schema management was removed in V6")
+
+
+class _DebugRecallStore:
+    """Delegate recall reads while suppressing production reinforcement."""
+
+    def __init__(self, store: MemoryBrainStore) -> None:
+        self._store = store
+        self.account_id = store.account_id
+
+    def reinforce_recall(self, _event_ids: Sequence[str], link_ids: Sequence[str] = ()) -> None:
+        del link_ids
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+
+def _deprecation_headers() -> dict[str, str]:
     return {
         "Deprecation": "true",
         "Sunset": _ROOT_SUNSET_DATE,
@@ -107,973 +71,1110 @@ def _deprecation_headers() -> Dict[str, str]:
 
 
 def _gone_response() -> JSONResponse:
-    """根级 /api/memory/* 写端点 → 410 Gone"""
-    return JSONResponse(
-        {
-            "success": False,
-            "error": {
-                "code": "GONE",
-                "message": "根级 /api/memory/* 写操作已废弃，请改用 /api/accounts/{account_id}/memory/*",
-                "details": {"successor": "/api/accounts/{account_id}/memory/*"},
-            },
-        },
+    return fail(
+        "GONE",
+        "该记忆端点已废弃，请使用账号级 V6 记忆 API",
+        {"successor": "/api/accounts/{account_id}/memory"},
         status_code=410,
     )
 
 
-def _map_memory_dto(row: Dict[str, Any]) -> Dict[str, Any]:
-    """MEM-502：统一 DTO 字段 — category / by_category，不再混用 type / by_type
-
-    底层 SQLite 表使用 category 字段，此函数确保响应中始终包含 category，
-    并将旧字段 type（如有）映射为 category 以保持向后兼容。
-    """
-    if not row or not isinstance(row, dict):
-        return row
-    # 确保 category 字段存在
-    if "category" not in row and "type" in row:
-        row["category"] = row["type"]
-    return row
+def _with_deprecation(response: JSONResponse) -> JSONResponse:
+    response.headers.update(_deprecation_headers())
+    return response
 
 
-def _map_memory_list(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """批量映射 memory DTO"""
-    return [_map_memory_dto(dict(r)) for r in (rows or [])]
+def _jsonable(value: Any) -> Any:
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [_jsonable(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
-# ═══════════════════════════════════════════════════════
-#  路由工厂
-# ═══════════════════════════════════════════════════════
+def _bounded_int(value: Any, default: int, minimum: int, maximum: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(minimum, min(parsed, maximum))
 
-def create_memory_routes(persona_store, scheduler=None, data_dir: str = "./data", account_manager=None):
-    """创建记忆相关路由
 
-    PRD-V5 §9.2 MEM-502：
-    - 根级 /api/memory/* GET 端点标记废弃，返回 Deprecation/Sunset 头，
-      从配置的默认账号读取数据（若 account_manager 可用）。
-    - 根级 /api/memory/* 写端点（POST/PUT/DELETE）返回 410 Gone。
-    - 新实现请使用 /api/accounts/{account_id}/memory/*。
+def _recall_engine_options(runtime_engine: Any = None) -> dict[str, Any]:
+    """Mirror account limits for the non-reinforcing admin recall engine."""
 
-    Args:
-        persona_store: PersonaStore 实例（保留参数以兼容老调用）
-        scheduler: Scheduler 实例（可选；仅用于 JSON 迁移时读取 DataStore）
-        data_dir: 数据目录（PRD V3 §9.2 要求显式参数，不再隐式从 scheduler.ds 推断）
-        account_manager: AccountManager 实例（MEM-502：用于解析默认账号数据目录）
-    """
-    from starlette.routing import Route
+    return {
+        "rerank_timeout": float(getattr(runtime_engine, "rerank_timeout", 8.0)),
+        "prompt_budget": int(getattr(runtime_engine, "prompt_budget", 5000)),
+        "max_candidates": int(getattr(runtime_engine, "max_candidates", 20)),
+        "max_events": int(getattr(runtime_engine, "max_events", 5)),
+        "max_associations": int(getattr(runtime_engine, "max_associations", 2)),
+        "relevance_baseline": float(
+            getattr(runtime_engine, "relevance_baseline", 0.65)
+        ),
+        "vector_batch_size": int(getattr(runtime_engine, "vector_batch_size", 2048)),
+    }
 
-    # 兼容旧调用：若未传 data_dir，则回退到 scheduler.ds.data_dir
-    if not data_dir:
-        ds = getattr(scheduler, "ds", None)
-        data_dir = ds.data_dir if ds else "./data"
 
-    def _resolve_default_data_dir() -> str:
-        """MEM-502：从 account_manager 解析默认账号数据目录，回退到 data_dir"""
-        if account_manager:
-            default_id = account_manager.get_default_id()
-            if default_id:
-                dd = _resolve_account_data_dir(account_manager, default_id)
-                if dd:
-                    return dd
-        return data_dir
+def _job_index_health(event: Mapping[str, Any], jobs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    statuses = {
+        str(job.get("job_type") or ""): str(job.get("status") or "")
+        for job in jobs
+        if str(job.get("event_id") or "") == str(event.get("id") or "")
+    }
+    embedding_states = [statuses.get("embed_event"), statuses.get("embed_chunks")]
+    if embedding_states and all(state == "completed" for state in embedding_states):
+        embedding = "ready"
+    elif any(state == "dead" for state in embedding_states):
+        embedding = "degraded"
+    elif any(state == "blocked" for state in embedding_states):
+        embedding = "blocked"
+    else:
+        embedding = "pending"
+    status = str(event.get("index_status") or "pending")
+    return {
+        "status": status,
+        "healthy": status == "ready",
+        "fts": "ready",
+        "embedding": embedding,
+        "jobs": statuses,
+    }
 
-    def _deprecated_json(data: Any, status_code: int = 200) -> JSONResponse:
-        """返回带 Deprecation/Sunset 头的 JSON 响应"""
-        return JSONResponse(
-            {"success": True, "data": data},
-            status_code=status_code,
-            headers=_deprecation_headers(),
+
+def _event_dto(
+    event: Mapping[str, Any],
+    *,
+    jobs: Sequence[Mapping[str, Any]] = (),
+    include_full: bool = False,
+    hit_channels: Sequence[str] = (),
+    evidence_chunk_ids: Iterable[str] = (),
+) -> dict[str, Any]:
+    event_id = str(event.get("id") or event.get("event_id") or "")
+    summary = str(event.get("summary") or "")
+    title = str(event.get("title") or "")
+    content = summary or title
+    sources = list(event.get("sources") or [])
+    if not content and sources:
+        content = str(sources[0].get("full_text") or "")
+    chunks = list(event.get("chunks") or [])
+    evidence_ids = {str(value) for value in evidence_chunk_ids if value}
+    dto: dict[str, Any] = {
+        "id": event_id,
+        "event_id": event_id,
+        "event_type": str(event.get("event_type") or "observation"),
+        "category": str(event.get("event_type") or "observation"),
+        "title": title,
+        "summary": summary,
+        "content": content,
+        "source_type": str(event.get("source_type") or ""),
+        "source": str(event.get("source_type") or ""),
+        "index_status": str(event.get("index_status") or "pending"),
+        "status": str(event.get("index_status") or "pending"),
+        "importance": float(event.get("importance") or 0.0),
+        "scene": str(event.get("scene") or ""),
+        "speaker_actor_id": str(event.get("speaker_actor_id") or ""),
+        "persona_id": str(event.get("persona_id") or ""),
+        "occurred_at": event.get("occurred_at"),
+        "created_at": event.get("created_at"),
+        "updated_at": event.get("updated_at"),
+        "recall_count": int(event.get("recall_count") or 0),
+        "last_recalled_at": event.get("last_recalled_at"),
+        "source_count": len(sources),
+        "observation_count": len(event.get("observations") or []),
+        "chunk_count": len(chunks),
+        "entity_count": len(event.get("entities") or []),
+        "index_health": _job_index_health(event, jobs),
+        "hit_channels": list(dict.fromkeys(str(item) for item in hit_channels if item)),
+    }
+    if include_full:
+        dto.update(
+            {
+                "metadata": _jsonable(event.get("metadata") or {}),
+                "sources": _jsonable(sources),
+                "observations": _jsonable(event.get("observations") or []),
+                "chunks": _jsonable(chunks),
+                "entities": _jsonable(event.get("entities") or []),
+                "links": _jsonable(event.get("links") or []),
+                "evidence_chunks": _jsonable(
+                    [chunk for chunk in chunks if not evidence_ids or str(chunk.get("id")) in evidence_ids]
+                ),
+            }
         )
+    return dto
 
-    # ── 固定路由（必须在 /api/memory/{id} 前）──
 
-    async def search_memories(request: Request) -> JSONResponse:
-        # MEM-502：根级写端点 → 410 Gone
-        return _gone_response()
+class _MemoryApi:
+    def __init__(self, account_manager: Any, data_root: str | Path) -> None:
+        self.account_manager = account_manager
+        self.data_root = Path(getattr(account_manager, "data_root", None) or data_root or "./data")
+        self._stores: dict[str, MemoryBrainStore] = {}
 
-    async def migrate_json_to_sqlite(request: Request) -> JSONResponse:
-        # MEM-502：根级写端点 → 410 Gone
-        return _gone_response()
+    def default_account_id(self) -> str:
+        if self.account_manager:
+            account_id = str(self.account_manager.get_default_id() or "").strip()
+            if account_id:
+                return account_id
+        return "default"
 
-    async def get_memory_stats(request: Request) -> JSONResponse:
+    def account_exists(self, account_id: str) -> bool:
+        if not self.account_manager:
+            return False
         try:
-            dd = _resolve_default_data_dir()
-            conn = _get_conn(dd)
-            _ensure_schema(conn, dd)
-            conn.row_factory = sqlite3.Row
+            return bool(self.account_manager.has_account(account_id))
+        except Exception:
+            return False
 
-            total = conn.execute(
-                "SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1"
-            ).fetchone()[0]
-
-            by_cat = dict(conn.execute(
-                "SELECT category, COUNT(*) FROM memory_atoms WHERE is_active = 1 GROUP BY category"
-            ).fetchall())
-
-            recent_24h = conn.execute(
-                "SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1 AND created_at > ?",
-                (_now_ts() - 86400,),
-            ).fetchone()[0]
-
-            # 图谱统计：节点数 = 记忆数 + 独立用户数 + 类别数，边数 ≈ 记忆数 × 平均连接数
-            unique_users = conn.execute(
-                "SELECT COUNT(DISTINCT username) FROM memory_atoms WHERE is_active = 1 AND username IS NOT NULL AND username != ''"
-            ).fetchone()[0]
-            graph_nodes = total + unique_users + len(by_cat)
-            graph_edges = conn.execute(
-                "SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1 AND username IS NOT NULL AND username != ''"
-            ).fetchone()[0] + total  # mentions_user + categorized_as
-
-            # 会话统计
-            sessions = dict(conn.execute(
-                "SELECT session_id, COUNT(*) FROM memory_atoms WHERE is_active = 1 AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id"
-            ).fetchall())
-
-            conn.close()
-            return _deprecated_json({
-                "total": total,
-                "by_category": by_cat,
-                "recent_24h": recent_24h,
-                "graph_nodes": graph_nodes,
-                "graph_edges": graph_edges,
-                "sessions": sessions,
-                "account_id": account_manager.get_default_id() if account_manager else "",
-            })
-        except Exception as e:
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "INTERNAL_ERROR", "message": str(e), "details": {}},
-            }, status_code=500)
-
-    # ── /api/memory ──
-
-    async def list_memories(request: Request) -> JSONResponse:
+    def runtime_account(self, account_id: str) -> Any:
+        if not self.account_manager:
+            return None
         try:
-            dd = _resolve_default_data_dir()
-            page = int(request.query_params.get("page", 1))
-            page_size = int(request.query_params.get("page_size", 20))
-            # MEM-502：统一接受 category（也接受旧 type 参数以向后兼容）
-            category = request.query_params.get("category", "") or request.query_params.get("type", "")
-            user_id = request.query_params.get("user_id", "")
-            keyword = request.query_params.get("keyword", "")
-            active = request.query_params.get("active", "1")
+            return self.account_manager.get_account(account_id)
+        except Exception:
+            return None
 
-            conn = _get_conn(dd)
-            _ensure_schema(conn, dd)
-            conn.row_factory = sqlite3.Row
+    def is_disabled(self, account_id: str) -> bool:
+        return self.account_exists(account_id) and self.runtime_account(account_id) is None
 
-            sql = "SELECT * FROM memory_atoms WHERE 1=1"
-            params = []
+    def store(self, account_id: str) -> MemoryBrainStore:
+        if account_id not in self._stores:
+            self._stores[account_id] = MemoryBrainStore.for_account(self.data_root, account_id)
+        return self._stores[account_id]
 
-            if category:
-                sql += " AND category = ?"
-                params.append(category)
-            if user_id:
-                sql += " AND user_id = ?"
-                params.append(user_id)
-            if keyword:
-                sql += " AND content LIKE ?"
-                params.append(f"%{keyword}%")
-            if active in ("0", "false"):
-                sql += " AND is_active = 0"
-            else:
-                sql += " AND is_active = 1"
-
-            total_row = conn.execute(
-                "SELECT COUNT(*) FROM memory_atoms WHERE 1=1"
-                + (" AND category = ?" if category else "")
-                + (" AND user_id = ?" if user_id else "")
-                + (" AND content LIKE ?" if keyword else "")
-                + (" AND is_active = 0" if active in ("0", "false") else " AND is_active = 1"),
-                params,
-            ).fetchone()
-            total = total_row[0] if total_row else 0
-
-            sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            params.extend([page_size, (page - 1) * page_size])
-
-            rows = conn.execute(sql, params).fetchall()
-            conn.close()
-
-            return _deprecated_json({
-                "items": _map_memory_list([dict(r) for r in rows]),
-                "page": page,
-                "page_size": page_size,
-                "total": total,
-            })
-        except Exception as e:
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "INTERNAL_ERROR", "message": str(e), "details": {}},
-            }, status_code=500)
-
-    async def get_memory(request: Request) -> JSONResponse:
+    def resolve(self, request: Request, *, root: bool = False) -> tuple[str, MemoryBrainStore] | JSONResponse:
+        account_id = self.default_account_id() if root else str(request.path_params.get("account_id") or "")
+        if not root and not self.account_exists(account_id):
+            return fail("NOT_FOUND", f"账号不存在: {account_id}", status_code=404)
         try:
-            mem_id = request.path_params.get("id")
-            dd = _resolve_default_data_dir()
-            conn = _get_conn(dd)
-            _ensure_schema(conn, dd)
-            conn.row_factory = sqlite3.Row
-            row = conn.execute(
-                "SELECT * FROM memory_atoms WHERE id = ?", (mem_id,)
-            ).fetchone()
-            conn.close()
-            if not row:
-                return JSONResponse({
-                    "success": False,
-                    "error": {"code": "NOT_FOUND", "message": "记忆不存在", "details": {"id": mem_id}},
-                }, status_code=404)
-            return _deprecated_json(_map_memory_dto(dict(row)))
-        except Exception as e:
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "INTERNAL_ERROR", "message": str(e), "details": {}},
-            }, status_code=500)
+            return account_id, self.store(account_id)
+        except ValueError as exc:
+            return fail("INVALID_ACCOUNT_ID", str(exc), status_code=400)
+        except Exception:
+            logger.exception("初始化 V6 记忆库失败", extra={"account_id": account_id})
+            return fail_internal("记忆库初始化失败")
 
-    async def delete_memory(request: Request) -> JSONResponse:
-        # MEM-502：根级写端点 → 410 Gone
-        return _gone_response()
-
-    # ═══════════════════════════════════════════════════════
-    #  图谱可视化 API
-    # ═══════════════════════════════════════════════════════
-
-    def _build_graph_snapshot(rows: List[sqlite3.Row]) -> Dict[str, Any]:
-        """从 memory_atoms 行构建图谱快照（节点 + 边 + 记忆 + 条目）
-
-        节点类型：
-        - summary: 每条记忆本身
-        - person:  从 username 字段提取的用户节点
-        - topic:   从 category 字段提取的类别节点
-        """
-        nodes: List[Dict[str, Any]] = []
-        edges: List[Dict[str, Any]] = []
-        memories: List[Dict[str, Any]] = []
-        entries: List[Dict[str, Any]] = []
-
-        # 实体节点 ID 用负数避免与记忆 ID 冲突
-        person_id_map: Dict[str, int] = {}  # username → node_id
-        topic_id_map: Dict[str, int] = {}   # category → node_id
-        _next_person_id = -1
-        _next_topic_id = -100000
-
-        node_type_breakdown: Dict[str, int] = {"summary": 0, "person": 0, "topic": 0}
-        relation_breakdown: Dict[str, int] = {}
-
-        edge_counter = 0
-
-        def _add_edge(src: int, tgt: int, relation: str, mem_id: int):
-            nonlocal edge_counter
-            edge_counter += 1
-            edges.append({
-                "id": edge_counter,
-                "source": src,
-                "target": tgt,
-                "relation_type": relation,
-                "memory_id": mem_id,
-                "weight": 1,
-                "confidence": 0.9,
-            })
-            relation_breakdown[relation] = relation_breakdown.get(relation, 0) + 1
-
-        for row in rows:
-            mem_id = int(row["id"])
-            content = str(row["content"] or "")
-            category = str(row["category"] or "episodic")
-            username = str(row["username"] or "") if row["username"] else ""
-            session_id = str(row["session_id"] or "") if row["session_id"] else ""
-
-            # 记忆节点
-            nodes.append({
-                "id": mem_id,
-                "type": "summary",
-                "label": content[:40] + ("…" if len(content) > 40 else ""),
-                "weight": float(row["importance_score"] or 0.5),
-                "memory_count": 1,
-                "degree": 0,
-                "entry_count": 1,
-            })
-            node_type_breakdown["summary"] += 1
-
-            memories.append({
-                "memory_id": mem_id,
-                "summary": content[:80],
-                "content": content,
-                "memory_type": category,
-                "category": category,
-                "importance": float(row["importance_score"] or 0.5),
-                "status": "active" if row["is_active"] else "archived",
-                "session_id": session_id,
-            })
-
-            entry_node_ids = [mem_id]
-
-            # 用户节点
-            if username:
-                if username not in person_id_map:
-                    person_id_map[username] = _next_person_id
-                    _next_person_id -= 1
-                    pid = person_id_map[username]
-                    nodes.append({
-                        "id": pid,
-                        "type": "person",
-                        "label": username,
-                        "weight": 1,
-                        "memory_count": 0,
-                        "degree": 0,
-                        "entry_count": 0,
-                    })
-                    node_type_breakdown["person"] += 1
-                pid = person_id_map[username]
-                _add_edge(mem_id, pid, "mentions_user", mem_id)
-                entry_node_ids.append(pid)
-
-            # 类别节点
-            if category:
-                if category not in topic_id_map:
-                    topic_id_map[category] = _next_topic_id
-                    _next_topic_id -= 1
-                    tid = topic_id_map[category]
-                    nodes.append({
-                        "id": tid,
-                        "type": "topic",
-                        "label": category,
-                        "weight": 1,
-                        "memory_count": 0,
-                        "degree": 0,
-                        "entry_count": 0,
-                    })
-                    node_type_breakdown["topic"] += 1
-                tid = topic_id_map[category]
-                _add_edge(mem_id, tid, "categorized_as", mem_id)
-                entry_node_ids.append(tid)
-
-            entries.append({
-                "memory_id": mem_id,
-                "node_ids": entry_node_ids,
-            })
-
-        # 更新节点 degree
-        node_degree: Dict[int, int] = {}
-        for edge in edges:
-            node_degree[edge["source"]] = node_degree.get(edge["source"], 0) + 1
-            node_degree[edge["target"]] = node_degree.get(edge["target"], 0) + 1
-        for node in nodes:
-            node["degree"] = node_degree.get(node["id"], 0)
-
-        return {
-            "snapshot": {
-                "nodes": nodes,
-                "edges": edges,
-                "memories": memories,
-                "entries": entries,
-            },
-            "summary": {
-                "node_type_breakdown": node_type_breakdown,
-                "relation_breakdown": relation_breakdown,
-            },
-            "total_memories": len(memories),
-            "graph_nodes": len(nodes),
-            "graph_edges": len(edges),
-        }
-
-    async def get_memory_graph(request: Request) -> JSONResponse:
-        """GET /api/memory/graph — 图谱总览（废弃，从默认账号读取）"""
-        try:
-            dd = _resolve_default_data_dir()
-            session_id = request.query_params.get("session_id", "")
-            limit = min(int(request.query_params.get("limit", 200)), 500)
-
-            conn = _get_conn(dd)
-            _ensure_schema(conn, dd)
-            conn.row_factory = sqlite3.Row
-
-            sql = "SELECT * FROM memory_atoms WHERE is_active = 1"
-            params: list = []
-            if session_id:
-                sql += " AND session_id = ?"
-                params.append(session_id)
-            sql += " ORDER BY created_at DESC LIMIT ?"
-            params.append(limit)
-
-            rows = conn.execute(sql, params).fetchall()
-            conn.close()
-
-            graph = _build_graph_snapshot(rows)
-            graph["enabled"] = True
-            graph["mode"] = "overview"
-            graph["sessions"] = {}
-
-            return _deprecated_json(graph)
-        except Exception as e:
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "INTERNAL_ERROR", "message": str(e), "details": {}},
-            }, status_code=500)
-
-    async def query_memory_graph(request: Request) -> JSONResponse:
-        """POST /api/memory/graph/query — MEM-502：根级写端点 → 410 Gone"""
-        return _gone_response()
-
-    # ── 路由列表（固定路由在前）──
-    # PRD-V5 §9.2 MEM-502：旧路由 /api/memory/* 标记为废弃，
-    # 新实现请使用 /api/accounts/{account_id}/memory/* 系列端点
-    return [
-        Route("/api/memory/search", search_memories, methods=["POST"]),
-        Route("/api/memory/migrate", migrate_json_to_sqlite, methods=["POST"]),
-        Route("/api/memory/stats", get_memory_stats, methods=["GET"]),
-        Route("/api/memory/graph", get_memory_graph, methods=["GET"]),
-        Route("/api/memory/graph/query", query_memory_graph, methods=["POST"]),
-        Route("/api/memory", list_memories, methods=["GET"]),
-        Route("/api/memory/{id}", get_memory, methods=["GET"]),
-        Route("/api/memory/{id}", delete_memory, methods=["DELETE"]),
-    ]
-
-
-# ═══════════════════════════════════════════════════════
-#  PRD V4 MEM-009：账号化记忆 API
-#  /api/accounts/{account_id}/memory/*
-#  每个请求从 account_manager 解析账号数据目录，
-#  确保页面看到的统计来自 data/accounts/{account_id}
-# ═══════════════════════════════════════════════════════
-
-def _resolve_account_data_dir(account_manager, account_id: str) -> Optional[str]:
-    """MEM-502：从 account_manager 解析账号数据目录
-
-    解析顺序：
-    1. 运行时实例（enabled 账号）→ account_data_dir
-    2. 配置注册表（disabled / init-failed 账号）→ {data_root}/accounts/{account_id}
-       不要求运行实例存在，admin 可只读访问禁用账号记忆数据。
-    """
-    if not account_manager:
-        return None
-    # 1. 运行时实例（enabled 账号）
-    acc = account_manager.get_account(account_id)
-    if acc:
-        data_dir = getattr(acc, "account_data_dir", None)
-        if data_dir:
-            return data_dir
-        ds = getattr(acc, "data_store", None)
-        if ds:
-            data_dir = getattr(ds, "data_dir", None)
-            if data_dir:
-                return data_dir
-    # 2. 配置注册表（disabled / init-failed 账号）— 不要求运行实例
-    if account_manager.has_account(account_id):
-        data_root = getattr(account_manager, "data_root", "./data")
-        return os.path.join(str(data_root), "accounts", account_id)
-    return None
-
-
-def _is_account_disabled(account_manager, account_id: str) -> bool:
-    """MEM-502：判断账号是否为禁用状态（无运行时实例但存在于配置注册表）
-
-    Returns:
-        True 如果账号在配置中存在但没有运行时实例（disabled / init-failed）
-    """
-    if not account_manager:
-        return False
-    acc = account_manager.get_account(account_id)
-    if acc:
-        return False  # 运行时实例存在 → enabled
-    return account_manager.has_account(account_id)
-
-
-def create_account_memory_routes(account_manager):
-    """创建账号化记忆路由
-
-    PRD-V5 §9.2 MEM-502：
-    - GET    /api/accounts/{id}/memory/stats
-    - POST   /api/accounts/{id}/memory/search
-    - GET    /api/accounts/{id}/memory          (列表)
-    - GET    /api/accounts/{id}/memory/{mem_id}
-    - DELETE /api/accounts/{id}/memory/{mem_id}
-    - POST   /api/accounts/{id}/memory/migrate
-    - GET    /api/accounts/{id}/memory/graph     (图谱总览)
-    - POST   /api/accounts/{id}/memory/graph/query (关键词搜索子图)
-
-    禁用账号（无运行时实例但存在于配置注册表）：
-    - GET（只读）允许访问，数据目录从 AccountConfigRegistry 解析
-    - POST/PUT/DELETE（写操作）拒绝，返回 403
-    """
-    from starlette.routing import Route
-    from .responses import ok, fail, fail_internal
-
-    async def _resolve_or_fail(request: Request):
-        """解析账号数据目录，失败时返回 JSONResponse
-
-        Returns:
-            (data_dir, error_response) — 二者之一为 None
-        """
-        acc_id = request.path_params.get("account_id", "")
-        if not account_manager or not account_manager.has_account(acc_id):
-            return None, fail("NOT_FOUND", f"账号不存在: {acc_id}", status_code=404)
-        data_dir = _resolve_account_data_dir(account_manager, acc_id)
-        if not data_dir:
-            return None, fail("NOT_FOUND", f"账号数据目录未初始化: {acc_id}", status_code=404)
-        return data_dir, None
-
-    def _reject_if_disabled(request: Request):
-        """禁用账号写操作拒绝。返回 JSONResponse 或 None"""
-        acc_id = request.path_params.get("account_id", "")
-        if _is_account_disabled(account_manager, acc_id):
+    def reject_mutation(self, account_id: str) -> JSONResponse | None:
+        if self.is_disabled(account_id):
             return fail(
                 "FORBIDDEN",
-                f"账号 {acc_id} 已禁用，只支持只读访问（GET），写操作请先启用账号",
+                f"账号 {account_id} 已禁用，只允许读取记忆",
                 status_code=403,
             )
         return None
 
-    async def account_memory_stats(request: Request) -> JSONResponse:
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
+    async def audit_mutation(
+        self,
+        action: str,
+        account_id: str,
+        *,
+        object_id: str = "",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Record a bodyless admin action without changing operation success."""
+        audit_store = getattr(self.account_manager, "audit_store", None)
+        method = (
+            getattr(audit_store, "record_async", None)
+            or getattr(audit_store, "record", None)
+        )
+        if not callable(method):
+            return
+        target = {
+            "kind": "memory_admin",
+            "action": str(action),
+            "account_id": str(account_id),
+        }
+        if object_id:
+            target["object_id"] = str(object_id)
+        target.update(dict(details or {}))
         try:
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            conn.row_factory = sqlite3.Row
-            total = conn.execute("SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1").fetchone()[0]
-            by_cat = dict(conn.execute(
-                "SELECT category, COUNT(*) FROM memory_atoms WHERE is_active = 1 GROUP BY category"
-            ).fetchall())
-            recent_24h = conn.execute(
-                "SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1 AND created_at > ?",
-                (_now_ts() - 86400,),
-            ).fetchone()[0]
-            # 图谱统计
-            unique_users = conn.execute(
-                "SELECT COUNT(DISTINCT username) FROM memory_atoms WHERE is_active = 1 AND username IS NOT NULL AND username != ''"
-            ).fetchone()[0]
-            graph_nodes = total + unique_users + len(by_cat)
-            graph_edges = conn.execute(
-                "SELECT COUNT(*) FROM memory_atoms WHERE is_active = 1 AND username IS NOT NULL AND username != ''"
-            ).fetchone()[0] + total
-            sessions = dict(conn.execute(
-                "SELECT session_id, COUNT(*) FROM memory_atoms WHERE is_active = 1 AND session_id IS NOT NULL AND session_id != '' GROUP BY session_id"
-            ).fetchall())
-            conn.close()
-            return ok({
-                "total": total,
-                "by_category": by_cat,
-                "recent_24h": recent_24h,
-                "graph_nodes": graph_nodes,
-                "graph_edges": graph_edges,
-                "sessions": sessions,
-                "account_id": request.path_params.get("account_id", ""),
-            })
-        except Exception as e:
-            return fail_internal(str(e))
+            result = method(
+                scene="memory_admin",
+                persona_id="admin",
+                input_summary=str(action),
+                published=True,
+                target=target,
+                status="published",
+            )
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            logger.warning(
+                "记录记忆管理审计失败: action=%s account=%s error=%s",
+                action,
+                account_id,
+                type(exc).__name__,
+            )
 
-    async def account_memory_search(request: Request) -> JSONResponse:
-        # POST — 禁用账号写操作拒绝（search 是 POST 读操作，但遵循 POST→写拒绝规则）
-        disabled_err = _reject_if_disabled(request)
-        if disabled_err:
-            return disabled_err
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
-        try:
-            body = await request.json()
-            keyword = body.get("keyword", "")
-            limit = int(body.get("limit", 20))
-            # MEM-502：统一接受 category（也接受旧 type 参数）
-            category = body.get("category", "") or body.get("type", "")
-            user_id = body.get("user_id", "")
-            if not keyword:
-                return ok([])
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            conn.row_factory = sqlite3.Row
-            sql = "SELECT * FROM memory_atoms WHERE content LIKE ? AND is_active = 1"
-            params: list = [f"%{keyword}%"]
-            if category:
-                sql += " AND category = ?"
-                params.append(category)
-            if user_id:
-                sql += " AND user_id = ?"
-                params.append(str(user_id))
-            sql += " ORDER BY created_at DESC LIMIT ?"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-            conn.close()
-            return ok(_map_memory_list([dict(r) for r in rows]))
-        except Exception as e:
-            return fail_internal(str(e))
+    def _all_jobs(self, store: MemoryBrainStore) -> list[dict[str, Any]]:
+        return store.list_jobs(limit=500, offset=0)
 
-    async def account_memory_list(request: Request) -> JSONResponse:
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
-        try:
-            page = int(request.query_params.get("page", 1))
-            page_size = int(request.query_params.get("page_size", 20))
-            # MEM-502：统一接受 category（也接受旧 type 参数）
-            category = request.query_params.get("category", "") or request.query_params.get("type", "")
-            user_id = request.query_params.get("user_id", "")
-            keyword = request.query_params.get("keyword", "")
-            active = request.query_params.get("active", "1")
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            conn.row_factory = sqlite3.Row
-            sql = "SELECT * FROM memory_atoms WHERE 1=1"
-            params: list = []
-            if category:
-                sql += " AND category = ?"
-                params.append(category)
-            if user_id:
-                sql += " AND user_id = ?"
-                params.append(str(user_id))
-            if keyword:
-                sql += " AND content LIKE ?"
-                params.append(f"%{keyword}%")
-            if active in ("0", "false"):
-                sql += " AND is_active = 0"
-            else:
-                sql += " AND is_active = 1"
-            # total
-            count_sql = "SELECT COUNT(*) FROM memory_atoms WHERE 1=1"
-            count_params: list = []
-            if category:
-                count_sql += " AND category = ?"
-                count_params.append(category)
-            if user_id:
-                count_sql += " AND user_id = ?"
-                count_params.append(str(user_id))
-            if keyword:
-                count_sql += " AND content LIKE ?"
-                count_params.append(f"%{keyword}%")
-            if active in ("0", "false"):
-                count_sql += " AND is_active = 0"
-            else:
-                count_sql += " AND is_active = 1"
-            total = conn.execute(count_sql, count_params).fetchone()[0]
-            sql += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
-            params.extend([page_size, (page - 1) * page_size])
-            rows = conn.execute(sql, params).fetchall()
-            conn.close()
-            return ok({
-                "items": _map_memory_list([dict(r) for r in rows]),
-                "page": page,
-                "page_size": page_size,
-                "total": total,
-            })
-        except Exception as e:
-            return fail_internal(str(e))
+    def stats(self, store: MemoryBrainStore, account_id: str) -> dict[str, Any]:
+        raw = store.stats()
+        counts = dict(raw.get("counts") or {})
+        events = store.list_events(limit=500, offset=0)
+        now = time.time()
+        by_event_type: dict[str, int] = {}
+        index_statuses: dict[str, int] = {}
+        for event in events:
+            event_type = str(event.get("event_type") or "observation")
+            by_event_type[event_type] = by_event_type.get(event_type, 0) + 1
+            status = str(event.get("index_status") or "pending")
+            index_statuses[status] = index_statuses.get(status, 0) + 1
+        health = _jsonable(store.health_check())
+        total = int(counts.get("memory_events") or 0)
+        return {
+            "account_id": account_id,
+            "total": total,
+            "by_category": by_event_type,
+            "categories": by_event_type,
+            "by_source": dict(raw.get("sources") or {}),
+            "sources": dict(raw.get("sources") or {}),
+            "recent_24h": sum(1 for event in events if float(event.get("created_at") or 0) > now - 86400),
+            "weekly_new": sum(1 for event in events if float(event.get("created_at") or 0) > now - 604800),
+            "counts": counts,
+            "jobs": dict(raw.get("jobs") or {}),
+            "index_statuses": index_statuses,
+            "health": health,
+            "schema_version": raw.get("schema_version"),
+            "graph_nodes": int(counts.get("memory_events") or 0) + int(counts.get("memory_entities") or 0),
+            "graph_edges": int(counts.get("memory_links") or 0),
+            "sessions": {},
+        }
 
-    async def account_memory_get(request: Request) -> JSONResponse:
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
-        try:
-            mem_id = request.path_params.get("mem_id")
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            conn.row_factory = sqlite3.Row
-            row = conn.execute("SELECT * FROM memory_atoms WHERE id = ?", (mem_id,)).fetchone()
-            conn.close()
-            if not row:
-                return fail("NOT_FOUND", "记忆不存在", status_code=404)
-            return ok(_map_memory_dto(dict(row)))
-        except Exception as e:
-            return fail_internal(str(e))
+    def list_events(self, request: Request, store: MemoryBrainStore) -> dict[str, Any]:
+        page = _bounded_int(request.query_params.get("page"), 1, 1, 1_000_000)
+        page_size = _bounded_int(request.query_params.get("page_size"), 20, 1, _MAX_PAGE_SIZE)
+        source_type = str(request.query_params.get("source_type") or "").strip()
+        category = str(request.query_params.get("category") or request.query_params.get("type") or "").strip()
+        status = str(request.query_params.get("status") or "").strip()
+        keyword = str(request.query_params.get("keyword") or "").strip()
+        active = str(request.query_params.get("active") or "").lower()
+        if active in {"0", "false"}:
+            return {"items": [], "page": page, "page_size": page_size, "total": 0}
 
-    async def account_memory_delete(request: Request) -> JSONResponse:
-        # DELETE — 禁用账号写操作拒绝
-        disabled_err = _reject_if_disabled(request)
-        if disabled_err:
-            return disabled_err
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
-        try:
-            mem_id = request.path_params.get("mem_id")
-            conn = _get_conn(data_dir)
-            conn.execute("UPDATE memory_atoms SET is_active = 0 WHERE id = ?", (mem_id,))
-            conn.commit()
-            conn.close()
-            return ok(message="记忆已删除")
-        except Exception as e:
-            return fail_internal(str(e))
+        if keyword:
+            matched = self.search(store, keyword, limit=500)["items"]
+            rows = [item["_event"] for item in matched]
+        elif category or status:
+            rows = store.list_events(limit=500, offset=0, source_type=source_type or None, status=status or None)
+        else:
+            rows = store.list_events(
+                limit=page_size,
+                offset=(page - 1) * page_size,
+                source_type=source_type or None,
+            )
 
-    async def account_memory_migrate(request: Request) -> JSONResponse:
-        # POST — 禁用账号写操作拒绝
-        disabled_err = _reject_if_disabled(request)
-        if disabled_err:
-            return disabled_err
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
-        try:
-            acc_id = request.path_params.get("account_id", "")
-            acc = account_manager.get_account(acc_id)
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            existing = conn.execute("SELECT COUNT(*) FROM memory_atoms").fetchone()[0]
-            if existing > 0:
-                conn.close()
-                return ok({"skipped": True, "existing_count": existing}, "already migrated, skip")
-            ds = getattr(acc, "data_store", None)
-            migrated = 0
-            sources = {
-                "memory.json": ("episodic", "text"),
-                "permanent_memory.json": ("factual", "text"),
-                "watch_log.json": ("episodic", "title"),
-                "dynamic_log.json": ("episodic", "text"),
-                "weekly_summary.json": ("episodic", "summary"),
-            }
-            for filename, (category, content_key) in sources.items():
-                if not ds:
+        if category:
+            rows = [
+                row for row in rows
+                if str(row.get("event_type") or "") == category or str(row.get("source_type") or "") == category
+            ]
+        if source_type:
+            rows = [row for row in rows if str(row.get("source_type") or "") == source_type]
+
+        if keyword or category or status:
+            total = len(rows)
+            rows = rows[(page - 1) * page_size : page * page_size]
+        elif source_type:
+            total = int(store.stats().get("sources", {}).get(source_type, 0))
+        else:
+            total = int(store.stats().get("counts", {}).get("memory_events", 0))
+
+        event_ids = [str(row.get("id") or "") for row in rows]
+        detailed = store.get_events(event_ids, chunks_per_event=None)
+        jobs = self._all_jobs(store)
+        return {
+            "items": [_event_dto(event, jobs=jobs) for event in detailed],
+            "page": page,
+            "page_size": page_size,
+            "total": total,
+        }
+
+    def search(self, store: MemoryBrainStore, query: str, limit: int = 20) -> dict[str, Any]:
+        query = str(query or "").strip()
+        limit = max(1, min(int(limit), 100))
+        if not query:
+            return {"query": "", "items": [], "results": [], "total": 0}
+
+        merged: dict[str, dict[str, Any]] = {}
+
+        def collect(hits: Sequence[Mapping[str, Any]], channel: str) -> None:
+            for rank, hit in enumerate(hits, start=1):
+                event_id = str(hit.get("event_id") or hit.get("id") or "")
+                if not event_id:
                     continue
-                try:
-                    raw = ds.load_json(filename, [])
-                    if not isinstance(raw, list):
-                        continue
-                    for item in raw:
-                        try:
-                            content_val = str(item.get(content_key, item.get("text", "")))[:1000]
-                            now = _now_ts()
-                            meta = {"source_file": filename, "migrated": True}
-                            conn.execute(
-                                "INSERT INTO memory_atoms (category, content, metadata, created_at, last_accessed, is_active) VALUES (?, ?, ?, ?, ?, 1)",
-                                (category, content_val, json.dumps(meta, ensure_ascii=False, default=str), now, now),
-                            )
-                            rowid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                            try:
-                                conn.execute("INSERT INTO memory_fts(rowid, content) VALUES (?, ?)", (rowid, content_val[:2000]))
-                            except Exception:
-                                pass
-                            migrated += 1
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-            conn.commit()
-            conn.close()
-            return ok({"migrated": migrated}, f"migrated {migrated} records")
-        except Exception as e:
-            return fail_internal(str(e))
+                item = merged.setdefault(
+                    event_id,
+                    {"event_id": event_id, "channels": [], "evidence_ids": [], "rank_score": 0.0},
+                )
+                if channel not in item["channels"]:
+                    item["channels"].append(channel)
+                chunk_id = str(hit.get("chunk_id") or "")
+                if chunk_id and chunk_id not in item["evidence_ids"]:
+                    item["evidence_ids"].append(chunk_id)
+                item["rank_score"] += 1.0 / rank
 
-    # ═══════════════════════════════════════════════════════
-    #  MEM-502：账号化图谱 API
-    # ═══════════════════════════════════════════════════════
+        collect(store.find_events_by_identifiers([query], limit=limit), "explicit_id")
+        collect(store.search_events_fts(query, limit=limit * 2), "event_fts")
+        collect(store.search_chunks_fts(query, limit=limit * 3), "chunk_fts")
+        ordered = sorted(merged.values(), key=lambda item: (-item["rank_score"], item["event_id"]))[:limit]
+        events = {event["id"]: event for event in store.get_events([item["event_id"] for item in ordered], chunks_per_event=None)}
+        jobs = self._all_jobs(store)
+        items: list[dict[str, Any]] = []
+        for hit in ordered:
+            event = events.get(hit["event_id"])
+            if not event:
+                continue
+            dto = _event_dto(
+                event,
+                jobs=jobs,
+                include_full=True,
+                hit_channels=hit["channels"],
+                evidence_chunk_ids=hit["evidence_ids"],
+            )
+            dto["lexical_score"] = min(1.0, float(hit["rank_score"]))
+            dto["_event"] = event
+            items.append(dto)
+        public_items = [{key: value for key, value in item.items() if key != "_event"} for item in items]
+        return {"query": query, "items": items, "results": public_items, "total": len(items)}
 
-    async def account_memory_graph(request: Request) -> JSONResponse:
-        """GET /api/accounts/{id}/memory/graph — 账号图谱总览"""
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
+    def detail(self, store: MemoryBrainStore, event_id: str) -> dict[str, Any] | None:
+        event = store.get_event(event_id, chunks_per_event=None)
+        if not event:
+            return None
+        jobs = self._all_jobs(store)
+        dto = _event_dto(event, jobs=jobs, include_full=True)
+        dto["jobs"] = [_jsonable(job) for job in jobs if str(job.get("event_id") or "") == event_id]
+        return dto
+
+    def graph(self, store: MemoryBrainStore, event_ids: Sequence[str] | None = None) -> dict[str, Any]:
+        if event_ids is None:
+            event_ids = [event["id"] for event in store.list_events(limit=_MAX_GRAPH_EVENTS, offset=0)]
+        event_ids = list(dict.fromkeys(str(value) for value in event_ids if value))[:_MAX_GRAPH_EVENTS]
+        events = store.get_events(event_ids, chunks_per_event=0)
+        nodes: dict[str, dict[str, Any]] = {}
+        edges: dict[str, dict[str, Any]] = {}
+        memories: list[dict[str, Any]] = []
+        pending_links: list[Mapping[str, Any]] = []
+        type_counts: dict[str, int] = {}
+        relation_counts: dict[str, int] = {}
+
+        def add_node(node: dict[str, Any]) -> None:
+            node_id = str(node["id"])
+            if node_id not in nodes:
+                node["degree"] = 0
+                nodes[node_id] = node
+
+        def add_edge(edge: dict[str, Any]) -> None:
+            edge_id = str(edge["id"])
+            if edge_id in edges or str(edge["source"]) not in nodes or str(edge["target"]) not in nodes:
+                return
+            edges[edge_id] = edge
+            nodes[str(edge["source"])]["degree"] += 1
+            nodes[str(edge["target"])]["degree"] += 1
+            relation = str(edge.get("relation_type") or "related_to")
+            relation_counts[relation] = relation_counts.get(relation, 0) + 1
+
+        for event in events:
+            event_id = str(event["id"])
+            label = str(event.get("title") or event.get("summary") or event_id)
+            add_node(
+                {
+                    "id": event_id,
+                    "type": "event",
+                    "node_kind": "event",
+                    "label": label[:80],
+                    "weight": float(event.get("importance") or 0.5),
+                    "source_type": str(event.get("source_type") or ""),
+                    "index_status": str(event.get("index_status") or "pending"),
+                }
+            )
+            type_counts["event"] = type_counts.get("event", 0) + 1
+            memories.append(_event_dto(event))
+            for mention in event.get("entities") or []:
+                entity_id = str(mention.get("entity_id") or "")
+                if not entity_id:
+                    continue
+                entity_type = str(mention.get("entity_type") or "topic")
+                add_node(
+                    {
+                        "id": entity_id,
+                        "type": entity_type,
+                        "node_kind": "entity",
+                        "label": str(mention.get("canonical_name") or mention.get("surface_text") or entity_id),
+                        "weight": float(mention.get("confidence") or 1.0),
+                        "entity_type": entity_type,
+                    }
+                )
+                edge_id = f"mention:{event_id}:{entity_id}"
+                add_edge(
+                    {
+                        "id": edge_id,
+                        "source": event_id,
+                        "target": entity_id,
+                        "relation_type": "mentions",
+                        "weight": float(mention.get("confidence") or 1.0),
+                        "confidence": float(mention.get("confidence") or 1.0),
+                    }
+                )
+            pending_links.extend(event.get("links") or [])
+
+        # Event rows may arrive in any order. Resolve event-to-event links only
+        # after every node exists so graph output is deterministic.
+        for link in pending_links:
+            source = str(link.get("source_event_id") or "")
+            target = str(link.get("target_event_id") or "")
+            add_edge(
+                {
+                    "id": str(link.get("id") or f"link:{source}:{target}"),
+                    "source": source,
+                    "target": target,
+                    "relation_type": str(link.get("relation_type") or "related_to"),
+                    "weight": float(link.get("weight") or 0.5),
+                    "confidence": float(link.get("weight") or 0.5),
+                    "evidence_ids": list(link.get("evidence_ids") or []),
+                }
+            )
+
+        # Entity types are counted only after all mentions have been deduplicated.
+        for node in nodes.values():
+            if node.get("node_kind") == "entity":
+                node_type = str(node.get("type") or "topic")
+                type_counts[node_type] = type_counts.get(node_type, 0) + 1
+        snapshot = {
+            "nodes": list(nodes.values()),
+            "edges": list(edges.values()),
+            "memories": memories,
+            "entries": memories,
+        }
+        return {
+            "snapshot": snapshot,
+            "nodes": snapshot["nodes"],
+            "edges": snapshot["edges"],
+            "graph_nodes": len(nodes),
+            "graph_edges": len(edges),
+            "total_memories": len(events),
+            "summary": {
+                "node_type_breakdown": type_counts,
+                "relation_breakdown": relation_counts,
+            },
+        }
+
+    async def _call_recall(
+        self, account_id: str, store: MemoryBrainStore, query: RecallQuery
+    ) -> tuple[Any, str]:
+        account = self.runtime_account(account_id)
+        for name in ("memory_brain_service", "memory_service", "memory_brain"):
+            target = getattr(account, name, None) if account else None
+            method = getattr(target, "recall_debug", None)
+            if not callable(method) and getattr(target, "gateway", None) is not None:
+                runtime_engine = getattr(target, "recall_engine", None)
+                engine = RecallEngine(
+                    _DebugRecallStore(store),
+                    target.gateway,
+                    **_recall_engine_options(runtime_engine),
+                )
+                return await engine.recall(query), ""
+            method = method or getattr(target, "recall", None) or getattr(target, "retrieve", None)
+            if target is store or not callable(method):
+                continue
+            before = {item["id"] for item in store.list_recall_traces(limit=5, offset=0)}
+            result = method(query)
+            result = await result if inspect.isawaitable(result) else result
+            new_traces = [
+                item
+                for item in store.list_recall_traces(limit=5, offset=0)
+                if item["id"] not in before and str(item.get("scene") or "") == query.scene
+            ]
+            exact = next(
+                (
+                    item
+                    for item in new_traces
+                    if item.get("query_hash") == content_hash(query.current_message)
+                ),
+                None,
+            )
+            persisted_id = str((exact or (new_traces[0] if new_traces else {})).get("id") or "")
+            return result, persisted_id
+
+        gateway = None
+        if account:
+            gateway = getattr(account, "memory_model_gateway", None) or getattr(account, "model_gateway", None)
+        runtime_engine = getattr(account, "recall_engine", None) if account else None
+        if gateway is not None:
+            engine = RecallEngine(
+                _DebugRecallStore(store),
+                gateway,
+                **_recall_engine_options(runtime_engine),
+            )
+        else:
+            engine = RecallEngine(
+                _DebugRecallStore(store),
+                chat_provider=getattr(account, "llm", None) if account else None,
+                embedding_provider=getattr(account, "embedding_provider", None) if account else None,
+                **_recall_engine_options(runtime_engine),
+            )
+        return await engine.recall(query), ""
+
+    def _trace_candidates(self, trace: Any) -> list[dict[str, Any]]:
+        raw = getattr(trace, "candidates", None)
+        if raw is None and isinstance(trace, Mapping):
+            raw = trace.get("candidates")
+        result: list[dict[str, Any]] = []
+        for candidate in raw or []:
+            item = _jsonable(candidate)
+            event_id = str(item.get("candidate_id") or item.get("event_id") or "")
+            normalized = {
+                **item,
+                "event_id": event_id,
+                "candidate_id": event_id,
+                "channels": list(item.get("channels") or []),
+                "D": item.get("deterministic_score", item.get("d", 0.0)),
+                "L": item.get("llm_score", item.get("l")),
+                "F": item.get("final_score", item.get("f", 0.0)),
+                "injected": bool(item.get("accepted") or item.get("injected")),
+            }
+            result.append(normalized)
+        return result
+
+    def recall_result(
+        self,
+        store: MemoryBrainStore,
+        query: RecallQuery,
+        result: Any,
+        persisted_trace_id: str = "",
+    ) -> dict[str, Any]:
+        if isinstance(result, Mapping):
+            raw = dict(result)
+            trace = raw.get("trace") or {}
+            events = list(raw.get("events") or raw.get("memories") or [])
+            evidence_text = str(raw.get("prompt_evidence") or raw.get("final_prompt") or "")
+            existing_trace_id = str(raw.get("trace_id") or persisted_trace_id or "")
+        else:
+            trace = getattr(result, "trace", {})
+            events = list(getattr(result, "events", ()) or getattr(result, "memories", ()))
+            evidence = getattr(result, "evidence", None)
+            evidence_text = str(getattr(evidence, "text", "") or getattr(result, "prompt_evidence", ""))
+            existing_trace_id = str(getattr(result, "trace_id", "") or persisted_trace_id or "")
+
+        trace_data = _jsonable(trace)
+        candidates = self._trace_candidates(trace)
+        mode = str(trace_data.get("mode") or ("fallback" if trace_data.get("used_fallback") else "llm"))
+        if not existing_trace_id:
+            persisted_candidates = [
+                {
+                    "event_id": item["event_id"],
+                    "channels": item["channels"],
+                    "channel_ranks": item.get("channel_ranks") or {},
+                    "rrf_score": item.get("rrf_score") or 0.0,
+                    "deterministic_score": item.get("D") or 0.0,
+                    "llm_score": item.get("L"),
+                    "final_score": item.get("F") or 0.0,
+                    "decision": item.get("kind") or "direct",
+                    "threshold": item.get("threshold") or 0.0,
+                    "reason": item.get("reason") or "",
+                    "evidence_ids": item.get("evidence_ids") or [],
+                    "injected": item.get("injected", False),
+                    "accepted": item.get("accepted", item.get("injected", False)),
+                }
+                for item in candidates
+            ]
+            existing_trace_id = store.save_recall_trace(
+                query_hash=content_hash(query.current_message),
+                query_text=query.current_message,
+                scene=query.scene,
+                used_fallback=mode == "fallback",
+                rerank_status=str(trace_data.get("rerank_status") or ""),
+                rerank_calls=int(trace_data.get("rerank_calls") or 0),
+                channel_errors=trace_data.get("channel_errors") or {},
+                latency_ms=float(trace_data.get("latency_ms") or 0.0),
+                prompt_chars=len(evidence_text),
+                candidates=persisted_candidates,
+            )
+        jobs = self._all_jobs(store)
+        return {
+            "trace_id": existing_trace_id,
+            "events": [_event_dto(event, jobs=jobs, include_full=True) for event in events],
+            "memories": [_event_dto(event, jobs=jobs) for event in events],
+            "final_prompt": evidence_text,
+            "prompt_evidence": evidence_text,
+            "trace": {**trace_data, "mode": mode, "candidates": candidates},
+        }
+
+    def trace_detail(self, store: MemoryBrainStore, trace_id: str) -> dict[str, Any] | None:
+        trace = store.get_recall_trace(trace_id)
+        if not trace:
+            return None
+        used_fallback = bool(trace.get("used_fallback"))
+        candidates = []
+        injected_ids: list[str] = []
+        for raw in trace.get("candidates") or []:
+            item = dict(raw)
+            event_id = str(item.get("event_id") or "")
+            decision = str(item.get("decision") or "direct")
+            if item.get("injected") and event_id:
+                injected_ids.append(event_id)
+            candidates.append(
+                {
+                    **item,
+                    "candidate_id": event_id,
+                    "D": item.get("deterministic_score"),
+                    "L": item.get("llm_score"),
+                    "F": item.get("final_score"),
+                    "kind": decision,
+                    "threshold": item.get("threshold") or (
+                        (0.88 if decision == "association" else 0.80)
+                        if used_fallback
+                        else (0.80 if decision == "association" else 0.72)
+                    ),
+                }
+            )
+        selected = store.get_events(injected_ids, chunks_per_event=None)
+        candidate_by_event = {
+            str(item.get("event_id") or ""): item
+            for item in candidates
+            if item.get("injected") and item.get("event_id")
+        }
+        verified_selected = []
+        for event in selected:
+            event_id = str(event.get("id") or event.get("event_id") or "")
+            candidate = candidate_by_event.get(event_id)
+            if candidate is None:
+                continue
+            evidence_ids = set(candidate.get("evidence_ids") or [])
+            value = dict(event)
+            value["_recall_kind"] = candidate.get("kind") or "direct"
+            value["chunks"] = [
+                dict(chunk)
+                for chunk in event.get("chunks") or []
+                if str(chunk.get("id") or chunk.get("chunk_id") or "") in evidence_ids
+            ][:2]
+            verified_selected.append(value)
+        selected = verified_selected
+        evidence = render_memory_evidence(selected, max_total_chars=5000, max_events=5, max_associations=2)
+        return {
+            **trace,
+            "used_fallback": used_fallback,
+            "mode": (
+                "empty"
+                if not candidates
+                else ("fallback" if used_fallback else "llm")
+            ),
+            "candidates": candidates,
+            "events": [_event_dto(event, include_full=True) for event in selected],
+            "final_prompt": evidence.text,
+            "prompt_reconstructed": True,
+        }
+
+
+def _body_query(body: Mapping[str, Any]) -> str:
+    return str(body.get("query") or body.get("keyword") or body.get("current_message") or body.get("message") or "").strip()
+
+
+def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
+    async def resolved(request: Request) -> tuple[str, MemoryBrainStore] | JSONResponse:
+        return api.resolve(request)
+
+    async def stats(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
         try:
-            session_id = request.query_params.get("session_id", "")
-            limit = min(int(request.query_params.get("limit", 200)), 500)
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            conn.row_factory = sqlite3.Row
-            sql = "SELECT * FROM memory_atoms WHERE is_active = 1"
-            params: list = []
-            if session_id:
-                sql += " AND session_id = ?"
-                params.append(session_id)
-            sql += " ORDER BY created_at DESC LIMIT ?"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-            conn.close()
-            graph = _build_graph_snapshot_shared(rows)
-            graph["enabled"] = True
-            graph["mode"] = "overview"
-            graph["sessions"] = {}
-            graph["account_id"] = request.path_params.get("account_id", "")
-            return ok(graph)
-        except Exception as e:
-            return fail_internal(str(e))
+            return ok(api.stats(store, account_id))
+        except Exception:
+            logger.exception("读取记忆统计失败", extra={"account_id": account_id})
+            return fail_internal("读取记忆统计失败")
 
-    async def account_memory_graph_query(request: Request) -> JSONResponse:
-        """POST /api/accounts/{id}/memory/graph/query — 账号关键词搜索子图"""
-        # POST — 禁用账号写操作拒绝（graph query 是 POST 读操作，但遵循 POST→写拒绝规则）
-        disabled_err = _reject_if_disabled(request)
-        if disabled_err:
-            return disabled_err
-        data_dir, err = await _resolve_or_fail(request)
-        if err:
-            return err
+    async def listing(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            return ok(api.list_events(request, store))
+        except Exception:
+            logger.exception("读取记忆列表失败", extra={"account_id": account_id})
+            return fail_internal("读取记忆列表失败")
+
+    async def detail(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            item = api.detail(store, str(request.path_params.get("mem_id") or ""))
+            return ok(item) if item else fail("NOT_FOUND", "记忆不存在", status_code=404)
+        except Exception:
+            logger.exception("读取记忆详情失败", extra={"account_id": account_id})
+            return fail_internal("读取记忆详情失败")
+
+    async def search(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            body = await request.json() if request.method == "POST" else dict(request.query_params)
+            if not isinstance(body, Mapping):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+            query = _body_query(body)
+            result = api.search(store, query, _bounded_int(body.get("limit"), 20, 1, 100))
+            result["items"] = [{key: val for key, val in item.items() if key != "_event"} for item in result["items"]]
+            return ok(result)
+        except Exception:
+            logger.exception("搜索记忆失败", extra={"account_id": account_id})
+            return fail_internal("搜索记忆失败")
+
+    async def recall(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
         try:
             body = await request.json()
-            keyword = str(body.get("query", "")).strip()
-            memory_id = body.get("memory_id")
-            session_id = str(body.get("session_id", "")).strip()
-            limit = min(int(body.get("limit", 100)), 300)
-            conn = _get_conn(data_dir)
-            _ensure_schema(conn, data_dir)
-            conn.row_factory = sqlite3.Row
-            sql = "SELECT * FROM memory_atoms WHERE is_active = 1"
-            params: list = []
-            if memory_id:
-                sql += " AND id = ?"
-                params.append(int(memory_id))
-            elif keyword:
-                sql += " AND content LIKE ?"
-                params.append(f"%{keyword}%")
-            if session_id:
-                sql += " AND session_id = ?"
-                params.append(session_id)
-            sql += " ORDER BY created_at DESC LIMIT ?"
-            params.append(limit)
-            rows = conn.execute(sql, params).fetchall()
-            conn.close()
-            graph = _build_graph_snapshot_shared(rows)
-            graph["enabled"] = True
-            graph["mode"] = "query"
-            graph["sessions"] = {}
-            graph["account_id"] = request.path_params.get("account_id", "")
-            if memory_id and rows:
-                graph["matched_node_ids"] = [int(rows[0]["id"])]
-            elif keyword:
-                graph["matched_node_ids"] = [int(r["id"]) for r in rows[:10]]
-            else:
-                graph["matched_node_ids"] = []
-            return ok(graph)
-        except Exception as e:
-            return fail_internal(str(e))
+            if not isinstance(body, Mapping):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+            message = _body_query(body)
+            if not message:
+                return fail("INVALID_INPUT", "query 不能为空", status_code=400)
+            recent_turns = body.get("recent_turns") or []
+            if not isinstance(recent_turns, list):
+                return fail("INVALID_INPUT", "recent_turns 必须是数组", status_code=400)
+            query = RecallQuery(
+                current_message=message,
+                recent_turns=recent_turns,
+                account_id=account_id,
+                speaker_actor_id=str(body.get("speaker_actor_id") or ""),
+                title=str(body.get("title") or ""),
+                bvid=str(body.get("bvid") or ""),
+                oid=str(body.get("oid") or ""),
+                scene=str(body.get("scene") or "memory_debug"),
+                explicit_ids=tuple(body.get("explicit_ids") or ()),
+                entity_hints=tuple(body.get("entity_hints") or ()),
+            )
+            result, persisted_trace_id = await api._call_recall(account_id, store, query)
+            return ok(api.recall_result(store, query, result, persisted_trace_id))
+        except Exception:
+            logger.exception("记忆召回调试失败", extra={"account_id": account_id})
+            return fail_internal("记忆召回调试失败")
+
+    async def delete(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        rejected = api.reject_mutation(account_id)
+        if rejected:
+            return rejected
+        event_id = str(request.path_params.get("mem_id") or "")
+        try:
+            deleted = store.hard_delete_event(event_id, reason="admin_api", deleted_by="admin")
+            if not deleted:
+                return fail("NOT_FOUND", "记忆不存在", status_code=404)
+            await api.audit_mutation("hard_delete", account_id, object_id=event_id)
+            return ok({"id": event_id, "deleted": True, "tombstone": True}, "记忆已永久删除")
+        except Exception:
+            logger.exception("永久删除记忆失败", extra={"account_id": account_id, "event_id": event_id})
+            return fail_internal("永久删除记忆失败")
+
+    async def graph(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            return ok(api.graph(store))
+        except Exception:
+            logger.exception("读取记忆图谱失败", extra={"account_id": account_id})
+            return fail_internal("读取记忆图谱失败")
+
+    async def graph_query(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            body = await request.json()
+            if not isinstance(body, Mapping):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+            query = _body_query(body)
+            if not query:
+                return ok(api.graph(store))
+            hits = api.search(store, query, limit=50)["items"]
+            event_ids = [str(item["id"]) for item in hits]
+            related = store.related_events(event_ids, limit=50)
+            event_ids.extend(str(item.get("event_id") or "") for item in related)
+            return ok(api.graph(store, event_ids))
+        except Exception:
+            logger.exception("查询记忆图谱失败", extra={"account_id": account_id})
+            return fail_internal("查询记忆图谱失败")
+
+    async def traces(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            limit = _bounded_int(request.query_params.get("limit"), 100, 1, 500)
+            offset = _bounded_int(request.query_params.get("offset"), 0, 0, 1_000_000)
+            items = store.list_recall_traces(limit=limit, offset=offset)
+            return ok({"items": items, "limit": limit, "offset": offset})
+        except Exception:
+            logger.exception("读取召回记录失败", extra={"account_id": account_id})
+            return fail_internal("读取召回记录失败")
+
+    async def trace_detail(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            item = api.trace_detail(store, str(request.path_params.get("trace_id") or ""))
+            return ok(item) if item else fail("NOT_FOUND", "召回记录不存在", status_code=404)
+        except Exception:
+            logger.exception("读取召回记录详情失败", extra={"account_id": account_id})
+            return fail_internal("读取召回记录详情失败")
+
+    async def jobs(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        try:
+            status = str(request.query_params.get("status") or "").strip() or None
+            limit = _bounded_int(request.query_params.get("limit"), 100, 1, 500)
+            offset = _bounded_int(request.query_params.get("offset"), 0, 0, 1_000_000)
+            items = store.list_jobs(status=status, limit=limit, offset=offset)
+            return ok({"items": items, "limit": limit, "offset": offset, "status": status})
+        except Exception:
+            logger.exception("读取记忆任务失败", extra={"account_id": account_id})
+            return fail_internal("读取记忆任务失败")
+
+    async def retry_job(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        rejected = api.reject_mutation(account_id)
+        if rejected:
+            return rejected
+        job_id = str(request.path_params.get("job_id") or "")
+        try:
+            if not store.retry_dead_letter(job_id):
+                return fail("NOT_FOUND", "死信任务不存在或当前不可重试", status_code=404)
+            await api.audit_mutation("retry_dead_letter", account_id, object_id=job_id)
+            return ok({"id": job_id, "status": "pending"}, "任务已重新排队")
+        except Exception:
+            logger.exception("重试记忆任务失败", extra={"account_id": account_id, "job_id": job_id})
+            return fail_internal("重试记忆任务失败")
+
+    async def reindex(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        rejected = api.reject_mutation(account_id)
+        if rejected:
+            return rejected
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, Mapping):
+            return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+        try:
+            event_id = str(body.get("event_id") or "").strip()
+            if event_id and not store.get_event(event_id, chunks_per_event=0):
+                return fail("NOT_FOUND", "记忆不存在", status_code=404)
+            if not event_id:
+                report = store.reindex_all(
+                    clear_enrichment=bool(body.get("clear_enrichment", True))
+                )
+                await api.audit_mutation(
+                    "reindex",
+                    account_id,
+                    details={"events_requeued": int(report.get("events") or 0)},
+                )
+                return ok({**report, "event_id": None})
+
+            fts = store.rebuild_fts()
+            events = [store.get_event(event_id, chunks_per_event=0)]
+            requeued = 0
+            for event in events:
+                if not event:
+                    continue
+                changed = False
+                for job_type in _JOB_TYPES:
+                    changed = store.requeue_event_job(str(event["id"]), job_type) or changed
+                if changed:
+                    store.set_event_index_status(str(event["id"]), "pending")
+                    requeued += 1
+            await api.audit_mutation(
+                "reindex",
+                account_id,
+                object_id=event_id,
+                details={"events_requeued": requeued},
+            )
+            return ok({"fts": fts, "events_requeued": requeued, "event_id": event_id or None})
+        except Exception:
+            logger.exception("重建记忆索引失败", extra={"account_id": account_id})
+            return fail_internal("重建记忆索引失败")
+
+    return {
+        "stats": stats,
+        "listing": listing,
+        "detail": detail,
+        "search": search,
+        "recall": recall,
+        "delete": delete,
+        "graph": graph,
+        "graph_query": graph_query,
+        "traces": traces,
+        "trace_detail": trace_detail,
+        "jobs": jobs,
+        "retry_job": retry_job,
+        "reindex": reindex,
+    }
+
+
+def create_account_memory_routes(account_manager: Any) -> list[Route]:
+    """Create the authoritative account-scoped V6 memory routes."""
+
+    api = _MemoryApi(account_manager, getattr(account_manager, "data_root", "./data"))
+    handlers = _account_handlers(api)
+
+    async def migrate(_request: Request) -> JSONResponse:
+        return _gone_response()
 
     return [
-        Route("/api/accounts/{account_id}/memory/stats", account_memory_stats, methods=["GET"]),
-        Route("/api/accounts/{account_id}/memory/search", account_memory_search, methods=["POST"]),
-        Route("/api/accounts/{account_id}/memory/migrate", account_memory_migrate, methods=["POST"]),
-        Route("/api/accounts/{account_id}/memory/graph", account_memory_graph, methods=["GET"]),
-        Route("/api/accounts/{account_id}/memory/graph/query", account_memory_graph_query, methods=["POST"]),
-        Route("/api/accounts/{account_id}/memory", account_memory_list, methods=["GET"]),
-        Route("/api/accounts/{account_id}/memory/{mem_id}", account_memory_get, methods=["GET"]),
-        Route("/api/accounts/{account_id}/memory/{mem_id}", account_memory_delete, methods=["DELETE"]),
+        Route("/api/accounts/{account_id}/memory/stats", handlers["stats"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/search", handlers["search"], methods=["GET", "POST"]),
+        Route("/api/accounts/{account_id}/memory/recall", handlers["traces"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/recall", handlers["recall"], methods=["POST"]),
+        Route("/api/accounts/{account_id}/memory/recall/{trace_id}", handlers["trace_detail"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/recall-traces", handlers["traces"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/recall-traces/{trace_id}", handlers["trace_detail"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/graph", handlers["graph"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/graph/query", handlers["graph_query"], methods=["POST"]),
+        Route("/api/accounts/{account_id}/memory/reindex", handlers["reindex"], methods=["POST"]),
+        Route("/api/accounts/{account_id}/memory/jobs", handlers["jobs"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/jobs/{job_id}/retry", handlers["retry_job"], methods=["POST"]),
+        Route("/api/accounts/{account_id}/memory/migrate", migrate, methods=["POST"]),
+        Route("/api/accounts/{account_id}/memory", handlers["listing"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/{mem_id}", handlers["detail"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/{mem_id}", handlers["delete"], methods=["DELETE"]),
     ]
 
 
-def _build_graph_snapshot_shared(rows: List[sqlite3.Row]) -> Dict[str, Any]:
-    """MEM-502：共享图谱快照构建（供根级和账号级路由复用）
+def create_memory_routes(
+    persona_store: Any,
+    scheduler: Any = None,
+    data_dir: str = "./data",
+    account_manager: Any = None,
+) -> list[Route]:
+    """Create deprecated root reads mapped to the default account's V6 brain.
 
-    节点类型：
-    - summary: 每条记忆本身
-    - person:  从 username 字段提取的用户节点
-    - topic:   从 category 字段提取的类别节点
+    Every root-level mutation remains permanently gone.  The retained arguments
+    are part of the web-panel factory contract.
     """
-    nodes: List[Dict[str, Any]] = []
-    edges: List[Dict[str, Any]] = []
-    memories: List[Dict[str, Any]] = []
-    entries: List[Dict[str, Any]] = []
 
-    person_id_map: Dict[str, int] = {}
-    topic_id_map: Dict[str, int] = {}
-    _next_person_id = -1
-    _next_topic_id = -100000
+    del persona_store, scheduler
+    api = _MemoryApi(account_manager, data_dir)
 
-    node_type_breakdown: Dict[str, int] = {"summary": 0, "person": 0, "topic": 0}
-    relation_breakdown: Dict[str, int] = {}
-    edge_counter = 0
+    def root_request(request: Request) -> Request:
+        return request
 
-    def _add_edge(src: int, tgt: int, relation: str, mem_id: int):
-        nonlocal edge_counter
-        edge_counter += 1
-        edges.append({
-            "id": edge_counter,
-            "source": src,
-            "target": tgt,
-            "relation_type": relation,
-            "memory_id": mem_id,
-            "weight": 1,
-            "confidence": 0.9,
-        })
-        relation_breakdown[relation] = relation_breakdown.get(relation, 0) + 1
+    async def root_call(request: Request, operation: str) -> JSONResponse:
+        value = api.resolve(root_request(request), root=True)
+        if isinstance(value, JSONResponse):
+            return _with_deprecation(value)
+        account_id, store = value
+        try:
+            if operation == "stats":
+                response = ok(api.stats(store, account_id))
+            elif operation == "search":
+                query = _body_query(dict(request.query_params))
+                result = api.search(
+                    store,
+                    query,
+                    _bounded_int(request.query_params.get("limit"), 20, 1, 100),
+                )
+                result["items"] = [
+                    {key: val for key, val in item.items() if key != "_event"}
+                    for item in result["items"]
+                ]
+                response = ok(result)
+            elif operation == "listing":
+                response = ok(api.list_events(request, store))
+            elif operation == "detail":
+                item = api.detail(store, str(request.path_params.get("id") or ""))
+                response = ok(item) if item else fail("NOT_FOUND", "记忆不存在", status_code=404)
+            elif operation == "graph":
+                response = ok(api.graph(store))
+            elif operation == "traces":
+                limit = _bounded_int(request.query_params.get("limit"), 100, 1, 500)
+                offset = _bounded_int(request.query_params.get("offset"), 0, 0, 1_000_000)
+                response = ok({"items": store.list_recall_traces(limit=limit, offset=offset), "limit": limit, "offset": offset})
+            elif operation == "trace_detail":
+                item = api.trace_detail(store, str(request.path_params.get("trace_id") or ""))
+                response = ok(item) if item else fail("NOT_FOUND", "召回记录不存在", status_code=404)
+            elif operation == "jobs":
+                status = str(request.query_params.get("status") or "").strip() or None
+                response = ok({"items": store.list_jobs(status=status, limit=100, offset=0)})
+            else:
+                response = fail("NOT_FOUND", "端点不存在", status_code=404)
+            return _with_deprecation(response)
+        except Exception:
+            logger.exception("读取默认账号 V6 记忆失败", extra={"account_id": account_id})
+            return _with_deprecation(fail_internal("读取记忆失败"))
 
-    for row in rows:
-        mem_id = int(row["id"])
-        content = str(row["content"] or "")
-        category = str(row["category"] or "episodic")
-        username = str(row["username"] or "") if row["username"] else ""
-        session_id = str(row["session_id"] or "") if row["session_id"] else ""
+    async def stats(request: Request) -> JSONResponse:
+        return await root_call(request, "stats")
 
-        nodes.append({
-            "id": mem_id,
-            "type": "summary",
-            "label": content[:40] + ("…" if len(content) > 40 else ""),
-            "weight": float(row["importance_score"] or 0.5),
-            "memory_count": 1,
-            "degree": 0,
-            "entry_count": 1,
-        })
-        node_type_breakdown["summary"] += 1
+    async def listing(request: Request) -> JSONResponse:
+        return await root_call(request, "listing")
 
-        memories.append({
-            "memory_id": mem_id,
-            "summary": content[:80],
-            "content": content,
-            "memory_type": category,
-            "category": category,
-            "importance": float(row["importance_score"] or 0.5),
-            "status": "active" if row["is_active"] else "archived",
-            "session_id": session_id,
-        })
+    async def search(request: Request) -> JSONResponse:
+        return await root_call(request, "search")
 
-        entry_node_ids = [mem_id]
+    async def detail(request: Request) -> JSONResponse:
+        return await root_call(request, "detail")
 
-        if username:
-            if username not in person_id_map:
-                person_id_map[username] = _next_person_id
-                _next_person_id -= 1
-                pid = person_id_map[username]
-                nodes.append({
-                    "id": pid,
-                    "type": "person",
-                    "label": username,
-                    "weight": 1,
-                    "memory_count": 0,
-                    "degree": 0,
-                    "entry_count": 0,
-                })
-                node_type_breakdown["person"] += 1
-            pid = person_id_map[username]
-            _add_edge(mem_id, pid, "mentions_user", mem_id)
-            entry_node_ids.append(pid)
+    async def graph(request: Request) -> JSONResponse:
+        return await root_call(request, "graph")
 
-        if category:
-            if category not in topic_id_map:
-                topic_id_map[category] = _next_topic_id
-                _next_topic_id -= 1
-                tid = topic_id_map[category]
-                nodes.append({
-                    "id": tid,
-                    "type": "topic",
-                    "label": category,
-                    "weight": 1,
-                    "memory_count": 0,
-                    "degree": 0,
-                    "entry_count": 0,
-                })
-                node_type_breakdown["topic"] += 1
-            tid = topic_id_map[category]
-            _add_edge(mem_id, tid, "categorized_as", mem_id)
-            entry_node_ids.append(tid)
+    async def traces(request: Request) -> JSONResponse:
+        return await root_call(request, "traces")
 
-        entries.append({
-            "memory_id": mem_id,
-            "node_ids": entry_node_ids,
-        })
+    async def trace_detail(request: Request) -> JSONResponse:
+        return await root_call(request, "trace_detail")
 
-    node_degree: Dict[int, int] = {}
-    for edge in edges:
-        node_degree[edge["source"]] = node_degree.get(edge["source"], 0) + 1
-        node_degree[edge["target"]] = node_degree.get(edge["target"], 0) + 1
-    for node in nodes:
-        node["degree"] = node_degree.get(node["id"], 0)
+    async def jobs(request: Request) -> JSONResponse:
+        return await root_call(request, "jobs")
 
-    return {
-        "snapshot": {
-            "nodes": nodes,
-            "edges": edges,
-            "memories": memories,
-            "entries": entries,
-        },
-        "summary": {
-            "node_type_breakdown": node_type_breakdown,
-            "relation_breakdown": relation_breakdown,
-        },
-        "total_memories": len(memories),
-        "graph_nodes": len(nodes),
-        "graph_edges": len(edges),
-    }
+    async def gone(_request: Request) -> JSONResponse:
+        return _gone_response()
+
+    return [
+        Route("/api/memory/stats", stats, methods=["GET"]),
+        Route("/api/memory/search", search, methods=["GET"]),
+        Route("/api/memory/recall", traces, methods=["GET"]),
+        Route("/api/memory/recall/{trace_id}", trace_detail, methods=["GET"]),
+        Route("/api/memory/recall-traces", traces, methods=["GET"]),
+        Route("/api/memory/recall-traces/{trace_id}", trace_detail, methods=["GET"]),
+        Route("/api/memory/graph", graph, methods=["GET"]),
+        Route("/api/memory/jobs", jobs, methods=["GET"]),
+        Route("/api/memory/search", gone, methods=["POST"]),
+        Route("/api/memory/recall", gone, methods=["POST"]),
+        Route("/api/memory/graph/query", gone, methods=["POST"]),
+        Route("/api/memory/reindex", gone, methods=["POST"]),
+        Route("/api/memory/jobs/{job_id}/retry", gone, methods=["POST"]),
+        Route("/api/memory/migrate", gone, methods=["POST"]),
+        Route("/api/memory", listing, methods=["GET"]),
+        Route("/api/memory/{id}", detail, methods=["GET"]),
+        Route("/api/memory/{id}", gone, methods=["DELETE", "PATCH", "PUT", "POST"]),
+    ]

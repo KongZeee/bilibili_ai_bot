@@ -27,7 +27,7 @@ from starlette.requests import Request
 logger = logging.getLogger("bilibot.api.personas")
 
 
-def create_personas_routes(persona_store, orchestrator):
+def create_personas_routes(persona_store, orchestrator, llm_manager=None):
     """创建人格相关路由"""
     from starlette.routing import Route
     from starlette.responses import JSONResponse
@@ -141,6 +141,7 @@ def create_personas_routes(persona_store, orchestrator):
             test_input = body.get("input", "")
             persona_id = body.get("persona_id")
             use_llm = body.get("use_llm", False)
+            llm_provider_id = body.get("llm_provider_id", "")
 
             if not test_input:
                 return JSONResponse({
@@ -170,9 +171,23 @@ def create_personas_routes(persona_store, orchestrator):
             }
 
             # 可选：真实 LLM 调用
-            if use_llm and orchestrator.memory:
+            if use_llm:
+                provider = llm_manager.resolve_chat(llm_provider_id) if llm_manager else None
+                if provider is None:
+                    if not llm_provider_id:
+                        # 未指定 Provider 且无默认 LLM
+                        return JSONResponse({
+                            "success": False,
+                            "error": {"code": "LLM_NOT_CONFIGURED", "message": "请先配置 LLM", "details": {}},
+                        }, status_code=400)
+                    else:
+                        # 指定了 Provider 但找不到
+                        return JSONResponse({
+                            "success": False,
+                            "error": {"code": "LLM_NOT_FOUND", "message": "找不到 LLM Provider", "details": {}},
+                        }, status_code=400)
                 try:
-                    output = await orchestrator.memory.llm.generate(
+                    output = await provider.generate(
                         prompt=user_prompt,
                         system_prompt=system_prompt,
                         max_tokens=200,
@@ -200,9 +215,20 @@ def create_personas_routes(persona_store, orchestrator):
         })
 
     async def import_persona(request: Request) -> JSONResponse:
+        from .responses import fail, fail_invalid_input
         try:
-            body = await request.json()
-            persona_data = body if isinstance(body, dict) else body.get("persona", {})
+            try:
+                body = await request.json()
+            except Exception:
+                return fail_invalid_input("请求体不是合法 JSON")
+            if isinstance(body, dict) and "persona" in body:
+                persona_data = body["persona"]
+            elif isinstance(body, dict):
+                persona_data = body
+            else:
+                return fail_invalid_input("请求体必须是 JSON 对象")
+            if not isinstance(persona_data, dict):
+                return fail_invalid_input("persona 数据必须是 JSON 对象")
             persona = persona_store.import_persona(persona_data)
             return JSONResponse({
                 "success": True,
@@ -236,7 +262,8 @@ def create_personas_routes(persona_store, orchestrator):
             market = [p for p in items if p.get("github_url")]
             return JSONResponse({"success": True, "data": market})
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"列出人格市场失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def import_from_github(request: Request) -> JSONResponse:
         """从 GitHub raw URL 导入人格 JSON"""
@@ -246,6 +273,27 @@ def create_personas_routes(persona_store, orchestrator):
             url = body.get("github_url", "")
             if not url:
                 return fail("INVALID_INPUT", "缺少 github_url 参数", status_code=400)
+
+            # SSRF 防护：只允许 https + GitHub 域名
+            from urllib.parse import urlparse
+            import ipaddress
+            parsed = urlparse(url)
+            if parsed.scheme != "https":
+                return fail("INVALID_INPUT", "仅支持 https:// 协议", status_code=400)
+            allowed_hosts = ("raw.githubusercontent.com", "github.com", "gist.githubusercontent.com")
+            if parsed.hostname not in allowed_hosts:
+                return fail("INVALID_INPUT", f"仅支持 GitHub 域名: {allowed_hosts}", status_code=400)
+            # 防止通过域名解析到内网 IP（再校验一次解析结果）
+            try:
+                import socket
+                resolved_ips = socket.getaddrinfo(parsed.hostname, None)
+                for _, _, _, sockaddr in resolved_ips:
+                    ip = ipaddress.ip_address(sockaddr[0])
+                    if ip.is_private or ip.is_loopback or ip.is_link_local:
+                        return fail("INVALID_INPUT", "目标地址解析到内网 IP，拒绝请求", status_code=400)
+            except (socket.gaierror, ValueError):
+                pass
+
             import urllib.request, json as _json
             req = urllib.request.Request(url, headers={"User-Agent": "BiliBot-Market/1.0"})
             with urllib.request.urlopen(req, timeout=10) as resp:
@@ -253,7 +301,8 @@ def create_personas_routes(persona_store, orchestrator):
             persona = persona_store.import_persona(data)
             return JSONResponse({"success": True, "message": "imported", "data": persona})
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"从 GitHub 导入人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     # ── P3: 自动人格评测 ──
 
@@ -264,10 +313,23 @@ def create_personas_routes(persona_store, orchestrator):
             persona_id = request.path_params.get("id")
             body = await request.json() if request.method == "POST" else {}
             use_llm = body.get("use_llm", False)
+            llm_provider_id = body.get("llm_provider_id", "")
 
             persona = persona_store._personas.get(persona_id) if persona_id else None
             if not persona:
                 return fail("NOT_FOUND", f"人格 {persona_id} 不存在", status_code=404)
+
+            # 解析 LLM Provider（仅在 use_llm 时）
+            provider = None
+            if use_llm:
+                provider = llm_manager.resolve_chat(llm_provider_id) if llm_manager else None
+                if provider is None:
+                    if not llm_provider_id:
+                        # 未指定 Provider 且无默认 LLM
+                        return fail("LLM_NOT_CONFIGURED", "请先配置 LLM", status_code=400)
+                    else:
+                        # 指定了 Provider 但找不到
+                        return fail("LLM_NOT_FOUND", "找不到 LLM Provider", status_code=400)
 
             test_cases = [
                 ("UP主更新啦！快来看~", "reply_comment"),
@@ -285,9 +347,9 @@ def create_personas_routes(persona_store, orchestrator):
                 sc, checks = _score_persona_rules(persona)
                 output_text = ""
                 llm_err = None
-                if use_llm and orchestrator.memory:
+                if use_llm and provider:
                     try:
-                        output_text = await orchestrator.memory.llm.generate(
+                        output_text = await provider.generate(
                             prompt=up, system_prompt=sp, max_tokens=120,
                         )
                     except Exception as e:
@@ -315,7 +377,8 @@ def create_personas_routes(persona_store, orchestrator):
                 "results": results,
             }})
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"评估人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     def _score_persona_rules(persona) -> tuple:
         score = 60
@@ -341,14 +404,14 @@ def create_personas_routes(persona_store, orchestrator):
         Route("/api/personas/current", get_current_persona, methods=["GET"]),
         Route("/api/personas/preview", preview_prompt, methods=["GET"]),
         Route("/api/personas/test", test_persona, methods=["POST"]),
+        Route("/api/personas/market", list_personas_market, methods=["GET"]),
+        Route("/api/personas/import", import_persona, methods=["POST"]),
+        Route("/api/personas/import/github", import_from_github, methods=["POST"]),
         Route("/api/personas/{id}", get_persona, methods=["GET"]),
         Route("/api/personas/{id}", update_persona, methods=["PATCH"]),
         Route("/api/personas/{id}", delete_persona, methods=["DELETE"]),
         Route("/api/personas/{id}/activate", activate_persona, methods=["POST"]),
         Route("/api/personas/{id}/copy", copy_persona, methods=["POST"]),
-        Route("/api/personas/import", import_persona, methods=["POST"]),
         Route("/api/personas/{id}/export", export_persona, methods=["GET"]),
-        Route("/api/personas/market", list_personas_market, methods=["GET"]),
-        Route("/api/personas/import/github", import_from_github, methods=["POST"]),
         Route("/api/personas/{id}/evaluate", evaluate_persona, methods=["POST"]),
     ]

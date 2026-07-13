@@ -76,9 +76,12 @@ class InteractionPolicyEngine:
         VID-501：每个动作独立拥有 enabled / max_per_day / max_per_video / score_threshold。
         """
         cfg = self._interactions_cfg.get(action, {}) or {}
+        # Task 22.1：comment 默认日上限与 CommentPolicy.DEFAULT_MAX_PER_DAY 一致，
+        # 避免开启 enabled 却未显式配置 max_per_day 时被静默全禁
+        default_max_per_day = CommentPolicy.DEFAULT_MAX_PER_DAY if action == "comment" else 0
         return {
             "enabled": bool(cfg.get("enabled", False)),
-            "max_per_day": int(cfg.get("max_per_day", 0)),
+            "max_per_day": int(cfg.get("max_per_day", default_max_per_day)),
             # 每个动作独立的 per-video 限制（默认 1）；coin 可在配置中放大
             "max_per_video": int(cfg.get("max_per_video", 1)),
             "score_threshold": float(cfg.get("score_threshold",
@@ -238,9 +241,12 @@ class InteractionPolicyEngine:
             return {"planned": False, "reason": f"score_below_{cfg['score_threshold']}", "cfg": cfg}
 
         # 4. 日预算
-        used_today = self._count_today(action)
-        if used_today >= cfg["max_per_day"]:
-            return {"planned": False, "reason": "daily_budget_exhausted", "cfg": cfg, "used": used_today}
+        # Task 22.2：comment 的日预算交由 CommentPolicy 接管（计 proactive_comments 表），
+        # interaction_log 的 comment 计数可能与回复评论混计，故此处跳过 comment 的日预算判断
+        if action != "comment":
+            used_today = self._count_today(action)
+            if used_today >= cfg["max_per_day"]:
+                return {"planned": False, "reason": "daily_budget_exhausted", "cfg": cfg, "used": used_today}
 
         # 5. 视频级去重（VID-501：每个动作独立 per-video 限制 + 账号级去重）
         max_per_video = cfg.get("max_per_video", 1)

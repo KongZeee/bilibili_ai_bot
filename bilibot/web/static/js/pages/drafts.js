@@ -2,7 +2,7 @@
 const { h, ref, reactive, onMounted, computed } = window.Vue;
 import { appState, refreshAccounts } from '../state.js';
 import { api } from '../api.js';
-import { Button, Badge, FormSelect, FormTextarea, Modal, EmptyState, Pagination, Loading } from '../components/common.js';
+import { Button, Badge, FormSelect, FormTextarea, Modal, ConfirmModal, createConfirmHelper, EmptyState, Pagination, Loading } from '../components/common.js';
 import { formatTime } from '../utils.js';
 
 export const DraftsPage = {
@@ -29,10 +29,7 @@ export const DraftsPage = {
             draft: null,
         });
 
-        const filteredDrafts = computed(() => {
-            if (filterStatus.value === 'all') return drafts.value;
-            return drafts.value.filter(d => d.status === filterStatus.value);
-        });
+        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
 
         const statusFilters = [
             { value: 'pending', label: '待审核' },
@@ -46,7 +43,11 @@ export const DraftsPage = {
             if (!selectedAccount.value) return;
             loading.value = true;
             try {
-                const data = await api.dynamicDrafts.list(selectedAccount.value);
+                const data = await api.dynamicDrafts.list(selectedAccount.value, {
+                    status: filterStatus.value === 'all' ? undefined : filterStatus.value,
+                    page: page.value,
+                    page_size: pageSize,
+                });
                 drafts.value = data.items || data || [];
                 total.value = data.total || drafts.value.length || 0;
             } catch (e) {
@@ -56,44 +57,67 @@ export const DraftsPage = {
             }
         }
 
-        async function approve(draft) {
-            if (!confirm(`确认通过草稿 #${draft.id}？将通过审核并加入发布队列。`)) return;
-            try {
-                await api.dynamicDrafts.approve(selectedAccount.value, draft.id);
-                appState.notify('草稿已通过', 'success');
-                refresh();
-            } catch (e) {
-                appState.notify('操作失败：' + (e.message || e), 'danger');
-            }
+        // BUG F-004：approve 必须带 expected_revision（乐观锁）
+        function approve(draft) {
+            showConfirm({
+                title: '确认通过',
+                message: `确认通过草稿 #${draft.id}？将通过审核并加入发布队列。`,
+                confirmText: '通过',
+                action: async () => {
+                    try {
+                        await api.dynamicDrafts.approve(selectedAccount.value, draft.id,
+                            { expected_revision: draft.revision });
+                        appState.notify('草稿已通过', 'success');
+                        refresh();
+                    } catch (e) {
+                        appState.notify('操作失败：' + (e.message || e), 'danger');
+                    }
+                },
+            });
         }
 
-        async function reject(draft) {
-            const reason = prompt(`拒绝草稿 #${draft.id} 的原因（可选）：`);
-            if (reason === null) return;
-            try {
-                await api.dynamicDrafts.reject(selectedAccount.value, draft.id, reason || '');
-                appState.notify('草稿已拒绝', 'success');
-                refresh();
-            } catch (e) {
-                appState.notify('操作失败：' + (e.message || e), 'danger');
-            }
+        // BUG F-006：后端读 note 不读 reason
+        function reject(draft) {
+            showConfirm({
+                title: '拒绝草稿',
+                message: `拒绝草稿 #${draft.id} 的原因（可选）：`,
+                confirmText: '拒绝',
+                danger: true,
+                prompt: true,
+                promptPlaceholder: '输入拒绝原因…',
+                action: async (reason) => {
+                    try {
+                        await api.dynamicDrafts.reject(selectedAccount.value, draft.id, reason || '');
+                        appState.notify('草稿已拒绝', 'success');
+                        refresh();
+                    } catch (e) {
+                        appState.notify('操作失败：' + (e.message || e), 'danger');
+                    }
+                },
+            });
         }
 
-        async function retry(draft) {
-            if (!confirm(`重新生成草稿 #${draft.id}？将调用 LLM 重新生成内容。`)) return;
-            try {
-                await api.dynamicDrafts.retry(selectedAccount.value, draft.id);
-                appState.notify('已触发重新生成', 'info');
-                setTimeout(refresh, 1500);
-            } catch (e) {
-                appState.notify('操作失败：' + (e.message || e), 'danger');
-            }
+        function retry(draft) {
+            showConfirm({
+                title: '重新生成',
+                message: `重新生成草稿 #${draft.id}？将调用 LLM 重新生成内容。`,
+                confirmText: '重新生成',
+                action: async () => {
+                    try {
+                        await api.dynamicDrafts.retry(selectedAccount.value, draft.id);
+                        appState.notify('已触发重新生成', 'info');
+                        setTimeout(refresh, 1500);
+                    } catch (e) {
+                        appState.notify('操作失败：' + (e.message || e), 'danger');
+                    }
+                },
+            });
         }
 
         function openEdit(draft) {
             editModal.draft = draft;
             editModal.content = draft.content || '';
-            editModal.version = draft.version;
+            editModal.revision = draft.revision;  // BUG F-005: 字段是 revision，不是 version
             editModal.saving = false;
             editModal.visible = true;
         }
@@ -102,16 +126,17 @@ export const DraftsPage = {
             if (!editModal.draft) return;
             editModal.saving = true;
             try {
+                // BUG F-005: 后端要求 expected_revision，不认 version
                 await api.dynamicDrafts.update(selectedAccount.value, editModal.draft.id, {
                     content: editModal.content,
-                    version: editModal.version,
+                    expected_revision: editModal.revision,
                 });
                 appState.notify('草稿已保存', 'success');
                 editModal.visible = false;
                 refresh();
             } catch (e) {
                 const msg = e.message || String(e);
-                if (msg.includes('version') || msg.includes('409')) {
+                if (msg.includes('version') || msg.includes('409') || msg.includes('revision')) {
                     appState.notify('草稿已被其他人修改，请刷新后重试', 'warning');
                 } else {
                     appState.notify('保存失败：' + msg, 'danger');
@@ -225,11 +250,12 @@ export const DraftsPage = {
                                 onClick: () => {
                                     filterStatus.value = f.value;
                                     page.value = 1;
+                                    refresh();
                                 },
                             }, f.label)),
                         ),
                     ]),
-                    filteredDrafts.value.length === 0
+                    drafts.value.length === 0
                         ? h(EmptyState, { icon: 'folder', title: '暂无草稿', desc: '当前账号没有待审核的动态草稿' })
                         : h('div', { class: 'grid', style: 'gap:0; min-width:0;' }, [
                             // 表头
@@ -244,7 +270,7 @@ export const DraftsPage = {
                                 h('span', { class: 'whitespace-nowrap' }, '操作'),
                             ]),
                             // 数据行
-                            ...filteredDrafts.value.map(d => h('div', {
+                            ...drafts.value.map(d => h('div', {
                                 key: d.id,
                                 class: 'grid items-center',
                                 style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;`,
@@ -258,7 +284,16 @@ export const DraftsPage = {
                                     class: 'truncate',
                                     style: 'cursor:pointer; min-width:0;',
                                     title: d.content || '',
+                                    role: 'button',
+                                    tabindex: '0',
+                                    'aria-label': '预览草稿内容',
                                     onClick: () => openPreview(d),
+                                    onKeydown: (e) => {
+                                        if (e.key === 'Enter' || e.key === ' ') {
+                                            e.preventDefault();
+                                            openPreview(d);
+                                        }
+                                    },
                                 }, d.content || '(空)'),
                                 h('span', {
                                     class: ['badge',
@@ -336,6 +371,20 @@ export const DraftsPage = {
                         ),
                     ]),
                     footer: () => h(Button, { onClick: () => previewModal.visible = false }, () => '关闭'),
+                }),
+
+                // ═══ 确认对话框 ═══
+                h(ConfirmModal, {
+                    modelValue: confirmState.visible,
+                    title: confirmState.title,
+                    message: confirmState.message,
+                    confirmText: confirmState.confirmText,
+                    cancelText: confirmState.cancelText,
+                    danger: confirmState.danger,
+                    prompt: confirmState.prompt,
+                    promptPlaceholder: confirmState.promptPlaceholder,
+                    'onUpdate:modelValue': (v) => confirmState.visible = v,
+                    onConfirm: handleConfirm,
                 }),
             ]);
     },

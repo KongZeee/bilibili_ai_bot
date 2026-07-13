@@ -16,6 +16,7 @@ PRD V4 ACC-003：二维码登录安全模型
 - POST /api/accounts/{id}/qr-login            - 创建目标绑定的登录会话
 - GET  /api/accounts/{id}/qr-login/{session}  - 鉴权轮询并定向写入
 """
+import asyncio
 import hashlib
 import logging
 import time
@@ -29,16 +30,28 @@ from .responses import ok, fail, fail_internal
 logger = logging.getLogger("bilibot.api.accounts")
 
 
-def _save_accounts_to_config(config_loader, account_manager, config_path: str):
-    """将账号配置持久化到 config.yaml"""
+_config_write_lock = None  # asyncio.Lock，延迟初始化（须在 event loop 中创建）
+
+
+def _get_config_write_lock() -> "asyncio.Lock":
+    """延迟初始化配置写锁（首次调用须在 event loop 中）"""
+    global _config_write_lock
+    if _config_write_lock is None:
+        _config_write_lock = asyncio.Lock()
+    return _config_write_lock
+
+
+async def _save_accounts_to_config(config_loader, account_manager, config_path: str):
+    """将账号配置持久化到 config.yaml（加锁防止并发读-改-写丢失修改）"""
     try:
-        raw = config_loader.get_raw_config()
-        accounts_dict = account_manager.save_to_config()
-        raw["accounts"] = accounts_dict["accounts"]
-        raw["default_account"] = accounts_dict["default_account"]
-        raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-        config_loader.save_config(raw, config_path)
-        return True
+        async with _get_config_write_lock():
+            raw = config_loader.get_raw_config()
+            accounts_dict = account_manager.save_to_config()
+            raw["accounts"] = accounts_dict["accounts"]
+            raw["default_account"] = accounts_dict["default_account"]
+            raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
+            config_loader.save_config(raw, config_path)
+            return True
     except Exception as e:
         logger.error(f"持久化账号配置失败: {e}")
         return False
@@ -52,7 +65,14 @@ def _validate_llm_id(llm_manager, llm_id: str):
     """
     if not llm_id:
         return None  # 空 llm_id 允许（使用默认）
-    provider = llm_manager.get_provider(llm_id)
+    # get_provider()/resolve_chat() intentionally falls back to the routed
+    # default. Validation must inspect the exact configured provider instead,
+    # otherwise an unknown ID is silently accepted as the default provider.
+    providers = getattr(llm_manager, "_providers", None)
+    if isinstance(providers, dict):
+        provider = providers.get(llm_id)
+    else:
+        provider = llm_manager.get_provider(llm_id)
     if provider is None:
         return ("LLM_PROVIDER_NOT_FOUND", f"LLM Provider 不存在: {llm_id}")
     if not provider.enabled:
@@ -88,6 +108,17 @@ _qr_session_keys: dict = {}
 
 _QR_SESSION_TTL = 180  # 秒
 _QR_TERMINAL_STATUSES = ("confirmed", "expired", "cancelled")
+_QR_TERMINAL_RETENTION = 300  # 终态会话保留 5 分钟（用于 410 响应后清理）
+
+_qr_lock = None  # asyncio.Lock，延迟初始化（须在 event loop 中创建）
+
+
+def _get_qr_lock() -> "asyncio.Lock":
+    """延迟初始化 QR 会话锁（首次调用须在 event loop 中）"""
+    global _qr_lock
+    if _qr_lock is None:
+        _qr_lock = asyncio.Lock()
+    return _qr_lock
 
 
 def _extract_admin_token(request: Request) -> str:
@@ -115,17 +146,29 @@ def _short(value: str, n: int = 8) -> str:
     return value[:n] + "..." if len(value) > n else value
 
 
-def _cleanup_qr_session(session_id: str):
-    """移除会话的临时 key（终态会话保留在 _qr_sessions 中用于 410 响应）"""
-    _qr_session_keys.pop(session_id, None)
-
-
 def _invalidate_qr_session(session_id: str, status: str):
-    """标记会话为终态并移除临时 key"""
+    """标记会话为终态并移除临时 key（调用方须持有 _qr_lock）"""
     sess = _qr_sessions.get(session_id)
     if sess is not None:
         sess["status"] = status
+        sess["terminal_at"] = time.time()
     _qr_session_keys.pop(session_id, None)
+
+
+async def _cleanup_terminal_qr_sessions():
+    """清理超过保留期的终态会话（防止内存泄漏）
+
+    终态会话（confirmed/expired/cancelled）保留 _QR_TERMINAL_RETENTION 秒
+    用于 410 响应，超期后删除。
+    """
+    now = time.time()
+    async with _get_qr_lock():
+        for sid in list(_qr_sessions.keys()):
+            sess = _qr_sessions[sid]
+            terminal_at = sess.get("terminal_at")
+            if terminal_at is not None and (now - terminal_at) > _QR_TERMINAL_RETENTION:
+                _qr_sessions.pop(sid, None)
+                _qr_session_keys.pop(sid, None)
 
 
 def create_accounts_routes(account_manager, config_loader, config_path: str = "config.yaml"):
@@ -153,7 +196,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             if err:
                 return fail(err[0], err[1])
             account_manager.add_account(body)
-            _save_accounts_to_config(config_loader, account_manager, config_path)
+            await _save_accounts_to_config(config_loader, account_manager, config_path)
             # ACC-501：账号可能 enabled=false（无运行时实例），用 get_account_status
             status = account_manager.get_account_status(acc_id)
             _enrich_llm_status(status, llm_manager)
@@ -161,7 +204,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         except ValueError as e:
             return fail("VALIDATION_ERROR", str(e))
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"添加账号失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def delete_account(request: Request) -> JSONResponse:
         acc_id = request.path_params.get("id")
@@ -171,7 +215,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         removed = await account_manager.remove_account_async(acc_id)
         if not removed:
             return fail("NOT_FOUND", f"账号不存在: {acc_id}")
-        _save_accounts_to_config(config_loader, account_manager, config_path)
+        await _save_accounts_to_config(config_loader, account_manager, config_path)
         return ok(message="账号已删除")
 
     async def update_account(request: Request) -> JSONResponse:
@@ -190,19 +234,20 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                     return fail(err[0], err[1])
             # ACC-501：通过配置注册表更新（敏感字段占位符保留原值）
             account_manager.update_account_config(acc_id, body)
-            _save_accounts_to_config(config_loader, account_manager, config_path)
+            await _save_accounts_to_config(config_loader, account_manager, config_path)
             # ACC-501：用 get_account_status 支持禁用账号
             status = account_manager.get_account_status(acc_id)
             _enrich_llm_status(status, llm_manager)
             return ok(status, "账号配置已更新（重启后生效）")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"更新账号配置失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def set_default(request: Request) -> JSONResponse:
         acc_id = request.path_params.get("id")
         if not account_manager.set_default(acc_id):
             return fail("NOT_FOUND", f"账号不存在: {acc_id}")
-        _save_accounts_to_config(config_loader, account_manager, config_path)
+        await _save_accounts_to_config(config_loader, account_manager, config_path)
         return ok(message=f"默认账号已设置为: {acc_id}")
 
     async def bind_persona(request: Request) -> JSONResponse:
@@ -255,7 +300,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 "profile_id": acc.profile_id,
                 "persona_id": acc.persona_id,
             })
-            _save_accounts_to_config(config_loader, account_manager, config_path)
+            await _save_accounts_to_config(config_loader, account_manager, config_path)
             active = acc.persona_store.get_account_persona_id(acc_id) or "(默认)"
             return ok({
                 "profile_id": acc.profile_id,
@@ -263,7 +308,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 "available_personas": acc.persona_store.get_available_personas_for_account(acc_id),
             }, f"账号 {acc_id} 人格已绑定: {active}")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"绑定人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def switch_persona(request: Request) -> JSONResponse:
         """切换账号当前激活的人格（仅当账号绑定了 profile 时有效）
@@ -286,13 +332,14 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             acc.account_config["persona_id"] = persona_id
             # ACC-501：同步到配置注册表
             account_manager.update_account_config(acc_id, {"persona_id": persona_id})
-            _save_accounts_to_config(config_loader, account_manager, config_path)
+            await _save_accounts_to_config(config_loader, account_manager, config_path)
             return ok({
                 "active_persona_id": persona_id,
                 "available_personas": acc.persona_store.get_available_personas_for_account(acc_id),
             }, f"账号 {acc_id} 已切换人格: {persona_id}")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"切换人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def list_account_personas(request: Request) -> JSONResponse:
         """列出账号可用的人格（含当前激活人格）"""
@@ -326,10 +373,11 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             acc.account_config["llm_id"] = llm_id
             # ACC-501：同步到配置注册表
             account_manager.update_account_config(acc_id, {"llm_id": llm_id})
-            _save_accounts_to_config(config_loader, account_manager, config_path)
+            await _save_accounts_to_config(config_loader, account_manager, config_path)
             return ok(message=f"账号 {acc_id} LLM 已绑定: {llm_id or '(默认)'}")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"绑定 LLM 失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def start_account(request: Request) -> JSONResponse:
         """PRD V4 BOOT-002：后台启动，立即返回 task_id 和状态，不等待调度循环"""
@@ -338,7 +386,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         if not acc:
             # ACC-501：账号可能刚通过 PATCH 启用但无运行时实例
             if not account_manager.create_runtime_instance(acc_id):
-                return fail("NOT_FOUND", f"账号不存在或未启用: {acc_id}")
+                return fail("INSTANCE_CREATE_FAILED", f"账号不存在或未启用: {acc_id}")
             acc = account_manager.get_account(acc_id)
             if not acc:
                 return fail_internal("创建账号实例失败")
@@ -358,7 +406,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 "task_id": id(acc._scheduler_task) if acc._scheduler_task else None,
             }, "账号已启动")
         except Exception as e:
-            return fail_internal(f"启动失败: {e}")
+            logger.error(f"启动账号失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def stop_account(request: Request) -> JSONResponse:
         acc_id = request.path_params.get("id")
@@ -371,7 +420,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             acc.stop()
             return ok(acc.get_status(), "账号已停止")
         except Exception as e:
-            return fail_internal(f"停止失败: {e}")
+            logger.error(f"停止账号失败: {e}", exc_info=True)
+            return fail_internal()
 
     # ═══════════════════════════════════════════════════════
     #  PRD-V5 §5.2 ACC-503：二维码登录会话闭环
@@ -398,26 +448,30 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 return fail("UNAUTHORIZED", "缺少管理员会话凭证", status_code=401)
             creator_hash = _sha256_hex(admin_token)
 
-            now = time.time()
-            # 清理该账号的过期/终态会话
-            for sid in list(_qr_sessions.keys()):
-                sess = _qr_sessions[sid]
-                if sess.get("account_id") != acc_id:
-                    continue
-                if sess.get("expire_at", 0) < now or sess.get("status") in _QR_TERMINAL_STATUSES:
-                    _qr_sessions.pop(sid, None)
-                    _qr_session_keys.pop(sid, None)
+            # 清理终态会话（全局，防止内存泄漏）
+            await _cleanup_terminal_qr_sessions()
 
-            # 同一账号同一时刻最多一个活跃会话
-            for sess in _qr_sessions.values():
-                if (sess.get("account_id") == acc_id
-                        and sess.get("expire_at", 0) >= now
-                        and sess.get("status") not in _QR_TERMINAL_STATUSES):
-                    return fail("QR_SESSION_EXISTS", "该账号已有活跃的二维码登录会话，请等待过期后重试")
+            now = time.time()
+            # 加锁：清理该账号过期/终态会话 + 检查活跃会话（TOCTOU 防护）
+            async with _get_qr_lock():
+                for sid in list(_qr_sessions.keys()):
+                    sess = _qr_sessions[sid]
+                    if sess.get("account_id") != acc_id:
+                        continue
+                    if sess.get("expire_at", 0) < now or sess.get("status") in _QR_TERMINAL_STATUSES:
+                        _qr_sessions.pop(sid, None)
+                        _qr_session_keys.pop(sid, None)
+
+                # 同一账号同一时刻最多一个活跃会话
+                for sess in _qr_sessions.values():
+                    if (sess.get("account_id") == acc_id
+                            and sess.get("expire_at", 0) >= now
+                            and sess.get("status") not in _QR_TERMINAL_STATUSES):
+                        return fail("QR_SESSION_EXISTS", "该账号已有活跃的二维码登录会话，请等待过期后重试")
 
             # 调用 B站 API 获取二维码
             from ..bilibili_qrlogin import BilibiliQRLogin
-            qr_login = BilibiliQRLogin(config_loader)
+            qr_login = BilibiliQRLogin(config_loader, config_path=config_path)
             try:
                 result = await qr_login.get_qrcode()
             finally:
@@ -429,18 +483,19 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             raw_key = result["key"]
             key_hash = _sha256_hex(raw_key)
 
-            # 创建会话（不含 raw key）
-            qr_session_id = uuid.uuid4().hex
-            _qr_sessions[qr_session_id] = {
-                "account_id": acc_id,
-                "creator_session_hash": creator_hash,
-                "qrcode_key_hash": key_hash,
-                "status": "created",
-                "expire_at": now + _QR_SESSION_TTL,
-                "created_at": now,
-            }
-            # raw key 仅临时保留在内存，用于轮询 B站 API
-            _qr_session_keys[qr_session_id] = raw_key
+            # 加锁：创建会话（不含 raw key）
+            async with _get_qr_lock():
+                qr_session_id = uuid.uuid4().hex
+                _qr_sessions[qr_session_id] = {
+                    "account_id": acc_id,
+                    "creator_session_hash": creator_hash,
+                    "qrcode_key_hash": key_hash,
+                    "status": "created",
+                    "expire_at": now + _QR_SESSION_TTL,
+                    "created_at": now,
+                }
+                # raw key 仅临时保留在内存，用于轮询 B站 API
+                _qr_session_keys[qr_session_id] = raw_key
 
             logger.info(
                 f"QR session created: sid={_short(qr_session_id)} account={acc_id} "
@@ -456,7 +511,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 "status": "created",
             }, "二维码登录会话已创建")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"创建 QR 登录会话失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def qr_login_poll(request: Request) -> JSONResponse:
         """GET /api/accounts/{id}/qr-login/{session_id}
@@ -472,49 +528,54 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             acc_id = request.path_params.get("id")
             session_id = request.path_params.get("session_id")
 
-            sess = _qr_sessions.get(session_id)
-            if not sess:
-                return fail("QR_SESSION_NOT_FOUND", "二维码会话不存在或已失效", status_code=404)
+            # 清理终态会话（全局，防止内存泄漏）
+            await _cleanup_terminal_qr_sessions()
 
-            # 验证创建者管理员会话
-            admin_token = _extract_admin_token(request)
-            if not admin_token:
-                return fail("UNAUTHORIZED", "缺少管理员会话凭证", status_code=401)
-            creator_hash = _sha256_hex(admin_token)
-            if sess.get("creator_session_hash") != creator_hash:
-                logger.warning(
-                    f"QR session owner mismatch: sid={_short(session_id)} "
-                    f"account={acc_id} creator={_short(creator_hash)}"
-                )
-                return fail("QR_SESSION_OWNER_MISMATCH",
-                            "会话创建者不匹配", status_code=403)
+            # 加锁：会话查找 + 鉴权 + 终态/过期检查 + 取临时 key
+            async with _get_qr_lock():
+                sess = _qr_sessions.get(session_id)
+                if not sess:
+                    return fail("QR_SESSION_NOT_FOUND", "二维码会话不存在或已失效", status_code=404)
 
-            # 验证会话属于目标账号
-            if sess.get("account_id") != acc_id:
-                return fail("QR_SESSION_MISMATCH",
-                            "会话与目标账号不匹配", status_code=403)
+                # 验证创建者管理员会话
+                admin_token = _extract_admin_token(request)
+                if not admin_token:
+                    return fail("UNAUTHORIZED", "缺少管理员会话凭证", status_code=401)
+                creator_hash = _sha256_hex(admin_token)
+                if sess.get("creator_session_hash") != creator_hash:
+                    logger.warning(
+                        f"QR session owner mismatch: sid={_short(session_id)} "
+                        f"account={acc_id} creator={_short(creator_hash)}"
+                    )
+                    return fail("QR_SESSION_OWNER_MISMATCH",
+                                "会话创建者不匹配", status_code=403)
 
-            # 终态会话：一次性，再次操作返回 410
-            status = sess.get("status", "created")
-            if status in _QR_TERMINAL_STATUSES:
-                return fail("QR_SESSION_GONE",
-                            f"会话已结束: {status}", status_code=410)
+                # 验证会话属于目标账号
+                if sess.get("account_id") != acc_id:
+                    return fail("QR_SESSION_MISMATCH",
+                                "会话与目标账号不匹配", status_code=403)
 
-            # 验证未过期
-            now = time.time()
-            if sess.get("expire_at", 0) < now:
-                _invalidate_qr_session(session_id, "expired")
-                logger.info(f"QR session expired: sid={_short(session_id)} account={acc_id}")
-                return fail("QR_SESSION_EXPIRED", "二维码会话已过期", status_code=410)
+                # 终态会话：一次性，再次操作返回 410
+                status = sess.get("status", "created")
+                if status in _QR_TERMINAL_STATUSES:
+                    return fail("QR_SESSION_GONE",
+                                f"会话已结束: {status}", status_code=410)
 
-            # 取临时 key 轮询 B站
-            raw_key = _qr_session_keys.get(session_id, "")
-            if not raw_key:
-                _invalidate_qr_session(session_id, "expired")
-                return fail("QR_SESSION_EXPIRED", "会话凭据缺失", status_code=410)
+                # 验证未过期
+                now = time.time()
+                if sess.get("expire_at", 0) < now:
+                    _invalidate_qr_session(session_id, "expired")
+                    logger.info(f"QR session expired: sid={_short(session_id)} account={acc_id}")
+                    return fail("QR_SESSION_EXPIRED", "二维码会话已过期", status_code=410)
+
+                # 取临时 key 轮询 B站
+                raw_key = _qr_session_keys.get(session_id, "")
+                if not raw_key:
+                    _invalidate_qr_session(session_id, "expired")
+                    return fail("QR_SESSION_EXPIRED", "会话凭据缺失", status_code=410)
 
             from ..bilibili_qrlogin import BilibiliQRLogin
-            qr_login = BilibiliQRLogin(config_loader)
+            qr_login = BilibiliQRLogin(config_loader, config_path=config_path)
             try:
                 result = await qr_login.check_status(raw_key)
             finally:
@@ -524,7 +585,10 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             message = result.get("message", "")
 
             if b_status == "scanned":
-                sess["status"] = "scanned"
+                async with _get_qr_lock():
+                    sess = _qr_sessions.get(session_id)
+                    if sess is not None:
+                        sess["status"] = "scanned"
                 return ok({
                     "status": "scanned",
                     "message": message,
@@ -532,7 +596,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 })
 
             if b_status == "expired":
-                _invalidate_qr_session(session_id, "expired")
+                async with _get_qr_lock():
+                    _invalidate_qr_session(session_id, "expired")
                 logger.info(f"QR session expired (B站): sid={_short(session_id)} account={acc_id}")
                 return ok({
                     "status": "expired",
@@ -543,7 +608,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             if b_status == "confirmed":
                 # 账号可能在会话创建后被删除
                 if not account_manager.has_account(acc_id):
-                    _invalidate_qr_session(session_id, "expired")
+                    async with _get_qr_lock():
+                        _invalidate_qr_session(session_id, "expired")
                     return fail("ACCOUNT_NOT_FOUND",
                                 f"账号已被删除: {acc_id}", status_code=404)
 
@@ -554,7 +620,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                     return fail("QR_SAVE_FAILED", save_result.get("message", "保存配置失败"))
 
                 # 立即失效会话（一次性）
-                _invalidate_qr_session(session_id, "confirmed")
+                async with _get_qr_lock():
+                    _invalidate_qr_session(session_id, "confirmed")
 
                 # 同步配置注册表（qrlogin 直接写 config.yaml，需拾取到注册表）
                 try:
@@ -588,7 +655,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 "account_id": acc_id,
             })
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"轮询 QR 登录状态失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def qr_login_cancel(request: Request) -> JSONResponse:
         """POST /api/accounts/{id}/qr-login/{session_id}/cancel
@@ -601,32 +669,35 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             acc_id = request.path_params.get("id")
             session_id = request.path_params.get("session_id")
 
-            sess = _qr_sessions.get(session_id)
-            if not sess:
-                return fail("QR_SESSION_NOT_FOUND", "二维码会话不存在或已失效", status_code=404)
+            # 加锁：会话查找 + 鉴权 + 终态检查 + 取消
+            async with _get_qr_lock():
+                sess = _qr_sessions.get(session_id)
+                if not sess:
+                    return fail("QR_SESSION_NOT_FOUND", "二维码会话不存在或已失效", status_code=404)
 
-            admin_token = _extract_admin_token(request)
-            if not admin_token:
-                return fail("UNAUTHORIZED", "缺少管理员会话凭证", status_code=401)
-            creator_hash = _sha256_hex(admin_token)
-            if sess.get("creator_session_hash") != creator_hash:
-                return fail("QR_SESSION_OWNER_MISMATCH",
-                            "会话创建者不匹配", status_code=403)
+                admin_token = _extract_admin_token(request)
+                if not admin_token:
+                    return fail("UNAUTHORIZED", "缺少管理员会话凭证", status_code=401)
+                creator_hash = _sha256_hex(admin_token)
+                if sess.get("creator_session_hash") != creator_hash:
+                    return fail("QR_SESSION_OWNER_MISMATCH",
+                                "会话创建者不匹配", status_code=403)
 
-            if sess.get("account_id") != acc_id:
-                return fail("QR_SESSION_MISMATCH",
-                            "会话与目标账号不匹配", status_code=403)
+                if sess.get("account_id") != acc_id:
+                    return fail("QR_SESSION_MISMATCH",
+                                "会话与目标账号不匹配", status_code=403)
 
-            status = sess.get("status", "created")
-            if status in _QR_TERMINAL_STATUSES:
-                return fail("QR_SESSION_GONE",
-                            f"会话已结束: {status}", status_code=410)
+                status = sess.get("status", "created")
+                if status in _QR_TERMINAL_STATUSES:
+                    return fail("QR_SESSION_GONE",
+                                f"会话已结束: {status}", status_code=410)
 
-            _invalidate_qr_session(session_id, "cancelled")
+                _invalidate_qr_session(session_id, "cancelled")
             logger.info(f"QR session cancelled: sid={_short(session_id)} account={acc_id}")
             return ok({"status": "cancelled", "account_id": acc_id}, "会话已取消")
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"取消 QR 登录会话失败: {e}", exc_info=True)
+            return fail_internal()
 
     # ═══════════════════════════════════════════════════════
     #  PRD-V5 §7.4 / TASK-501：手动任务 API（账号级）
@@ -640,6 +711,23 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         if acc.scheduler is None:
             return None, fail("SCHEDULER_UNAVAILABLE", "账号调度器未初始化", status_code=503)
         return acc.scheduler, None
+
+    def _get_account_task_store(acc_id: str):
+        """获取账号的 TaskRunStore（不要求调度器运行）
+
+        调度器运行时复用其 task_store；否则基于 account_data_dir 构造
+        临时实例读取持久化 SQLite（任务列表查询无需运行时调度器）。
+        """
+        acc = account_manager.get_account(acc_id)
+        if not acc:
+            return None, fail("NOT_FOUND", f"账号不存在: {acc_id}", status_code=404)
+        if acc.scheduler is not None and getattr(acc.scheduler, "task_store", None) is not None:
+            return acc.scheduler.task_store, None
+        # 调度器未初始化：基于账号数据目录构造 TaskRunStore（只读查询）
+        import os
+        from bilibot.services.task_store import TaskRunStore
+        db_path = os.path.join(acc.account_data_dir, "task_runs.db")
+        return TaskRunStore(db_path, account_id=acc_id), None
 
     async def trigger_proactive_video_task(request: Request) -> JSONResponse:
         """POST /api/accounts/{id}/tasks/proactive-video → 202 + task_id
@@ -669,7 +757,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             return ok({"task_id": task_id, "status": "scheduled"},
                        "任务已创建（异步执行）", status_code=202)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"触发主动视频任务失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def trigger_dynamic_task(request: Request) -> JSONResponse:
         """POST /api/accounts/{id}/tasks/dynamic → 202 + task_id"""
@@ -693,7 +782,45 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             return ok({"task_id": task_id, "status": "scheduled"},
                        "任务已创建（异步执行）", status_code=202)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"触发动态任务失败: {e}", exc_info=True)
+            return fail_internal()
+
+    async def list_account_tasks(request: Request) -> JSONResponse:
+        """GET /api/accounts/{id}/tasks → 分页列出账号任务
+
+        支持查询参数：page（默认 1）、page_size（默认 20，上限 100）、
+        status（可选，按任务状态过滤）。不要求调度器运行。
+        """
+        try:
+            acc_id = request.path_params.get("id")
+            task_store, err = _get_account_task_store(acc_id)
+            if err is not None:
+                return err
+            # 分页参数解析（容错）
+            try:
+                page = max(1, int(request.query_params.get("page", "1")))
+            except (ValueError, TypeError):
+                page = 1
+            try:
+                page_size = max(1, min(100, int(request.query_params.get("page_size", "20"))))
+            except (ValueError, TypeError):
+                page_size = 20
+            status = request.query_params.get("status") or None
+            offset = (page - 1) * page_size
+            from bilibot.services.task_store import desensitize_task_run
+            tasks = task_store.list_by_account(
+                acc_id, limit=page_size, offset=offset, status=status,
+            )
+            total = task_store.count_by_account(acc_id, status=status)
+            return ok({
+                "items": [desensitize_task_run(t) for t in tasks],
+                "total": total,
+                "page": page,
+                "page_size": page_size,
+            })
+        except Exception as e:
+            logger.error(f"列出账号任务失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def get_account_task(request: Request) -> JSONResponse:
         """GET /api/accounts/{id}/tasks/{task_id} → status + desensitized result"""
@@ -709,7 +836,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             from bilibot.services.task_store import desensitize_task_run
             return ok(desensitize_task_run(task))
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"获取账号任务失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def cancel_account_task(request: Request) -> JSONResponse:
         """POST /api/accounts/{id}/tasks/{task_id}/cancel
@@ -733,7 +861,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                         f"任务状态 {task.status} 不允许取消（仅 scheduled/claimed 可取消）",
                         status_code=409)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"取消账号任务失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def retry_account_task(request: Request) -> JSONResponse:
         """POST /api/accounts/{id}/tasks/{task_id}/retry
@@ -757,7 +886,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                         f"任务状态 {task.status} 不允许重试（仅 retry_wait/failed/interrupted 可重试）",
                         status_code=409)
         except Exception as e:
-            return fail_internal(str(e))
+            logger.error(f"重试账号任务失败: {e}", exc_info=True)
+            return fail_internal()
 
     return [
         Route("/api/accounts", list_accounts, methods=["GET"]),
@@ -778,6 +908,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         Route("/api/accounts/{id}/qr-login/{session_id}", qr_login_poll, methods=["GET"]),
         Route("/api/accounts/{id}/qr-login/{session_id}/cancel", qr_login_cancel, methods=["POST"]),
         # PRD-V5 §7.4 / TASK-501：手动任务 API（账号级）
+        Route("/api/accounts/{id}/tasks", list_account_tasks, methods=["GET"]),
         Route("/api/accounts/{id}/tasks/proactive-video", trigger_proactive_video_task, methods=["POST"]),
         Route("/api/accounts/{id}/tasks/dynamic", trigger_dynamic_task, methods=["POST"]),
         Route("/api/accounts/{id}/tasks/{task_id}", get_account_task, methods=["GET"]),

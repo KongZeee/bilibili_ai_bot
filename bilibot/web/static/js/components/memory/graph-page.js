@@ -3,6 +3,7 @@ const { defineComponent, h, ref, reactive, computed, onMounted, watch } = window
 import { api } from '../../api.js';
 import { Card, Button, Badge, Loading, EmptyState, Icon, HeroPanel } from '../common.js';
 import { appState, showToast } from '../../state.js';
+import { formatTime } from '../../utils.js';
 
 // 节点类型 → chart 色号映射
 const TYPE_COLOR_INDEX = { summary: 1, person: 5, topic: 3 };
@@ -25,12 +26,6 @@ const CATEGORY_LABELS = {
 
 function categoryLabel(cat) {
     return CATEGORY_LABELS[cat] || cat || '未分类';
-}
-
-function formatTime(ts) {
-    if (!ts) return '-';
-    const d = new Date(typeof ts === 'number' && ts < 1e12 ? ts * 1000 : ts);
-    return d.toLocaleString('zh-CN', { hour12: false });
 }
 
 // 节点位置计算：force / tree / radial

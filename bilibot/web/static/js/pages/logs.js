@@ -59,6 +59,10 @@ export const LogsPage = defineComponent({
         async function download() {
             try {
                 const resp = await fetch('/api/logs/download', { credentials: 'same-origin' });
+                if (resp.status === 401) {
+                    window.location.href = '/login';
+                    return;
+                }
                 const blob = await resp.blob();
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
