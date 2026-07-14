@@ -564,9 +564,16 @@ class BilibiliAPI:
                 if resp.status != 200:
                     logger.warning(f"下载视频流失败: HTTP {resp.status}")
                     return None
-                with open(video_file, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(1024 * 256):
-                        f.write(chunk)
+                buf = []
+                async for chunk in resp.content.iter_chunked(1024 * 256):
+                    buf.append(chunk)
+
+                def _write_video():
+                    with open(video_file, "wb") as f:
+                        for c in buf:
+                            f.write(c)
+
+                await asyncio.to_thread(_write_video)
             logger.info(f"视频流下载完成: {video_file}")
         except Exception as e:
             logger.error(f"下载视频流异常: {e}")
@@ -580,44 +587,48 @@ class BilibiliAPI:
                 try:
                     async with session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                         if resp.status == 200:
-                            with open(audio_file, "wb") as f:
-                                async for chunk in resp.content.iter_chunked(1024 * 256):
-                                    f.write(chunk)
+                            abuf = []
+                            async for chunk in resp.content.iter_chunked(1024 * 256):
+                                abuf.append(chunk)
+                            def _write_audio():
+                                with open(audio_file, "wb") as f:
+                                    for c in abuf:
+                                        f.write(c)
+                            await asyncio.to_thread(_write_audio)
                             audio_downloaded = True
                             logger.info(f"音频流下载完成: {audio_file}")
                 except Exception as e:
                     logger.warning(f"下载音频流失败（不影响视频分析）: {e}")
 
-        # 合并视频和音频（需要 ffmpeg）
-        import subprocess
+        # 合并视频和音频（ffmpeg 子进程异步化，避免阻塞事件循环）
         try:
             if audio_downloaded:
-                proc = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_file, "-i", audio_file,
-                     "-c", "copy", "-movflags", "+faststart", output_file],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=120, encoding="utf-8", errors="ignore",
-                )
+                cmd = ["ffmpeg", "-y", "-i", video_file, "-i", audio_file,
+                       "-c", "copy", "-movflags", "+faststart", output_file]
             else:
-                proc = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_file,
-                     "-c", "copy", "-movflags", "+faststart", output_file],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=120, encoding="utf-8", errors="ignore",
-                )
+                cmd = ["ffmpeg", "-y", "-i", video_file,
+                       "-c", "copy", "-movflags", "+faststart", output_file]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                raise TimeoutError("ffmpeg timeout")
             if proc.returncode != 0:
-                logger.warning(f"ffmpeg 合并失败: {proc.stderr[:300]}")
-                # 合并失败时直接用视频流
-                # PRD 4.3：os.replace 跨平台原子替换，避免 Windows 上目标已存在时失败
+                err_text = (stderr or b"").decode("utf-8", errors="ignore")[:300]
+                logger.warning(f"ffmpeg 合并失败: {err_text}")
                 os.replace(video_file, output_file)
-                # VID-604：清理残留的音频临时文件
                 for tmp in [audio_file]:
                     try:
                         os.remove(tmp)
                     except Exception:
                         pass
             else:
-                # 清理临时流文件
                 for tmp in [video_file, audio_file]:
                     try:
                         os.remove(tmp)
@@ -627,10 +638,8 @@ class BilibiliAPI:
             return output_file
         except Exception as e:
             logger.error(f"ffmpeg 合并异常: {e}")
-            # 降级：直接用视频流文件
             if os.path.exists(video_file):
                 os.replace(video_file, output_file)
-            # VID-604：清理残留的音频临时文件
             for tmp in [audio_file]:
                 try:
                     os.remove(tmp)
@@ -1498,9 +1507,16 @@ class BilibiliAPI:
                 if resp.status != 200:
                     logger.warning(f"下载番剧视频流失败: HTTP {resp.status}")
                     return None
-                with open(video_file, "wb") as f:
-                    async for chunk in resp.content.iter_chunked(1024 * 256):
-                        f.write(chunk)
+                vbuf = []
+                async for chunk in resp.content.iter_chunked(1024 * 256):
+                    vbuf.append(chunk)
+
+                def _write_v():
+                    with open(video_file, "wb") as f:
+                        for c in vbuf:
+                            f.write(c)
+
+                await asyncio.to_thread(_write_v)
             logger.info(f"番剧视频流下载完成: {video_file}")
         except Exception as e:
             logger.error(f"下载番剧视频流异常: {e}")
@@ -1514,40 +1530,50 @@ class BilibiliAPI:
                 try:
                     async with session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as resp:
                         if resp.status == 200:
-                            with open(audio_file, "wb") as f:
-                                async for chunk in resp.content.iter_chunked(1024 * 256):
-                                    f.write(chunk)
+                            abuf = []
+                            async for chunk in resp.content.iter_chunked(1024 * 256):
+                                abuf.append(chunk)
+
+                            def _write_a():
+                                with open(audio_file, "wb") as f:
+                                    for c in abuf:
+                                        f.write(c)
+
+                            await asyncio.to_thread(_write_a)
                             audio_downloaded = True
                             logger.info(f"番剧音频流下载完成: {audio_file}")
                 except Exception as e:
                     logger.warning(f"下载番剧音频流失败（不影响视频分析）: {e}")
 
-        # ffmpeg 合并
-        import subprocess
+        # ffmpeg 合并（异步子进程，避免阻塞事件循环）
         try:
             if audio_downloaded:
-                proc = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_file, "-i", audio_file,
-                     "-c", "copy", "-movflags", "+faststart", output_file],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=120, encoding="utf-8", errors="ignore",
-                )
+                cmd = ["ffmpeg", "-y", "-i", video_file, "-i", audio_file,
+                       "-c", "copy", "-movflags", "+faststart", output_file]
             else:
-                proc = subprocess.run(
-                    ["ffmpeg", "-y", "-i", video_file,
-                     "-c", "copy", "-movflags", "+faststart", output_file],
-                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    text=True, timeout=120, encoding="utf-8", errors="ignore",
-                )
+                cmd = ["ffmpeg", "-y", "-i", video_file,
+                       "-c", "copy", "-movflags", "+faststart", output_file]
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                raise TimeoutError("ffmpeg timeout")
             if proc.returncode != 0:
-                logger.warning(f"ffmpeg 合并番剧失败: {proc.stderr[:300]}")
-                # 合并失败时用纯视频流
+                err_text = (stderr or b"").decode("utf-8", errors="ignore")[:300]
+                logger.warning(f"ffmpeg 合并番剧失败: {err_text}")
                 import shutil as _shutil
                 _shutil.move(video_file, output_file)
         except Exception as e:
             logger.error(f"ffmpeg 合并番剧异常: {e}")
             import shutil as _shutil
-            _shutil.move(video_file, output_file)
+            if os.path.exists(video_file):
+                _shutil.move(video_file, output_file)
 
         # 清理临时文件
         for tmp in (video_file, audio_file):

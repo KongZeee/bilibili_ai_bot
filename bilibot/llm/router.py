@@ -57,6 +57,8 @@ class ModelRouter:
         self._local_whisper: dict = {}
         self._allow_llm_fallback: bool = False
         self._completion_max_concurrency: int = 2
+        self._rate_limit_cooldown_seconds: float = 30.0
+        self._vision_max_concurrency_hard_cap: int = 8
         self._completion_gates = {}
 
     # ══════════════════════════════════════
@@ -75,14 +77,7 @@ class ModelRouter:
 
         raw = self._config_loader.get_raw_config()
         self._allow_llm_fallback = bool(raw.get("allow_llm_fallback", False))
-        limits = raw.get("model_request_limits", {}) or {}
-        try:
-            configured_concurrency = int(
-                limits.get("chat_completion_max_concurrency_per_endpoint", 2)
-            )
-        except (TypeError, ValueError):
-            configured_concurrency = 2
-        self._completion_max_concurrency = max(1, min(configured_concurrency, 16))
+        self._load_request_limits(raw)
 
         # 读取 model_routing
         routing = raw.get("model_routing", {}) or {}
@@ -106,6 +101,7 @@ class ModelRouter:
                 if not self._routing[t] and self._pools[t]:
                     self._routing[t] = next(iter(self._pools[t]))
 
+        self._apply_request_limits_to_providers()
         self._configure_completion_gates()
 
         # 汇总日志
@@ -113,9 +109,66 @@ class ModelRouter:
             count = len(self._pools[t])
             routed = self._routing[t] or "(无)"
             logger.info(f"[router] {t}: {count} 个 Provider, 路由 → {routed}")
+        logger.info(
+            f"[router] request limits: per_key_concurrency={self._completion_max_concurrency}, "
+            f"rate_limit_cooldown={self._rate_limit_cooldown_seconds:g}s, "
+            f"vision_hard_cap={self._vision_max_concurrency_hard_cap}"
+        )
+
+    def _load_request_limits(self, raw: dict) -> None:
+        limits = raw.get("model_request_limits", {}) or {}
+        try:
+            configured_concurrency = int(
+                limits.get("chat_completion_max_concurrency_per_endpoint", 2)
+            )
+        except (TypeError, ValueError):
+            configured_concurrency = 2
+        self._completion_max_concurrency = max(1, min(configured_concurrency, 16))
+        try:
+            cooldown = float(limits.get("rate_limit_cooldown_seconds", 30))
+        except (TypeError, ValueError):
+            cooldown = 30.0
+        self._rate_limit_cooldown_seconds = max(1.0, min(cooldown, 600.0))
+        try:
+            vision_cap = int(limits.get("vision_max_concurrency_hard_cap", 8))
+        except (TypeError, ValueError):
+            vision_cap = 8
+        self._vision_max_concurrency_hard_cap = max(1, min(vision_cap, 64))
+
+    def _apply_request_limits_to_providers(self) -> None:
+        for pool in self._pools.values():
+            for provider in pool.values():
+                if hasattr(provider, "set_rate_limit_cooldown"):
+                    provider.set_rate_limit_cooldown(self._rate_limit_cooldown_seconds)
+
+    def get_request_limits(self) -> dict:
+        return {
+            "chat_completion_max_concurrency_per_endpoint": self._completion_max_concurrency,
+            "rate_limit_cooldown_seconds": self._rate_limit_cooldown_seconds,
+            "vision_max_concurrency_hard_cap": self._vision_max_concurrency_hard_cap,
+        }
+
+    def vision_effective_concurrency(self, requested_window: int = 2) -> int:
+        """Clamp vision window by hard cap and routed vision key budget."""
+        try:
+            requested = int(requested_window)
+        except (TypeError, ValueError):
+            requested = 2
+        requested = max(1, requested)
+        hard_cap = self._vision_max_concurrency_hard_cap
+        per_key = self._completion_max_concurrency
+        vp = self.resolve_vision()
+        key_count = 1
+        if vp is not None:
+            key_count = max(
+                1,
+                int(getattr(vp, "vision_api_key_count", 0) or getattr(vp, "api_key_count", 1) or 1),
+            )
+        budget = max(1, key_count * per_key)
+        return max(1, min(requested, hard_cap, budget))
 
     def _configure_completion_gates(self) -> None:
-        """Share one gate when chat and vision consume the same endpoint quota."""
+        """Share one gate when providers consume the same endpoint+key quota."""
 
         previous = self._completion_gates
         current = {}
@@ -135,9 +188,9 @@ class ModelRouter:
                 current[identity] = gate
             return gate
 
-        providers = list(self._pools[CHAT].values()) + list(
-            self._pools[VISION].values()
-        )
+        providers = []
+        for ptype in PROVIDER_TYPES:
+            providers.extend(self._pools[ptype].values())
         for provider in providers:
             provider.set_completion_gates(
                 chat=resolve_gate(provider.base_url, provider.api_key),
@@ -146,6 +199,7 @@ class ModelRouter:
                 )
                 if provider.vision_enabled
                 else None,
+                resolve_gate=resolve_gate,
             )
         self._completion_gates = current
 
@@ -160,6 +214,9 @@ class ModelRouter:
                 try:
                     provider_cfg = dict(cfg)
                     provider_cfg.setdefault("max_retries", 0)
+                    provider_cfg.setdefault(
+                        "rate_limit_cooldown_seconds", self._rate_limit_cooldown_seconds
+                    )
                     self._pools[CHAT][pid] = LLMProvider(pid, provider_cfg)
                     logger.info(f"[router] 已加载对话 Provider: {pid} ({cfg.get('model', '')})")
                 except Exception as e:
@@ -175,11 +232,14 @@ class ModelRouter:
                     continue
                 pid = cfg.get("id") or f"chat_{i}"
                 # V1 api_key 回退
-                if not cfg.get("api_key") and v1_llm.get("api_key"):
+                if not cfg.get("api_key") and not cfg.get("api_keys") and v1_llm.get("api_key"):
                     cfg = {**cfg, "api_key": v1_llm["api_key"]}
                 try:
                     provider_cfg = dict(cfg)
                     provider_cfg.setdefault("max_retries", 0)
+                    provider_cfg.setdefault(
+                        "rate_limit_cooldown_seconds", self._rate_limit_cooldown_seconds
+                    )
                     self._pools[CHAT][pid] = LLMProvider(pid, provider_cfg)
                     logger.info(f"[router] V2迁移对话 Provider: {pid}")
                 except Exception as e:
@@ -224,9 +284,11 @@ class ModelRouter:
                 # 需要把 model/base_url/api_key 包装到 vision 子段里
                 cfg = dict(cfg)  # shallow copy
                 cfg.setdefault("max_retries", 0)
+                cfg["rate_limit_cooldown_seconds"] = self._rate_limit_cooldown_seconds
                 cfg["vision"] = {
                     "model": cfg.get("model", ""),
                     "api_key": cfg.get("api_key", ""),
+                    "api_keys": list(cfg.get("api_keys") or []),
                     "base_url": cfg.get("base_url", ""),
                     "enabled": True,
                 }
@@ -304,9 +366,11 @@ class ModelRouter:
                 cfg = self._fallback_api_key(raw, cfg)
                 # BUG B-003：包装 embedding 子段
                 cfg = dict(cfg)
+                cfg["rate_limit_cooldown_seconds"] = self._rate_limit_cooldown_seconds
                 cfg["embedding"] = {
                     "model": cfg.get("model", ""),
                     "api_key": cfg.get("api_key", ""),
+                    "api_keys": list(cfg.get("api_keys") or []),
                     "base_url": cfg.get("base_url", ""),
                     "enabled": True,
                 }
@@ -463,11 +527,17 @@ class ModelRouter:
                 pass
 
     def _fallback_api_key(self, raw: dict, cfg: dict) -> dict:
-        """api_key 留空时回退到默认对话 Provider"""
-        if not cfg.get("api_key"):
+        """api_key / api_keys 留空时回退到默认对话 Provider"""
+        has_keys = bool(cfg.get("api_key")) or bool(cfg.get("api_keys"))
+        if not has_keys:
             chat_key = self._get_chat_api_key(raw)
-            if chat_key:
-                cfg = {**cfg, "api_key": chat_key}
+            chat_keys = self._get_chat_api_keys(raw)
+            if chat_keys or chat_key:
+                cfg = {
+                    **cfg,
+                    "api_key": chat_key or (chat_keys[0] if chat_keys else ""),
+                    "api_keys": list(chat_keys),
+                }
             if not cfg.get("base_url"):
                 chat_url = self._get_chat_base_url(raw)
                 if chat_url:
@@ -476,16 +546,29 @@ class ModelRouter:
 
     def _get_chat_api_key(self, raw: dict) -> str:
         """获取默认对话 Provider 的 api_key（用于回退）"""
-        # 优先从 chat_providers
-        for cfg in (raw.get("chat_providers") or []):
-            if isinstance(cfg, dict) and cfg.get("api_key"):
-                return cfg["api_key"]
-        # V2 llm_providers
-        for cfg in (raw.get("llm_providers") or []):
-            if isinstance(cfg, dict) and cfg.get("api_key"):
-                return cfg["api_key"]
-        # V1 llm
+        keys = self._get_chat_api_keys(raw)
+        if keys:
+            return keys[0]
         return (raw.get("llm") or {}).get("api_key", "")
+
+    def _get_chat_api_keys(self, raw: dict) -> list:
+        """获取默认对话 Provider 的密钥列表（用于回退）"""
+        from bilibot.llm.provider import normalize_api_keys
+
+        for cfg in (raw.get("chat_providers") or []):
+            if isinstance(cfg, dict):
+                keys = normalize_api_keys(cfg)
+                if keys:
+                    return keys
+        for cfg in (raw.get("llm_providers") or []):
+            if isinstance(cfg, dict):
+                keys = normalize_api_keys(cfg)
+                if keys:
+                    return keys
+        v1 = raw.get("llm") or {}
+        if isinstance(v1, dict):
+            return normalize_api_keys(v1)
+        return []
 
     def _get_chat_base_url(self, raw: dict) -> str:
         """获取默认对话 Provider 的 base_url"""
@@ -578,6 +661,26 @@ class ModelRouter:
         provider_config = dict(config)
         if ptype in (CHAT, VISION):
             provider_config.setdefault("max_retries", 0)
+        provider_config.setdefault(
+            "rate_limit_cooldown_seconds", self._rate_limit_cooldown_seconds
+        )
+        # Vision/Embedding need nested sub-config for LLMProvider fields
+        if ptype == VISION:
+            provider_config["vision"] = {
+                "model": provider_config.get("model", ""),
+                "api_key": provider_config.get("api_key", ""),
+                "api_keys": list(provider_config.get("api_keys") or []),
+                "base_url": provider_config.get("base_url", ""),
+                "enabled": True,
+            }
+        if ptype == EMBEDDING:
+            provider_config["embedding"] = {
+                "model": provider_config.get("model", ""),
+                "api_key": provider_config.get("api_key", ""),
+                "api_keys": list(provider_config.get("api_keys") or []),
+                "base_url": provider_config.get("base_url", ""),
+                "enabled": True,
+            }
         self._pools[ptype][pid] = LLMProvider(pid, provider_config)
         if not self._routing[ptype]:
             self._routing[ptype] = pid
@@ -592,12 +695,49 @@ class ModelRouter:
             return False
         # 敏感字段留空时从旧实例继承
         new_config = {**config, "id": pid}
-        if not new_config.get("api_key"):
+        if not new_config.get("api_key") and "api_keys" not in new_config:
             new_config["api_key"] = old.api_key
+            new_config["api_keys"] = list(getattr(old, "api_keys", []) or [])
+        elif not new_config.get("api_key") and new_config.get("api_keys"):
+            keys = new_config.get("api_keys") or []
+            if isinstance(keys, list) and keys:
+                new_config["api_key"] = keys[0]
+        elif new_config.get("api_key") and "api_keys" not in new_config:
+            # single-key update: keep as primary + single-element pool
+            new_config["api_keys"] = [new_config["api_key"]]
         if not new_config.get("base_url"):
             new_config["base_url"] = old.base_url
         if ptype in (CHAT, VISION):
             new_config.setdefault("max_retries", 0)
+        new_config.setdefault(
+            "rate_limit_cooldown_seconds", self._rate_limit_cooldown_seconds
+        )
+        if ptype == VISION:
+            new_config["vision"] = {
+                "model": new_config.get("model", old.model),
+                "api_key": new_config.get("api_key", old.api_key),
+                "api_keys": list(new_config.get("api_keys") or getattr(old, "api_keys", []) or []),
+                "base_url": new_config.get("base_url", old.base_url),
+                "enabled": True,
+            }
+        if ptype == EMBEDDING:
+            new_config["embedding"] = {
+                "model": new_config.get("model", old.model),
+                "api_key": new_config.get("api_key", old.api_key),
+                "api_keys": list(new_config.get("api_keys") or getattr(old, "api_keys", []) or []),
+                "base_url": new_config.get("base_url", old.base_url),
+                "enabled": True,
+            }
+        # Preserve name/model/enabled defaults from old when omitted
+        new_config.setdefault("name", old.name)
+        new_config.setdefault("model", old.model)
+        new_config.setdefault("enabled", old.enabled)
+        if ptype == CHAT:
+            new_config.setdefault("max_tokens", old.max_tokens)
+            new_config.setdefault("temperature", old.temperature)
+        if ptype == IMAGE:
+            new_config.setdefault("default_size", getattr(old, "default_size", "1024x768"))
+            new_config.setdefault("timeout", getattr(old, "timeout", 120))
         pool[pid] = LLMProvider(pid, new_config)
         self._configure_completion_gates()
         logger.info(f"[router] 已更新 {ptype} Provider: {pid}")
@@ -625,10 +765,12 @@ class ModelRouter:
             key = CONFIG_KEYS[ptype]
             items = []
             for pid, p in self._pools[ptype].items():
+                keys = list(getattr(p, "api_keys", []) or [])
                 item = {
                     "id": pid,
                     "name": p.name,
-                    "api_key": p.api_key,
+                    "api_key": p.api_key or (keys[0] if keys else ""),
+                    "api_keys": keys,
                     "base_url": p.base_url,
                     "model": p.model,
                     "enabled": p.enabled,
@@ -646,6 +788,7 @@ class ModelRouter:
             result[key] = items
         result["model_routing"] = dict(self._routing)
         result["allow_llm_fallback"] = self._allow_llm_fallback
+        result["model_request_limits"] = self.get_request_limits()
         return result
 
     # ══════════════════════════════════════

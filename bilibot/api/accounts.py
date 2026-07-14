@@ -182,6 +182,14 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             _enrich_llm_status(s, llm_manager)
         return ok(statuses)
 
+    async def get_account(request: Request) -> JSONResponse:
+        acc_id = request.path_params.get("id")
+        if not account_manager.has_account(acc_id):
+            return fail("NOT_FOUND", f"账号不存在: {acc_id}", status_code=404)
+        status = account_manager.get_account_status(acc_id)
+        _enrich_llm_status(status, llm_manager)
+        return ok(status)
+
     async def add_account(request: Request) -> JSONResponse:
         try:
             body = await request.json()
@@ -202,7 +210,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             _enrich_llm_status(status, llm_manager)
             return ok(status, "账号添加成功")
         except ValueError as e:
-            return fail("VALIDATION_ERROR", str(e))
+            logger.warning("添加账号校验失败: %s", e)
+            return fail("VALIDATION_ERROR", "账号参数不合法")
         except Exception as e:
             logger.error(f"添加账号失败: {e}", exc_info=True)
             return fail_internal()
@@ -414,11 +423,15 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         acc = account_manager.get_account(acc_id)
         if not acc:
             return fail("NOT_FOUND", f"账号不存在: {acc_id}")
-        if not acc.is_running():
-            return ok(message="账号未在运行")
         try:
-            acc.stop()
-            return ok(acc.get_status(), "账号已停止")
+            # close() 取消调度任务并释放 memory worker / HTTP session，避免 stop/start 泄漏
+            if hasattr(acc, "close"):
+                await acc.close()
+            else:
+                acc.stop()
+            status = account_manager.get_account_status(acc_id)
+            _enrich_llm_status(status, llm_manager)
+            return ok(status, "账号已停止")
         except Exception as e:
             logger.error(f"停止账号失败: {e}", exc_info=True)
             return fail_internal()
@@ -892,6 +905,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
     return [
         Route("/api/accounts", list_accounts, methods=["GET"]),
         Route("/api/accounts", add_account, methods=["POST"]),
+        Route("/api/accounts/{id}", get_account, methods=["GET"]),
         Route("/api/accounts/{id}", delete_account, methods=["DELETE"]),
         Route("/api/accounts/{id}", update_account, methods=["PATCH"]),
         Route("/api/accounts/{id}/set-default", set_default, methods=["POST"]),

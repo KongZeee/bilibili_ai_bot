@@ -34,6 +34,35 @@
 }
 
 /* ============ 2. Button 变体（基础 .btn / .icon-btn 已在 layout.css 定义） ============ */
+/* 兼容 Button 组件输出的 btn-* 与 layout 中的 .btn.primary / .btn.ghost */
+.btn-primary {
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+    border-color: transparent;
+}
+.btn-primary:hover {
+    background: hsl(var(--primary) / 0.92);
+}
+.btn-ghost {
+    background: transparent;
+    color: hsl(var(--accent-foreground));
+    border-color: hsl(var(--border));
+    box-shadow: none;
+}
+.btn-ghost:hover {
+    background: hsl(var(--accent) / 0.3);
+    border-color: hsl(var(--accent));
+}
+.btn-secondary {
+    background: hsl(var(--card));
+    color: hsl(var(--foreground));
+    border-color: hsl(var(--border));
+    box-shadow: var(--shadow-xs);
+}
+.btn-secondary:hover {
+    background: hsl(var(--muted));
+    border-color: hsl(var(--accent));
+}
 .btn-danger {
     background: hsl(var(--destructive) / 0.12);
     color: hsl(var(--destructive));

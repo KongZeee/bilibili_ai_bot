@@ -284,19 +284,31 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
             if parsed.hostname not in allowed_hosts:
                 return fail("INVALID_INPUT", f"仅支持 GitHub 域名: {allowed_hosts}", status_code=400)
             # 防止通过域名解析到内网 IP（再校验一次解析结果）
+            # getaddrinfo 返回 5 元组 (family, type, proto, canonname, sockaddr)
             try:
                 import socket
                 resolved_ips = socket.getaddrinfo(parsed.hostname, None)
-                for _, _, _, sockaddr in resolved_ips:
+                if not resolved_ips:
+                    return fail("INVALID_INPUT", "无法解析目标域名", status_code=400)
+                for family, type_, proto, canonname, sockaddr in resolved_ips:
                     ip = ipaddress.ip_address(sockaddr[0])
-                    if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
                         return fail("INVALID_INPUT", "目标地址解析到内网 IP，拒绝请求", status_code=400)
-            except (socket.gaierror, ValueError):
-                pass
+            except (socket.gaierror, ValueError, OSError):
+                return fail("INVALID_INPUT", "域名解析失败，拒绝请求", status_code=400)
 
             import urllib.request, json as _json
             req = urllib.request.Request(url, headers={"User-Agent": "BiliBot-Market/1.0"})
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            # 禁止跟随重定向，防止跳到内网/非白名单 host
+            class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            opener = urllib.request.build_opener(_NoRedirect)
+            with opener.open(req, timeout=10) as resp:
+                final_host = urlparse(resp.geturl()).hostname
+                if final_host not in allowed_hosts:
+                    return fail("INVALID_INPUT", "重定向目标不在允许域名内", status_code=400)
                 data = _json.loads(resp.read().decode("utf-8"))
             persona = persona_store.import_persona(data)
             return JSONResponse({"success": True, "message": "imported", "data": persona})

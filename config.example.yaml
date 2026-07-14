@@ -12,6 +12,10 @@ chat_providers:
   - id: siliconflow
     name: 硅基流动
     api_key: ""
+    # 可选：多 API Key 密钥池（同 base_url/model），并行分发降低 429
+    # api_keys:
+    #   - "sk-key-1"
+    #   - "sk-key-2"
     base_url: "https://api.siliconflow.cn/v1"
     model: "Qwen/Qwen2.5-72B-Instruct"
     max_tokens: 1024
@@ -29,6 +33,10 @@ vision_providers:
   - id: siliconflow-vision
     name: 硅基流动视觉
     api_key: ""                    # 留空则回退到对话模型的 api_key
+    # 视频理解高并发推荐配置多 key：
+    # api_keys:
+    #   - "sk-vision-1"
+    #   - "sk-vision-2"
     base_url: "https://api.siliconflow.cn/v1"
     model: "Qwen/Qwen2-VL-72B-Instruct"
     enabled: false
@@ -79,9 +87,14 @@ model_routing:
 # PRD-V5 §5.3 LLM-501：生产模式不允许 LLM 静默回退
 allow_llm_fallback: false
 
-# Chat and Vision providers sharing one endpoint and credential share this gate.
+# 模型请求限制（配置页可改）
+# - 每密钥并发：同一 base_url+api_key 的最大并发
+# - 429 冷却：触发速率限制后该密钥暂停使用秒数
+# - 视觉并发硬顶：视频理解视觉轨并发绝对上限（与密钥数、每密钥并发共同决定实际并行）
 model_request_limits:
   chat_completion_max_concurrency_per_endpoint: 2
+  rate_limit_cooldown_seconds: 30
+  vision_max_concurrency_hard_cap: 8
 
 # ── V2: 多账号 ──
 
@@ -315,8 +328,9 @@ video_analysis:
   frame_extractor: "ffmpeg"
   scenedetect_threshold: 27.0
   image_max_size: 768
-  # Vision frames remain one observation each, but request starts are paced.
+  # 视觉并发窗口（期望值）；实际并发 = min(本值, 视觉硬顶, 密钥数×每密钥并发)
   vision_window_size: 2
+  # 视觉请求起步速率（每分钟）；多 key 时运行时按密钥数线性放大
   vision_requests_per_minute: 10
   # 临时目录（留空则用 {data_dir}/video_temp）
   temp_dir: ""

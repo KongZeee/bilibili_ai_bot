@@ -78,6 +78,7 @@ RELOAD_CONTRACT = {
     "logging": "immediate",
     "llm": "immediate",
     "bilibili": "immediate",
+    "model_request_limits": "next_task",
 }
 
 # accounts 子字段级别的特殊契约（覆盖 accounts 整体的 restart_account）
@@ -884,6 +885,37 @@ def _build_config_schema() -> dict:
                 "default_llm": {"type": "string", "label": "默认 LLM Provider ID"},
                 "default_account": {"type": "string", "label": "默认账号 ID"},
             }
+        },
+        "model_request_limits": {
+            "type": "object",
+            "label": "模型请求限制",
+            "description": "多 API Key 并行与速率限制相关参数（对应 config.yaml 顶层 model_request_limits）",
+            "fields": {
+                "chat_completion_max_concurrency_per_endpoint": {
+                    "type": "number",
+                    "label": "每密钥并发上限",
+                    "default": 2,
+                    "min": 1,
+                    "max": 16,
+                    "description": "同一 base_url + api_key 的最大并发请求数",
+                },
+                "rate_limit_cooldown_seconds": {
+                    "type": "number",
+                    "label": "429 冷却秒数",
+                    "default": 30,
+                    "min": 1,
+                    "max": 600,
+                    "description": "触发速率限制后该密钥暂停使用的秒数",
+                },
+                "vision_max_concurrency_hard_cap": {
+                    "type": "number",
+                    "label": "视觉并发硬顶",
+                    "default": 8,
+                    "min": 1,
+                    "max": 64,
+                    "description": "视频理解视觉轨并发绝对上限（防止随密钥数无限放大）",
+                },
+            },
         },
     }
 

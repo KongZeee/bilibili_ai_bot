@@ -124,8 +124,9 @@ def create_image_generation_routes(config_loader, config_path: str):
                     break
             if not provider_cfg:
                 return fail("IMAGE_NOT_CONFIGURED", "未找到已启用的文生图 Provider，请到模型分配页配置", status_code=400)
-            if not provider_cfg.get("api_key") or not provider_cfg.get("model"):
-                return fail("IMAGE_NOT_CONFIGURED", "文生图 Provider 未配置 api_key 或 model", status_code=400)
+            has_key = bool(provider_cfg.get("api_key")) or bool(provider_cfg.get("api_keys"))
+            if not has_key or not provider_cfg.get("model"):
+                return fail("IMAGE_NOT_CONFIGURED", "文生图 Provider 未配置 api_key/api_keys 或 model", status_code=400)
 
             from bilibot.image.provider import ImageProvider
             provider = ImageProvider(provider_cfg)

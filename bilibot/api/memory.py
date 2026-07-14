@@ -6,6 +6,7 @@ It never opens a legacy memory database and never falls back to legacy JSON.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import time
@@ -314,15 +315,18 @@ class _MemoryApi:
     def stats(self, store: MemoryBrainStore, account_id: str) -> dict[str, Any]:
         raw = store.stats()
         counts = dict(raw.get("counts") or {})
+        # 全表 GROUP BY，避免 list_events(limit=500) 截断导致分类不全
+        by_event_type = {
+            str(k or "observation"): int(v or 0)
+            for k, v in dict(raw.get("event_types") or {}).items()
+        }
+        index_statuses = {
+            str(k or "pending"): int(v or 0)
+            for k, v in dict(raw.get("index_statuses") or {}).items()
+        }
+        # 近 24h / 近 7 日：仅扫最近一批时间戳（展示用，允许近似）
         events = store.list_events(limit=500, offset=0)
         now = time.time()
-        by_event_type: dict[str, int] = {}
-        index_statuses: dict[str, int] = {}
-        for event in events:
-            event_type = str(event.get("event_type") or "observation")
-            by_event_type[event_type] = by_event_type.get(event_type, 0) + 1
-            status = str(event.get("index_status") or "pending")
-            index_statuses[status] = index_statuses.get(status, 0) + 1
         health = _jsonable(store.health_check())
         total = int(counts.get("memory_events") or 0)
         return {
@@ -784,7 +788,8 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
             return value
         account_id, store = value
         try:
-            return ok(api.stats(store, account_id))
+            data = await asyncio.to_thread(api.stats, store, account_id)
+            return ok(data)
         except Exception:
             logger.exception("读取记忆统计失败", extra={"account_id": account_id})
             return fail_internal("读取记忆统计失败")
@@ -795,7 +800,8 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
             return value
         account_id, store = value
         try:
-            return ok(api.list_events(request, store))
+            data = await asyncio.to_thread(api.list_events, request, store)
+            return ok(data)
         except Exception:
             logger.exception("读取记忆列表失败", extra={"account_id": account_id})
             return fail_internal("读取记忆列表失败")
@@ -806,7 +812,8 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
             return value
         account_id, store = value
         try:
-            item = api.detail(store, str(request.path_params.get("mem_id") or ""))
+            mem_id = str(request.path_params.get("mem_id") or "")
+            item = await asyncio.to_thread(api.detail, store, mem_id)
             return ok(item) if item else fail("NOT_FOUND", "记忆不存在", status_code=404)
         except Exception:
             logger.exception("读取记忆详情失败", extra={"account_id": account_id})
@@ -822,7 +829,8 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
             if not isinstance(body, Mapping):
                 return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             query = _body_query(body)
-            result = api.search(store, query, _bounded_int(body.get("limit"), 20, 1, 100))
+            limit = _bounded_int(body.get("limit"), 20, 1, 100)
+            result = await asyncio.to_thread(api.search, store, query, limit)
             result["items"] = [{key: val for key, val in item.items() if key != "_event"} for item in result["items"]]
             return ok(result)
         except Exception:

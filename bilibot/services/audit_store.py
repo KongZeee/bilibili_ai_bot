@@ -293,17 +293,20 @@ class AuditStore:
 
     def list_by_status(
         self,
-        scene: str,
+        scene: Any = "",
         status: str = "",
         page: int = 1,
         page_size: int = 20,
+        keyword: str = "",
     ) -> Dict[str, Any]:
         """UI-606：按状态分页查询审计记录（SQL 层过滤）
 
         替代旧实现中拉取全部记录再内存过滤的模式。
 
         Args:
-            scene: 场景过滤（如 reply_comment）
+            scene: 场景过滤。支持：
+                - str：单个 scene（如 reply_comment）
+                - Sequence[str]：多个 scene（IN 查询，如回复 + 主动评论）
             status: 状态筛选，取值：
                 - "" / "all"：全部
                 - "pending"：未发布且无 failure_reason
@@ -311,6 +314,7 @@ class AuditStore:
                 - "failed"：未发布且 target.failure_reason 非空
             page: 页码（1-based）
             page_size: 每页条数
+            keyword: 可选关键词（匹配 input_summary / context_summary / output）
 
         Returns:
             {"items": [...], "total": int, "page": int, "page_size": int}
@@ -318,11 +322,27 @@ class AuditStore:
         page = max(1, int(page))
         page_size = max(1, int(page_size))
         offset = (page - 1) * page_size
+        keyword = (keyword or "").strip()
+
+        if isinstance(scene, (list, tuple, set)):
+            scenes = [str(s).strip() for s in scene if str(s).strip()]
+        elif scene:
+            scenes = [str(scene).strip()]
+        else:
+            scenes = []
 
         conn = self._get_conn()
         conn.row_factory = sqlite3.Row
-        base_sql = "FROM generation_audits WHERE scene = ?"
-        params: list = [scene]
+        if not scenes:
+            base_sql = "FROM generation_audits WHERE 1=1"
+            params: list = []
+        elif len(scenes) == 1:
+            base_sql = "FROM generation_audits WHERE scene = ?"
+            params = [scenes[0]]
+        else:
+            placeholders = ",".join("?" for _ in scenes)
+            base_sql = f"FROM generation_audits WHERE scene IN ({placeholders})"
+            params = list(scenes)
 
         if status == "pending":
             # 未发布 且 无 failure_reason
@@ -341,6 +361,14 @@ class AuditStore:
                 " AND json_extract(target, '$.failure_reason') != ''"
             )
         # else: status 为空或未知 → 不附加条件，返回全部
+
+        if keyword:
+            base_sql += (
+                " AND (input_summary LIKE ? OR context_summary LIKE ?"
+                " OR output LIKE ? OR prompt_preview LIKE ?)"
+            )
+            kw = f"%{keyword}%"
+            params.extend([kw, kw, kw, kw])
 
         total = conn.execute(
             f"SELECT COUNT(*) {base_sql}", params

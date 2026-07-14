@@ -265,10 +265,11 @@ class AccountInstance:
         try:
             from bilibot.image import ImageProvider
             img_p = self.llm_manager.resolve_image() if self.llm_manager else None
-            if img_p and img_p.enabled and img_p.api_key:
+            if img_p and img_p.enabled and (img_p.api_key or getattr(img_p, "api_keys", None)):
                 self.image_provider = ImageProvider({
                     "enabled": True,
                     "api_key": img_p.api_key,
+                    "api_keys": list(getattr(img_p, "api_keys", []) or []),
                     "base_url": img_p.base_url,
                     "model": img_p.model,
                     "default_size": getattr(img_p, "default_size", "1024x768"),

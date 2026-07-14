@@ -50,14 +50,15 @@ def create_replies_routes(audit_store) -> list[Route]:
             except (ValueError, TypeError):
                 return fail("INVALID_INPUT", "page/page_size 必须是正整数", status_code=400)
             status = request.query_params.get("status", "")
+            keyword = (request.query_params.get("keyword") or "").strip()
 
-            # UI-606：将状态筛选下推到 SQL 层（AuditStore.list_by_status），
-            # 用 WHERE + LIMIT/OFFSET 替代旧的「拉全量后内存过滤」。
+            # 评论页同时展示：回复评论 + 主动看视频后发的评论
             result = audit_store.list_by_status(
-                scene="reply_comment",
+                scene=("reply_comment", "proactive_comment"),
                 status=status,
                 page=page,
                 page_size=page_size,
+                keyword=keyword,
             )
 
             return ok({

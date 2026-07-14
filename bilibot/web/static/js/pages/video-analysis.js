@@ -157,7 +157,7 @@ export const VideoAnalysisPage = {
                 h('span', { class: 'muted', style: 'font-size:0.88rem;' }, label),
                 p
                     ? h('span', { style: 'font-size:0.88rem;' }, `${p.name || p.id} · ${p.model || '-'}`)
-                    : h(Badge, { type: 'muted' }, () => '未路由'),
+                    : h(Badge, { type: 'muted' }, () => '未配置'),
             ]);
         }
 
@@ -197,9 +197,9 @@ export const VideoAnalysisPage = {
                         ]),
                         h('div', { class: 'card-body grid gap-2' }, [
                             providerRow('视觉模型', visionProvider.value),
-                            providerRow('ASR 模型', asrProvider.value),
+                            providerRow('语音识别模型', asrProvider.value),
                             h('div', { class: 'flex items-center justify-between' }, [
-                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '本地 Whisper'),
+                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '本地语音识别'),
                                 h(Badge, { type: localWhisper.value?.enabled ? 'success' : 'muted' }, () => localWhisper.value?.enabled ? '已启用' : '未启用'),
                             ]),
                             h('div', { class: 'flex items-center justify-between' }, [
@@ -271,6 +271,7 @@ export const VideoAnalysisPage = {
                                     'onUpdate:modelValue': (v) => config.vision_window_size = parseInt(v) || 5,
                                     type: 'number',
                                 }),
+                                h(FormHint, '期望并发；实际受「配置页 → 模型请求限制」的视觉并发硬顶与密钥数约束'),
                             ]),
                             h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '视频时长上限（秒）'),
@@ -331,13 +332,13 @@ export const VideoAnalysisPage = {
                                 h(FormHint, 'VID-503：单次视频下载的最大字节数（默认 200MB）'),
                             ]),
                             h('div', { class: 'form-group' }, [
-                                h('label', { class: 'form-label' }, '本地 Whisper 最大并发'),
+                                h('label', { class: 'form-label' }, '本地语音识别最大并发'),
                                 h(FormInput, {
                                     modelValue: String(config.max_local_whisper_workers),
                                     'onUpdate:modelValue': (v) => config.max_local_whisper_workers = parseInt(v) || 1,
                                     type: 'number',
                                 }),
-                                h(FormHint, '本地 Whisper 转写的最大并发 worker 数'),
+                                h(FormHint, '本地语音识别转写的最大并发数'),
                             ]),
                             h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '临时目录磁盘配额（字节）'),
@@ -429,7 +430,7 @@ export const VideoAnalysisPage = {
                     h('div', { class: 'card-header' }, [
                         h('div', { class: 'grid gap-1' }, [
                             h('span', { class: 'eyebrow' }, '模型配置'),
-                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '视听模型 Provider（只读）'),
+                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '视听模型服务商（只读）'),
                         ]),
                     ]),
                     h('div', { class: 'card-body grid gap-3' }, [
@@ -440,7 +441,7 @@ export const VideoAnalysisPage = {
                                 visionProvider.value
                                     ? h('div', { class: 'grid gap-1' }, [
                                         h('div', { class: 'flex items-center justify-between' }, [
-                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'Provider'),
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '服务商'),
                                             h('span', { style: 'font-size:0.88rem;' }, visionProvider.value.name || visionProvider.value.id),
                                         ]),
                                         h('div', { class: 'flex items-center justify-between' }, [
@@ -448,19 +449,19 @@ export const VideoAnalysisPage = {
                                             h('span', { style: 'font-size:0.88rem;' }, visionProvider.value.model || '-'),
                                         ]),
                                         h('div', { class: 'flex items-center justify-between' }, [
-                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API Key'),
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API 密钥'),
                                             h(Badge, { type: visionProvider.value.has_api_key ? 'success' : 'danger' }, () => visionProvider.value.has_api_key ? '已配置' : '未配置'),
                                         ]),
                                     ])
-                                    : h(EmptyState, { title: '未路由视觉 Provider', desc: '请到模型分配页配置 vision 类型' }),
+                                    : h(EmptyState, { title: '未配置视觉服务商', desc: '请到模型分配页配置视觉类型' }),
                             ]),
-                            // ASR 模型
+                            // 语音识别模型
                             h('div', { class: 'form-group span-2' }, [
-                                h('label', { class: 'form-label' }, 'ASR 语音识别'),
+                                h('label', { class: 'form-label' }, '语音识别'),
                                 asrProvider.value
                                     ? h('div', { class: 'grid gap-1' }, [
                                         h('div', { class: 'flex items-center justify-between' }, [
-                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'Provider'),
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '服务商'),
                                             h('span', { style: 'font-size:0.88rem;' }, asrProvider.value.name || asrProvider.value.id),
                                         ]),
                                         h('div', { class: 'flex items-center justify-between' }, [
@@ -468,15 +469,15 @@ export const VideoAnalysisPage = {
                                             h('span', { style: 'font-size:0.88rem;' }, asrProvider.value.model || '-'),
                                         ]),
                                         h('div', { class: 'flex items-center justify-between' }, [
-                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API Key'),
+                                            h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API 密钥'),
                                             h(Badge, { type: asrProvider.value.has_api_key ? 'success' : 'danger' }, () => asrProvider.value.has_api_key ? '已配置' : '未配置'),
                                         ]),
                                     ])
-                                    : h(EmptyState, { title: '未路由 ASR Provider', desc: '请到模型分配页配置 asr 类型' }),
+                                    : h(EmptyState, { title: '未配置语音识别服务商', desc: '请到模型分配页配置语音识别类型' }),
                             ]),
-                            // 本地 Whisper
+                            // 本地语音识别
                             localWhisper.value?.enabled && h('div', { class: 'form-group span-2' }, [
-                                h('label', { class: 'form-label' }, '本地 Whisper'),
+                                h('label', { class: 'form-label' }, '本地语音识别'),
                                 h('div', { class: 'grid gap-1' }, [
                                     h('div', { class: 'flex items-center justify-between' }, [
                                         h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '模型大小'),
@@ -505,14 +506,14 @@ export const VideoAnalysisPage = {
                 }, [
                     h('div', { class: 'card-header' }, [
                         h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, 'ASR 配置'),
-                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '本地 Whisper'),
+                            h('span', { class: 'eyebrow' }, '语音识别'),
+                            h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '本地语音识别'),
                         ]),
                     ]),
                     h('div', { class: 'card-body grid gap-3' }, [
                         h('div', { class: 'form-grid-2col' }, [
                             h('div', { class: 'form-group' }, [
-                                h('label', { class: 'form-label' }, '启用本地 Whisper'),
+                                h('label', { class: 'form-label' }, '启用本地语音识别'),
                                 h('div', { class: 'flex items-center gap-2' }, [
                                     h(Toggle, {
                                         modelValue: localWhisperEdit.enabled,
@@ -520,7 +521,7 @@ export const VideoAnalysisPage = {
                                     }),
                                     h('span', { class: 'form-hint' }, localWhisperEdit.enabled ? '已启用' : '已禁用'),
                                 ]),
-                                h(FormHint, '启用后可在无云端 ASR 时使用本地 Whisper 转写'),
+                                h(FormHint, '启用后可在无云端语音服务时使用本地模型转写'),
                             ]),
                             h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '模型大小'),
@@ -554,7 +555,7 @@ export const VideoAnalysisPage = {
                             h('p', {
                                 class: 'muted m-0',
                                 style: 'font-size:0.88rem; line-height:1.6;',
-                            }, '本地 Whisper 需安装 faster-whisper（pip install faster-whisper）。GPU 设备需对应驱动与 CUDA/cuDNN 支持。修改后保存即生效，下次视频分析任务将使用新配置。'),
+                            }, '本地语音识别需安装 faster-whisper。使用 GPU 时需对应驱动与 CUDA 支持。修改后保存即生效，下次视频分析将使用新配置。'),
                         ]),
                     ]),
                 ]),

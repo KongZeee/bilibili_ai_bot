@@ -88,7 +88,7 @@ export const PersonaListPage = defineComponent({
             if (list.length === 0) {
                 return [{ value: '', label: '默认模型' }];
             }
-            return list.map(p => ({ value: String(p.id), label: p.name || p.provider || `LLM ${p.id}` }));
+            return list.map(p => ({ value: String(p.id), label: p.name || p.provider || `模型 ${p.id}` }));
         });
 
         // ── 数据加载 ──
@@ -202,7 +202,14 @@ export const PersonaListPage = defineComponent({
                 return;
             }
             try {
-                const payload = { ...createForm };
+                // 后端 persona_store 只持久化 base_prompt，不认 system_prompt
+                const payload = {
+                    name: createForm.name,
+                    description: createForm.description,
+                    base_prompt: createForm.system_prompt,
+                    personality: createForm.personality,
+                    appearance: createForm.appearance,
+                };
                 if (editingId.value) {
                     await api.personas.update(editingId.value, payload);
                     showToast('人格已更新', 'success');
@@ -239,8 +246,8 @@ export const PersonaListPage = defineComponent({
                     (typeof result === 'string' ? result : (result ? JSON.stringify(result) : '（无回复）'));
             } catch (e) {
                 if (e.code === 'LLM_NOT_FOUND' || e.code === 'LLM_NOT_CONFIGURED') {
-                    testReply.value = '请先在 LLM 管理页面配置并启用一个 LLM Provider';
-                    showToast('请先在 LLM 管理页面配置并启用一个 LLM Provider', 'warning');
+                    testReply.value = '请先在模型管理页面配置并启用一个对话模型服务商';
+                    showToast('请先在模型管理页面配置并启用一个对话模型服务商', 'warning');
                 } else {
                     testReply.value = '测试失败: ' + e.message;
                     showToast('测试失败: ' + e.message, 'error');
@@ -447,7 +454,7 @@ export const PersonaListPage = defineComponent({
                         ]),
                         // LLM 模型选择
                         h(FormSelect, {
-                            label: 'LLM 模型',
+                            label: '对话模型',
                             modelValue: selectedLlm.value,
                             'onUpdate:modelValue': (v) => selectedLlm.value = v,
                             options: llmOptions.value,

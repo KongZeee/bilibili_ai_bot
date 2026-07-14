@@ -36,6 +36,7 @@ SENSITIVE_LEAF_NAMES = {
     "buvid3",
     "refresh_token",
     "api_key",
+    "api_keys",
     "secret_key",
     "admin_password",
     "admin_username",
@@ -525,7 +526,15 @@ class ConfigLoader:
                 result = {}
                 for key, value in data.items():
                     path = f"{prefix}.{key}" if prefix else key
-                    if path in SENSITIVE_PATHS or key in SENSITIVE_LEAF_NAMES:
+                    if key == "api_keys" and isinstance(value, list):
+                        # Preserve count; never leak key material.
+                        result[key] = [
+                            SENSITIVE_PLACEHOLDER
+                            for item in value
+                            if isinstance(item, str) and item.strip()
+                            and item not in SENSITIVE_PLACEHOLDERS
+                        ]
+                    elif path in SENSITIVE_PATHS or key in SENSITIVE_LEAF_NAMES:
                         if value and value != SENSITIVE_PLACEHOLDER:
                             result[key] = SENSITIVE_PLACEHOLDER
                         else:

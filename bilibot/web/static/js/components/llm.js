@@ -2,21 +2,41 @@
 const { defineComponent, h, ref, computed, onMounted } = window.Vue;
 import { api } from '../api.js';
 import { appState, refreshAccounts, showToast } from '../state.js';
-import { Button, Badge, Modal, FormInput, Toggle, EmptyState, Loading, ConfirmModal, createConfirmHelper } from './common.js';
+import { Button, Badge, Modal, FormInput, FormTextarea, Toggle, EmptyState, Loading, ConfirmModal, createConfirmHelper } from './common.js';
+
+function parseApiKeysText(text) {
+    if (!text || typeof text !== 'string') return [];
+    return text
+        .split(/[\n,]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+}
+
+function keysPayloadFromForm(form) {
+    const keys = parseApiKeysText(form.api_keys_text || '');
+    const single = (form.api_key || '').trim();
+    if (keys.length) {
+        return { api_keys: keys, api_key: keys[0] };
+    }
+    if (single) {
+        return { api_key: single, api_keys: [single] };
+    }
+    return null;
+}
 
 // Tab 配置：type 与后端 PROVIDER_TYPES 对齐
 const TABS = [
-    { type: 'chat',      label: '对话模型',  eyebrow: 'Chat',       desc: '主动回复 / 动态 / 记忆提取' },
-    { type: 'vision',    label: '视觉模型',  eyebrow: 'Vision',     desc: '视频视觉轨理解' },
-    { type: 'embedding', label: 'Embedding', eyebrow: 'Embedding',  desc: '记忆向量检索' },
-    { type: 'asr',       label: 'ASR',       eyebrow: 'ASR',        desc: '视频音频轨转写' },
-    { type: 'image',     label: '文生图',    eyebrow: 'Image',      desc: '动态配图生成' },
+    { type: 'chat',      label: '对话模型',  eyebrow: '对话',   desc: '主动回复 / 动态 / 记忆提取' },
+    { type: 'vision',    label: '视觉模型',  eyebrow: '视觉',   desc: '视频画面理解' },
+    { type: 'embedding', label: '向量模型',  eyebrow: '向量',   desc: '记忆向量检索' },
+    { type: 'asr',       label: '语音识别',  eyebrow: '语音',   desc: '视频音频转写' },
+    { type: 'image',     label: '文生图',    eyebrow: '配图',   desc: '动态配图生成' },
 ];
 
 // 默认表单值（按类型）
 function defaultForm(type) {
     const base = {
-        id: '', name: '', api_key: '', base_url: '', model: '', enabled: true,
+        id: '', name: '', api_key: '', api_keys_text: '', base_url: '', model: '', enabled: true,
     };
     if (type === 'chat') {
         base.max_tokens = 1024;
@@ -91,8 +111,13 @@ export const LlmListPage = defineComponent({
             try {
                 const payload = { ...form.value };
                 if (!payload.id) delete payload.id;
+                delete payload.api_keys_text;
+                const keys = keysPayloadFromForm(form.value);
+                if (keys) {
+                    Object.assign(payload, keys);
+                }
                 await api.modelRouting.addProvider(activeTab.value, payload);
-                showToast('Provider 添加成功', 'success');
+                showToast('服务商添加成功', 'success');
                 showAdd.value = false;
                 await loadOverview();
             } catch (e) {
@@ -107,6 +132,8 @@ export const LlmListPage = defineComponent({
             f.model = p.model || '';
             f.base_url = p.base_url || '';
             f.api_key = ''; // 不回显，留空不修改
+            f.api_keys_text = '';
+            f._api_key_count = p.api_key_count || (p.has_api_key ? 1 : 0);
             f.enabled = p.enabled ?? true;
             if (activeTab.value === 'chat') {
                 f.max_tokens = p.max_tokens ?? 1024;
@@ -138,10 +165,12 @@ export const LlmListPage = defineComponent({
                     payload.timeout = Number(editForm.value.timeout) || 120;
                 }
                 // 仅当用户输入了新 key 时才发送，避免空串覆盖
-                if (editForm.value.api_key) payload.api_key = editForm.value.api_key;
+                const keys = keysPayloadFromForm(editForm.value);
+                if (keys) Object.assign(payload, keys);
+                else if (editForm.value.api_key) payload.api_key = editForm.value.api_key;
 
                 await api.modelRouting.updateProvider(activeTab.value, editingId.value, payload);
-                showToast('Provider 已更新', 'success');
+                showToast('服务商已更新', 'success');
                 showEdit.value = false;
                 await loadOverview();
             } catch (e) {
@@ -150,12 +179,12 @@ export const LlmListPage = defineComponent({
         }
 
         function deleteProvider(p) {
-            let message = '确定删除此 Provider？';
+            let message = '确定删除此服务商？';
             // chat 类型：检查账号引用
             if (activeTab.value === 'chat') {
                 const usage = llmUsage.value[p.id] || [];
                 if (usage.length > 0) {
-                    message = `此 Provider 被 ${usage.length} 个账号引用，删除后引用将失效。继续？`;
+                    message = `此服务商被 ${usage.length} 个账号引用，删除后引用将失效。继续？`;
                 }
             }
             showConfirm({
@@ -252,8 +281,8 @@ export const LlmListPage = defineComponent({
             if (currentProviders.value.length === 0) {
                 return h(EmptyState, {
                     icon: 'folder',
-                    title: `暂无 ${TABS.find(t => t.type === activeTab.value)?.label || ''} Provider`,
-                    desc: '点击右上角添加第一个 Provider',
+                    title: `暂无${TABS.find(t => t.type === activeTab.value)?.label || ''}服务商`,
+                    desc: '点击右上角添加第一个服务商',
                 });
             }
             return h('div', { class: 'grid', style: 'gap:0; min-width:0;' }, [
@@ -303,6 +332,7 @@ export const LlmListPage = defineComponent({
                             }, p.base_url || '-'),
                             h('div', { class: 'flex items-center gap-1 flex-wrap', style: 'margin-top:calc(var(--spacing) * 0.5);' }, [
                                 !p.has_api_key && h(Badge, { type: 'warning', size: 'sm' }, () => '无密钥'),
+                                p.has_api_key && h(Badge, { type: 'info', size: 'sm' }, () => `密钥 ×${p.api_key_count || 1}`),
                             ].filter(Boolean)),
                         ]),
                         h('span', {
@@ -347,16 +377,16 @@ export const LlmListPage = defineComponent({
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
                             h('span', { class: 'eyebrow' }, '模型管理'),
-                            h(Badge, { type: 'info' }, () => 'V3 路由'),
+                            h(Badge, { type: 'info' }, () => '多类型'),
                         ]),
                         h('h2', {
                             style: 'margin:0; font-size:1.65rem; line-height:1.1; text-wrap:balance; word-break:keep-all;',
-                        }, '模型 Provider'),
+                        }, '模型服务商'),
                         h('div', { class: 'flex items-baseline gap-2 flex-wrap' }, [
                             h('span', {
                                 style: 'font-size:2.4rem; font-weight:500; line-height:1; font-variant-numeric:tabular-nums;',
                             }, String(currentProviders.value.length || 0)),
-                            h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, `个 ${tab.label} Provider`),
+                            h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, `个${tab.label}服务商`),
                         ]),
                         h('p', { class: 'muted m-0' }, tab.desc),
                     ]),
@@ -373,7 +403,7 @@ export const LlmListPage = defineComponent({
                         ]),
                         h('div', { class: 'card-body grid gap-2' }, [
                             h('div', { class: 'flex items-center justify-between' }, [
-                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '已路由 Provider'),
+                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '当前服务商'),
                                 h(Badge, { type: routedProvider ? 'success' : 'muted' }, () => routedProvider ? (routedProvider.name || routedProvider.id) : '未设置'),
                             ]),
                             h('div', { class: 'flex items-center justify-between' }, [
@@ -385,7 +415,7 @@ export const LlmListPage = defineComponent({
                             h(Button, {
                                 type: 'primary',
                                 onClick: openAdd,
-                            }, () => `+ 添加 ${tab.label} Provider`),
+                            }, () => `+ 添加${tab.label}服务商`),
                         ]),
                     ]),
                 ]),
@@ -419,7 +449,7 @@ export const LlmListPage = defineComponent({
                             h('span', { class: 'eyebrow' }, tab.eyebrow),
                             h('h2', {
                                 style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;',
-                            }, `${tab.label} Provider 管理`),
+                            }, `${tab.label}服务商管理`),
                         ]),
                         h(Button, { type: 'primary', size: 'sm', onClick: openAdd }, () => '+ 新增'),
                     ]),
@@ -430,21 +460,27 @@ export const LlmListPage = defineComponent({
                 h(Modal, {
                     modelValue: showAdd.value,
                     'onUpdate:modelValue': (v) => showAdd.value = v,
-                    title: `添加 ${tab.label} Provider`,
+                    title: `添加${tab.label}服务商`,
                     width: '600px',
                 }, {
                     default: () => h('div', { class: 'grid gap-3' }, [
-                        h(FormInput, { label: 'ID（可选）', modelValue: form.value.id,
-                            'onUpdate:modelValue': (v) => form.value.id = v, placeholder: '留空自动生成，如: siliconflow' }),
+                        h(FormInput, { label: '编号（可选）', modelValue: form.value.id,
+                            'onUpdate:modelValue': (v) => form.value.id = v, placeholder: '留空自动生成' }),
                         h(FormInput, { label: '名称', modelValue: form.value.name,
                             'onUpdate:modelValue': (v) => form.value.name = v }),
                         h(FormInput, { label: '模型', modelValue: form.value.model,
                             'onUpdate:modelValue': (v) => form.value.model = v,
                             placeholder: '如 Qwen/Qwen2.5-72B-Instruct' }),
-                        h(FormInput, { label: 'Base URL', modelValue: form.value.base_url,
+                        h(FormInput, { label: '接口地址', modelValue: form.value.base_url,
                             'onUpdate:modelValue': (v) => form.value.base_url = v }),
-                        h(FormInput, { label: 'API Key', modelValue: form.value.api_key,
-                            'onUpdate:modelValue': (v) => form.value.api_key = v, type: 'password' }),
+                        h(FormTextarea, {
+                            label: 'API 密钥（可多行，每行一个）',
+                            modelValue: form.value.api_keys_text,
+                            'onUpdate:modelValue': (v) => form.value.api_keys_text = v,
+                            rows: 3,
+                            placeholder: 'sk-xxx\nsk-yyy\n（同一 base_url/model 下并行分发）',
+                            hint: '多个密钥用于并行提速、降低 429；也可只填一行',
+                        }),
                         ...renderExtraFields(form.value),
                         h('div', { class: 'flex items-center justify-between' }, [
                             h('span', { class: 'eyebrow' }, '启用'),
@@ -464,7 +500,7 @@ export const LlmListPage = defineComponent({
                 h(Modal, {
                     modelValue: showEdit.value,
                     'onUpdate:modelValue': (v) => showEdit.value = v,
-                    title: `编辑 ${tab.label} Provider — ${editingId.value}`,
+                    title: `编辑${tab.label}服务商 — ${editingId.value}`,
                     width: '640px',
                 }, {
                     default: () => h('div', { class: 'grid gap-3' }, [
@@ -475,10 +511,16 @@ export const LlmListPage = defineComponent({
                             h(FormInput, { label: '模型', modelValue: editForm.value.model,
                                 'onUpdate:modelValue': (v) => editForm.value.model = v,
                                 placeholder: '如 Qwen/Qwen2.5-72B-Instruct' }),
-                            h(FormInput, { label: 'Base URL', modelValue: editForm.value.base_url,
+                            h(FormInput, { label: '接口地址', modelValue: editForm.value.base_url,
                                 'onUpdate:modelValue': (v) => editForm.value.base_url = v }),
-                            h(FormInput, { label: 'API Key（留空不修改）', modelValue: editForm.value.api_key,
-                                'onUpdate:modelValue': (v) => editForm.value.api_key = v, type: 'password' }),
+                            h(FormTextarea, {
+                                label: `API 密钥（当前 ${editForm.value._api_key_count || 0} 个；留空不修改）`,
+                                modelValue: editForm.value.api_keys_text,
+                                'onUpdate:modelValue': (v) => editForm.value.api_keys_text = v,
+                                rows: 3,
+                                placeholder: '留空保留原密钥；填写则整表替换（每行一个）',
+                                hint: '多密钥并行分发，尤其适合视觉/高并发场景',
+                            }),
                         ]),
                         ...renderExtraFields(editForm.value),
                         h('div', { class: 'flex items-center justify-between' }, [

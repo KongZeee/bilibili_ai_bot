@@ -188,9 +188,12 @@ export const SystemPage = {
         async function loadBackups() {
             backupLoading.value = true;
             try {
-                backups.value = await api.backup.list() || [];
+                const data = await api.backup.list();
+                // 后端 ok({"backups": [...]})，api 解包后为 { backups: [...] }
+                backups.value = data?.backups || data?.items || (Array.isArray(data) ? data : []);
             } catch (e) {
                 appState.notify('加载备份列表失败：' + (e.message || e), 'danger');
+                backups.value = [];
             } finally {
                 backupLoading.value = false;
             }

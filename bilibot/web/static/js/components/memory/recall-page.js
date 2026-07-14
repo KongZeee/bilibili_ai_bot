@@ -11,7 +11,7 @@ function score(value) {
 }
 
 function modeLabel(mode) {
-    return mode === 'llm' ? 'LLM 重排' : mode === 'fallback' ? '确定性降级' : '空召回';
+    return mode === 'llm' ? '模型重排' : mode === 'fallback' ? '确定性降级' : '空召回';
 }
 
 function normalizeCandidate(candidate, mode = 'llm') {
@@ -179,12 +179,12 @@ export const MemoryRecallPage = defineComponent({
                                 h('input', { class: 'form-input', value: title.value, onInput: event => title.value = event.target.value }),
                             ]),
                             h('label', { class: 'grid gap-1' }, [
-                                h('span', { class: 'form-label' }, 'BVID'),
-                                h('input', { class: 'form-input', value: bvid.value, onInput: event => bvid.value = event.target.value }),
+                                h('span', { class: 'form-label' }, '视频 BV 号'),
+                                h('input', { class: 'form-input', value: bvid.value, onInput: event => bvid.value = event.target.value, placeholder: '可选' }),
                             ]),
                             h('label', { class: 'grid gap-1' }, [
-                                h('span', { class: 'form-label' }, 'OID'),
-                                h('input', { class: 'form-input', value: oid.value, onInput: event => oid.value = event.target.value }),
+                                h('span', { class: 'form-label' }, '对象 ID'),
+                                h('input', { class: 'form-input', value: oid.value, onInput: event => oid.value = event.target.value, placeholder: '可选' }),
                             ]),
                             h('label', { class: 'grid gap-1' }, [
                                 h('span', { class: 'form-label' }, '场景'),
@@ -220,7 +220,7 @@ export const MemoryRecallPage = defineComponent({
                     }, [
                         h('div', { class: 'flex items-center justify-between gap-2' }, [
                             h('div', { class: 'grid gap-1' }, [
-                                h('span', { class: 'eyebrow' }, 'Trace'),
+                                h('span', { class: 'eyebrow' }, '历史'),
                                 h('h2', { class: 'm-0', style: 'font-size: 1.15rem;' }, '最近召回'),
                             ]),
                             h(Button, { type: 'ghost', size: 'sm', loading: historyLoading.value, onClick: loadTraces }, () => '刷新'),
@@ -228,7 +228,7 @@ export const MemoryRecallPage = defineComponent({
                         historyLoading.value && traces.value.length === 0
                             ? h(Loading)
                             : traces.value.length === 0
-                                ? h('p', { class: 'muted m-0' }, '暂无 trace')
+                                ? h('p', { class: 'muted m-0' }, '暂无记录')
                                 : traces.value.map(item => h('button', {
                                     key: item.id,
                                     type: 'button',
@@ -281,9 +281,9 @@ export const MemoryRecallPage = defineComponent({
                                         h('div', { class: 'grid gap-2', style: `grid-template-columns: ${candidateColumns}; padding: 0 0 calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border));` }, [
                                             h('span', { style: headerStyle }, '候选事件'),
                                             h('span', { style: headerStyle }, '命中通道'),
-                                            h('span', { style: headerStyle }, 'D'),
-                                            h('span', { style: headerStyle }, 'L'),
-                                            h('span', { style: headerStyle }, 'F'),
+                                            h('span', { style: headerStyle }, '确定分'),
+                                            h('span', { style: headerStyle }, '模型分'),
+                                            h('span', { style: headerStyle }, '最终分'),
                                             h('span', { style: headerStyle }, '阈值'),
                                             h('span', { style: headerStyle }, '类型 / 决策'),
                                         ]),
@@ -326,7 +326,7 @@ export const MemoryRecallPage = defineComponent({
                                     style: 'padding: calc(var(--spacing) * 2.5) 0; border-top: 1px solid hsl(var(--border));',
                                 }, [
                                     h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, [
-                                        h('span', { class: 'badge badge-info' }, event.source_type || event.source || 'unknown'),
+                                        h('span', { class: 'badge badge-info' }, event.source_type || event.source || '未知'),
                                         h('code', { style: 'font-size: .76rem;' }, event.id),
                                     ]),
                                     h('p', { class: 'm-0 memory-break', style: 'line-height: 1.55;' }, event.summary || event.content || '-'),
@@ -346,7 +346,7 @@ export const MemoryRecallPage = defineComponent({
                             }, [
                                 h('div', { class: 'flex justify-between gap-2', style: 'flex-wrap: wrap;' }, [
                                     h('div', { class: 'grid gap-1' }, [
-                                        h('span', { class: 'eyebrow' }, 'Prompt'),
+                                        h('span', { class: 'eyebrow' }, '提示词'),
                                         h('h2', { class: 'm-0', style: 'font-size: 1.15rem;' }, '最终记忆证据'),
                                     ]),
                                     h('span', { class: 'muted', style: 'font-size: .82rem;' }, `${finalPrompt.value.length} / 5000 字`),

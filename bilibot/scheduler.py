@@ -175,10 +175,15 @@ class Scheduler:
         # 调度状态
         self._proactive_times: List[tuple] = []
         self._proactive_triggered: set = set()
+        # 同账号主动看视频串行：上一条未完成时下一条排队等待，避免叠跑 + 抢资源
+        self._proactive_video_lock: Optional[asyncio.Lock] = None
+        self._proactive_video_inflight: int = 0
         self._dynamic_times: List[tuple] = []
         self._dynamic_triggered: set = set()
         # PRD V6：轮询状态去重日志——只在数值变化时打印 INFO，否则 DEBUG，避免日志膨胀
         self._last_notify_count: Optional[int] = None
+        self._last_at_notify_count: Optional[int] = None
+        self._last_at_merged_count: Optional[int] = None
         self._last_own_dynamic_count: Optional[int] = None
         self._last_all_replied_fingerprint: Optional[str] = None
         self._last_dm_session_count: Optional[int] = None
@@ -261,6 +266,12 @@ class Scheduler:
 
         task.add_done_callback(_on_done)
         return task
+
+    def _get_proactive_video_lock(self) -> asyncio.Lock:
+        """Lazy loop-bound lock so proactive video runs serially per account."""
+        if self._proactive_video_lock is None:
+            self._proactive_video_lock = asyncio.Lock()
+        return self._proactive_video_lock
 
     async def _archive_required(self, envelope):
         """Archive a raw observation before any irreversible business action."""
@@ -927,7 +938,22 @@ class Scheduler:
                             if at_id and at_id not in existing_ids:
                                 items.append(at_item)
                                 existing_ids.add(at_id)
-                        logger.info(f"@我的 通知返回 {len(at_items)} 条，合并后候选共 {len(items)} 条")
+                        # 与 reply 通知一致：数量无变化时降级 DEBUG，避免主循环每轮刷屏
+                        _at_count = len(at_items)
+                        _merged = len(items)
+                        if (
+                            _at_count != self._last_at_notify_count
+                            or _merged != self._last_at_merged_count
+                        ):
+                            logger.info(
+                                f"@我的 通知返回 {_at_count} 条，合并后候选共 {_merged} 条"
+                            )
+                            self._last_at_notify_count = _at_count
+                            self._last_at_merged_count = _merged
+                        else:
+                            logger.debug(
+                                f"@我的 通知返回 {_at_count} 条，合并后候选共 {_merged} 条（无变化）"
+                            )
             except Exception as at_exc:
                 logger.warning(f"获取@我的通知失败: {at_exc}")
 
@@ -1228,7 +1254,16 @@ class Scheduler:
                         continue
 
                     if not outcome.is_generated:
-                        # retryable / permanent → deferred（非终态，可恢复）
+                        # 永久错误（如 LLM 未配置）→ failed 终态，禁止 deferred 空转
+                        if getattr(outcome, "is_permanent_error", False):
+                            logger.error(
+                                f"LLM 永久失败 (code={outcome.error_code})，标记 rejected"
+                            )
+                            self.reply_state_store.mark_rejected(
+                                comment_type, reply_id,
+                                reason=f"generation_permanent: {outcome.error_code}",
+                            )
+                            continue
                         logger.warning(
                             f"LLM 生成未成功 (status={outcome.status}, code={outcome.error_code})，deferred"
                         )
@@ -1299,16 +1334,16 @@ class Scheduler:
                                     },
                                 )
                                 continue
-                            if not self.safety_checker.check_rate_limit(scene="reply_comment", account_id=self.account_id):
-                                # PRD V4 §9.1：限流 → deferred（非终态，可恢复）
-                                logger.warning("评论发布频率限制触发，deferred")
+                            rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
+                                scene="reply_comment", account_id=self.account_id,
+                            )
+                            if not rate_ok:
+                                logger.warning("评论发布频率限制触发，deferred: %s", rate_reason)
                                 self.reply_state_store.mark_deferred(
                                     comment_type, reply_id,
                                     reason="rate_limited", error_code="RATE_LIMIT",
                                 )
                                 continue
-                            # PRD 4.4：预占频率配额（失败也计数，防止反复尝试失败永不触发限流）
-                            self.safety_checker.record_publish(scene="reply_comment", account_id=self.account_id)
                         except Exception as e:
                             # PRD V4 §9.1：安全检查异常 → deferred（非终态，可恢复）
                             logger.error(f"安全检查异常，deferred: {e}", exc_info=True)
@@ -1728,21 +1763,18 @@ class Scheduler:
                                     continue
                             except Exception as e:
                                 logger.warning(f"幂等检查失败，继续重试: {e}")
-                        # Task 9：重试路径也需频率检查和预占配额（与主路径一致）
+                        # Task 9：重试路径也需原子预占配额（与主路径一致）
                         if self.safety_checker is not None:
-                            if not self.safety_checker.check_rate_limit(
-                                scene="reply_comment", account_id=self.account_id
-                            ):
-                                logger.warning("重试路径评论发布频率限制触发，deferred")
+                            rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
+                                scene="reply_comment", account_id=self.account_id,
+                            )
+                            if not rate_ok:
+                                logger.warning("重试路径评论发布频率限制触发，deferred: %s", rate_reason)
                                 self.reply_state_store.mark_deferred(
                                     ct, rpid,
                                     reason="rate_limited", error_code="RATE_LIMIT",
                                 )
                                 continue
-                            # PRD 4.4：预占频率配额（失败也计数）
-                            self.safety_checker.record_publish(
-                                scene="reply_comment", account_id=self.account_id
-                            )
                         # 直接使用原始文本重新发布（不调用 generate_reply）
                         await self._archive_bot_action(
                             action_key=(
@@ -1926,7 +1958,12 @@ class Scheduler:
                             continue
 
                         if not outcome.is_generated:
-                            # retryable/permanent → 继续 defer
+                            if getattr(outcome, "is_permanent_error", False):
+                                self.reply_state_store.mark_rejected(
+                                    ct, rpid,
+                                    reason=f"retry_gen_permanent: {outcome.error_code}",
+                                )
+                                continue
                             self.reply_state_store.mark_deferred(
                                 ct, rpid,
                                 reason=f"retry_gen_{outcome.status}: {outcome.error_code}",
@@ -1990,17 +2027,15 @@ class Scheduler:
                                         ct, rpid, reason=f"safety_check: {reason}",
                                     )
                                     continue
-                                if not self.safety_checker.check_rate_limit(
-                                    scene="reply_comment", account_id=self.account_id
-                                ):
+                                rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
+                                    scene="reply_comment", account_id=self.account_id,
+                                )
+                                if not rate_ok:
                                     self.reply_state_store.mark_deferred(
                                         ct, rpid,
                                         reason="rate_limited_retry", error_code="RATE_LIMIT",
                                     )
                                     continue
-                                self.safety_checker.record_publish(
-                                    scene="reply_comment", account_id=self.account_id
-                                )
                             except Exception as safety_err:
                                 self.reply_state_store.mark_deferred(
                                     ct, rpid,
@@ -2341,16 +2376,24 @@ class Scheduler:
             logger.warning(f"主动评论动作 {action_id} mark_publishing 失败")
             return ""
 
-        # PRD 3.5 / COM-004：审计记录
+        # PRD 3.5 / COM-004：审计记录（评论页与 reply_comment 一并展示）
         audit_id = None
         if self.audit_store is not None:
             try:
                 audit_id = await self.audit_store.record_async(
                     scene="proactive_comment",
                     persona_id=persona_id_for_policy or "default",
+                    input_summary=f"主动评论 · 《{title}》 · UP {owner}",
+                    context_summary=f"主动看视频后发表评论 bvid={bvid}",
                     prompt_preview=f"视频: {title} | UP: {owner}",
                     output=comment_text,
-                    target={"bvid": bvid, "oid": oid},
+                    target={
+                        "bvid": bvid,
+                        "oid": oid,
+                        "video_title": title,
+                        "owner": owner,
+                        "kind": "proactive_comment",
+                    },
                 )
             except Exception as e:
                 logger.warning(f"审计记录失败: {e}")
@@ -2366,6 +2409,7 @@ class Scheduler:
             )
         except Exception as e:
             # PRD-V5 §10.2 COM-501：HTTP 异常 → 平台可能已收到 → result_unknown
+            # 配额策略：结果不确定时不退还（可能已发出）
             logger.error(f"评论发表异常（平台可能已收到）: {e}", exc_info=True)
             self.proactive_comment_store.mark_result_unknown(
                 action_id, "PUBLISH_EXCEPTION", str(e),
@@ -2390,7 +2434,6 @@ class Scheduler:
                     "unknown proactive comment result could not be archived: action=%s",
                     action_id,
                 )
-            # 兼容旧逻辑：仍记录 CommentPolicy / InteractionPolicy
             try:
                 await self.comment_policy.record_async(
                     bvid=bvid, oid=str(oid), content=comment_text,
@@ -2603,10 +2646,11 @@ class Scheduler:
                                     action.action_id, "SAFETY_REJECTED", sreason,
                                 )
                                 continue
-                            if not self.safety_checker.check_rate_limit(
+                            rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
                                 scene="proactive_comment", account_id=self.account_id,
-                            ):
-                                logger.warning("重试主动评论频率限制触发")
+                            )
+                            if not rate_ok:
+                                logger.warning("重试主动评论频率限制触发: %s", rate_reason)
                                 self.proactive_comment_store.mark_failed(
                                     action.action_id, "RATE_LIMITED",
                                     "proactive_comment rate limited",
@@ -2619,16 +2663,22 @@ class Scheduler:
                                 action.action_id, "SAFETY_CHECK_ERROR", str(se),
                             )
                             continue
-                    # COM-602：创建审计记录（便于成功后 mark_published）
+                    # COM-602：创建审计记录（便于成功后 mark_published；评论页可展示）
                     audit_id = None
                     if self.audit_store is not None:
                         try:
                             audit_id = await self.audit_store.record_async(
                                 scene="proactive_comment",
                                 persona_id=action.persona_id or "default",
+                                input_summary=f"主动评论重试 · bvid={action.bvid}",
+                                context_summary=f"主动评论重试发布 bvid={action.bvid}",
                                 prompt_preview=f"retry bvid={action.bvid}",
                                 output=reply_text,
-                                target={"bvid": action.bvid, "oid": oid},
+                                target={
+                                    "bvid": action.bvid,
+                                    "oid": oid,
+                                    "kind": "proactive_comment",
+                                },
                             )
                         except Exception as e:
                             logger.warning(f"重试审计记录失败: {e}")
@@ -2709,6 +2759,13 @@ class Scheduler:
                         action.action_id, "RETRY_PUBLISH_FAILED",
                         "重试发布失败：bili.post_comment 返回 False",
                     )
+                    if self.safety_checker is not None:
+                        try:
+                            self.safety_checker.refund_publish(
+                                scene="proactive_comment", account_id=self.account_id,
+                            )
+                        except Exception:
+                            pass
                     try:
                         await self._archive_bot_action(
                             action_key=(
@@ -3110,15 +3167,16 @@ class Scheduler:
                                 pm_state.id, reason=reason or "safety_check_failed",
                             )
                             continue
-                        if not self.safety_checker.check_rate_limit(scene="private_message", account_id=self.account_id):
-                            logger.warning("私信频率限制触发")
+                        rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
+                            scene="private_message", account_id=self.account_id,
+                        )
+                        if not rate_ok:
+                            logger.warning("私信频率限制触发: %s", rate_reason)
                             self.pm_state_store.mark_deferred(
                                 pm_state.id, reason="rate_limited",
                                 error_code="PM_RATE_LIMITED",
                             )
                             continue
-                        # PRD 4.4：预占频率配额
-                        self.safety_checker.record_publish(scene="private_message", account_id=self.account_id)
 
                     # 推进：safety_pending → publish_pending
                     pm_state = self.pm_state_store.update_status(
@@ -3758,6 +3816,8 @@ class Scheduler:
         - task_id 不为空时通过 TaskRunStore 跟踪生命周期
         - claim → start → succeed/fail（创建协程 ≠ 成功）
         - 平台结果不确定时 mark_result_unknown（不自动重发）
+
+        同账号串行：若上一条主动看视频仍在执行，本条在锁上排队等待（不丢 slot、不叠跑）。
         """
         logger.info("开始主动看视频...")
         if not self.bili:
@@ -3792,6 +3852,21 @@ class Scheduler:
                 logger.warning(f"TaskRun {task_id} start 失败（可能已被处理）")
                 return
 
+        lock = self._get_proactive_video_lock()
+        if lock.locked() or self._proactive_video_inflight > 0:
+            logger.info(
+                "主动看视频排队等待：同账号已有进行中的任务 "
+                f"(inflight={self._proactive_video_inflight}, task_id={task_id or '-'})"
+            )
+        async with lock:
+            self._proactive_video_inflight += 1
+            try:
+                await self._do_proactive_video_locked(task_id=task_id)
+            finally:
+                self._proactive_video_inflight = max(0, self._proactive_video_inflight - 1)
+
+    async def _do_proactive_video_locked(self, task_id: Optional[str] = None):
+        """主动看视频主体（调用方已持有同账号串行锁）。"""
         # PRD V4 COM-001：features 在方法内独立读取（与 _check_proactive_tasks 解耦）
         features = self.config_loader.get_raw_config().get("features", {})
 
@@ -4296,8 +4371,9 @@ class Scheduler:
             if comment_decision.get("planned"):
                 action_outcomes["comment"] = "success" if comment_text else "failed_or_skipped"
             interaction_summary = self.interaction_policy.get_today_summary()
+            # Distinct from video_observation (raw AV archive): this is post-watch evaluation.
             experience_lines = [
-                f"观察了视频《{title}》，UP主 {owner}",
+                f"观看并评价了视频《{title}》，UP主 {owner}",
                 f"评分: {score}",
                 f"心情: {mood}",
             ]
@@ -4323,6 +4399,7 @@ class Scheduler:
                     metadata={
                         "bvid": bvid,
                         "oid": str(oid),
+                        "owner": owner,
                         "watch_state": watch_state,
                         "watched": watched_flag,
                         "action_outcomes": action_outcomes,
@@ -4692,10 +4769,11 @@ class Scheduler:
                     metadata={"reason_code": "SAFETY_REJECTED"},
                 )
                 return
-            if not self.safety_checker.check_rate_limit(
-                scene="dynamic_post", account_id=self.account_id
-            ):
-                logger.warning("动态发布频率限制触发，跳过本次")
+            rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
+                scene="dynamic_post", account_id=self.account_id,
+            )
+            if not rate_ok:
+                logger.warning("动态发布频率限制触发，跳过本次: %s", rate_reason)
                 if audit_id and self.audit_store:
                     try:
                         self.audit_store.mark_published(
@@ -4714,10 +4792,6 @@ class Scheduler:
                     metadata={"reason_code": "RATE_LIMITED"},
                 )
                 return
-            # PRD 4.4：预占频率配额
-            self.safety_checker.record_publish(
-                scene="dynamic_post", account_id=self.account_id
-            )
 
             # 4.5 生成配图（如果配置了 with_image 且 image_provider 可用）
             image_list = []
@@ -5114,12 +5188,13 @@ class Scheduler:
                                     "草稿配图上传失败", retryable=True)
                     return
 
-            # DYN-602：发布前频率限制检查
+            # DYN-602：发布前原子预占频率配额
+            rate_reserved = False
             if self.safety_checker is not None:
-                if not self.safety_checker.check_rate_limit(
-                    scene="dynamic_post", account_id=self.account_id
-                ):
-                    # Task 11.2：限流时回退草稿状态为 retry_wait，避免卡死在 publishing
+                rate_ok, rate_reason = self.safety_checker.check_and_record_rate_limit(
+                    scene="dynamic_post", account_id=self.account_id,
+                )
+                if not rate_ok:
                     try:
                         store.mark_retry_wait(
                             draft_id, "dynamic_post rate limited"
@@ -5142,6 +5217,7 @@ class Scheduler:
                         },
                     )
                     return
+                rate_reserved = True
 
             # 发布
             try:
@@ -5149,6 +5225,7 @@ class Scheduler:
                     content, images=image_list if image_list else None
                 )
             except Exception as publish_exc:
+                # 结果不确定：不退配额
                 error_name = type(publish_exc).__name__
                 store.mark_result_unknown(draft_id, error_name)
                 self._mark_task_result_unknown(
@@ -5175,16 +5252,19 @@ class Scheduler:
                 return
             if not success:
                 self._check_bili_risk_control("dynamic_post")
+                if rate_reserved and self.safety_checker is not None:
+                    try:
+                        self.safety_checker.refund_publish(
+                            scene="dynamic_post", account_id=self.account_id,
+                        )
+                    except Exception:
+                        pass
 
             if success:
                 store.mark_published(draft_id)
                 logger.info(f"动态草稿发布成功: {draft_id}")
-                # DYN-602：记录频率配额 + 内容（与 _do_post_dynamic 一致）
                 if self.safety_checker is not None:
                     try:
-                        self.safety_checker.record_publish(
-                            scene="dynamic_post", account_id=self.account_id
-                        )
                         self.safety_checker.record_content(content, account_id=self.account_id)
                     except Exception:
                         pass

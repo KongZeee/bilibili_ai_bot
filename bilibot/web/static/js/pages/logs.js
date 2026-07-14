@@ -17,11 +17,19 @@ export const LogsPage = defineComponent({
 
         const levelFilters = [
             { value: '', label: '全部', color: '#00ff9c' },
-            { value: 'DEBUG', label: 'DEBUG', color: '#56b6c2' },
-            { value: 'INFO', label: 'INFO', color: '#61afef' },
-            { value: 'WARNING', label: 'WARN', color: '#e5c07b' },
-            { value: 'ERROR', label: 'ERROR', color: '#e06c75' },
+            { value: 'DEBUG', label: '调试', color: '#56b6c2' },
+            { value: 'INFO', label: '信息', color: '#61afef' },
+            { value: 'WARNING', label: '警告', color: '#e5c07b' },
+            { value: 'ERROR', label: '错误', color: '#e06c75' },
         ];
+
+        const LEVEL_ZH = {
+            DEBUG: '调试',
+            INFO: '信息',
+            WARNING: '警告',
+            ERROR: '错误',
+            CRITICAL: '严重',
+        };
 
         // 统计各级别数量
         const levelCounts = computed(() => {
@@ -110,7 +118,7 @@ export const LogsPage = defineComponent({
                         ]),
                         h('span', {
                             style: 'color:#e5e5e5; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:0.82rem; font-weight:500;',
-                        }, 'bililog — bash — 80×24'),
+                        }, '系统日志'),
                     ]),
                     // 右侧：状态
                     h('div', {
@@ -119,9 +127,9 @@ export const LogsPage = defineComponent({
                         h('span', { style: `color:${levelCounts.value.ERROR > 0 ? '#e06c75' : '#56b6c2'};` },
                             `● ${logs.value.length} 行`),
                         levelCounts.value.ERROR > 0 && h('span', { style: 'color:#e06c75;' },
-                            `✕ ${levelCounts.value.ERROR} ERR`),
+                            `✕ ${levelCounts.value.ERROR} 错误`),
                         levelCounts.value.WARNING > 0 && h('span', { style: 'color:#e5c07b;' },
-                            `⚠ ${levelCounts.value.WARNING} WARN`),
+                            `⚠ ${levelCounts.value.WARNING} 警告`),
                     ]),
                 ]),
 
@@ -142,7 +150,7 @@ export const LogsPage = defineComponent({
                         value: keyword.value,
                         onInput: (e) => keyword.value = e.target.value,
                         onKeyup: (e) => { if (e.key === 'Enter') load(); },
-                        placeholder: 'grep ...',
+                        placeholder: '搜索关键词…',
                         style: 'flex:0 1 220px; min-width:140px; padding:0.25rem 0.6rem; background:#0d0d0d; border:1px solid #333; border-radius:4px; color:#e5e5e5; font-family:ui-monospace,monospace; font-size:0.78rem; outline:none;',
                     }),
                     h('button', {
@@ -167,40 +175,30 @@ export const LogsPage = defineComponent({
                     logs.value.length === 0
                         ? h('div', {
                             style: 'color:#555; text-align:center; padding:3rem 0; font-style:italic;',
-                        }, '$ no logs found')
-                        : logs.value.map((l, i) => h('div', {
-                            key: i,
-                            style: 'display:flex; align-items:flex-start; gap:0; padding:0.1rem 0.5rem; border-radius:2px; transition:background 0.1s; white-space:pre; overflow-x:hidden;',
-                            onMouseenter: (e) => e.target.style.background = '#1a1a1a',
-                            onMouseleave: (e) => e.target.style.background = 'transparent',
-                        }, [
-                            // 行号
-                            h('span', {
-                                style: 'flex:0 0 3.5rem; color:#444; user-select:none; text-align:right; padding-right:0.6rem; min-width:3.5rem;',
-                            }, String(i + 1).padStart(4, ' ')),
-                            // 时间戳
-                            h('span', {
-                                style: 'flex:0 0 auto; color:#666; padding-right:0.6rem; white-space:nowrap;',
-                            }, (l.ts || l.timestamp || '').padEnd(19, ' ')),
-                            // 级别
-                            h('span', {
-                                style: `flex:0 0 auto; color:${levelColor(l.level)}; font-weight:600; padding-right:0.6rem; white-space:nowrap;`,
-                            }, `[${(l.level || 'INFO').toUpperCase()}]`.padEnd(9, ' ')),
-                            // 消息内容
-                            h('span', {
-                                style: 'flex:1; min-width:0; color:#d4d4d4; white-space:pre-wrap; word-break:break-all;',
-                            }, l.line || l.message || l.msg || ''),
-                        ])),
-                    // 终端提示符
-                    h('div', {
-                        style: 'display:flex; gap:0.5rem; padding:0.3rem 0.5rem; color:#28c840;',
-                    }, [
-                        h('span', { style: 'color:#28c840;' }, 'bililog@bilibot'),
-                        h('span', { style: 'color:#666;' }, ':'),
-                        h('span', { style: 'color:#61afef;' }, '~/logs'),
-                        h('span', { style: 'color:#666;' }, '$'),
-                        h('span', { style: 'display:inline-block; width:8px; height:0.9rem; background:#28c840; animation:blink 1s step-end infinite; vertical-align:middle;' }),
-                    ]),
+                        }, '暂无日志')
+                        : logs.value.map((l, i) => {
+                            const lv = (l.level || 'INFO').toUpperCase();
+                            return h('div', {
+                                key: i,
+                                style: 'display:flex; align-items:flex-start; gap:0; padding:0.1rem 0.5rem; border-radius:2px; transition:background 0.1s; white-space:pre; overflow-x:hidden;',
+                                onMouseenter: (e) => e.target.style.background = '#1a1a1a',
+                                onMouseleave: (e) => e.target.style.background = 'transparent',
+                            }, [
+                                h('span', {
+                                    style: 'flex:0 0 3.5rem; color:#444; user-select:none; text-align:right; padding-right:0.6rem; min-width:3.5rem;',
+                                }, String(i + 1).padStart(4, ' ')),
+                                h('span', {
+                                    style: 'flex:0 0 auto; color:#666; padding-right:0.6rem; white-space:nowrap;',
+                                }, (l.ts || l.timestamp || '').padEnd(19, ' ')),
+                                h('span', {
+                                    style: `flex:0 0 auto; color:${levelColor(l.level)}; font-weight:600; padding-right:0.6rem; white-space:nowrap;`,
+                                    title: lv,
+                                }, `[${LEVEL_ZH[lv] || lv}]`.padEnd(6, ' ')),
+                                h('span', {
+                                    style: 'flex:1; min-width:0; color:#d4d4d4; white-space:pre-wrap; word-break:break-all;',
+                                }, l.line || l.message || l.msg || ''),
+                            ]);
+                        }),
                 ]),
             ]);
     },

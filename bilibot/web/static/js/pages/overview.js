@@ -4,7 +4,7 @@ import { api } from '../api.js';
 import { Card, Button, Badge, Loading, EmptyState, Icon, KpiCard, ActionList } from '../components/common.js';
 import { showToast } from '../state.js';
 import { navigate } from '../router.js';
-import { formatTime } from '../utils.js';
+import { formatTime, auditSceneLabel, auditStatusLabel, auditStatusBadgeType } from '../utils.js';
 
 export const OverviewPage = defineComponent({
     name: 'OverviewPage',
@@ -19,20 +19,22 @@ export const OverviewPage = defineComponent({
         async function loadData() {
             loading.value = true;
             try {
-                const [statusData, auditsData, commentAuditsData] = await Promise.all([
+                const [statusData, auditsData, auditStats] = await Promise.all([
                     api.status(),
-                    api.audits({ page: 1, page_size: 5 }).catch(() => ({ items: [], total: 0 })),
-                    api.audits({ scene: 'reply_comment', page: 1, page_size: 1 }).catch(() => ({ total: 0 })),
+                    api.audits({ page: 1, page_size: 5 }).catch(() => ({ items: [] })),
+                    api.get('/api/audit/stats').catch(() => null),
                 ]);
                 status.value = statusData;
-                audits.value = auditsData?.items || auditsData || [];
-                auditsTotal.value = auditsData?.total || audits.value.length || 0;
-                commentAuditsTotal.value = commentAuditsData?.total || 0;
+                audits.value = auditsData?.items || (Array.isArray(auditsData) ? auditsData : []);
+                // list 端点无 total；KPI 用 /api/audit/stats（扁平字段 + total）
+                const published = Number(auditStats?.published || 0);
+                const totalAll = Number(auditStats?.total || 0);
+                auditsTotal.value = totalAll || audits.value.length || 0;
+                commentAuditsTotal.value = published || totalAll || 0;
 
-                // 尝试获取记忆条数（取第一个账号）
                 try {
                     const accounts = await api.accounts.list();
-                    const accList = accounts?.items || accounts || [];
+                    const accList = Array.isArray(accounts) ? accounts : (accounts?.items || []);
                     if (accList.length > 0) {
                         const firstAcc = accList[0].id || accList[0].account_id;
                         if (firstAcc) {
@@ -80,7 +82,7 @@ export const OverviewPage = defineComponent({
                             ]),
                         ]),
                         h('p', { class: 'muted m-0' },
-                            status.value?.bilibili?.authenticated ? '已登录 · 最近检查刚刚' : '未登录 · 请前往账号管理'),
+                            status.value?.bilibili?.authenticated ? '已登录' : '未登录 · 请前往账号管理'),
                     ]),
                     // Card B: LLM 服务状态
                     h('article', {
@@ -93,7 +95,7 @@ export const OverviewPage = defineComponent({
                                 h('h2', {
                                     class: 'm-0',
                                     style: 'font-size: 1.35rem; line-height: 1.1; text-wrap: balance; word-break: keep-all;',
-                                }, 'LLM 服务'),
+                                }, '对话模型'),
                             ]),
                             h('span', {
                                 class: 'inline-flex items-center gap-1 whitespace-nowrap',
@@ -169,27 +171,42 @@ export const OverviewPage = defineComponent({
                                     style: 'grid-template-columns: 8.5rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.14em;',
                                 }, [
                                     h('span', { class: 'whitespace-nowrap' }, '时间'),
-                                    h('span', { class: 'whitespace-nowrap' }, '账号'),
-                                    h('span', { class: 'whitespace-nowrap' }, '类型'),
+                                    h('span', { class: 'whitespace-nowrap' }, '人格'),
+                                    h('span', { class: 'whitespace-nowrap' }, '场景'),
                                     h('span', { class: 'whitespace-nowrap' }, '内容预览'),
                                     h('span', { class: 'whitespace-nowrap' }, '状态'),
                                 ]),
                                 // 数据行
-                                ...audits.value.map(a => h('div', {
-                                    class: 'grid items-center',
-                                    style: 'grid-template-columns: 8.5rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;',
-                                }, [
-                                    h('span', {
-                                        class: 'whitespace-nowrap',
-                                        style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums;',
-                                    }, formatTime(a.created_at)),
-                                    h('span', { class: 'truncate' }, a.persona_id || '-'),
-                                    h('span', { class: 'truncate' }, a.scene || '-'),
-                                    h('span', { class: 'truncate' }, (a.input_summary || a.output || '').slice(0, 30)),
-                                    h('span', {
-                                        class: ['badge', a.status === 'approved' ? 'badge-success' : 'badge-warning'],
-                                    }, a.status === 'approved' ? '已通过' : '待审核'),
-                                ])),
+                                ...audits.value.map(a => {
+                                    const badge = auditStatusBadgeType(a.status, { published: a.published });
+                                    const preview = (a.output || a.input_summary || '').replace(/\s+/g, ' ').trim();
+                                    return h('div', {
+                                        class: 'grid items-center',
+                                        style: 'grid-template-columns: 8.5rem 3.5rem 4.5rem minmax(0, 1fr) 5.5rem; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;',
+                                    }, [
+                                        h('span', {
+                                            class: 'whitespace-nowrap',
+                                            style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums;',
+                                        }, formatTime(a.created_at)),
+                                        h('span', {
+                                            class: 'truncate',
+                                            title: a.persona_id || '',
+                                        }, a.persona_id || '默认'),
+                                        h('span', {
+                                            class: 'truncate',
+                                            title: a.scene || '',
+                                        }, auditSceneLabel(a.scene)),
+                                        h('span', {
+                                            class: 'truncate',
+                                            title: preview,
+                                        }, preview ? (preview.length > 36 ? preview.slice(0, 36) + '…' : preview) : '（无内容）'),
+                                        h('span', {
+                                            class: `badge badge-${badge}`,
+                                        }, a.status === 'published' || a.published
+                                            ? '已发布'
+                                            : auditStatusLabel(a.status, { published: a.published })),
+                                    ]);
+                                }),
                             ]),
                     ]),
 

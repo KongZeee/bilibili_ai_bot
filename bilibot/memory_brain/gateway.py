@@ -296,6 +296,79 @@ class MemoryModelGateway:
             or "unknown"
         )
 
+    @staticmethod
+    def _sanitize_event_summary(event: Mapping[str, Any], summary: str) -> str:
+        """Guard against common LLM role confusions (e.g. watch -> publish)."""
+        text = str(summary or "").strip()
+        original = str(event.get("summary") or event.get("event_summary") or "").strip()
+        event_type = str(event.get("event_type") or "").strip()
+        source_type = str(event.get("source_type") or "").strip()
+        title = str(event.get("title") or event.get("event_title") or "").strip()
+        metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+        owner = str((metadata or {}).get("owner") or "").strip()
+
+        def _looks_like_publish(s: str) -> bool:
+            return any(
+                p in s
+                for p in (
+                    "发布了视频",
+                    "发布视频",
+                    "上传了视频",
+                    "投稿了视频",
+                    "投稿视频",
+                    "发布了该视频",
+                )
+            )
+
+        def _fallback_watch() -> str:
+            if (
+                original
+                and any(token in original for token in ("观察", "观看", "看了"))
+                and not _looks_like_publish(original)
+            ):
+                return original
+            if title:
+                base = f"观察了视频《{title}》"
+                return f"{base}，UP主 {owner}" if owner else base
+            if original and not _looks_like_publish(original):
+                return original
+            return "观察了视频"
+
+        is_video_watch = (
+            event_type in {"video_observation", "video_metadata_observation", "bangumi_episode"}
+            or source_type in {"video", "video_metadata"}
+        )
+        is_video_experience = (
+            event_type == "bot_experience" or source_type == "video_experience"
+        )
+        if is_video_watch or is_video_experience:
+            bad_publish = (
+                "发布了视频",
+                "发布视频",
+                "上传了视频",
+                "投稿了视频",
+                "投稿视频",
+                "发布了该视频",
+            )
+            # "UP主XXX发布的视频" is OK as attribution; "亚托莉/自己发布了视频" is not.
+            if any(p in text for p in bad_publish):
+                # Keep only if it clearly attributes to UP, not the bot.
+                botish = any(
+                    token in text[:40]
+                    for token in ("亚托莉", "自己", "Bot", "bot", "本人")
+                )
+                upish = "UP主" in text or "up主" in text
+                if botish or not upish:
+                    return _fallback_watch() if is_video_watch else (
+                        original
+                        or (
+                            f"观看并评价了视频《{title}》"
+                            if title
+                            else (text or original)
+                        )
+                    )
+        return text or original
+
     async def summarize_event(self, event: Mapping[str, Any]) -> str:
         sources = event.get("sources") or []
         source = "\n\n".join(str(item.get("full_text") or "") for item in sources)
@@ -318,6 +391,8 @@ class MemoryModelGateway:
             "metadata": event.get("metadata") or {},
             "sources": source_meta,
         }
+        event_type = str(event.get("event_type") or "")
+        source_type = str(event.get("source_type") or "")
         prompt = (
             "Summarize this observed event faithfully in concise Chinese. "
             "Treat user claims as reported statements, not verified facts. "
@@ -329,13 +404,24 @@ class MemoryModelGateway:
             "2) If source_type is bot_action or speaker_actor_id is self, summarize it as Bot/\u4e9a\u6258\u8389/\u81ea\u5df1 performing or saying the action. "
             "Never write \u7528\u6237\u8bc4\u8bba\u79f0/\u7528\u6237\u8868\u793a for Bot's own reply text. "
             "3) For reply_comment bot actions, say \u4e9a\u6258\u8389\u56de\u590d\u4e86\u8bc4\u8bba\uff0c\u5185\u5bb9\u4e3a... "
-            "4) Do not invent unseen platform titles.\n\n"
+            "4) Do not invent unseen platform titles. "
+            "5) CRITICAL video role rules: "
+            "If event_type is video_observation / video_metadata_observation / bangumi_episode, "
+            "or source_type is video / video_metadata, this is Bot WATCHING or analyzing someone else's video. "
+            "You MUST write \u89c2\u770b/\u89c2\u5bdf/\u770b\u4e86\u89c6\u9891, NEVER \u53d1\u5e03\u4e86\u89c6\u9891/\u4e0a\u4f20\u4e86\u89c6\u9891/\u6295\u7a3f. "
+            "The UP\u4e3b may have published the video; Bot did not publish it. "
+            "If event_type is bot_experience or source_type is video_experience, "
+            "summarize as Bot watched and evaluated the video (score/mood/review/actions), "
+            "still NEVER claim Bot published/uploaded the video. "
+            "6) Prefer the existing event summary phrasing when present and correct.\n\n"
+            f"event_type={event_type}; source_type={source_type}\n"
             "Event metadata JSON:\n"
             + json.dumps(event_meta, ensure_ascii=False, default=str)
             + "\n\nRaw sources:\n"
             + source
         )
-        return await self.generate(prompt, max_tokens=600, temperature=0.0)
+        raw = await self.generate(prompt, max_tokens=600, temperature=0.0)
+        return self._sanitize_event_summary(event, raw or "")
 
     async def extract_entities(self, event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
         source = "\n\n".join(str(item.get("full_text") or "") for item in event["sources"])

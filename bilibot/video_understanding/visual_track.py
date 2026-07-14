@@ -361,6 +361,33 @@ def extract_keyframes(
     return _extract_frames_fallback(video_path, output_dir, fps, duration, no_of_frames)
 
 
+def _prepare_visual_frames(
+    video_path: str,
+    fps: float,
+    duration: float,
+    output_dir: str,
+    frame_extractor: str = "katna",
+    scenedetect_threshold: float = 27.0,
+    image_max_size: int = 768,
+) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], int]:
+    """CPU/ffmpeg-heavy keyframe extraction + resize (must not run on event loop)."""
+    no_of_frames = _calculate_frame_count(duration)
+    logger.info(f"目标抽帧数: {no_of_frames}")
+
+    frames = extract_keyframes(
+        video_path, output_dir, fps, duration, no_of_frames,
+        frame_extractor=frame_extractor, scenedetect_threshold=scenedetect_threshold,
+    )
+    if not frames:
+        return [], [], no_of_frames
+
+    resized_frames: List[Tuple[int, str]] = []
+    for frame_number, path in frames:
+        resized = _resize_image(path, image_max_size)
+        resized_frames.append((frame_number, resized))
+    return frames, resized_frames, no_of_frames
+
+
 async def describe_visual_track(
     video_path: str,
     fps: float,
@@ -385,12 +412,16 @@ async def describe_visual_track(
     Returns:
         (视觉事件列表, 是否画面基本静止)
     """
-    no_of_frames = _calculate_frame_count(duration)
-    logger.info(f"目标抽帧数: {no_of_frames}")
-
-    frames = extract_keyframes(
-        video_path, output_dir, fps, duration, no_of_frames,
-        frame_extractor=frame_extractor, scenedetect_threshold=scenedetect_threshold,
+    # Offload scenedetect/katna/ffmpeg/resize so the asyncio event loop (Web) stays responsive.
+    frames, resized_frames, no_of_frames = await asyncio.to_thread(
+        _prepare_visual_frames,
+        video_path,
+        fps,
+        duration,
+        output_dir,
+        frame_extractor,
+        scenedetect_threshold,
+        image_max_size,
     )
     if not frames:
         logger.warning("未抽到任何关键帧")
@@ -403,13 +434,10 @@ async def describe_visual_track(
             )
         return [], False
 
-    resized_frames = []
-    for frame_number, path in frames:
-        resized = _resize_image(path, image_max_size)
-        resized_frames.append((frame_number, resized))
-
     visual_events: List[VisualEvent] = []
-    effective_window = max(1, min(int(vision_window_size), 2))
+    # Hard cap is applied by caller (VideoUnderstandingConfig / ModelRouter).
+    # Keep a safety floor only; do not force the old hardcoded "2".
+    effective_window = max(1, int(vision_window_size))
     if effective_window != vision_window_size:
         logger.warning(
             f"Vision concurrency capped: {vision_window_size} -> {effective_window}"

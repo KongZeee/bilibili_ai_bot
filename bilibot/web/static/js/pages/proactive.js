@@ -1,9 +1,9 @@
 // pages/proactive.js - 主动行为页（Golden Time 设计稿）
-const { defineComponent, h, ref, onMounted } = window.Vue;
+const { defineComponent, h, ref, onMounted, watch } = window.Vue;
 import { api } from '../api.js';
 import { appState, showToast, refreshAccounts } from '../state.js';
 import { Button, Badge, FormSelect, Loading, EmptyState, Icon } from '../components/common.js';
-import { formatTime } from '../utils.js';
+import { formatTime, auditSceneLabel, auditStatusLabel, auditStatusBadgeType } from '../utils.js';
 
 export const ProactivePage = defineComponent({
     name: 'ProactivePage',
@@ -18,7 +18,7 @@ export const ProactivePage = defineComponent({
             loading.value = true;
             try {
                 const data = await api.accounts.tasks(selectedAccount.value, { page_size: 100 });
-                tasks.value = data.items || data || [];
+                tasks.value = data.items || (Array.isArray(data) ? data : []);
             } catch (e) {
                 showToast('加载任务列表失败: ' + e.message, 'error');
                 tasks.value = [];
@@ -47,11 +47,30 @@ export const ProactivePage = defineComponent({
             finally { triggering.value = false; }
         }
 
-        onMounted(() => {
-            if (!appState.accountsLoaded) refreshAccounts();
-            if (appState.accounts.length > 0 && !selectedAccount.value) {
+        async function ensureAccountAndLoad() {
+            if (!appState.accountsLoaded) {
+                await refreshAccounts();
+            }
+            if (!selectedAccount.value && appState.accounts.length > 0) {
                 const first = appState.accounts[0];
                 selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
+            }
+            if (selectedAccount.value) await loadTasks();
+        }
+
+        onMounted(ensureAccountAndLoad);
+
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
+                const first = appState.accounts[0];
+                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
+                loadTasks();
+            }
+        });
+
+        watch(() => appState.currentAccountId, (id) => {
+            if (id && id !== selectedAccount.value) {
+                selectedAccount.value = id;
                 loadTasks();
             }
         });
@@ -153,17 +172,21 @@ export const ProactivePage = defineComponent({
                                 class: 'grid items-center',
                                 style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;`,
                             }, [
-                                h('span', { class: 'truncate' }, t.scene || t.task_id || '-'),
+                                h('span', {
+                                    class: 'truncate',
+                                    title: t.task_id || '',
+                                }, auditSceneLabel(t.scene) !== '-' ? auditSceneLabel(t.scene) : (t.task_id || '-')),
                                 h('span', {
                                     class: 'badge badge-info',
-                                }, t.trigger_type || t.scene || '-'),
+                                }, ({
+                                    manual: '手动触发',
+                                    scheduled: '定时',
+                                    cron: '定时',
+                                    system: '系统',
+                                })[t.trigger_type] || auditSceneLabel(t.scene) || t.trigger_type || '-'),
                                 h('span', {
-                                    class: ['badge',
-                                        t.status === 'succeeded' ? 'badge-success'
-                                        : (t.status === 'failed' || t.status === 'expired' || t.status === 'result_unknown') ? 'badge-danger'
-                                        : t.status === 'running' ? 'badge-info'
-                                        : 'badge-warning'].join(' '),
-                                }, t.status || 'pending'),
+                                    class: `badge badge-${auditStatusBadgeType(t.status)}`,
+                                }, auditStatusLabel(t.status) || '待处理'),
                                 h('span', {
                                     class: 'whitespace-nowrap truncate',
                                     style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; font-size:0.85rem;',

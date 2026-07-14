@@ -76,8 +76,9 @@ def create_llm_providers_routes(
     async def add_provider(request: Request) -> JSONResponse:
         try:
             body = await request.json()
-            if not body.get("api_key"):
-                return fail("VALIDATION_ERROR", "api_key 不能为空")
+            has_keys = bool(body.get("api_key")) or bool(body.get("api_keys"))
+            if not has_keys:
+                return fail("VALIDATION_ERROR", "api_key / api_keys 不能为空")
             if not body.get("model"):
                 return fail("VALIDATION_ERROR", "model 不能为空")
             llm_id = llm_manager.add_provider(body)

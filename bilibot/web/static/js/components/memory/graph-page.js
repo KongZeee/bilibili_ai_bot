@@ -11,6 +11,19 @@ const TYPE_LABELS = { summary: '记忆节点', person: '用户节点', topic: '�
 
 // 分类标签映射（与 list-page 保持一致）
 const CATEGORY_LABELS = {
+    conversation_message: '对话消息',
+    conversation_context: '对话上下文',
+    conversation: '对话',
+    video_observation: '视频观察',
+    video_metadata_observation: '视频元数据',
+    bangumi_episode: '番剧剧集',
+    bot_experience: '观看评价',
+    bot_action: 'Bot 行为',
+    action_intent: '行为意图',
+    action_outcome: '行为结果',
+    web_observation: '联网参考',
+    reflection: '反思总结',
+    observation: '观察',
     episodic: '情景记忆',
     factual: '事实记忆',
     procedural: '程序记忆',

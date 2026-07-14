@@ -93,11 +93,18 @@ class VideoUnderstandingConfig:
         self.frame_extractor: str = va.get("frame_extractor", "katna")
         self.scenedetect_threshold: float = float(va.get("scenedetect_threshold", 27.0))
         self.image_max_size: int = int(va.get("image_max_size", 768))
-        requested_vision_window = int(va.get("vision_window_size", 2))
-        self.vision_window_size: int = max(1, min(requested_vision_window, 2))
-        requested_vision_rate = int(va.get("vision_requests_per_minute", 10))
+        # Soft request from video_analysis; absolute clamp applied later via router hard cap.
+        try:
+            requested_vision_window = int(va.get("vision_window_size", 2))
+        except (TypeError, ValueError):
+            requested_vision_window = 2
+        self.vision_window_size: int = max(1, min(requested_vision_window, 64))
+        try:
+            requested_vision_rate = int(va.get("vision_requests_per_minute", 10))
+        except (TypeError, ValueError):
+            requested_vision_rate = 10
         self.vision_requests_per_minute: int = max(
-            1, min(requested_vision_rate, 60)
+            1, min(requested_vision_rate, 600)
         )
 
         # PRD-V5 §8.2 VID-503：资源边界配置
@@ -401,13 +408,35 @@ class VideoUnderstandingService:
                         return [], False
                     # 番剧字幕识别模式：使用带字幕转写指令的视觉 prompt
                     vision_prompt = SUBTITLE_VISION_PROMPT if read_subtitles else VISION_SYSTEM_PROMPT
+                    effective_window = cfg.vision_window_size
+                    effective_rpm = cfg.vision_requests_per_minute
+                    resolve_effective = getattr(
+                        self.llm_manager, "vision_effective_concurrency", None
+                    )
+                    if callable(resolve_effective):
+                        effective_window = resolve_effective(cfg.vision_window_size)
+                    # Scale RPM with key count so multi-key pools are not starved by a single-key budget.
+                    key_count = 1
+                    resolve_vision = getattr(self.llm_manager, "resolve_vision", None)
+                    if callable(resolve_vision):
+                        vp = resolve_vision()
+                        if vp is not None:
+                            key_count = max(
+                                1,
+                                int(
+                                    getattr(vp, "vision_api_key_count", 0)
+                                    or getattr(vp, "api_key_count", 1)
+                                    or 1
+                                ),
+                            )
+                    effective_rpm = max(1, int(cfg.vision_requests_per_minute) * key_count)
                     return await describe_visual_track(
                         prep.video_path, prep.fps, prep.duration, frames_dir, self.adapter,
                         frame_extractor=cfg.frame_extractor,
                         scenedetect_threshold=cfg.scenedetect_threshold,
                         image_max_size=cfg.image_max_size,
-                        vision_window_size=cfg.vision_window_size,
-                        vision_requests_per_minute=cfg.vision_requests_per_minute,
+                        vision_window_size=effective_window,
+                        vision_requests_per_minute=effective_rpm,
                         vision_prompt=vision_prompt,
                         require_complete=require_complete_visual,
                     )

@@ -9,9 +9,9 @@ import { navigate } from '../router.js';
 // 功能卡片元信息（与后端 PROVIDER_TYPES / FEATURE_LABELS 对齐）
 const FEATURE_META = [
     { type: 'chat',      label: '对话',       icon: 'message-circle-more', desc: '主动回复 / 动态 / 记忆提取' },
-    { type: 'vision',    label: '视觉',       icon: 'circle-check',        desc: '视频视觉轨理解' },
-    { type: 'embedding', label: 'Embedding',  icon: 'star',                desc: '记忆向量检索' },
-    { type: 'asr',       label: 'ASR',        icon: 'file',                desc: '视频音频轨转写' },
+    { type: 'vision',    label: '视觉',       icon: 'circle-check',        desc: '视频画面理解' },
+    { type: 'embedding', label: '向量检索',   icon: 'star',                desc: '记忆向量检索' },
+    { type: 'asr',       label: '语音识别',   icon: 'file',                desc: '视频音频转写' },
     { type: 'image',     label: '文生图',     icon: 'folder-open',         desc: '动态配图生成' },
 ];
 
@@ -112,16 +112,16 @@ export const ModelRoutingPage = defineComponent({
                         ])
                         : h('div', {
                             style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.6); background: hsl(var(--muted) / 0.18); color: hsl(var(--muted-foreground)); font-size:0.86rem; margin-top:calc(var(--spacing) * 1);',
-                        }, '尚未分配 Provider'),
+                        }, '尚未分配服务商'),
                 ]),
 
-                // 底部：Provider 下拉切换
+                // 底部：服务商下拉切换
                 h('div', { class: 'grid gap-1' }, [
                     h('label', {
                         class: 'form-label',
                         for: selectId,
-                        style: 'font-size:0.78rem; text-transform: uppercase; letter-spacing: 0.1em;',
-                    }, '切换 Provider'),
+                        style: 'font-size:0.78rem; letter-spacing: 0.06em;',
+                    }, '切换服务商'),
                     h('div', { class: 'flex items-center gap-2' }, [
                         h('select', {
                             class: 'form-input',
@@ -131,7 +131,7 @@ export const ModelRoutingPage = defineComponent({
                             onChange: (e) => { pending[feat.type] = e.target.value; },
                             style: 'flex: 1 1 auto;',
                         }, providers.length === 0
-                            ? [h('option', { value: '' }, '暂无可用 Provider')]
+                            ? [h('option', { value: '' }, '暂无可用服务商')]
                             : [
                                 h('option', { value: '' }, '— 未分配 —'),
                                 ...providers.map(p => h('option', {
@@ -149,7 +149,7 @@ export const ModelRoutingPage = defineComponent({
                     h('span', {
                         class: 'muted',
                         style: 'font-size:0.74rem;',
-                    }, `共 ${providers.length} 个 Provider`),
+                    }, `共 ${providers.length} 个服务商`),
                 ]),
             ]);
         }
@@ -166,18 +166,18 @@ export const ModelRoutingPage = defineComponent({
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
                             h('span', { class: 'eyebrow' }, '模型分配'),
-                            h(Badge, { type: 'info' }, () => 'V3 路由'),
+                            h(Badge, { type: 'info' }, () => '功能路由'),
                         ]),
                         h('h2', {
                             style: 'margin:0; font-size:1.65rem; line-height:1.1; text-wrap:balance; word-break:keep-all;',
-                        }, '功能 → Provider 路由'),
+                        }, '功能 → 服务商路由'),
                         h('div', { class: 'flex items-baseline gap-2 flex-wrap' }, [
                             h('span', {
                                 style: 'font-size:2.4rem; font-weight:500; line-height:1; font-variant-numeric:tabular-nums;',
                             }, String(FEATURE_META.filter(f => routing.value[f.type]).length || 0)),
                             h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, `/ ${FEATURE_META.length} 项功能已路由`),
                         ]),
-                        h('p', { class: 'muted m-0' }, '为对话、视觉、Embedding、ASR、文生图各自指定 Provider'),
+                        h('p', { class: 'muted m-0' }, '为对话、视觉、向量检索、语音识别、文生图各自指定服务商'),
                     ]),
                     // 右侧：操作引导
                     h('article', {
@@ -187,17 +187,17 @@ export const ModelRoutingPage = defineComponent({
                         h('div', { class: 'card-header' }, [
                             h('div', { class: 'grid gap-1' }, [
                                 h('span', { class: 'eyebrow' }, '快速操作'),
-                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, 'Provider 管理'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '服务商管理'),
                             ]),
                         ]),
                         h('div', { class: 'card-body grid gap-2' }, [
-                            h('p', { class: 'muted m-0', style: 'font-size:0.88rem; line-height:1.6;' }, '在此页面仅为各功能指定已有 Provider；新增 / 编辑 / 删除 Provider 请前往「LLM 管理」多 Tab 页面。'),
+                            h('p', { class: 'muted m-0', style: 'font-size:0.88rem; line-height:1.6;' }, '本页只为各功能指定已有服务商；新增 / 编辑 / 删除请前往「模型管理」。'),
                             h('div', { class: 'flex items-center gap-2 flex-wrap' }, [
                                 h(Button, {
                                     type: 'primary',
                                     size: 'sm',
                                     onClick: () => navigate('/llm'),
-                                }, () => '前往 LLM 管理'),
+                                }, () => '前往模型管理'),
                                 h(Button, {
                                     type: 'ghost',
                                     size: 'sm',

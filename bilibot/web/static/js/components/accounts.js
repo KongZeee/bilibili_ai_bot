@@ -237,11 +237,11 @@ export const AccountListPage = defineComponent({
                                 h('div', {
                                     style: `display:grid;align-items:center;gap:calc(var(--spacing) * 3);padding-bottom:calc(var(--spacing) * 3);border-bottom:1px solid hsl(var(--border));grid-template-columns:${tableCols};`,
                                 }, [
-                                    h('span', { style: headerLabelStyle }, 'UID'),
+                                    h('span', { style: headerLabelStyle }, '账号 UID'),
                                     h('span', { style: headerLabelStyle }, '昵称'),
                                     h('span', { style: headerLabelStyle }, '状态'),
                                     h('span', { style: headerLabelStyle }, '人格'),
-                                    h('span', { style: headerLabelStyle }, 'LLM'),
+                                    h('span', { style: headerLabelStyle }, '对话模型'),
                                     h('span', { style: headerLabelStyle }, '最近活跃'),
                                     h('span', { style: headerLabelStyle + 'text-align:right;' }, '操作'),
                                 ]),
@@ -368,7 +368,7 @@ export const AccountListPage = defineComponent({
                                 },
                             },
                             { iconName: 'star', label: '配置人格', onClick: () => navigate('/personas') },
-                            { iconName: 'box', label: '配置 LLM', onClick: () => navigate('/llm') },
+                            { iconName: 'box', label: '配置模型', onClick: () => navigate('/llm') },
                         ],
                     }),
                 ]),
@@ -383,12 +383,12 @@ export const AccountListPage = defineComponent({
             }, {
                 default: () => h('div', { style: 'display:grid;gap:calc(var(--spacing) * 3);' }, [
                     h(FormInput, {
-                        label: 'UID',
+                        label: '账号 UID',
                         modelValue: addForm.uid,
                         'onUpdate:modelValue': (v) => addForm.uid = v,
                         id: 'add-uid', name: 'add-uid',
                         autocomplete: 'off', spellcheck: false,
-                        placeholder: 'B站 UID',
+                        placeholder: 'B站用户 UID',
                     }),
                     h(FormInput, {
                         label: '昵称',
@@ -490,12 +490,12 @@ const AccountInfoTab = defineComponent({
             ]),
             h('div', { class: 'card-body', style: detailCardBodyStyle }, [
                 h(FormInput, {
-                    label: 'UID',
+                    label: '账号 UID',
                     modelValue: form.value.dede_user_id,
                     'onUpdate:modelValue': (v) => form.value.dede_user_id = v,
                     id: 'info-uid', name: 'info-uid',
                     autocomplete: 'off', spellcheck: false,
-                    placeholder: 'B站 UID',
+                    placeholder: 'B站用户 UID',
                 }),
                 h(FormInput, {
                     label: '昵称',
@@ -673,7 +673,7 @@ const AccountLlmTab = defineComponent({
         const saving = ref(false);
 
         const llmOptions = computed(() => [
-            { value: '', label: '默认 LLM' },
+            { value: '', label: '使用默认模型' },
             ...appState.llmProviders.map(p => ({
                 value: p.id,
                 label: `${p.name} (${p.model})${p.enabled ? '' : ' [已禁用]'}`,
@@ -684,7 +684,7 @@ const AccountLlmTab = defineComponent({
             saving.value = true;
             try {
                 await api.accounts.bindLlm(props.account.id, selected.value);
-                showToast('LLM 绑定已更新', 'success');
+                showToast('对话模型绑定已更新', 'success');
                 await refreshAccounts();
             } catch (e) {
                 showToast('绑定失败: ' + e.message, 'error');
@@ -699,23 +699,23 @@ const AccountLlmTab = defineComponent({
         }, [
             h('div', { class: 'card-header' }, [
                 h('div', { class: 'grid gap-1' }, [
-                    h('span', { class: 'eyebrow' }, 'LLM 配置'),
+                    h('span', { class: 'eyebrow' }, '模型配置'),
                     h('h2', { style: detailHeadingStyle }, '模型绑定'),
                 ]),
             ]),
             h('div', { class: 'card-body', style: detailCardBodyStyle }, [
                 h('p', {
                     style: 'margin:0; font-size:0.88rem; color:hsl(var(--muted-foreground));',
-                }, '选择此账号使用的 LLM Provider。留空则使用默认 LLM。'),
+                }, '选择此账号使用的对话模型服务商。留空则使用默认模型。'),
                 h(FormSelect, {
-                    label: 'LLM Provider',
+                    label: '对话模型服务商',
                     modelValue: selected.value,
                     'onUpdate:modelValue': (v) => selected.value = v,
                     options: llmOptions.value,
                     id: 'llm-provider', name: 'llm-provider',
                 }),
                 props.account.fallback_reason
-                    ? h('div', { class: 'form-error' }, '回退原因: ' + props.account.fallback_reason)
+                    ? h('div', { class: 'form-error' }, '回退原因：' + props.account.fallback_reason)
                     : null,
                 h('div', {}, [
                     primaryBtn('保存', { loading: saving.value, onClick: save }),
@@ -981,7 +981,7 @@ export const AccountDetailPage = defineComponent({
         const tabs = [
             { id: 'info', label: '信息' },
             { id: 'login', label: '登录' },
-            { id: 'llm', label: 'LLM' },
+            { id: 'llm', label: '模型' },
             { id: 'persona', label: '人格' },
             { id: 'status', label: '状态' },
         ];

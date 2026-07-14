@@ -1406,12 +1406,26 @@ class MemoryBrainStore:
                     "SELECT source_type,count(*) AS count FROM memory_events GROUP BY source_type"
                 ).fetchall()
             }
+            event_type_counts = {
+                row["event_type"]: row["count"]
+                for row in conn.execute(
+                    "SELECT event_type,count(*) AS count FROM memory_events GROUP BY event_type"
+                ).fetchall()
+            }
+            index_status_counts = {
+                row["index_status"]: row["count"]
+                for row in conn.execute(
+                    "SELECT index_status,count(*) AS count FROM memory_events GROUP BY index_status"
+                ).fetchall()
+            }
             return {
                 "account_id": self.account_id,
                 "db_path": str(self.db_path),
                 "counts": table_counts,
                 "jobs": job_counts,
                 "sources": source_counts,
+                "event_types": event_type_counts,
+                "index_statuses": index_status_counts,
                 "schema_version": SCHEMA_VERSION,
             }
         finally:

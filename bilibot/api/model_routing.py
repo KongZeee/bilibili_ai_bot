@@ -113,6 +113,11 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
             body = await request.json()
             if not body.get("model"):
                 return fail("VALIDATION_ERROR", "model 不能为空")
+            # local-whisper ASR 可不填 key；其余类型至少需要一个密钥
+            if ptype != "asr" or (body.get("id") != "local-whisper" and not body.get("model_size")):
+                has_keys = bool(body.get("api_key")) or bool(body.get("api_keys"))
+                if not has_keys and ptype != "asr":
+                    return fail("VALIDATION_ERROR", "api_key / api_keys 不能为空")
             pid = router.add_provider(ptype, body)
             _save_to_config(config_loader, router, config_path)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 添加成功")

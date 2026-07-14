@@ -18,7 +18,7 @@ export const NAV_GROUPS = [
         items: [
             { path: '/accounts', label: '账号管理', icon: 'user', meta: '已接入' },
             { path: '/personas', label: '人格管理', icon: 'star', meta: '多角色' },
-            { path: '/llm', label: 'LLM 管理', icon: 'box', meta: '多模型' },
+            { path: '/llm', label: '模型管理', icon: 'box', meta: '多模型' },
             { path: '/model-routing', label: '模型分配', icon: 'arrow-right', meta: '路由' },
         ],
     },
@@ -51,12 +51,12 @@ export const NAV_GROUPS = [
 // 页面副标题映射
 const PAGE_SUBTITLES = {
     '/': 'BiliBot 运营全景一览，实时掌握账号状态、互动表现与系统健康度。',
-    '/accounts': '管理 B站账号接入、Cookie 凭证、人格绑定与 LLM 通道配置。',
+    '/accounts': '管理 B站账号接入、Cookie 凭证、人格绑定与对话模型配置。',
     '/personas': '为不同账号配置专属 AI 人格，定义性格、语气与交互边界。',
     '/memory/graph': '以三维可旋转视角探索记忆节点间的关联关系。',
     '/memory/list': '浏览与管理 Bot 记忆库中的所有记忆条目，支持分类筛选与召回测试。',
     '/memory/recall': '测试 Bot 记忆库的召回能力，验证记忆检索效果。',
-    '/config': '配置 B站账号、LLM 服务、回复策略与主动行为等全局参数。',
+    '/config': '配置 B站账号、模型服务、回复策略与主动行为等全局参数。',
     '/comments': '查看与管理评论回复记录，跟踪互动状态。',
     '/logs': '查看系统运行日志，支持按级别和关键词筛选。',
     '/proactive': '管理与触发 Bot 的主动行为任务。',
@@ -64,8 +64,8 @@ const PAGE_SUBTITLES = {
     '/image-gen': '配置与测试文生图功能。',
     '/video-analysis': '配置与测试视频理解功能。',
     '/system': '系统安全管理与备份恢复。',
-    '/llm': '管理 LLM Provider 列表，配置模型与 API 密钥。',
-    '/model-routing': '为对话、视觉、Embedding、ASR、文生图各自指定当前路由的 Provider。',
+    '/llm': '管理各类型模型服务商，配置模型名称与 API 密钥。',
+    '/model-routing': '为对话、视觉、向量检索、语音识别、文生图各自指定当前服务商。',
 };
 
 // 根据路径找到所属分组（返回分组标签）
@@ -129,11 +129,19 @@ export const Sidebar = defineComponent({
     emits: ['navigate', 'close'],
     setup(props, { emit }) {
         const paused = ref(false);
-        onMounted(async () => {
+        async function refreshPauseStatus() {
             try {
                 const data = await api.safety.pauseStatus();
                 paused.value = !!data?.paused;
             } catch (_) { /* 读取暂停状态失败，保持默认 */ }
+        }
+        onMounted(() => {
+            refreshPauseStatus();
+            // 路由切换时同步暂停态（系统页 pause/resume 后侧边栏需更新）
+            window.addEventListener('hashchange', refreshPauseStatus);
+        });
+        onBeforeUnmount(() => {
+            window.removeEventListener('hashchange', refreshPauseStatus);
         });
         return () => [
             // 遮罩层 — 仅移动端可见（CSS 控制），点击关闭抽屉

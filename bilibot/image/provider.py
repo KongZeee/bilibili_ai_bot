@@ -28,26 +28,49 @@ class ImageProvider:
 
     def __init__(self, config: dict):
         self.enabled: bool = config.get("enabled", False)
-        self.api_key: str = config.get("api_key", "")
+        keys = []
+        raw_keys = config.get("api_keys")
+        if isinstance(raw_keys, list):
+            keys.extend([k.strip() for k in raw_keys if isinstance(k, str) and k.strip()])
+        primary = config.get("api_key", "") or ""
+        if isinstance(primary, str) and primary.strip():
+            keys.append(primary.strip())
+        # de-dupe
+        seen = set()
+        ordered = []
+        for k in keys:
+            if k not in seen:
+                seen.add(k)
+                ordered.append(k)
+        self.api_keys: list = ordered
+        self.api_key: str = ordered[0] if ordered else ""
         self.base_url: str = config.get("base_url", "https://apihub.agnes-ai.com/v1")
         self.model: str = config.get("model", "agnes-image-2.1-flash")
         self.default_size: str = config.get("default_size", "1024x768")
         self.timeout: int = int(config.get("timeout", 120))
+        self._rr = 0
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
 
     def is_available(self) -> bool:
         # PRD 3.14：必须 enabled=True 且配置了 api_key 和 model
-        return bool(self.enabled and self.api_key and self.model)
+        return bool(self.enabled and (self.api_key or self.api_keys) and self.model)
 
-    async def _get_session(self) -> aiohttp.ClientSession:
-        async with self._session_lock:
-            if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession(
-                    headers={"Authorization": f"Bearer {self.api_key}"},
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                )
-            return self._session
+    def _next_key(self) -> str:
+        keys = self.api_keys or ([self.api_key] if self.api_key else [])
+        if not keys:
+            return ""
+        key = keys[self._rr % len(keys)]
+        self._rr += 1
+        return key
+
+    async def _get_session(self, api_key: str = "") -> aiohttp.ClientSession:
+        key = api_key or self.api_key
+        # One-shot session per call when multi-key; avoid sticky Authorization header.
+        return aiohttp.ClientSession(
+            headers={"Authorization": f"Bearer {key}"},
+            timeout=aiohttp.ClientTimeout(total=self.timeout),
+        )
 
     async def generate(self, prompt: str, size: str = "") -> Optional[bytes]:
         """
@@ -72,43 +95,60 @@ class ImageProvider:
             "return_base64": True,
         }
 
-        session = await self._get_session()
-        try:
-            async with session.post(url, json=body) as resp:
-                if resp.status != 200:
-                    text = await resp.text()
-                    logger.error(f"文生图 API 返回 HTTP {resp.status}: {text[:300]}")
-                    return None
-                result = await resp.json()
+        keys = self.api_keys or ([self.api_key] if self.api_key else [])
+        last_err = None
+        for _ in range(max(1, min(len(keys), 4))):
+            key = self._next_key()
+            session = await self._get_session(key)
+            try:
+                async with session.post(url, json=body) as resp:
+                    if resp.status == 429:
+                        text = await resp.text()
+                        last_err = f"HTTP 429: {text[:200]}"
+                        logger.warning(f"文生图 429，切换密钥重试: {text[:120]}")
+                        continue
+                    if resp.status != 200:
+                        text = await resp.text()
+                        logger.error(f"文生图 API 返回 HTTP {resp.status}: {text[:300]}")
+                        return None
+                    result = await resp.json()
 
-            data_list = result.get("data", [])
-            if not data_list:
-                logger.error(f"文生图 API 返回空 data: {result}")
+                data_list = result.get("data", [])
+                if not data_list:
+                    logger.error(f"文生图 API 返回空 data: {result}")
+                    return None
+
+                item = data_list[0]
+
+                # 优先 b64_json
+                b64 = item.get("b64_json")
+                if b64:
+                    logger.info(f"文生图成功 (b64): prompt={prompt[:50]}...")
+                    return base64.b64decode(b64)
+
+                # 回退 URL 下载
+                img_url = item.get("url")
+                if img_url:
+                    logger.info(f"文生图成功 (url): {img_url}")
+                    async with session.get(img_url) as img_resp:
+                        if img_resp.status == 200:
+                            return await img_resp.read()
+                        logger.error(f"下载生成的图片失败: HTTP {img_resp.status}")
+                        return None
+
+                logger.error("文生图 API 返回无 b64_json 也无 url")
                 return None
-
-            item = data_list[0]
-
-            # 优先 b64_json
-            b64 = item.get("b64_json")
-            if b64:
-                logger.info(f"文生图成功 (b64): prompt={prompt[:50]}...")
-                return base64.b64decode(b64)
-
-            # 回退 URL 下载
-            img_url = item.get("url")
-            if img_url:
-                logger.info(f"文生图成功 (url): {img_url}")
-                async with session.get(img_url) as img_resp:
-                    if img_resp.status == 200:
-                        return await img_resp.read()
-                    logger.error(f"下载生成的图片失败: HTTP {img_resp.status}")
-                    return None
-
-            logger.error("文生图 API 返回无 b64_json 也无 url")
-            return None
-        except Exception as e:
-            logger.error(f"文生图异常: {e}", exc_info=True)
-            return None
+            except Exception as e:
+                last_err = e
+                logger.error(f"文生图异常: {e}", exc_info=True)
+            finally:
+                try:
+                    await session.close()
+                except Exception:
+                    pass
+        if last_err:
+            logger.error(f"文生图全部密钥失败: {last_err}")
+        return None
 
     async def generate_and_save(self, prompt: str, save_path: str, size: str = "") -> Optional[str]:
         """

@@ -52,7 +52,7 @@ export const ImageGenPage = {
 
         async function testConnection() {
             if (!provider.value?.id) {
-                appState.notify('未路由文生图 Provider，请先到模型分配页配置', 'warning');
+                appState.notify('未配置文生图服务商，请先到模型分配页设置', 'warning');
                 return;
             }
             testing.value = true;
@@ -74,7 +74,7 @@ export const ImageGenPage = {
                 return;
             }
             if (!provider.value?.id) {
-                genError.value = '未路由文生图 Provider，请先到模型分配页配置';
+                genError.value = '未配置文生图服务商，请先到模型分配页设置';
                 return;
             }
             generating.value = true;
@@ -114,7 +114,7 @@ export const ImageGenPage = {
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
                             h('span', { class: 'eyebrow' }, '文生图'),
-                            h(Badge, { type: provider.value ? 'success' : 'muted' }, () => provider.value ? '已路由' : '未路由'),
+                            h(Badge, { type: provider.value ? 'success' : 'muted' }, () => provider.value ? '已配置' : '未配置'),
                         ]),
                         h('h2', {
                             style: 'margin:0; font-size:1.65rem; line-height:1.1; text-wrap:balance; word-break:keep-all;',
@@ -139,11 +139,11 @@ export const ImageGenPage = {
                         ]),
                         h('div', { class: 'card-body grid gap-2' }, [
                             h('div', { class: 'flex items-center justify-between' }, [
-                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '文生图 Provider'),
-                                h(Badge, { type: provider.value ? 'success' : 'muted' }, () => provider.value ? provider.value.name : '未路由'),
+                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '文生图服务商'),
+                                h(Badge, { type: provider.value ? 'success' : 'muted' }, () => provider.value ? provider.value.name : '未配置'),
                             ]),
                             h('div', { class: 'flex items-center justify-between' }, [
-                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API Key'),
+                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'API 密钥'),
                                 h(Badge, { type: provider.value?.has_api_key ? 'success' : 'danger' }, () => provider.value?.has_api_key ? '已配置' : '未配置'),
                             ]),
                             h('div', { class: 'flex items-center justify-between' }, [
@@ -173,14 +173,14 @@ export const ImageGenPage = {
                         h('div', { class: 'card-header' }, [
                             h('div', { class: 'grid gap-1' }, [
                                 h('span', { class: 'eyebrow' }, '模型配置'),
-                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '文生图 Provider（只读）'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '文生图服务商（只读）'),
                             ]),
                         ]),
                         h('div', { class: 'card-body grid gap-3' }, [
                             provider.value
                                 ? h('div', { class: 'grid gap-2' }, [
                                     h('div', { class: 'flex items-center justify-between' }, [
-                                        h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'Provider ID'),
+                                        h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '服务商编号'),
                                         h('span', { style: 'font-size:0.88rem; font-variant-numeric:tabular-nums;' }, provider.value.id),
                                     ]),
                                     h('div', { class: 'flex items-center justify-between' }, [
@@ -192,7 +192,7 @@ export const ImageGenPage = {
                                         h('span', { style: 'font-size:0.88rem;' }, provider.value.model || '-'),
                                     ]),
                                     h('div', { class: 'flex items-center justify-between' }, [
-                                        h('span', { class: 'muted', style: 'font-size:0.88rem;' }, 'Base URL'),
+                                        h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '接口地址'),
                                         h('span', { style: 'font-size:0.82rem; word-break:break-all; text-align:right; max-width:60%;' }, provider.value.base_url || '-'),
                                     ]),
                                     h('div', { class: 'flex items-center justify-between' }, [
@@ -201,8 +201,8 @@ export const ImageGenPage = {
                                     ]),
                                 ])
                                 : h(EmptyState, {
-                                    title: '未路由文生图 Provider',
-                                    desc: '请到「模型分配」页添加并路由 image 类型 Provider',
+                                    title: '未配置文生图服务商',
+                                    desc: '请到「模型分配」页添加并指定文生图服务商',
                                 }),
                             h('div', { class: 'flex items-center gap-2 flex-wrap' }, [
                                 h(Button, {
@@ -242,10 +242,10 @@ export const ImageGenPage = {
                                 }),
                                 h('span', { class: 'form-hint' }, withImage.value ? '已启用' : '已禁用'),
                             ]),
-                            h(FormHint, '启用后，发布动态时将自动调用文生图 Provider 生成配图'),
+                            h(FormHint, '启用后，发布动态时将自动调用文生图服务商生成配图'),
                             !provider.value && withImage.value && h('div', {
-                                style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.82rem;',
-                            }, '已启用动态配图但未路由 Provider，动态发布时将跳过配图'),
+                                style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.88rem;',
+                            }, '已启用动态配图但未配置服务商，动态发布时将跳过配图'),
                         ]),
                     ]),
                 ]),
@@ -262,7 +262,7 @@ export const ImageGenPage = {
                         h('div', { class: 'card-header' }, [
                             h('div', { class: 'grid gap-1' }, [
                                 h('span', { class: 'eyebrow' }, '生成测试'),
-                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '用自定义 Prompt 生成图片'),
+                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '用自定义提示词生成图片'),
                             ]),
                         ]),
                         h('div', { class: 'card-body grid gap-3' }, [
@@ -281,7 +281,7 @@ export const ImageGenPage = {
                                     disabled: !provider.value || !genPrompt.value.trim(),
                                 }, () => '生成图片'),
                                 h('span', { class: 'muted', style: 'font-size:0.82rem;' },
-                                    provider.value ? `模型: ${provider.value.model || '-'}` : '未路由 Provider'),
+                                    provider.value ? `模型：${provider.value.model || '-'}` : '未配置服务商'),
                             ]),
                             genError.value && h('div', {
                                 style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.88rem;',
@@ -299,7 +299,7 @@ export const ImageGenPage = {
                                     class: 'flex items-center justify-between gap-2 flex-wrap',
                                     style: 'font-size:0.82rem; color: hsl(var(--muted-foreground));',
                                 }, [
-                                    h('span', `Prompt: ${generatedImage.value.prompt}`),
+                                    h('span', `提示词：${generatedImage.value.prompt}`),
                                     h('span', `${generatedImage.value.size ? (generatedImage.value.size / 1024).toFixed(1) + ' KB' : ''} · ${generatedImage.value.model || ''}`),
                                 ]),
                             ]),

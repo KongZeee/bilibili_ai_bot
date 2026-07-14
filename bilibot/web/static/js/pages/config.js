@@ -90,6 +90,7 @@ const RENDERED_CATEGORIES = [
     'interactions',
     'memory',
     'global_defaults',
+    'model_request_limits',
     'data_dir',
     'logging',
 ];
@@ -233,6 +234,7 @@ export const ConfigPage = defineComponent({
         const interactionsSchema = schemaByCategory('interactions');
         const memorySchema = schemaByCategory('memory');
         const globalDefaultsSchema = schemaByCategory('global_defaults');
+        const modelRequestLimitsSchema = schemaByCategory('model_request_limits');
         const dataDirSchema = schemaByCategory('data_dir');
         const loggingSchema = schemaByCategory('logging');
         const activePersona = computed(() => personas.value.find(
@@ -261,7 +263,7 @@ export const ConfigPage = defineComponent({
         // Task 29.3：验证清单 — V3 结构
         const validations = computed(() => [
             { label: 'B站账号配置', passed: (config.value?.accounts?.length || 0) > 0 },
-            { label: 'LLM 服务连接', passed: (config.value?.chat_providers || []).some(p => p.api_key) },
+            { label: '对话模型连接', passed: (config.value?.chat_providers || []).some(p => p.api_key) },
             { label: '回复策略设置', passed: !!config.value?.reply },
             { label: '主动行为配置', passed: !!config.value?.proactive },
         ]);
@@ -528,11 +530,14 @@ export const ConfigPage = defineComponent({
                     style: 'grid-template-columns: repeat(2, minmax(0, 1fr));',
                 }, [
                     renderConfigCard('全局默认', 'Global Defaults', globalDefaultsSchema),
-                    renderConfigCard('日志设置', 'Logging', loggingSchema),
+                    renderConfigCard('模型请求限制', '多 Key 限流 / 视觉并发', modelRequestLimitsSchema),
                 ]),
 
-                // data_dir 单列（字符串类型，单独一行）
-                h('section', {}, [
+                h('section', {
+                    class: 'grid gap-4',
+                    style: 'grid-template-columns: repeat(2, minmax(0, 1fr));',
+                }, [
+                    renderConfigCard('日志设置', 'Logging', loggingSchema),
                     renderConfigCard('数据目录', 'Data Dir', dataDirSchema),
                 ]),
 

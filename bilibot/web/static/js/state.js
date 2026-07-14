@@ -50,7 +50,7 @@ export async function refreshLlm() {
         appState.llmProviders = await api.llm.list();
         appState.llmLoaded = true;
     } catch (e) {
-        showToast('加载 LLM 列表失败: ' + e.message, 'error');
+        showToast('加载模型列表失败: ' + e.message, 'error');
     }
 }
 

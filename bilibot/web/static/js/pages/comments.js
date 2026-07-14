@@ -3,7 +3,33 @@ const { defineComponent, h, ref, onMounted } = window.Vue;
 import { api } from '../api.js';
 import { showToast } from '../state.js';
 import { Button, Badge, FormInput, Loading, EmptyState, Icon, Pagination } from '../components/common.js';
-import { formatTime } from '../utils.js';
+import { formatTime, auditStatusLabel, auditStatusBadgeType } from '../utils.js';
+
+function parseTarget(raw) {
+    if (!raw) return {};
+    if (typeof raw === 'object') return raw;
+    try { return JSON.parse(raw); } catch { return {}; }
+}
+
+function isProactiveComment(r) {
+    return r.scene === 'proactive_comment' || parseTarget(r.target).kind === 'proactive_comment';
+}
+
+function replyStatusLabel(r) {
+    const target = parseTarget(r.target);
+    if (r.status === 'published' || r.published) {
+        return isProactiveComment(r) ? '已发布' : '已回复';
+    }
+    if (target.failure_reason || r.status === 'failed') return '失败';
+    return auditStatusLabel(r.status, { published: r.published });
+}
+
+function replyBadgeType(r) {
+    const target = parseTarget(r.target);
+    if (r.status === 'published' || r.published) return 'success';
+    if (target.failure_reason || r.status === 'failed') return 'danger';
+    return auditStatusBadgeType(r.status, { published: r.published });
+}
 
 export const CommentsPage = defineComponent({
     name: 'CommentsPage',
@@ -72,7 +98,7 @@ export const CommentsPage = defineComponent({
                             }, String(total.value || 0)),
                             h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '条回复记录'),
                         ]),
-                        h('p', { class: 'muted m-0' }, '查看 B 站评论与 AI 回复的全量审计轨迹'),
+                        h('p', { class: 'muted m-0' }, '查看评论回复与主动看视频后发表评论的审计轨迹'),
                     ]),
                     // 右侧：搜索 Card
                     h('article', {
@@ -121,7 +147,7 @@ export const CommentsPage = defineComponent({
                             h('span', { class: 'eyebrow' }, '审计队列'),
                             h('h2', {
                                 style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;',
-                            }, '评论回复记录'),
+                            }, '评论记录'),
                         ]),
                         // 状态筛选按钮组
                         h('div', { class: 'flex items-center gap-1 flex-wrap' },
@@ -141,14 +167,16 @@ export const CommentsPage = defineComponent({
                                 style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.14em;`,
                             }, [
                                 h('span', { class: 'whitespace-nowrap' }, '时间'),
-                                h('span', { class: 'whitespace-nowrap' }, '账号'),
+                                h('span', { class: 'whitespace-nowrap' }, '人格'),
                                 h('span', { class: 'whitespace-nowrap' }, '视频'),
                                 h('span', { class: 'whitespace-nowrap' }, '内容'),
                                 h('span', { class: 'whitespace-nowrap' }, '状态'),
                             ]),
                             // 数据行
                             ...replies.value.map(r => {
-                                const target = (() => { try { return typeof r.target === 'string' ? JSON.parse(r.target) : r.target; } catch { return {}; } })();
+                                const target = parseTarget(r.target);
+                                const badge = replyBadgeType(r);
+                                const proactive = isProactiveComment(r);
                                 return h('div', {
                                     key: r.id,
                                     class: 'grid items-center',
@@ -158,26 +186,35 @@ export const CommentsPage = defineComponent({
                                         class: 'whitespace-nowrap',
                                         style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; font-size:0.85rem;',
                                     }, formatTime(r.created_at)),
-                                    h('span', { class: 'truncate' }, r.persona_id || '-'),
-                                    h('span', { class: 'truncate', title: target.video_title || target.bvid || '' },
-                                        target.video_title || target.bvid || '-'),
+                                    h('div', { class: 'grid gap-1', style: 'min-width:0;' }, [
+                                        h('span', {
+                                            class: 'truncate',
+                                            title: r.persona_id || '',
+                                        }, r.persona_id || '默认人格'),
+                                        h('span', {
+                                            class: 'badge badge-info',
+                                            style: 'width:fit-content; font-size:0.72rem;',
+                                        }, proactive ? '主动评论' : '回复评论'),
+                                    ]),
+                                    h('span', {
+                                        class: 'truncate',
+                                        title: target.video_title || target.bvid || target.oid || '',
+                                    }, target.video_title || target.bvid || (target.oid ? `视频 ${target.oid}` : '-')),
                                     h('div', { class: 'grid gap-1', style: 'min-width:0;' }, [
                                         h('div', {
                                             class: 'truncate',
                                             style: 'color: hsl(var(--muted-foreground)); font-size:0.82rem;',
-                                            title: r.input_summary || '',
-                                        }, r.input_summary || '(无原评论)'),
+                                            title: r.input_summary || r.prompt_preview || '',
+                                        }, r.input_summary || r.prompt_preview || (proactive ? '（主动评论）' : '（无原评论）')),
                                         h('div', {
                                             class: 'truncate',
                                             title: r.output || '',
-                                        }, r.output || '(无回复)'),
+                                        }, r.output || '（无内容）'),
                                     ]),
                                     h('span', {
-                                        class: ['badge',
-                                            r.status === 'published' ? 'badge-success'
-                                            : r.status === 'failed' ? 'badge-danger'
-                                            : 'badge-warning'].join(' '),
-                                    }, r.status || 'pending'),
+                                        class: `badge badge-${badge}`,
+                                        title: target.failure_reason || r.status || '',
+                                    }, replyStatusLabel(r)),
                                 ]);
                             }),
                         ]),

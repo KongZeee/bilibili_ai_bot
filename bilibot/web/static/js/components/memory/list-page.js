@@ -6,8 +6,22 @@ import { appState, showToast } from '../../state.js';
 import { navigate } from '../../router.js';
 import { formatTime } from '../../utils.js';
 
-// 分类标签映射
+// 分类标签映射（V6 event_type + 兼容旧 key）
 const CATEGORY_LABELS = {
+    conversation_message: '对话消息',
+    conversation_context: '对话上下文',
+    conversation: '对话',
+    video_observation: '视频观察',
+    video_metadata_observation: '视频元数据',
+    bangumi_episode: '番剧剧集',
+    bot_experience: '观看评价',
+    bot_action: 'Bot 行为',
+    action_intent: '行为意图',
+    action_outcome: '行为结果',
+    web_observation: '联网参考',
+    reflection: '反思总结',
+    observation: '观察',
+    // 旧 V5 兼容
     episodic: '情景记忆',
     factual: '事实记忆',
     procedural: '程序记忆',
@@ -21,8 +35,31 @@ const CATEGORY_LABELS = {
     other: '其他',
 };
 
+// 来源 source_type 中文（列表「来源」列）
+const SOURCE_LABELS = {
+    video: '视频观看',
+    video_metadata: '视频元数据',
+    video_experience: '观看评价',
+    bot_action: 'Bot 行为',
+    comment: '评论',
+    comment_thread: '评论上下文',
+    web_reference: '联网参考',
+    dynamic: '动态',
+    private_message: '私信',
+    summary: '总结',
+    weekly_summary: '周总结',
+    asr: '语音转写',
+    subtitle: '字幕',
+    visual_description: '画面描述',
+    behavior_log: '行为日志',
+};
+
 function categoryLabel(cat) {
     return CATEGORY_LABELS[cat] || cat || '未分类';
+}
+
+function sourceLabel(src) {
+    return SOURCE_LABELS[src] || src || '-';
 }
 
 const STATUS_LABELS = {
@@ -276,12 +313,20 @@ export const MemoryListPage = defineComponent({
 
         function cycleCategory() {
             const cats = Object.keys(stats.value.categories || {});
+            // 首位 '' = 全部分类，保证能循环回到「全部」
+            const opts = ['', ...cats];
             if (cats.length === 0) {
-                showToast('暂无分类数据', 'info');
+                if (filterCategory.value) {
+                    filterCategory.value = '';
+                    page.value = 1;
+                    loadData();
+                } else {
+                    showToast('暂无分类数据', 'info');
+                }
                 return;
             }
-            const idx = cats.indexOf(filterCategory.value);
-            filterCategory.value = cats[(idx + 1) % cats.length];
+            const idx = opts.indexOf(filterCategory.value);
+            filterCategory.value = opts[(idx + 1) % opts.length];
             page.value = 1;
             loadData();
         }
@@ -290,6 +335,12 @@ export const MemoryListPage = defineComponent({
             const opts = ['', 'ready', 'pending', 'fts_only', 'enrichment_blocked', 'degraded'];
             const idx = opts.indexOf(filterStatus.value);
             filterStatus.value = opts[(idx + 1) % opts.length];
+            page.value = 1;
+            loadData();
+        }
+
+        function setCategory(cat) {
+            filterCategory.value = filterCategory.value === cat ? '' : cat;
             page.value = 1;
             loadData();
         }
@@ -406,8 +457,8 @@ export const MemoryListPage = defineComponent({
                                 h(Icon, { name: 'chevron-down', size: '0.75rem' }),
                             ]),
                             h(Button, { type: 'ghost', onClick: () => { page.value = 1; loadData(); } }, () => [
-                                '最近优先',
-                                h(Icon, { name: 'chevron-down', size: '0.75rem' }),
+                                h(Icon, { name: 'arrow-up', size: '0.9rem' }),
+                                '刷新列表',
                             ]),
                         ]),
                     ]),
@@ -495,7 +546,8 @@ export const MemoryListPage = defineComponent({
                                         // 来源
                                         h('span', {
                                             style: 'font-size: 0.92rem; color: hsl(var(--muted-foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
-                                        }, mem.source || '-'),
+                                            title: mem.source || mem.source_type || '',
+                                        }, sourceLabel(mem.source || mem.source_type)),
                                         // 时间
                                         h('span', {
                                             style: 'font-size: 0.92rem; color: hsl(var(--muted-foreground)); white-space: nowrap;',
@@ -506,7 +558,7 @@ export const MemoryListPage = defineComponent({
                                             style: `padding: calc(var(--spacing) * 0.4) calc(var(--spacing) * 1); border-radius: 999px; font-size: 0.78rem; ${mem.index_health?.healthy
                                                 ? 'background: hsl(var(--accent) / 0.34); color: hsl(var(--accent-foreground));'
                                                 : 'background: hsl(var(--muted)); color: hsl(var(--muted-foreground));'}`,
-                                            title: `FTS: ${mem.index_health?.fts || '-'} / Embedding: ${mem.index_health?.embedding || '-'}`,
+                                            title: `全文索引: ${mem.index_health?.fts || '-'} / 向量: ${mem.index_health?.embedding || '-'}`,
                                         }, statusLabel(mem.index_status || mem.status)),
                                         // 操作
                                         h('div', { class: 'flex items-center gap-1' }, [
@@ -664,7 +716,14 @@ export const MemoryListPage = defineComponent({
                                     class: 'muted m-0',
                                     style: 'font-size: 0.92rem;',
                                 }, '暂无分类数据')]
-                                : categoryStats.value.slice(0, 6).map(cat => h('div', { class: 'grid gap-1' }, [
+                                : categoryStats.value.slice(0, 6).map(cat => h('button', {
+                                    type: 'button',
+                                    key: cat.key,
+                                    class: 'grid gap-1',
+                                    style: `text-align: left; border: 0; background: ${filterCategory.value === cat.key ? 'hsl(var(--accent) / 0.12)' : 'transparent'}; border-radius: calc(var(--radius) * 0.4); padding: calc(var(--spacing) * 1); cursor: pointer;`,
+                                    title: `筛选：${cat.label}`,
+                                    onClick: () => setCategory(cat.key),
+                                }, [
                                     h('div', { class: 'flex items-center justify-between gap-2' }, [
                                         h('span', {
                                             style: 'font-size: 0.96rem; color: hsl(var(--foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
@@ -763,7 +822,7 @@ export const MemoryListPage = defineComponent({
                             ? h('div', { class: 'grid gap-4 memory-detail-scroll' }, [
                                 h('section', { class: 'grid gap-2' }, [
                                     h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, [
-                                        h('span', { class: 'badge badge-info' }, selectedMemory.value.source_type || 'unknown'),
+                                        h('span', { class: 'badge badge-info' }, selectedMemory.value.source_type || '未知'),
                                         h('span', { class: `badge ${selectedMemory.value.index_health?.healthy ? 'badge-success' : 'badge-warning'}` }, statusLabel(selectedMemory.value.index_status)),
                                         h('span', { class: 'badge badge-info' }, `${selectedMemory.value.chunk_count || 0} 分块`),
                                         h('span', { class: 'badge badge-info' }, `${selectedMemory.value.entity_count || 0} 实体`),
@@ -771,8 +830,8 @@ export const MemoryListPage = defineComponent({
                                     h('p', { class: 'm-0', style: 'line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere;' }, selectedMemory.value.summary || selectedMemory.value.content || '-'),
                                     h('div', { class: 'grid gap-1', style: 'grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); font-size: 0.84rem; color: hsl(var(--muted-foreground));' }, [
                                         h('span', `事件 ID: ${selectedMemory.value.id}`),
-                                        h('span', `FTS: ${selectedMemory.value.index_health?.fts || '-'}`),
-                                        h('span', `Embedding: ${selectedMemory.value.index_health?.embedding || '-'}`),
+                                        h('span', `全文索引: ${selectedMemory.value.index_health?.fts || '-'}`),
+                                        h('span', `向量: ${selectedMemory.value.index_health?.embedding || '-'}`),
                                         h('span', `召回次数: ${selectedMemory.value.recall_count || 0}`),
                                     ]),
                                     h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' },

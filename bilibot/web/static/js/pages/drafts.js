@@ -1,9 +1,29 @@
 // bilibot/web/static/js/pages/drafts.js - 动态草稿页（Golden Time 设计稿）
-const { h, ref, reactive, onMounted, computed } = window.Vue;
+const { h, ref, reactive, onMounted, onUnmounted, computed, watch } = window.Vue;
 import { appState, refreshAccounts } from '../state.js';
 import { api } from '../api.js';
 import { Button, Badge, FormSelect, FormTextarea, Modal, ConfirmModal, createConfirmHelper, EmptyState, Pagination, Loading } from '../components/common.js';
 import { formatTime } from '../utils.js';
+
+function draftId(d) {
+    return d?.draft_id || d?.id || '';
+}
+
+const STATUS_LABELS = {
+    generating: '生成中',
+    awaiting_review: '待审核',
+    approved: '已通过',
+    rejected: '已拒绝',
+    publishing: '发布中',
+    published: '已发布',
+    retry_wait: '等待重试',
+    result_unknown: '结果未知',
+    failed: '失败',
+    expired: '已过期',
+};
+
+const RETRYABLE = new Set(['approved', 'retry_wait', 'failed', 'result_unknown']);
+const REVIEWABLE = new Set(['awaiting_review']);
 
 export const DraftsPage = {
     name: 'DraftsPage',
@@ -11,16 +31,17 @@ export const DraftsPage = {
         const loading = ref(false);
         const drafts = ref([]);
         const selectedAccount = ref(appState.currentAccountId || '');
-        const filterStatus = ref('pending');
+        const filterStatus = ref('awaiting_review');
         const page = ref(1);
         const pageSize = 20;
         const total = ref(0);
+        let refreshTimer = null;
 
         const editModal = reactive({
             visible: false,
             draft: null,
             content: '',
-            version: 0,
+            revision: 0,
             saving: false,
         });
 
@@ -32,10 +53,13 @@ export const DraftsPage = {
         const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
 
         const statusFilters = [
-            { value: 'pending', label: '待审核' },
+            { value: 'awaiting_review', label: '待审核' },
             { value: 'approved', label: '已通过' },
-            { value: 'rejected', label: '已拒绝' },
+            { value: 'publishing', label: '发布中' },
+            { value: 'retry_wait', label: '等待重试' },
             { value: 'published', label: '已发布' },
+            { value: 'rejected', label: '已拒绝' },
+            { value: 'failed', label: '失败' },
             { value: 'all', label: '全部' },
         ];
 
@@ -48,7 +72,7 @@ export const DraftsPage = {
                     page: page.value,
                     page_size: pageSize,
                 });
-                drafts.value = data.items || data || [];
+                drafts.value = data.items || (Array.isArray(data) ? data : []);
                 total.value = data.total || drafts.value.length || 0;
             } catch (e) {
                 appState.notify('加载草稿失败：' + (e.message || e), 'danger');
@@ -57,16 +81,17 @@ export const DraftsPage = {
             }
         }
 
-        // BUG F-004：approve 必须带 expected_revision（乐观锁）
         function approve(draft) {
+            const id = draftId(draft);
             showConfirm({
                 title: '确认通过',
-                message: `确认通过草稿 #${draft.id}？将通过审核并加入发布队列。`,
+                message: `确认通过草稿 #${id}？将通过审核并加入发布队列。`,
                 confirmText: '通过',
                 action: async () => {
                     try {
-                        await api.dynamicDrafts.approve(selectedAccount.value, draft.id,
-                            { expected_revision: draft.revision });
+                        await api.dynamicDrafts.approve(selectedAccount.value, id, {
+                            expected_revision: draft.revision,
+                        });
                         appState.notify('草稿已通过', 'success');
                         refresh();
                     } catch (e) {
@@ -76,18 +101,18 @@ export const DraftsPage = {
             });
         }
 
-        // BUG F-006：后端读 note 不读 reason
         function reject(draft) {
+            const id = draftId(draft);
             showConfirm({
                 title: '拒绝草稿',
-                message: `拒绝草稿 #${draft.id} 的原因（可选）：`,
+                message: `拒绝草稿 #${id} 的原因（可选）：`,
                 confirmText: '拒绝',
                 danger: true,
                 prompt: true,
                 promptPlaceholder: '输入拒绝原因…',
                 action: async (reason) => {
                     try {
-                        await api.dynamicDrafts.reject(selectedAccount.value, draft.id, reason || '');
+                        await api.dynamicDrafts.reject(selectedAccount.value, id, reason || '');
                         appState.notify('草稿已拒绝', 'success');
                         refresh();
                     } catch (e) {
@@ -98,15 +123,17 @@ export const DraftsPage = {
         }
 
         function retry(draft) {
+            const id = draftId(draft);
             showConfirm({
-                title: '重新生成',
-                message: `重新生成草稿 #${draft.id}？将调用 LLM 重新生成内容。`,
-                confirmText: '重新生成',
+                title: '重新发布',
+                message: `将草稿 #${id} 重新加入发布队列？`,
+                confirmText: '重新发布',
                 action: async () => {
                     try {
-                        await api.dynamicDrafts.retry(selectedAccount.value, draft.id);
-                        appState.notify('已触发重新生成', 'info');
-                        setTimeout(refresh, 1500);
+                        await api.dynamicDrafts.retry(selectedAccount.value, id);
+                        appState.notify('已触发重新发布', 'info');
+                        if (refreshTimer) clearTimeout(refreshTimer);
+                        refreshTimer = setTimeout(refresh, 1500);
                     } catch (e) {
                         appState.notify('操作失败：' + (e.message || e), 'danger');
                     }
@@ -117,7 +144,7 @@ export const DraftsPage = {
         function openEdit(draft) {
             editModal.draft = draft;
             editModal.content = draft.content || '';
-            editModal.revision = draft.revision;  // BUG F-005: 字段是 revision，不是 version
+            editModal.revision = draft.revision;
             editModal.saving = false;
             editModal.visible = true;
         }
@@ -125,9 +152,9 @@ export const DraftsPage = {
         async function saveEdit() {
             if (!editModal.draft) return;
             editModal.saving = true;
+            const id = draftId(editModal.draft);
             try {
-                // BUG F-005: 后端要求 expected_revision，不认 version
-                await api.dynamicDrafts.update(selectedAccount.value, editModal.draft.id, {
+                await api.dynamicDrafts.update(selectedAccount.value, id, {
                     content: editModal.content,
                     expected_revision: editModal.revision,
                 });
@@ -151,19 +178,49 @@ export const DraftsPage = {
             previewModal.visible = true;
         }
 
-        onMounted(() => {
+        function statusBadgeType(status) {
+            if (status === 'approved' || status === 'published') return 'badge-success';
+            if (status === 'rejected' || status === 'failed' || status === 'expired') return 'badge-danger';
+            if (status === 'publishing' || status === 'retry_wait' || status === 'result_unknown') return 'badge-info';
+            return 'badge-warning';
+        }
+
+        function imageRefs(draft) {
+            const refs = draft?.image_refs || draft?.pictures || [];
+            return Array.isArray(refs) ? refs : [];
+        }
+
+        async function ensureAccountAndLoad() {
             if (!appState.accountsLoaded) {
-                refreshAccounts().then(() => {
-                    if (appState.accounts.length > 0 && !selectedAccount.value) {
-                        selectedAccount.value = appState.currentAccountId || appState.accounts[0].id;
-                        refresh();
-                    }
-                });
-            } else if (appState.accounts.length > 0 && !selectedAccount.value) {
+                await refreshAccounts();
+            }
+            if (!selectedAccount.value && appState.accounts.length > 0) {
+                selectedAccount.value = appState.currentAccountId || appState.accounts[0].id;
+            }
+            if (selectedAccount.value) refresh();
+        }
+
+        onMounted(ensureAccountAndLoad);
+
+        watch(() => appState.currentAccountId, (id) => {
+            if (id && id !== selectedAccount.value) {
+                selectedAccount.value = id;
+                page.value = 1;
+                refresh();
+            }
+        });
+
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
                 selectedAccount.value = appState.currentAccountId || appState.accounts[0].id;
                 refresh();
-            } else if (selectedAccount.value) {
-                refresh();
+            }
+        });
+
+        onUnmounted(() => {
+            if (refreshTimer) {
+                clearTimeout(refreshTimer);
+                refreshTimer = null;
             }
         });
 
@@ -177,12 +234,10 @@ export const DraftsPage = {
         return () => loading.value && drafts.value.length === 0
             ? h(Loading)
             : h('div', { class: 'view-frame' }, [
-                // ═══ hero-band：左侧草稿统计 + 右侧账号选择 ═══
                 h('section', {
                     class: 'grid gap-3',
                     style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
                 }, [
-                    // 左侧：hero-panel 草稿统计
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
                             h('span', { class: 'eyebrow' }, '动态草稿'),
@@ -197,9 +252,8 @@ export const DraftsPage = {
                             }, String(total.value || 0)),
                             h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '条草稿记录'),
                         ]),
-                        h('p', { class: 'muted m-0' }, '审核 AI 生成的动态内容，支持编辑、通过、拒绝与重新生成'),
+                        h('p', { class: 'muted m-0' }, '审核 AI 生成的动态内容，支持编辑、通过、拒绝与重新发布'),
                     ]),
-                    // 右侧：账号选择 Card
                     h('article', {
                         class: 'grid gap-3',
                         style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
@@ -230,7 +284,6 @@ export const DraftsPage = {
                     ]),
                 ]),
 
-                // ═══ 数据表格 ═══
                 h('article', {
                     class: 'grid gap-3',
                     style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4);',
@@ -242,7 +295,6 @@ export const DraftsPage = {
                                 style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;',
                             }, '草稿列表'),
                         ]),
-                        // 状态过滤按钮组
                         h('div', { class: 'flex items-center gap-1 flex-wrap' },
                             statusFilters.map(f => h('button', {
                                 key: f.value,
@@ -256,9 +308,8 @@ export const DraftsPage = {
                         ),
                     ]),
                     drafts.value.length === 0
-                        ? h(EmptyState, { icon: 'folder', title: '暂无草稿', desc: '当前账号没有待审核的动态草稿' })
+                        ? h(EmptyState, { icon: 'folder', title: '暂无草稿', desc: '当前筛选条件下没有动态草稿' })
                         : h('div', { class: 'grid', style: 'gap:0; min-width:0;' }, [
-                            // 表头
                             h('div', {
                                 class: 'grid items-center',
                                 style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.14em;`,
@@ -269,60 +320,57 @@ export const DraftsPage = {
                                 h('span', { class: 'whitespace-nowrap' }, '状态'),
                                 h('span', { class: 'whitespace-nowrap' }, '操作'),
                             ]),
-                            // 数据行
-                            ...drafts.value.map(d => h('div', {
-                                key: d.id,
-                                class: 'grid items-center',
-                                style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;`,
-                            }, [
-                                h('span', {
-                                    class: 'whitespace-nowrap',
-                                    style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; font-size:0.85rem;',
-                                }, formatTime(d.created_at)),
-                                h('span', { class: 'truncate' }, accName(selectedAccount.value)),
-                                h('div', {
-                                    class: 'truncate',
-                                    style: 'cursor:pointer; min-width:0;',
-                                    title: d.content || '',
-                                    role: 'button',
-                                    tabindex: '0',
-                                    'aria-label': '预览草稿内容',
-                                    onClick: () => openPreview(d),
-                                    onKeydown: (e) => {
-                                        if (e.key === 'Enter' || e.key === ' ') {
-                                            e.preventDefault();
-                                            openPreview(d);
-                                        }
-                                    },
-                                }, d.content || '(空)'),
-                                h('span', {
-                                    class: ['badge',
-                                        d.status === 'approved' ? 'badge-success'
-                                        : d.status === 'rejected' ? 'badge-danger'
-                                        : d.status === 'published' ? 'badge-info'
-                                        : 'badge-warning'].join(' '),
-                                }, d.status || 'pending'),
-                                h('div', { class: 'flex items-center gap-1 flex-wrap' }, [
-                                    d.status === 'pending' && h('button', {
-                                        class: 'btn btn-sm primary',
-                                        onClick: () => approve(d),
-                                    }, '通过'),
-                                    d.status === 'pending' && h('button', {
-                                        class: 'btn btn-sm btn-danger',
-                                        onClick: () => reject(d),
-                                    }, '拒绝'),
-                                    d.status === 'pending' && h('button', {
-                                        class: 'btn btn-sm ghost',
-                                        onClick: () => openEdit(d),
-                                    }, '编辑'),
-                                    (d.status === 'rejected' || d.status === 'pending') && h('button', {
-                                        class: 'btn btn-sm ghost',
-                                        onClick: () => retry(d),
-                                    }, '重新生成'),
-                                ].filter(Boolean)),
-                            ])),
+                            ...drafts.value.map(d => {
+                                const id = draftId(d);
+                                return h('div', {
+                                    key: id,
+                                    class: 'grid items-center',
+                                    style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 2.3) 0; border-top: 1px solid hsl(var(--border)); font-size: 0.95rem;`,
+                                }, [
+                                    h('span', {
+                                        class: 'whitespace-nowrap',
+                                        style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; font-size:0.85rem;',
+                                    }, formatTime(d.created_at)),
+                                    h('span', { class: 'truncate' }, accName(selectedAccount.value)),
+                                    h('div', {
+                                        class: 'truncate',
+                                        style: 'cursor:pointer; min-width:0;',
+                                        title: d.content || '',
+                                        role: 'button',
+                                        tabindex: '0',
+                                        'aria-label': '预览草稿内容',
+                                        onClick: () => openPreview(d),
+                                        onKeydown: (e) => {
+                                            if (e.key === 'Enter' || e.key === ' ') {
+                                                e.preventDefault();
+                                                openPreview(d);
+                                            }
+                                        },
+                                    }, d.content || '(空)'),
+                                    h('span', {
+                                        class: ['badge', statusBadgeType(d.status)].join(' '),
+                                    }, STATUS_LABELS[d.status] || d.status || '-'),
+                                    h('div', { class: 'flex items-center gap-1 flex-wrap' }, [
+                                        REVIEWABLE.has(d.status) && h('button', {
+                                            class: 'btn btn-sm primary',
+                                            onClick: () => approve(d),
+                                        }, '通过'),
+                                        REVIEWABLE.has(d.status) && h('button', {
+                                            class: 'btn btn-sm btn-danger',
+                                            onClick: () => reject(d),
+                                        }, '拒绝'),
+                                        REVIEWABLE.has(d.status) && h('button', {
+                                            class: 'btn btn-sm ghost',
+                                            onClick: () => openEdit(d),
+                                        }, '编辑'),
+                                        RETRYABLE.has(d.status) && h('button', {
+                                            class: 'btn btn-sm ghost',
+                                            onClick: () => retry(d),
+                                        }, '重新发布'),
+                                    ].filter(Boolean)),
+                                ]);
+                            }),
                         ]),
-                    // 底部分页
                     total.value > pageSize && h('div', { class: 'flex justify-end' }, [
                         h(Pagination, {
                             page: page.value,
@@ -333,10 +381,9 @@ export const DraftsPage = {
                     ]),
                 ]),
 
-                // ═══ 编辑弹窗 ═══
                 h(Modal, {
                     modelValue: editModal.visible,
-                    title: `编辑草稿 #${editModal.draft?.id || ''}`,
+                    title: `编辑草稿 #${draftId(editModal.draft)}`,
                     'onUpdate:modelValue': (v) => editModal.visible = v,
                 }, {
                     default: () => h('div', [
@@ -346,7 +393,7 @@ export const DraftsPage = {
                             rows: 8,
                             placeholder: '输入草稿内容...',
                         }),
-                        h('p', { class: 'form-hint' }, `当前版本：v${editModal.version}（乐观锁，保存时若版本不匹配将拒绝）`),
+                        h('p', { class: 'form-hint' }, `当前版本：v${editModal.revision ?? '-'}（乐观锁，保存时若版本不匹配将拒绝）`),
                     ]),
                     footer: () => h('div', { class: 'flex gap-2 justify-end' }, [
                         h(Button, { onClick: () => editModal.visible = false }, () => '取消'),
@@ -354,26 +401,28 @@ export const DraftsPage = {
                     ]),
                 }),
 
-                // ═══ 预览弹窗 ═══
                 h(Modal, {
                     modelValue: previewModal.visible,
-                    title: `草稿预览 #${previewModal.draft?.id || ''}`,
+                    title: `草稿预览 #${draftId(previewModal.draft)}`,
                     'onUpdate:modelValue': (v) => previewModal.visible = v,
                 }, {
                     default: () => h('div', { class: 'preview-content' }, [
                         h('pre', { style: 'white-space:pre-wrap; word-break:break-word; font-family:inherit; line-height:1.6' },
                             previewModal.draft?.content || '(空内容)'),
-                        previewModal.draft?.pictures && h('div', { class: 'flex gap-2 mt-3 flex-wrap' },
-                            (previewModal.draft.pictures || []).map(pic => h('img', {
-                                src: pic.src || pic.url,
-                                style: 'max-width:120px; max-height:120px; border-radius:8px; border:1px solid hsl(var(--border));',
-                            })),
+                        imageRefs(previewModal.draft).length > 0 && h('div', { class: 'flex gap-2 mt-3 flex-wrap' },
+                            imageRefs(previewModal.draft).map((pic, i) => {
+                                const src = typeof pic === 'string' ? pic : (pic.src || pic.url || pic.path || '');
+                                return src ? h('img', {
+                                    key: i,
+                                    src,
+                                    style: 'max-width:120px; max-height:120px; border-radius:8px; border:1px solid hsl(var(--border));',
+                                }) : null;
+                            }).filter(Boolean),
                         ),
                     ]),
                     footer: () => h(Button, { onClick: () => previewModal.visible = false }, () => '关闭'),
                 }),
 
-                // ═══ 确认对话框 ═══
                 h(ConfirmModal, {
                     modelValue: confirmState.visible,
                     title: confirmState.title,
