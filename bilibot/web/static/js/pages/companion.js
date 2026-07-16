@@ -162,6 +162,8 @@ export const CompanionPage = defineComponent({
             if (!selectedAccount.value && appState.accounts.length > 0) {
                 const first = appState.accounts[0];
                 selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
+                // selectedAccount 的 watch 会触发 loadAll
+                return;
             }
             if (selectedAccount.value) await loadAll();
         }
