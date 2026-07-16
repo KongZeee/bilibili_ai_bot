@@ -250,18 +250,11 @@ class ReplyGenerator:
                 )
 
             # 2. 调用 LLM（system_prompt 纯净，搜索结果在 user_prompt 的 Reference Block）
-            try:
-                from bilibot.services.token_usage import usage_context
-                with usage_context(
-                    scene=str(getattr(scene, "value", scene) or "reply_comment"),
-                    account_id=getattr(self, "account_id", "") or "",
-                ):
-                    reply_text = await self.llm.generate(
-                        prompt=final_user_prompt,
-                        system_prompt=system_prompt,
-                        max_tokens=200,
-                    )
-            except Exception:
+            from bilibot.services.token_usage import usage_context
+            with usage_context(
+                scene=str(getattr(scene, "value", scene) or "reply_comment"),
+                account_id=getattr(self, "account_id", "") or "",
+            ):
                 reply_text = await self.llm.generate(
                     prompt=final_user_prompt,
                     system_prompt=system_prompt,

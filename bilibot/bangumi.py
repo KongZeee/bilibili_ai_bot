@@ -999,7 +999,9 @@ class BangumiService:
                 analysis=analysis if analysis else "（无分析数据）",
                 context=f"\n【你之前看过的进度】\n{context}" if context else "",
             )
-            text = await provider.generate(prompt, max_tokens=350)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="bangumi_eval", account_id=getattr(self, "account_id", "") or ""):
+                text = await provider.generate(prompt, max_tokens=350)
             if not text:
                 return None
 
@@ -1029,7 +1031,9 @@ class BangumiService:
             if not provider:
                 return ""
             prompt = _COMMENT_PROMPT.format(title=title, ep_index=ep_index)
-            return await provider.generate(prompt, max_tokens=80) or ""
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="bangumi_comment", account_id=getattr(self, "account_id", "") or ""):
+                return await provider.generate(prompt, max_tokens=80) or ""
         except Exception:
             return ""
 

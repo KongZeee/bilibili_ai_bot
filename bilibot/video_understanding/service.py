@@ -254,9 +254,11 @@ class LLMVisionAdapter:
     async def generate(
         self, prompt: str, system_prompt: str = "", max_tokens: int = 1024, temperature: float = 0.7
     ) -> Optional[str]:
-        return await self.llm.generate(
-            prompt, system_prompt=system_prompt, max_tokens=max_tokens
-        )
+        from bilibot.services.token_usage import usage_context
+        with usage_context(scene="video_understanding", account_id=getattr(self, "account_id", "") or ""):
+            return await self.llm.generate(
+                prompt, system_prompt=system_prompt, max_tokens=max_tokens
+            )
 
 
 class VideoUnderstandingService:

@@ -172,15 +172,32 @@ class MemoryModelGateway:
             or getattr(provider, "complete", None)
         )
         try:
-            value = method(
-                prompt,
-                system_prompt=system_prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-            )
-        except TypeError:
-            value = method(prompt)
-        result = await asyncio.wait_for(_resolve(value), timeout=max(0.1, float(timeout)))
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="memory_brain", account_id=getattr(self, "account_id", "") or ""):
+                try:
+                    value = method(
+                        prompt,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                        temperature=temperature,
+                    )
+                except TypeError:
+                    value = method(prompt)
+                result = await asyncio.wait_for(_resolve(value), timeout=max(0.1, float(timeout)))
+        except ProviderNotConfigured:
+            raise
+        except Exception:
+            # preserve original behavior for provider errors outside usage_context import
+            try:
+                value = method(
+                    prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                )
+            except TypeError:
+                value = method(prompt)
+            result = await asyncio.wait_for(_resolve(value), timeout=max(0.1, float(timeout)))
         if result is None or not str(result).strip():
             raise ProviderNotConfigured("chat provider returned no result")
         return str(result).strip()

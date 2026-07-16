@@ -999,7 +999,9 @@ class WebSearchService:
 请用JSON回复：{{"need_search": true或false, "query": "搜索关键词(不需要搜索则留空)"}}
 直接输出JSON，不要加任何其他内容。"""
         try:
-            text = await self.llm.generate(prompt, max_tokens=80)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="web_search_judge", account_id=getattr(self, "account_id", "") or ""):
+                text = await self.llm.generate(prompt, max_tokens=80)
             if not text:
                 return ""
             text = text.replace("```json", "").replace("```", "").strip()
@@ -1070,7 +1072,9 @@ UP主：{owner}
 请用JSON回复：{{"need_search": true或false, "query": "搜索关键词(不需要搜索则留空)"}}
 直接输出JSON。"""
         try:
-            text = await self.llm.generate(prompt, max_tokens=100)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="web_search_video_judge", account_id=getattr(self, "account_id", "") or ""):
+                text = await self.llm.generate(prompt, max_tokens=100)
             if not text:
                 return ""
             text = text.replace("```json", "").replace("```", "").strip()
