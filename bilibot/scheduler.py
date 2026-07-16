@@ -6217,7 +6217,9 @@ class Scheduler:
                 f"{persona_block}"
                 f"\n动态内容: {content}\n\nImage prompt:"
             )
-            result = await self.llm.generate(prompt, max_tokens=120, temperature=0.7)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="image_prompt", account_id=self.account_id or ""):
+                result = await self.llm.generate(prompt, max_tokens=120, temperature=0.7)
             return result.strip() if result else None
         except Exception as e:
             logger.warning(f"生成图片 prompt 失败: {e}")

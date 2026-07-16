@@ -469,6 +469,60 @@ class TokenUsageStore:
 _GLOBAL_STORE: Optional[TokenUsageStore] = None
 _GLOBAL_LOCK = threading.Lock()
 
+# 异步上下文：让 LLMProvider 记录 usage 时带上 scene/account，无需改遍所有调用点
+try:
+    import contextvars
+except Exception:  # pragma: no cover
+    contextvars = None  # type: ignore
+
+if contextvars is not None:
+    _usage_scene: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+        "token_usage_scene", default=""
+    )
+    _usage_account: "contextvars.ContextVar[str]" = contextvars.ContextVar(
+        "token_usage_account", default=""
+    )
+else:  # pragma: no cover
+    _usage_scene = None  # type: ignore
+    _usage_account = None  # type: ignore
+
+
+class usage_context:
+    """with usage_context(scene='reply_comment', account_id='x'): await llm.generate(...)"""
+
+    def __init__(self, *, scene: str = "", account_id: str = ""):
+        self.scene = scene or ""
+        self.account_id = account_id or ""
+        self._tokens: list = []
+
+    def __enter__(self):
+        if _usage_scene is not None and self.scene:
+            self._tokens.append((_usage_scene, _usage_scene.set(self.scene)))
+        if _usage_account is not None and self.account_id:
+            self._tokens.append((_usage_account, _usage_account.set(self.account_id)))
+        return self
+
+    def __exit__(self, *exc):
+        for var, tok in reversed(self._tokens):
+            try:
+                var.reset(tok)
+            except Exception:
+                pass
+        return False
+
+
+def get_usage_context() -> Dict[str, str]:
+    scene = ""
+    account_id = ""
+    try:
+        if _usage_scene is not None:
+            scene = _usage_scene.get() or ""
+        if _usage_account is not None:
+            account_id = _usage_account.get() or ""
+    except Exception:
+        pass
+    return {"scene": scene, "account_id": account_id}
+
 
 def set_global_token_store(store: Optional[TokenUsageStore]) -> None:
     global _GLOBAL_STORE
@@ -486,6 +540,11 @@ def record_usage_safe(**kwargs: Any) -> None:
     if store is None:
         return
     try:
+        ctx = get_usage_context()
+        if not kwargs.get("scene"):
+            kwargs["scene"] = ctx.get("scene") or ""
+        if not kwargs.get("account_id"):
+            kwargs["account_id"] = ctx.get("account_id") or ""
         store.record(**kwargs)
     except Exception as e:
         logger.debug("token usage record failed: %s", e)
@@ -496,6 +555,13 @@ def record_response_safe(response: Any, **kwargs: Any) -> None:
     if store is None:
         return
     try:
+        ctx = get_usage_context()
+        if not kwargs.get("scene"):
+            kwargs["scene"] = ctx.get("scene") or ""
+        if not kwargs.get("account_id"):
+            kwargs["account_id"] = ctx.get("account_id") or ""
         store.record_from_response(response, **kwargs)
+    except Exception as e:
+        logger.debug("token usage record_from_response failed: %s", e)
     except Exception as e:
         logger.debug("token usage record_from_response failed: %s", e)

@@ -241,16 +241,25 @@ class CompanionLifeService:
             "creative_rules": getattr(p, "creative_rules", "") or "",
         }
 
-    async def _llm_text(self, system: str, user: str, max_tokens: int = 900) -> Optional[str]:
+    async def _llm_text(
+        self,
+        system: str,
+        user: str,
+        max_tokens: int = 900,
+        *,
+        scene: str = "companion",
+    ) -> Optional[str]:
         if not self.llm or not hasattr(self.llm, "generate"):
             return None
         try:
-            return await self.llm.generate(
-                prompt=user,
-                system_prompt=system,
-                max_tokens=max_tokens,
-                temperature=0.85,
-            )
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene=scene, account_id=self.account_id):
+                return await self.llm.generate(
+                    prompt=user,
+                    system_prompt=system,
+                    max_tokens=max_tokens,
+                    temperature=0.85,
+                )
         except Exception as e:
             logger.warning("[%s] companion LLM failed: %s", self.account_id, type(e).__name__)
             return None
@@ -763,7 +772,7 @@ class CompanionLifeService:
             dream_afterglow=state.dream_afterglow,
             item_count=self._cfg.schedule.item_count,
         )
-        raw = await self._llm_text(system, user, max_tokens=1200)
+        raw = await self._llm_text(system, user, max_tokens=1200, scene="life_plan")
         items: List[PlanItem] = []
         source = "fallback"
         if raw:
@@ -784,7 +793,7 @@ class CompanionLifeService:
         score = _plan_quality(items)
         if score < 55 and source == "llm":
             # one soft retry
-            raw2 = await self._llm_text(system, user + "\n上次时段质量偏低，请避免重叠并补全早晚。", max_tokens=1200)
+            raw2 = await self._llm_text(system, user + "\n上次时段质量偏低，请避免重叠并补全早晚。", max_tokens=1200, scene="life_plan")
             if raw2:
                 data = _extract_json(raw2)
                 rows = (data.get("schedule") if isinstance(data, dict) else data) or []
@@ -857,7 +866,7 @@ class CompanionLifeService:
             persona_name=bits["name"],
             energy=state.energy,
         )
-        raw = await self._llm_text(system, user, max_tokens=500)
+        raw = await self._llm_text(system, user, max_tokens=500, scene="life_plan")
         summary = target.activity
         events: List[str] = []
         hooks: List[str] = []
@@ -929,7 +938,7 @@ class CompanionLifeService:
             plan_summary=plan_sum,
             diary_hint=diary_hint,
         )
-        raw = await self._llm_text(system, user, max_tokens=1000)
+        raw = await self._llm_text(system, user, max_tokens=1000, scene="dream")
         dream = None
         if raw:
             data = _extract_json(raw)
@@ -1027,7 +1036,7 @@ class CompanionLifeService:
             energy=state.energy,
             mood_bias=state.mood_bias,
         )
-        raw = await self._llm_text(system, user, max_tokens=1100)
+        raw = await self._llm_text(system, user, max_tokens=1100, scene="diary")
         entry = None
         if raw:
             data = _extract_json(raw)
@@ -1175,7 +1184,7 @@ class CompanionLifeService:
             recent_topics=", ".join(self.get_topic_seeds()),
             plan_summary=plan_sum,
         )
-        raw = await self._llm_text(system, user, max_tokens=220)
+        raw = await self._llm_text(system, user, max_tokens=220, scene="exploration")
         query, motive = "", "随便看看公开资料"
         if raw:
             data = _extract_json(raw)
@@ -1244,7 +1253,7 @@ class CompanionLifeService:
             results_text=results_text,
             persona_prompt=bits["base_prompt"],
         )
-        raw2 = await self._llm_text(system2, user2, max_tokens=500)
+        raw2 = await self._llm_text(system2, user2, max_tokens=500, scene="exploration")
         impression, self_link, should_share = (
             ("没搜到什么有用的，下次换个关键词试试。" if not search_ok else "看了一些资料。"),
             "",
@@ -1353,7 +1362,7 @@ class CompanionLifeService:
                     persona_prompt=bits["base_prompt"] + (("\n" + bits.get("creative_rules", "")) if bits.get("creative_rules") else ""),
                     inspiration=insp,
                 )
-                raw = await self._llm_text(system, user, max_tokens=500)
+                raw = await self._llm_text(system, user, max_tokens=500, scene="creative")
                 meta = _extract_json(raw) if raw else None
                 if isinstance(meta, dict) and meta.get("title"):
                     proj = CreativeProject.from_dict(
@@ -1391,7 +1400,7 @@ class CompanionLifeService:
             budget=budget,
             persona_prompt=bits["base_prompt"],
         )
-        text = await self._llm_text(system, user, max_tokens=max(300, budget + 100))
+        text = await self._llm_text(system, user, max_tokens=max(300, budget + 100), scene="creative")
         if not text or len(text.strip()) < 40:
             proj.next_advance_at = now + 30 * 60
             proj.updated_at = _now_iso()
