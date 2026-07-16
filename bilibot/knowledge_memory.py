@@ -947,7 +947,9 @@ class MemoryProcessor:
             return []
         
         try:
-            response = await self.llm.generate(prompt, system_prompt=system_prompt, max_tokens=1500)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="memory_extract", account_id=getattr(self, "account_id", "") or ""):
+                response = await self.llm.generate(prompt, system_prompt=system_prompt, max_tokens=1500)
             if not response:
                 return []
             

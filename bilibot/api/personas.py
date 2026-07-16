@@ -194,11 +194,13 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
                             "error": {"code": "LLM_NOT_FOUND", "message": "找不到 LLM Provider", "details": {}},
                         }, status_code=400)
                 try:
-                    output = await provider.generate(
-                        prompt=user_prompt,
-                        system_prompt=system_prompt,
-                        max_tokens=200,
-                    )
+                    from bilibot.services.token_usage import usage_context
+                    with usage_context(scene="persona_test", account_id=""):
+                        output = await provider.generate(
+                            prompt=user_prompt,
+                            system_prompt=system_prompt,
+                            max_tokens=200,
+                        )
                     result["output"] = output or ""
                 except Exception as e:
                     result["output"] = f"[LLM调用失败: {e}]"
@@ -376,9 +378,11 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
                 llm_err = None
                 if use_llm and provider:
                     try:
-                        output_text = await provider.generate(
-                            prompt=up, system_prompt=sp, max_tokens=120,
-                        )
+                        from bilibot.services.token_usage import usage_context
+                        with usage_context(scene="persona_evaluate", account_id=""):
+                            output_text = await provider.generate(
+                                prompt=up, system_prompt=sp, max_tokens=120,
+                            )
                     except Exception as e:
                         llm_err = str(e)
                         sc = max(0, sc - 10)

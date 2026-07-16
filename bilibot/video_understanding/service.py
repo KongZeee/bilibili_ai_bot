@@ -230,7 +230,9 @@ class LLMVisionAdapter:
             data_url = await asyncio.to_thread(self._load_image_data_url, image_path)
             if data_url is None:
                 return None
-            return await self.llm.vision_analyze(data_url, prompt, max_tokens)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="video_vision", account_id=getattr(self, "account_id", "") or ""):
+                return await self.llm.vision_analyze(data_url, prompt, max_tokens)
         except Exception as e:
             # 上抛临时故障，避免静默丢帧；调用方（visual_track）按 require_complete 决定是否降级
             logger.error(f"Vision 描述失败 ({image_path}): {e}")
@@ -756,9 +758,11 @@ class VideoUnderstandingService:
         if not self.adapter:
             return None
         prompt = _QA_PROMPT_TEMPLATE.format(log=behavior_log, question=question)
-        return await self.adapter.generate(
-            prompt, system_prompt=_QA_SYSTEM_PROMPT, max_tokens=max_tokens, temperature=0.5
-        )
+        from bilibot.services.token_usage import usage_context
+        with usage_context(scene="video_qa", account_id=getattr(self, "account_id", "") or ""):
+            return await self.adapter.generate(
+                prompt, system_prompt=_QA_SYSTEM_PROMPT, max_tokens=max_tokens, temperature=0.5
+            )
 
     def shutdown(self) -> None:
         """PRD-V5 §8.2 VID-503：优雅关闭
