@@ -554,7 +554,9 @@ class HumanizedCommentGenerator:
             return None
         
         try:
-            response = await self.llm.generate(prompt, system_prompt=system_prompt, max_tokens=150)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="reply_comment", account_id=getattr(self, "account_id", "") or ""):
+                response = await self.llm.generate(prompt, system_prompt=system_prompt, max_tokens=150)
             if not response:
                 return None
             
@@ -740,11 +742,13 @@ UP主: {owner}
         last_error = ""
         for attempt in range(1, 3):
             try:
-                response = await self.llm.generate(
-                    prompt,
-                    system_prompt=system_prompt,
-                    max_tokens=max_tokens,
-                )
+                from bilibot.services.token_usage import usage_context
+                with usage_context(scene="proactive_video", account_id=getattr(self, "account_id", "") or ""):
+                    response = await self.llm.generate(
+                        prompt,
+                        system_prompt=system_prompt,
+                        max_tokens=max_tokens,
+                    )
                 if not response:
                     last_error = "empty_response"
                     continue
@@ -866,9 +870,11 @@ UP主: {owner}
             system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
 
         try:
-            response = await self.llm.generate(
-                prompt, system_prompt=system_prompt, max_tokens=80
-            )
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="proactive_comment", account_id=getattr(self, "account_id", "") or ""):
+                response = await self.llm.generate(
+                    prompt, system_prompt=system_prompt, max_tokens=80
+                )
             if not response:
                 return None
 
@@ -942,7 +948,9 @@ class DynamicPoster:
             ])
         
         try:
-            response = await self.llm.generate(prompt, max_tokens=200)
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="dynamic_post", account_id=getattr(self, "account_id", "") or ""):
+                response = await self.llm.generate(prompt, max_tokens=200)
             if response:
                 # PRD 5.3：安全截断，避免在 emoji 多字节序列中间截断产生乱码
                 text = response.strip()[:200]
