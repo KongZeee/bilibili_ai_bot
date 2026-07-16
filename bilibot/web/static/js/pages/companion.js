@@ -171,16 +171,19 @@ export const CompanionPage = defineComponent({
             if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
                 const first = appState.accounts[0];
                 selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                loadAll();
+                // selectedAccount watch 会触发 loadAll，避免这里再调一次
             }
         });
         watch(() => appState.currentAccountId, (id) => {
             if (id && id !== selectedAccount.value) {
                 selectedAccount.value = id;
-                loadAll();
+                // selectedAccount watch 统一 loadAll
             }
         });
-        watch(selectedAccount, () => { if (selectedAccount.value) loadAll(); });
+        watch(selectedAccount, (id, prev) => {
+            if (id && id !== prev) loadAll();
+            else if (id && !state.value) loadAll();
+        });
 
         const enabled = computed(() => !!(state.value && state.value.enabled));
         const life = computed(() => (state.value && state.value.life_state) || {});

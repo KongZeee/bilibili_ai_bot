@@ -124,6 +124,22 @@ class ImageProvider:
             logger.warning("文生图 Provider 未配置 api_key")
             return None
 
+        # 文生图通常不返回 chat-style token usage；记 1 次调用便于面板统计
+        try:
+            from bilibot.services.token_usage import record_usage_safe
+            record_usage_safe(
+                provider_id=getattr(self, "provider_id", "") or getattr(self, "name", "") or "image",
+                model=getattr(self, "model", "") or "",
+                kind="image",
+                scene="image_generation",
+                prompt_tokens=0,
+                completion_tokens=0,
+                total_tokens=0,
+                meta={"size": size or getattr(self, "default_size", "")},
+            )
+        except Exception:
+            pass
+
         url = f"{self.base_url.rstrip('/')}/images/generations"
         body = {
             "model": self.model,
