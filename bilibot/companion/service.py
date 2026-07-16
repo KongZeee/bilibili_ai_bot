@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -11,11 +12,6 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
-
-try:
-    import asyncio
-except Exception:  # pragma: no cover
-    asyncio = None  # type: ignore
 
 from .config import CompanionConfig, load_companion_config
 from .models import (
@@ -165,13 +161,8 @@ class CompanionLifeService:
         self.store = CompanionStore(account_data_dir)
         self._cfg = self.reload_config()
         # 异步可重入保护：bool 在 await 间隙会误判；用 asyncio.Lock
-        self._tick_lock = None
-        try:
-            if asyncio is not None:
-                self._tick_lock = asyncio.Lock()
-        except Exception:
-            self._tick_lock = None
-        self._tick_busy = False  # sync fallback when no event loop yet
+        self._tick_lock: Optional[asyncio.Lock] = None
+        self._tick_busy = False  # sync fallback if lock not yet bound to loop
 
     # ── config ──
 
@@ -1449,13 +1440,14 @@ class CompanionLifeService:
         if not self.enabled:
             return result
 
-        # Prefer asyncio.Lock across await boundaries
+        # Prefer asyncio.Lock across await boundaries (create lazily on running loop)
         lock = self._tick_lock
-        if lock is None and asyncio is not None:
+        if lock is None:
             try:
                 self._tick_lock = asyncio.Lock()
                 lock = self._tick_lock
-            except Exception:
+            except RuntimeError:
+                # no running loop — fall back to busy flag
                 lock = None
 
         if lock is not None:

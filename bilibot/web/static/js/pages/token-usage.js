@@ -158,7 +158,7 @@ export const TokenUsagePage = defineComponent({
                 loading.value && !data.value
                     ? h(Loading)
                     : !data.value
-                        ? h(EmptyState, { title: '暂无统计', description: '发起 LLM 调用后将自动记录' })
+                        ? h(EmptyState, { title: '暂无统计', desc: '发起 LLM 调用后将自动记录' })
                         : h('div', { class: 'grid gap-3' }, [
                             h('section', {
                                 class: 'grid gap-3',
@@ -229,7 +229,7 @@ export const TokenUsagePage = defineComponent({
                                 Table(
                                     ['时间', '类型', '模型', 'P/C/T', '缓存', '场景'],
                                     (data.value.recent || []).map(r => [
-                                        formatTime(r.ts * 1000),
+                                        formatTime(r.ts),
                                         r.kind || '-',
                                         r.model || '-',
                                         `${fmt(r.prompt_tokens)}/${fmt(r.completion_tokens)}/${fmt(r.total_tokens)}`,

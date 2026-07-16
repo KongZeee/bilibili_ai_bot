@@ -253,7 +253,7 @@ export const CompanionPage = defineComponent({
                 loading.value && !state.value
                     ? h(Loading)
                     : !state.value
-                        ? h(EmptyState, { title: '暂无数据', description: '请选择账号，并在全局配置中启用 companion' })
+                        ? h(EmptyState, { title: '暂无数据', desc: '请选择账号，并在全局配置中启用 companion' })
                         : renderTab(tab.value),
             ]);
         };
