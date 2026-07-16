@@ -201,20 +201,14 @@ class CompanionLifeService:
 
     def _persona_bits(self) -> Dict[str, Any]:
         p = self._resolve_persona()
-        if not p:
-            return {
-                "id": "",
-                "name": "Bot",
-                "base_prompt": "",
-                "interests": [],
-                "life_background": "",
-            }
-        interests = list(getattr(p, "interests", None) or [])
-        if not interests and getattr(p, "tags", None):
-            interests = list(p.tags or [])
-        # merge config exploration interests
+        interests: List[str] = []
+        if p:
+            interests = list(getattr(p, "interests", None) or [])
+            if not interests and getattr(p, "tags", None):
+                interests = list(p.tags or [])
+        # merge config exploration interests (even without persona store)
         for x in self._cfg.exploration.interests:
-            if x not in interests:
+            if x and x not in interests:
                 interests.append(x)
         # revive proactive.interest_keywords
         try:
@@ -223,10 +217,20 @@ class CompanionLifeService:
             if isinstance(kws, str):
                 kws = [x.strip() for x in kws.split(",") if x.strip()]
             for x in kws:
-                if x and x not in interests:
+                if x and str(x) not in interests:
                     interests.append(str(x))
         except Exception:
             pass
+        if not p:
+            return {
+                "id": "",
+                "name": "Bot",
+                "base_prompt": "",
+                "interests": interests,
+                "life_background": "",
+                "diary_rules": "",
+                "creative_rules": "",
+            }
         return {
             "id": getattr(p, "id", "") or "",
             "name": getattr(p, "name", "") or "Bot",
