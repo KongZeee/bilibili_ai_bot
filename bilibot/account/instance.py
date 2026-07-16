@@ -99,6 +99,7 @@ class AccountInstance:
         self.memory_write_queue = None
         self.personality = None
         self.comment_context_service = None
+        self.companion = None
         self.scheduler = None
         # 账号级配置加载器（共享配置 + 账号 bilibili 凭据 + 账号 data_dir）
         self.account_config_loader = None
@@ -288,7 +289,33 @@ class AccountInstance:
         except Exception as e:
             logger.warning(f"[{self.account_id}] 文生图 Provider 初始化失败: {e}")
 
-        # 11. 调度器
+        # 11. 陪伴生活层（账号级；默认 companion.enabled=false）
+        self.companion = None
+        try:
+            from bilibot.companion import CompanionLifeService
+
+            self.companion = CompanionLifeService(
+                self.account_id,
+                self.account_data_dir,
+                config_loader=self.account_config_loader,
+                llm=self.llm,
+                persona_store=self.persona_store,
+                memory_brain=self.memory_brain,
+                web_search=None,  # filled after Scheduler creates WebSearchService
+                draft_store=None,  # filled after Scheduler draft store is available
+            )
+            # ContextBuilder 注入 companion 供回复上下文使用
+            if self.context_builder is not None:
+                self.context_builder.companion = self.companion
+            if self.companion.enabled:
+                logger.info(f"[{self.account_id}] 陪伴生活层已启用")
+            else:
+                logger.debug(f"[{self.account_id}] 陪伴生活层已加载（未启用）")
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 陪伴生活层初始化失败: {e}")
+            self.companion = None
+
+        # 12. 调度器
         from bilibot.scheduler import Scheduler
         # PRD-V5 §10.2 COM-501：每账号独立的主动评论原子幂等存储
         from bilibot.services.proactive_comment_store import ProactiveCommentStore
@@ -315,7 +342,15 @@ class AccountInstance:
             memory_brain=self.memory_brain,
             memory_write_queue=self.memory_write_queue,
             proactive_comment_store=self.proactive_comment_store,
+            companion=self.companion,
         )
+        # 回填 web_search / draft_store 给 companion
+        if self.companion is not None:
+            try:
+                self.companion.web_search = getattr(self.scheduler, "web_search", None)
+                self.companion.draft_store = self.scheduler.get_draft_store()
+            except Exception as e:
+                logger.debug(f"[{self.account_id}] companion 回填 web_search/draft 失败: {e}")
 
         logger.info(f"[{self.account_id}] 账号实例初始化完成")
 
@@ -732,6 +767,53 @@ class AccountInstance:
                     comment_policy.reload_config(raw)
         except Exception as e:
             logger.warning(f"[{self.account_id}] 互动策略热重载失败: {e}")
+
+        # 4) 陪伴生活层：热读 companion.*；同步 web_search / draft 引用
+        try:
+            if self.companion is not None:
+                self.companion.config_loader = self.account_config_loader
+                self.companion.llm = self.llm
+                self.companion.reload_config()
+                if self.scheduler is not None:
+                    self.companion.web_search = getattr(self.scheduler, "web_search", None)
+                    try:
+                        self.companion.draft_store = self.scheduler.get_draft_store()
+                    except Exception:
+                        pass
+                if self.context_builder is not None:
+                    self.context_builder.companion = self.companion
+                # 保持 scheduler 引用一致
+                if self.scheduler is not None:
+                    self.scheduler.companion = self.companion
+            elif self.companion is None and self.account_config_loader is not None:
+                # 运行中从未初始化过 companion 时，按配置补建
+                from bilibot.companion import load_companion_config
+
+                cfg = load_companion_config(raw)
+                if cfg.enabled:
+                    from bilibot.companion import CompanionLifeService
+
+                    self.companion = CompanionLifeService(
+                        self.account_id,
+                        self.account_data_dir,
+                        config_loader=self.account_config_loader,
+                        llm=self.llm,
+                        persona_store=self.persona_store,
+                        memory_brain=self.memory_brain,
+                        web_search=getattr(self.scheduler, "web_search", None) if self.scheduler else None,
+                        draft_store=(
+                            self.scheduler.get_draft_store()
+                            if self.scheduler is not None
+                            else None
+                        ),
+                    )
+                    if self.context_builder is not None:
+                        self.context_builder.companion = self.companion
+                    if self.scheduler is not None:
+                        self.scheduler.companion = self.companion
+                    logger.info(f"[{self.account_id}] 陪伴生活层已按配置新建")
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 陪伴生活层热重载失败: {e}")
 
         # 4) PersonalitySystem / UserStateSystem 持有旧 ConfigLoader，必须换新
         try:

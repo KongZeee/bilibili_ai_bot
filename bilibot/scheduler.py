@@ -52,7 +52,7 @@ class Scheduler:
                  audit_store=None, context_builder=None, comment_context_service=None,
                  safety_checker=None, account_id: str = "", video_understanding_service=None,
                  image_provider=None, knowledge_memory=None, memory_write_queue=None,
-                 proactive_comment_store=None, memory_brain=None):
+                 proactive_comment_store=None, memory_brain=None, companion=None):
         self.config_loader = config_loader
         self.user_state = user_state
         self.llm = llm
@@ -68,6 +68,8 @@ class Scheduler:
         # PRD §5.9：安全检查器（全局暂停 / 内容检查 / 频率限制 / 黑名单）
         # 可由 panel.py 在运行时注入（panel 创建后回填），构造期可为 None
         self.safety_checker = safety_checker
+        # 陪伴生活层（账号级，可选）
+        self.companion = companion
         # PRD V2：账号 ID（用于多账号人格解析 / 日志隔离）
         self.account_id = account_id
         # AccountInstance explicitly supplies memory_brain in V6.  A direct
@@ -1270,6 +1272,30 @@ class Scheduler:
 
                 # 2. 主动行为
                 await self._check_proactive_tasks(current_time)
+
+                # 2.5 陪伴生活层 tick（日程/日记/探索/创作；默认关闭）
+                if self.companion is not None and getattr(self.companion, "enabled", False):
+                    try:
+                        # 保持 web_search / draft 引用新鲜（热重载后可能换实例）
+                        if getattr(self.companion, "web_search", None) is None:
+                            self.companion.web_search = self.web_search
+                        if getattr(self.companion, "draft_store", None) is None:
+                            try:
+                                self.companion.draft_store = self.get_draft_store()
+                            except Exception:
+                                pass
+                        c_result = await self.companion.tick(now)
+                        actions = (c_result or {}).get("actions") or []
+                        if actions:
+                            logger.info(
+                                "[%s] companion tick: %s",
+                                self.account_id or "-",
+                                ",".join(actions),
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "companion tick 失败: %s", type(e).__name__, exc_info=True
+                        )
 
                 # 3. 周总结
                 await self._check_weekly_summary()
@@ -3116,15 +3142,35 @@ class Scheduler:
         comment_text = evaluation.get("comment", "") if llm_ok else ""
         if not comment_text or len(comment_text) < 5:
             try:
-                comment_text = await self.comment_generator.generate_proactive_comment(
-                    title=title,
-                    owner=owner,
-                    desc=desc,
-                    tags=tags_list,
-                    review=review,
-                    mood=mood,
-                    video_content=video_content,
-                )
+                companion_ctx = ""
+                companion = getattr(self, "companion", None)
+                if companion is not None and getattr(companion, "enabled", False):
+                    try:
+                        if hasattr(companion, "build_proactive_context_block"):
+                            companion_ctx = companion.build_proactive_context_block() or ""
+                    except Exception:
+                        companion_ctx = ""
+                try:
+                    comment_text = await self.comment_generator.generate_proactive_comment(
+                        title=title,
+                        owner=owner,
+                        desc=desc,
+                        tags=tags_list,
+                        review=review,
+                        mood=mood,
+                        video_content=video_content,
+                        companion_context=companion_ctx,
+                    )
+                except TypeError:
+                    comment_text = await self.comment_generator.generate_proactive_comment(
+                        title=title,
+                        owner=owner,
+                        desc=desc,
+                        tags=tags_list,
+                        review=review,
+                        mood=mood,
+                        video_content=video_content,
+                    )
             except Exception as e:
                 logger.warning(f"评论生成失败: {e}")
                 comment_text = ""
@@ -5269,7 +5315,19 @@ class Scheduler:
                 except Exception:
                     pass
 
-            source = random.choice(["recommend", "region"])
+            # 陪伴层：日程若在「刷 B 站/看视频」时段，略提高推荐流占比（更像「按心情刷」）
+            companion = getattr(self, "companion", None)
+            prefer_browse = bool(
+                companion is not None
+                and getattr(companion, "enabled", False)
+                and hasattr(companion, "wants_browse_bilibili_now")
+                and companion.wants_browse_bilibili_now()
+            )
+            if prefer_browse:
+                source = "recommend" if random.random() < 0.72 else "region"
+                logger.info("陪伴日程偏向刷站，视频来源权重偏向推荐流")
+            else:
+                source = random.choice(["recommend", "region"])
             if source == "recommend":
                 data = await self.bili.get_recommend_videos()
                 logger.info("视频来源: 推荐流")
@@ -5338,15 +5396,26 @@ class Scheduler:
                     )
                 return
 
-            # 随机打乱候选；video_detail 摘要失败时换下一条，而不是硬吃低质量截断。
+            # 随机打乱候选；再按陪伴兴趣/探索笔记软排序（更像「按兴趣点开」）
             if saved_bvid and available_videos and str(
                 available_videos[0].get("bvid") or ""
             ) == saved_bvid:
                 rest = available_videos[1:]
                 random.shuffle(rest)
+                if companion is not None and getattr(companion, "enabled", False) and hasattr(companion, "rank_video_candidates"):
+                    try:
+                        rest = companion.rank_video_candidates(rest)
+                    except Exception as e:
+                        logger.debug("companion rank videos failed: %s", e)
                 available_videos[1:] = rest
             else:
                 random.shuffle(available_videos)
+                if companion is not None and getattr(companion, "enabled", False) and hasattr(companion, "rank_video_candidates"):
+                    try:
+                        available_videos = companion.rank_video_candidates(available_videos)
+                        logger.info("已按陪伴兴趣软排序视频候选")
+                    except Exception as e:
+                        logger.debug("companion rank videos failed: %s", e)
             max_video_attempts = min(3, len(available_videos))
             last_skip_reason = ""
 
@@ -5725,8 +5794,26 @@ class Scheduler:
             # 3. LLM 评价视频（输入优先为 video_detail 摘要）
             # 评价失败不得写 bot_experience / succeed：否则去重会永久跳过该片。
             evaluation = None
+            companion_ctx = ""
+            companion = getattr(self, "companion", None)
+            if companion is not None and getattr(companion, "enabled", False):
+                try:
+                    if hasattr(companion, "build_proactive_context_block"):
+                        companion_ctx = companion.build_proactive_context_block() or ""
+                except Exception:
+                    companion_ctx = ""
             if self.comment_generator:
                 try:
+                    evaluation = await self.comment_generator.evaluate_video(
+                        title=title,
+                        owner=owner,
+                        desc=desc,
+                        tags=tags_list,
+                        hot_comments=hot_comments,
+                        video_content=video_content,
+                        companion_context=companion_ctx,
+                    )
+                except TypeError:
                     evaluation = await self.comment_generator.evaluate_video(
                         title=title,
                         owner=owner,
@@ -6052,6 +6139,22 @@ class Scheduler:
                 except Exception:
                     pass
 
+            # 陪伴生活层回写：精力/心情/当前活动/念头（让「看过视频」进入当天生活）
+            companion = getattr(self, "companion", None)
+            if companion is not None and getattr(companion, "enabled", False):
+                try:
+                    if hasattr(companion, "on_proactive_video_finished"):
+                        companion.on_proactive_video_finished(
+                            title=title or "",
+                            score=score,
+                            mood=str(mood or ""),
+                            review=str(review or ""),
+                            comment=str(comment_text or ""),
+                            bvid=str(bvid or ""),
+                        )
+                except Exception as e:
+                    logger.debug("companion video feedback failed: %s", e)
+
             logger.info(f"视频处理完成: 《{title}》 score={score} comment={'是' if comment_text else '否'}")
 
             # PRD-V5 §7：只有真正完成才 succeed（创建协程 ≠ 成功）
@@ -6192,11 +6295,28 @@ class Scheduler:
             # dynamic_publish.topics 非空时按权重或轮换选择主题
             # 最近已使用主题需记录，避免连续重复
             # topics 为空才允许自由发挥，代码不得固定传 topic=None 忽略配置
+            # 陪伴层开启时优先用生活种子（日记/念头/探索），更像「此刻想说什么」
             selected_topic: Optional[str] = None
+            companion = getattr(self, "companion", None)
+            companion_life_block = ""
+            if companion is not None and getattr(companion, "enabled", False):
+                try:
+                    if hasattr(companion, "build_proactive_context_block"):
+                        companion_life_block = companion.build_proactive_context_block() or ""
+                except Exception:
+                    companion_life_block = ""
             _cfg_loader = getattr(self, "config_loader", None)
             dp_cfg = _cfg_loader.get_raw_config().get("dynamic_publish", {}) if _cfg_loader else {}
             topics_cfg = dp_cfg.get("topics", []) or []
-            if topics_cfg:
+            if companion is not None and getattr(companion, "enabled", False) and hasattr(companion, "pick_dynamic_topic"):
+                try:
+                    selected_topic = companion.pick_dynamic_topic(topics_cfg)
+                    if selected_topic:
+                        logger.info(f"DYN-001 陪伴生活选中动态主题: {selected_topic}")
+                except Exception as e:
+                    logger.debug("companion pick_dynamic_topic failed: %s", e)
+                    selected_topic = None
+            if not selected_topic and topics_cfg:
                 try:
                     recent_topics: List[str] = []
                     if self.ds:
@@ -6213,6 +6333,13 @@ class Scheduler:
                 except Exception as e:
                     logger.warning(f"主题选择失败: {e}")
                     selected_topic = None
+            elif selected_topic and self.ds:
+                try:
+                    recent_topics = self.ds.load_json("recent_dynamic_topics.json", []) or []
+                    recent_topics.append(selected_topic)
+                    self.ds.save_json("recent_dynamic_topics.json", recent_topics[-5:])
+                except Exception:
+                    pass
             # selected_topic 为 None 表示 topics 为空，允许自由发挥
 
             # 召回近期经历（视频观察、评论互动、反思等），让动态内容有据可依
@@ -6236,6 +6363,13 @@ class Scheduler:
                 except Exception as recall_exc:
                     logger.debug(f"动态发布记忆召回失败: {recall_exc}")
 
+            if companion_life_block:
+                memory_evidence = (
+                    f"{companion_life_block}\n\n{memory_evidence}".strip()
+                    if memory_evidence
+                    else companion_life_block
+                )
+
             # 2. 通过 orchestrator 构建 prompt
             system_prompt = ""
             user_prompt = ""
@@ -6251,20 +6385,37 @@ class Scheduler:
 
             if self.orchestrator is not None:
                 try:
+                    extra_ctx = {"companion_life": companion_life_block} if companion_life_block else None
                     prompt_dict = self.orchestrator.build_dynamic_prompt(
                         topic=selected_topic,
                         related_videos=related_videos,
                         persona=persona,
                         memory_evidence=memory_evidence,
+                        extra_context=extra_ctx,
                     )
                     system_prompt = prompt_dict.get("system", "")
                     user_prompt = prompt_dict.get("user", "")
+                except TypeError:
+                    # 兼容旧签名
+                    try:
+                        prompt_dict = self.orchestrator.build_dynamic_prompt(
+                            topic=selected_topic,
+                            related_videos=related_videos,
+                            persona=persona,
+                            memory_evidence=memory_evidence,
+                        )
+                        system_prompt = prompt_dict.get("system", "")
+                        user_prompt = prompt_dict.get("user", "")
+                    except Exception as e:
+                        logger.warning(f"orchestrator.build_dynamic_prompt 失败: {e}")
                 except Exception as e:
                     logger.warning(f"orchestrator.build_dynamic_prompt 失败: {e}")
 
             if not system_prompt or not user_prompt:
                 # 仅在 orchestrator 不可用时回退到 legacy personality
                 system_prompt = self.personality.get_system_prompt()
+                if companion_life_block:
+                    system_prompt = f"{system_prompt}\n\n{companion_life_block}"
                 if selected_topic:
                     user_prompt = (
                         f"现在轮到你发B站动态了，主题是「{selected_topic}」。"
@@ -6584,6 +6735,17 @@ class Scheduler:
                     return
 
                 logger.info(f"动态发布成功: {content[:50]}...")
+                # 陪伴生活回写：发动态后更新活动/念头
+                companion = getattr(self, "companion", None)
+                if companion is not None and getattr(companion, "enabled", False):
+                    try:
+                        if hasattr(companion, "on_dynamic_posted"):
+                            companion.on_dynamic_posted(
+                                content=content or "",
+                                topic=selected_topic or "",
+                            )
+                    except Exception as e:
+                        logger.debug("companion dynamic feedback failed: %s", e)
                 # PRD-V5 §7：只有真正成功才 succeed
                 if task_id:
                     self._succeed_task(task_id, {

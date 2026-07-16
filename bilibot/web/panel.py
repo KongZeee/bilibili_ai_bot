@@ -565,6 +565,11 @@ def create_web_app(
         # PRD-V5 §4.1 DYN-501：动态草稿审核管理路由
         from ..api.dynamic_drafts import create_dynamic_drafts_routes
         dynamic_drafts_routes = create_dynamic_drafts_routes(account_manager, config_loader)
+        # 陪伴生活层
+        from ..api.companion import create_companion_routes
+        companion_routes = create_companion_routes(account_manager)
+    else:
+        companion_routes = []
     if llm_manager is not None:
         from ..api.llm_providers import create_llm_providers_routes
         llm_providers_routes = create_llm_providers_routes(
@@ -584,6 +589,19 @@ def create_web_app(
     if llm_manager is not None:
         from ..api.model_routing import create_model_routing_routes
         model_routing_routes = create_model_routing_routes(llm_manager, config_loader, config_path)
+
+    # Token 用量统计
+    token_usage_routes = []
+    try:
+        from ..api.token_usage import create_token_usage_routes
+        from ..services.token_usage import get_global_token_store
+        token_usage_routes = create_token_usage_routes(
+            token_store=get_global_token_store(),
+            data_dir=data_dir,
+        )
+    except Exception as e:
+        logger.warning("token usage routes 注册失败: %s", e)
+        token_usage_routes = []
 
     # ───────────────────────────────────────────────────
     # 安全 API（PRD §5.9）：全局暂停 / 黑名单
@@ -687,10 +705,12 @@ def create_web_app(
         safety_routes +
         accounts_routes +
         dynamic_drafts_routes +
+        companion_routes +
         llm_providers_routes +
         video_analysis_routes +
         image_generation_routes +
-        model_routing_routes
+        model_routing_routes +
+        token_usage_routes
     )
 
     # 创建应用

@@ -76,6 +76,7 @@ DEFAULT_SCENES = {
     "proactive_video": {"enabled": True},
     "dynamic_post": {"enabled": False},
     "weekly_summary": {"enabled": False},
+    "companion_exploration": {"enabled": True},
 }
 
 # PRD V4 SEA-003：短文本跳过阈值

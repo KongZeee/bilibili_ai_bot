@@ -108,7 +108,11 @@ class PromptOrchestrator:
         if extra_context:
             if extra_context.get("custom_rules"):
                 parts.append(f"\n【额外规则】\n{extra_context['custom_rules']}")
-        
+            # 陪伴生活层注入（短块，放在 system 尾部）
+            life = extra_context.get("companion_life") or extra_context.get("life_surface")
+            if life:
+                parts.append(f"\n{life}")
+
         return "\n".join(parts)
     
     def build_user_prompt(
@@ -212,9 +216,14 @@ class PromptOrchestrator:
             SceneType.BANGUMI_COMMENT: "番剧评论",
             SceneType.VIDEO_RECOMMEND: "视频推荐",
             SceneType.MEMORY_SUMMARY: "记忆清算",
+            SceneType.DIARY: "日记",
+            SceneType.DREAM: "梦境",
+            SceneType.LIFE_PLAN: "日程",
+            SceneType.EXPLORATION: "探索",
+            SceneType.CREATIVE: "创作",
         }
         return names.get(scene, scene.value)
-    
+
     def _get_scene_prefix(self, scene: SceneType) -> str:
         """获取场景前缀"""
         prefixes = {
@@ -226,6 +235,11 @@ class PromptOrchestrator:
             SceneType.BANGUMI_COMMENT: "请评论以下番剧：",
             SceneType.VIDEO_RECOMMEND: "请推荐以下视频给你的主人：",
             SceneType.MEMORY_SUMMARY: "请根据以下记忆内容进行整理总结：",
+            SceneType.DIARY: "请写今日日记：",
+            SceneType.DREAM: "请生成梦境：",
+            SceneType.LIFE_PLAN: "请生成今日日程：",
+            SceneType.EXPLORATION: "请整理探索笔记：",
+            SceneType.CREATIVE: "请续写创作内容：",
         }
         return prefixes.get(scene, "")
     
@@ -286,7 +300,8 @@ class PromptOrchestrator:
         topic: Optional[str] = None,
         related_videos: Optional[List[str]] = None,
         persona: Optional[Persona] = None,
-        memory_evidence: str = ""
+        memory_evidence: str = "",
+        extra_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """构建动态发布 Prompt"""
         content = topic or "请发布一条动态，内容可以关于你最近看的视频、心情或想法。"
@@ -299,14 +314,16 @@ class PromptOrchestrator:
             scene=SceneType.DYNAMIC_POST,
             content=content,
             persona=persona,
+            extra_context=extra_context,
             return_dict=True
         )
-    
+
     def build_proactive_comment_prompt(
         self,
         video: VideoContext,
         comment_topic: Optional[str] = None,
-        persona: Optional[Persona] = None
+        persona: Optional[Persona] = None,
+        extra_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, str]:
         """构建主动评论 Prompt"""
         content = (
@@ -318,16 +335,17 @@ class PromptOrchestrator:
             content += f"\n热评摘要：{video.hot_comment_summary}"
         if comment_topic:
             content += f"\n你想评论的方向：{comment_topic}"
-        
+
         # 构建上下文
         from ..models import ReplyContext
         ctx = ReplyContext(video=video)
-        
+
         return self.build(
             scene=SceneType.PROACTIVE_COMMENT,
             content=content,
             context=ctx,
             persona=persona,
+            extra_context=extra_context,
             return_dict=True
         )
     

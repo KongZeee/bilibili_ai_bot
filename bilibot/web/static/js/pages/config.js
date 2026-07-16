@@ -86,6 +86,7 @@ const RENDERED_CATEGORIES = [
     'proactive',
     'web_search',
     'features',
+    'companion',
     'dynamic_publish',
     'interactions',
     'memory',
@@ -265,6 +266,7 @@ export const ConfigPage = defineComponent({
         const proactiveSchema = schemaByCategory('proactive');
         const webSearchSchema = schemaByCategory('web_search');
         const featuresSchema = schemaByCategory('features');
+        const companionSchema = schemaByCategory('companion');
         const dynamicPublishSchema = schemaByCategory('dynamic_publish');
         const interactionsSchema = schemaByCategory('interactions');
         const memorySchema = schemaByCategory('memory');
@@ -550,6 +552,17 @@ export const ConfigPage = defineComponent({
                 }, [
                     renderConfigCard('功能开关', 'Features', featuresSchema),
                     renderConfigCard('动态发布', 'Dynamic Publish', dynamicPublishSchema),
+                ]),
+
+                h('section', {
+                    class: 'grid gap-4',
+                    style: 'grid-template-columns: minmax(0, 1fr);',
+                }, [
+                    renderConfigCard(
+                        '陪伴生活',
+                        '日程 / 梦境日记 / 探索 / 创作',
+                        companionSchema,
+                    ),
                 ]),
 
                 h('section', {

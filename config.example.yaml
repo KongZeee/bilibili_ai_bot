@@ -196,6 +196,47 @@ features:
   mood: true                 # 心情系统
   # B站 Cookie 自动检查间隔（小时）；账号级 ConfigLoader 会覆盖 bilibili 段，故放 features
   cookie_check_interval_hours: 6
+  # companion: false         # 可选；优先使用下方 companion.enabled
+
+# ── 陪伴生活层（人格化日程/梦境/日记/探索/创作；默认关闭）──
+# 灵感来自 astrbot_plugin_private_companion 概念，按 B 站多账号架构重写
+companion:
+  enabled: false             # 总开关
+  life_state:
+    enabled: true
+    inject_into_replies: true
+    energy_default: 70
+  schedule:
+    enabled: true
+    generate_time: "07:30"   # 每日生成日程时间
+    item_count: 8
+    detail_lead_minutes: 15  # 时段开始前多久细化
+  dream:
+    enabled: true
+    generate_with_diary: true
+  diary:
+    enabled: true
+    time: "23:10"
+    max_entries: 14
+    offer_dynamic_draft: false   # 日记 share_seed 是否进动态草稿箱
+  exploration:
+    enabled: false               # 依赖 web_search.enabled
+    min_interval_hours: 8
+    max_results: 6
+    interests: []                # 空则从人格 interests/tags + proactive.interest_keywords 推断
+    offer_dynamic_draft: false
+  news:
+    enabled: false
+    min_interval_hours: 6
+    sources: []                  # 预留 RSS URL 列表
+  creative:
+    enabled: false
+    max_active_projects: 2
+    chars_per_session: 220
+    inspiration_probability: 0.2
+    offer_dynamic_draft: false
+  dynamic_share:
+    require_review: true
 
 # ── 动态发布（PRD §5.2 / §5.6）──
 dynamic_publish:

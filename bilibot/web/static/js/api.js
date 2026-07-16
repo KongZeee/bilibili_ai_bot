@@ -82,6 +82,16 @@ export const api = {
         qrCancel: (id, sid) => api.post(`/api/accounts/${id}/qr-login/${sid}/cancel`),
         profiles: () => api.get('/api/accounts/profiles'),
         tasks: (id, params) => api.get(`/api/accounts/${id}/tasks?${buildQuery(params)}`),
+        companion: {
+            state: (id) => api.get(`/api/accounts/${id}/companion/state`),
+            plan: (id) => api.get(`/api/accounts/${id}/companion/plan`),
+            regeneratePlan: (id) => api.post(`/api/accounts/${id}/companion/plan/regenerate`),
+            diaries: (id) => api.get(`/api/accounts/${id}/companion/diaries`),
+            dreams: (id) => api.get(`/api/accounts/${id}/companion/dreams`),
+            notes: (id) => api.get(`/api/accounts/${id}/companion/notes`),
+            bookshelf: (id) => api.get(`/api/accounts/${id}/companion/bookshelf`),
+            trigger: (id, action) => api.post(`/api/accounts/${id}/companion/trigger`, { action: action || 'tick' }),
+        },
     },
 
     // LLM（旧 V2 接口，仍用于账号绑定等场景）

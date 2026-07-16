@@ -415,6 +415,15 @@ class ReplyGenerator:
         # 优先走 orchestrator（PRD V3 §8.3 / V4 §4.3.2）
         if self.orchestrator is not None:
             try:
+                extra_context = None
+                try:
+                    companion = getattr(self.context_builder, "companion", None) if self.context_builder else None
+                    if companion is not None and getattr(companion, "enabled", False):
+                        life = companion.get_prompt_surface() or ""
+                        if life:
+                            extra_context = {"companion_life": life}
+                except Exception:
+                    extra_context = None
                 prompt_dict = self.orchestrator.build(
                     scene=SceneType.REPLY_COMMENT,
                     content=f"{ctx_prefix}用户 {username} 评论说：{comment}\n\n"
@@ -422,6 +431,7 @@ class ReplyGenerator:
                             '不要重复"好的"、"谢谢"等空洞词汇。',
                     context=reply_context,
                     persona=persona,
+                    extra_context=extra_context,
                     return_dict=True,
                 )
                 return (

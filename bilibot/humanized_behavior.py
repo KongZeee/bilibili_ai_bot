@@ -634,6 +634,7 @@ class HumanizedCommentGenerator:
         tags: List[str],
         hot_comments: List = None,
         video_content: str = "",
+        companion_context: str = "",
     ) -> Optional[Dict]:
         """
         评价视频，返回评分、心情、评论等
@@ -641,6 +642,7 @@ class HumanizedCommentGenerator:
         Args:
             video_content: 视频理解服务生成的视听行为日志（Markdown），为空则只用元数据
             hot_comments: list[str] 或 list[dict]（含 content/name/mid/rpid）
+            companion_context: 可选，陪伴生活层短上下文（今日状态/念头）
 
         Returns:
             {
@@ -697,9 +699,13 @@ class HumanizedCommentGenerator:
 {video_content}
 """
 
+        life_section = ""
+        if companion_context and str(companion_context).strip():
+            life_section = f"\n【你今天的状态与念头】\n{str(companion_context).strip()[:500]}\n"
+
         prompt = f"""请评价以下B站视频，以你的角色视角观看后给出真实反馈。
 评论和评价要基于【视频详细内容/视频内容】里的具体信息，不要只复读标题。
-
+{life_section}
 【视频信息】
 标题: {title}
 UP主: {owner}
@@ -726,6 +732,8 @@ UP主: {owner}
         system_prompt = "你是一个真实的B站用户，正在看视频并评价。"
         if personality_info:
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
+        if companion_context and str(companion_context).strip():
+            system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
 
         # 长 digest + 搜索参考时 300 tokens 容易截断 JSON；放宽并允许一次重试。
         max_tokens = 500
@@ -794,12 +802,14 @@ UP主: {owner}
         review: str = "",
         mood: str = "",
         video_content: str = "",
+        companion_context: str = "",
     ) -> Optional[str]:
         """
         为视频生成主动评论（与 evaluate_video 的 comment 不同，这是更深入的评论）
 
         Args:
             video_content: 视频理解服务生成的视听行为日志（Markdown），为空则只用元数据
+            companion_context: 可选，陪伴生活层短上下文
 
         Returns:
             评论文本（≤40字），或 None 表示不评论
@@ -829,8 +839,12 @@ UP主: {owner}
             label = "【视频详细内容】" if is_digest else "【视频内容】"
             video_content_section = f"\n{label}\n{video_content}\n"
 
-        prompt = f"""你刚看完一个B站视频，想发一条评论。
+        life_section = ""
+        if companion_context and str(companion_context).strip():
+            life_section = f"\n【你今天的状态与念头】\n{str(companion_context).strip()[:400]}\n"
 
+        prompt = f"""你刚看完一个B站视频，想发一条评论。
+{life_section}
 【视频】{title} (UP主: {owner})
 【简介】{desc_text}
 【标签】{tags_text}{video_content_section}
@@ -848,6 +862,8 @@ UP主: {owner}
         system_prompt = "你是一个真实的B站用户，正在发评论。"
         if personality_info:
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
+        if companion_context and str(companion_context).strip():
+            system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
 
         try:
             response = await self.llm.generate(

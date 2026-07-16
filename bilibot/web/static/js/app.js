@@ -46,6 +46,7 @@ const pages = [
     { path: '/accounts', title: '账号管理' },
     { path: '/accounts/:id', title: '账号详情' },
     { path: '/personas', title: '人格管理' },
+    { path: '/companion', title: '陪伴生活' },
     { path: '/llm', title: '模型管理' },
     { path: '/model-routing', title: '模型分配' },
     { path: '/proactive', title: '主动行为' },
@@ -56,6 +57,7 @@ const pages = [
     { path: '/memory/list', title: '记忆列表' },
     { path: '/memory/recall', title: '召回测试' },
     { path: '/system', title: '系统设置' },
+    { path: '/token-usage', title: '用量统计' },
     { path: '/config', title: '全局配置' },
 ];
 
@@ -86,6 +88,8 @@ import { CommentsPage } from './pages/comments.js';
 registerRoute('/comments', CommentsPage, '评论');
 import { ProactivePage } from './pages/proactive.js';
 registerRoute('/proactive', ProactivePage, '主动行为');
+import { CompanionPage } from './pages/companion.js';
+registerRoute('/companion', CompanionPage, '陪伴生活', '账号与身份');
 import { DraftsPage } from './pages/drafts.js';
 registerRoute('/drafts', DraftsPage, '动态草稿', '内容创作');
 import { ImageGenPage } from './pages/image-gen.js';
@@ -94,6 +98,8 @@ import { VideoAnalysisPage } from './pages/video-analysis.js';
 registerRoute('/video-analysis', VideoAnalysisPage, '视频理解', '内容创作');
 import { SystemPage } from './pages/system.js';
 registerRoute('/system', SystemPage, '系统管理', '系统');
+import { TokenUsagePage } from './pages/token-usage.js';
+registerRoute('/token-usage', TokenUsagePage, '用量统计', '系统');
 import { ConfigPage } from './pages/config.js';
 registerRoute('/config', ConfigPage, '系统配置', '系统');
 

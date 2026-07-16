@@ -18,6 +18,7 @@ export const NAV_GROUPS = [
         items: [
             { path: '/accounts', label: '账号管理', icon: 'user', meta: '已接入' },
             { path: '/personas', label: '人格管理', icon: 'star', meta: '多角色' },
+            { path: '/companion', label: '陪伴生活', icon: 'heart', meta: '日程' },
             { path: '/llm', label: '模型管理', icon: 'box', meta: '多模型' },
             { path: '/model-routing', label: '模型分配', icon: 'arrow-right', meta: '路由' },
         ],
@@ -43,6 +44,7 @@ export const NAV_GROUPS = [
         label: '系统',
         items: [
             { path: '/system', label: '系统设置', icon: 'grip', meta: '基础' },
+            { path: '/token-usage', label: '用量统计', icon: 'box', meta: 'Token' },
             { path: '/config', label: '全局配置', icon: 'tag', meta: '参数' },
         ],
     },
@@ -53,6 +55,8 @@ const PAGE_SUBTITLES = {
     '/': 'BiliBot 运营全景一览，实时掌握账号状态、互动表现与系统健康度。',
     '/accounts': '管理 B站账号接入、Cookie 凭证、人格绑定与对话模型配置。',
     '/personas': '为不同账号配置专属 AI 人格，定义性格、语气与交互边界。',
+    '/companion': '查看与触发账号的拟人日程、生活状态、梦境日记、探索笔记与书柜创作。',
+    '/token-usage': '统计 LLM / Vision / Embedding 的 Token 消耗，按日、模型、场景与账号拆分。',
     '/memory/graph': '左侧视图设置，右侧整页可旋转 3D 图谱；可切换布局与统计信息。',
     '/memory/list': '浏览与管理 Bot 记忆库中的所有记忆条目，支持分类筛选与召回测试。',
     '/memory/recall': '测试 Bot 记忆库的召回能力，验证记忆检索效果。',

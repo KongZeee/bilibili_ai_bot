@@ -716,6 +716,17 @@ class LLMProvider:
                 )
 
             response = await self._chat_with_pool(_call)
+            try:
+                from bilibot.services.token_usage import record_response_safe
+                record_response_safe(
+                    response,
+                    provider_id=self.llm_id,
+                    model=model or self.model,
+                    kind="chat",
+                    scene="",
+                )
+            except Exception:
+                pass
             if response and response.choices:
                 result = response.choices[0].message.content
                 if result:
@@ -806,6 +817,16 @@ class LLMProvider:
                             messages=[{"role": "user", "content": content}],
                             max_tokens=max_tokens,
                         )
+                        try:
+                            from bilibot.services.token_usage import record_response_safe
+                            record_response_safe(
+                                response,
+                                provider_id=self.llm_id,
+                                model=vision_model,
+                                kind="vision",
+                            )
+                        except Exception:
+                            pass
                         if response.choices:
                             return response.choices[0].message.content.strip()
                         return None
@@ -849,6 +870,17 @@ class LLMProvider:
                         break
                     try:
                         response = await _call(client)
+                        try:
+                            from bilibot.services.token_usage import record_response_safe
+                            # embeddings usage often only has total/prompt
+                            record_response_safe(
+                                response,
+                                provider_id=self.llm_id,
+                                model=emb_model,
+                                kind="embedding",
+                            )
+                        except Exception:
+                            pass
                         if response.data:
                             return response.data[0].embedding
                         return None
@@ -881,6 +913,17 @@ class LLMProvider:
         try:
             async def _once(client):
                 response = await client.embeddings.create(model=emb_model, input=values)
+                try:
+                    from bilibot.services.token_usage import record_response_safe
+                    record_response_safe(
+                        response,
+                        provider_id=self.llm_id,
+                        model=emb_model,
+                        kind="embedding",
+                        meta={"batch_size": len(values)},
+                    )
+                except Exception:
+                    pass
                 data = list(response.data or ())
                 if len(data) != len(values):
                     return None

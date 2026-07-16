@@ -199,10 +199,23 @@ class ContextBuilder:
         if mood:
             parts.append(f"【当前心情】{mood}")
 
+        # 7. 陪伴生活层（账号级，可选）
+        companion_surface = ""
+        try:
+            companion = getattr(self, "companion", None)
+            if companion is not None and getattr(companion, "enabled", False):
+                companion_surface = companion.get_prompt_surface() or ""
+                if companion_surface:
+                    parts.append(companion_surface)
+                    meta["sources"].append("companion_life")
+        except Exception:
+            companion_surface = ""
+
         return {
             "text": "\n".join(parts),
             "meta": meta,
             "persona": persona,
+            "companion_life": companion_surface,
         }
 
     # ── 私有辅助 ──

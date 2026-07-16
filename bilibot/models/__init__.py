@@ -26,6 +26,12 @@ class SceneType(str, Enum):
     VIDEO_RECOMMEND = "video_recommend"
     MEMORY_SUMMARY = "memory_summary"
     SAFETY_CHECK = "safety_check"
+    # Companion life layer (persona living state)
+    DIARY = "diary"
+    DREAM = "dream"
+    LIFE_PLAN = "life_plan"
+    EXPLORATION = "exploration"
+    CREATIVE = "creative"
 
 
 class MemoryLevel(str, Enum):
@@ -77,6 +83,11 @@ class Persona:
     updated_at: str = ""
     # 外貌描述（中文）：用于动态配图时作为主角外貌注入图片生成 prompt
     appearance: str = ""
+    # 陪伴生活层扩展（可选，向后兼容空默认）
+    interests: list[str] = field(default_factory=list)
+    life_background: str = ""
+    diary_rules: str = ""
+    creative_rules: str = ""
     # P3: 市场元数据
     version: str = "1.0.0"
     author: str = ""
@@ -91,8 +102,11 @@ class Persona:
         return d
 
     @classmethod
-    def from_dict(cls, d: dict) -> "PersonaExample":
+    def from_dict(cls, d: dict) -> "Persona":
         examples = [PersonaExample.from_dict(e) for e in d.get("examples", [])]
+        interests = d.get("interests") or []
+        if isinstance(interests, str):
+            interests = [x.strip() for x in interests.replace("\n", ",").split(",") if x.strip()]
         return cls(
             id=d.get("id", ""),
             name=d.get("name", ""),
@@ -110,6 +124,10 @@ class Persona:
             created_at=d.get("created_at", ""),
             updated_at=d.get("updated_at", ""),
             appearance=d.get("appearance", ""),
+            interests=list(interests) if isinstance(interests, list) else [],
+            life_background=d.get("life_background", "") or "",
+            diary_rules=d.get("diary_rules", "") or "",
+            creative_rules=d.get("creative_rules", "") or "",
             version=d.get("version", "1.0.0"),
             author=d.get("author", ""),
             tags=d.get("tags", []),
@@ -125,6 +143,8 @@ class Persona:
             SceneType.DYNAMIC_POST: self.dynamic_rules,
             SceneType.WEEKLY_SUMMARY: self.weekly_rules,
             SceneType.BANGUMI_COMMENT: self.reply_rules,
+            SceneType.DIARY: self.diary_rules,
+            SceneType.CREATIVE: self.creative_rules,
         }
         return mapping.get(scene, "")
 

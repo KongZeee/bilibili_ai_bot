@@ -75,6 +75,7 @@ RELOAD_CONTRACT = {
     "interactions": "immediate",
     "personality": "immediate",
     "features": "immediate",
+    "companion": "immediate",
     "dynamic_publish": "immediate",
     "memory": "next_task",
     "proactive": "next_task",
@@ -668,6 +669,13 @@ def _build_config_schema() -> dict:
                                 "redact_query": {"type": "boolean", "label": "脱敏查询"},
                             }
                         },
+                        "companion_exploration": {
+                            "type": "object", "label": "陪伴探索",
+                            "fields": {
+                                "enabled": {"type": "boolean", "label": "启用", "default": True},
+                                "redact_query": {"type": "boolean", "label": "脱敏查询", "default": False},
+                            }
+                        },
                     }
                 },
                 # CFG-603：SEA-006 按 freshness 差异化缓存 TTL
@@ -722,7 +730,217 @@ def _build_config_schema() -> dict:
                 "web_search": {"type": "boolean", "label": "联网搜索(已迁移到web_search.enabled)", "deprecated": True},
                 "affection": {"type": "boolean", "label": "好感度系统"},
                 "mood": {"type": "boolean", "label": "心情系统"},
+                "cookie_check_interval_hours": {
+                    "type": "number",
+                    "label": "Cookie 检查间隔 (小时)",
+                    "default": 6,
+                    "description": "B站 Cookie 自动检查间隔；账号级 ConfigLoader 会覆盖 bilibili 段，故放 features",
+                },
             }
+        },
+        "companion": {
+            "type": "object",
+            "label": "陪伴生活",
+            "description": "拟人日程/生活状态/梦境日记/探索笔记/创作书柜。默认关闭。数据目录：data/accounts/{账号}/companion/",
+            "fields": {
+                "enabled": {
+                    "type": "boolean",
+                    "label": "启用陪伴生活",
+                    "default": False,
+                    "description": "总开关。开启后调度器每分钟 tick；控制台「陪伴生活」页可查看与手动触发",
+                },
+                "life_state": {
+                    "type": "object",
+                    "label": "生活状态",
+                    "fields": {
+                        "enabled": {"type": "boolean", "label": "启用生活状态", "default": True},
+                        "inject_into_replies": {
+                            "type": "boolean",
+                            "label": "注入回复提示词",
+                            "default": True,
+                            "description": "将今日精力/日程/梦境余韵注入评论回复 system prompt",
+                        },
+                        "energy_default": {
+                            "type": "number",
+                            "label": "默认精力 (0-100)",
+                            "default": 70,
+                            "min": 0,
+                            "max": 100,
+                        },
+                    },
+                },
+                "schedule": {
+                    "type": "object",
+                    "label": "日程",
+                    "fields": {
+                        "enabled": {"type": "boolean", "label": "启用日程", "default": True},
+                        "generate_time": {
+                            "type": "string",
+                            "label": "每日生成时间",
+                            "default": "07:30",
+                            "placeholder": "HH:MM",
+                            "description": "到达该时刻后生成当日拟人日程",
+                        },
+                        "item_count": {
+                            "type": "number",
+                            "label": "日程条目数",
+                            "default": 8,
+                            "min": 4,
+                            "max": 16,
+                        },
+                        "detail_lead_minutes": {
+                            "type": "number",
+                            "label": "时段细化提前量 (分钟)",
+                            "default": 15,
+                            "min": 0,
+                            "max": 120,
+                            "description": "时段开始前多久生成场景细化与话题种子",
+                        },
+                    },
+                },
+                "dream": {
+                    "type": "object",
+                    "label": "梦境",
+                    "fields": {
+                        "enabled": {"type": "boolean", "label": "启用梦境", "default": True},
+                        "generate_with_diary": {
+                            "type": "boolean",
+                            "label": "写日记前生成梦境",
+                            "default": True,
+                        },
+                    },
+                },
+                "diary": {
+                    "type": "object",
+                    "label": "日记",
+                    "fields": {
+                        "enabled": {"type": "boolean", "label": "启用日记", "default": True},
+                        "time": {
+                            "type": "string",
+                            "label": "每日写日记时间",
+                            "default": "23:10",
+                            "placeholder": "HH:MM",
+                        },
+                        "max_entries": {
+                            "type": "number",
+                            "label": "保留日记条数",
+                            "default": 14,
+                            "min": 3,
+                            "max": 60,
+                        },
+                        "offer_dynamic_draft": {
+                            "type": "boolean",
+                            "label": "日记可进动态草稿",
+                            "default": False,
+                            "description": "用日记 share_seed 创建动态草稿（不直接发布）",
+                        },
+                    },
+                },
+                "exploration": {
+                    "type": "object",
+                    "label": "主动探索",
+                    "fields": {
+                        "enabled": {
+                            "type": "boolean",
+                            "label": "启用主动探索",
+                            "default": False,
+                            "description": "需同时开启「联网搜索 → 启用」，并确保场景「陪伴探索」可用",
+                        },
+                        "min_interval_hours": {
+                            "type": "number",
+                            "label": "最小间隔 (小时)",
+                            "default": 8,
+                            "min": 1,
+                        },
+                        "max_results": {
+                            "type": "number",
+                            "label": "搜索结果数",
+                            "default": 6,
+                            "min": 1,
+                            "max": 20,
+                        },
+                        "interests": {
+                            "type": "array",
+                            "itemType": "string",
+                            "label": "探索兴趣",
+                            "description": "空则从人格 interests/tags 与 proactive.interest_keywords 推断",
+                        },
+                        "offer_dynamic_draft": {
+                            "type": "boolean",
+                            "label": "探索可进动态草稿",
+                            "default": False,
+                        },
+                    },
+                },
+                "news": {
+                    "type": "object",
+                    "label": "新闻阅读",
+                    "fields": {
+                        "enabled": {
+                            "type": "boolean",
+                            "label": "启用新闻源",
+                            "default": False,
+                            "description": "预留；当前探索主路径仍走 web_search",
+                        },
+                        "min_interval_hours": {
+                            "type": "number",
+                            "label": "最小间隔 (小时)",
+                            "default": 6,
+                            "min": 1,
+                        },
+                        "sources": {
+                            "type": "array",
+                            "itemType": "string",
+                            "label": "RSS / 源 URL",
+                        },
+                    },
+                },
+                "creative": {
+                    "type": "object",
+                    "label": "私下创作",
+                    "fields": {
+                        "enabled": {"type": "boolean", "label": "启用创作", "default": False},
+                        "max_active_projects": {
+                            "type": "number",
+                            "label": "最多同时项目数",
+                            "default": 2,
+                            "min": 1,
+                            "max": 5,
+                        },
+                        "chars_per_session": {
+                            "type": "number",
+                            "label": "每次创作字数",
+                            "default": 220,
+                            "min": 60,
+                            "max": 1200,
+                        },
+                        "inspiration_probability": {
+                            "type": "number",
+                            "label": "开新项目概率 (0-1)",
+                            "default": 0.2,
+                            "min": 0,
+                            "max": 1,
+                        },
+                        "offer_dynamic_draft": {
+                            "type": "boolean",
+                            "label": "里程碑可进动态草稿",
+                            "default": False,
+                        },
+                    },
+                },
+                "dynamic_share": {
+                    "type": "object",
+                    "label": "动态分享策略",
+                    "fields": {
+                        "require_review": {
+                            "type": "boolean",
+                            "label": "分享须经草稿审核",
+                            "default": True,
+                            "description": "陪伴产物默认只进草稿箱，不直接发 B 站",
+                        },
+                    },
+                },
+            },
         },
         "dynamic_publish": {
             "type": "object",
@@ -883,8 +1101,8 @@ def _build_config_schema() -> dict:
                 "interest_keywords": {
                     "type": "array",
                     "itemType": "string",
-                    "label": "兴趣关键词(暂未接入推荐)",
-                    "deprecated": True,
+                    "label": "兴趣关键词",
+                    "description": "供陪伴探索等兴趣推断使用；主动视频推荐仍以平台流为主",
                 },
                 # 运行时以 features.bangumi 为准
                 "bangumi": {
@@ -1108,8 +1326,8 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                     llm_mgr.reload_global_defaults(config)
                     return "applied"
                 return "applied_via_config_loader"
-            if field_key in ("web_search", "interactions", "video_analysis", "features", "personality"):
-                # 每账号 Scheduler / VU / bangumi / user_state 由 account_manager.reload_all() 统一刷
+            if field_key in ("web_search", "interactions", "video_analysis", "features", "personality", "companion"):
+                # 每账号 Scheduler / VU / bangumi / companion 由 account_manager.reload_all() 统一刷
                 if account_manager is not None:
                     return "applied"
                 if field_key == "web_search" and web_search_service is not None:
@@ -1386,7 +1604,7 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
             applied = {}
             for field_key in (
                 "safety", "web_search", "interactions", "reply",
-                "features", "logging", "model_request_limits", "video_analysis",
+                "features", "companion", "logging", "model_request_limits", "video_analysis",
             ):
                 if field_key not in raw and field_key not in (
                     "model_request_limits", "video_analysis", "logging"

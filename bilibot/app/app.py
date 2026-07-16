@@ -175,6 +175,15 @@ class BiliBotApp:
         from bilibot.services.audit_store import AuditStore
         self.audit_store = AuditStore(data_dir=self.data_root)
 
+        # Token 用量统计（全局，供控制台「用量统计」页）
+        try:
+            from bilibot.services.token_usage import TokenUsageStore, set_global_token_store
+            self.token_usage_store = TokenUsageStore(data_dir=self.data_root)
+            set_global_token_store(self.token_usage_store)
+        except Exception as e:
+            logging.getLogger("bilibot").warning("TokenUsageStore 初始化失败: %s", e)
+            self.token_usage_store = None
+
         # PRD V4 BOOT-003：SafetyService 在任何 Scheduler 启动前创建，
         # 不依赖 Web 初始化。web.enabled=false 不影响限流、黑名单、
         # 全局暂停、内容检查和审计。

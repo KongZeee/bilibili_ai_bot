@@ -60,6 +60,12 @@ export const AUDIT_SCENE_LABELS = {
     memory_admin: '记忆管理',
     image_generation: '文生图',
     video_analysis: '视频分析',
+    diary: '日记',
+    dream: '梦境',
+    life_plan: '日程',
+    exploration: '探索',
+    creative: '创作',
+    companion: '陪伴生活',
 };
 
 /** 审计/生成状态英文 → 中文 */
