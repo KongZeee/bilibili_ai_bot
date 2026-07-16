@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import random
@@ -10,6 +11,11 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
+
+try:
+    import asyncio
+except Exception:  # pragma: no cover
+    asyncio = None  # type: ignore
 
 from .config import CompanionConfig, load_companion_config
 from .models import (
@@ -158,7 +164,14 @@ class CompanionLifeService:
         self.draft_store = draft_store
         self.store = CompanionStore(account_data_dir)
         self._cfg = self.reload_config()
-        self._tick_lock = False
+        # 异步可重入保护：bool 在 await 间隙会误判；用 asyncio.Lock
+        self._tick_lock = None
+        try:
+            if asyncio is not None:
+                self._tick_lock = asyncio.Lock()
+        except Exception:
+            self._tick_lock = None
+        self._tick_busy = False  # sync fallback when no event loop yet
 
     # ── config ──
 
@@ -263,9 +276,15 @@ class CompanionLifeService:
         try:
             from bilibot.memory_brain.ingestion import text_observation
 
+            # 日记/梦境/日程等同日可重写：键带内容指纹，避免 IdempotencyConflict 刷警告
+            base_key = idempotency_key or f"{source_type}:{_today()}:{uuid.uuid4().hex[:8]}"
+            if source_type in {"diary", "dream", "life_plan", "creative", "web_reference"}:
+                digest = hashlib.sha1(str(text).encode("utf-8", errors="ignore")).hexdigest()[:10]
+                base_key = f"{base_key}:{digest}"
+
             env = text_observation(
                 account_id=self.account_id,
-                idempotency_key=idempotency_key or f"{source_type}:{_today()}:{uuid.uuid4().hex[:8]}",
+                idempotency_key=base_key,
                 source_type=source_type,
                 event_type=event_type,
                 text=text,
@@ -280,7 +299,12 @@ class CompanionLifeService:
             elif hasattr(self.memory_brain, "archive_observation"):
                 self.memory_brain.archive_observation(env)
         except Exception as e:
-            logger.warning("[%s] companion archive failed: %s", self.account_id, e)
+            msg = str(e)
+            # 同内容重入可静默；不同内容冲突仅 debug
+            if "already exists" in msg or "Idempotency" in type(e).__name__:
+                logger.debug("[%s] companion archive skip: %s", self.account_id, msg[:160])
+            else:
+                logger.warning("[%s] companion archive failed: %s", self.account_id, e)
 
     def _offer_draft(self, content: str, created_by: str) -> Optional[str]:
         if not content or not content.strip():
@@ -1073,6 +1097,57 @@ class CompanionLifeService:
             return True
         return 35 <= int(state.energy) <= 85
 
+    # 明显不可检索 / 虚构日常类 query
+    _BAD_QUERY_PATTERNS = (
+        re.compile(r"今天.*(做了|干了|在干|过得|发生)"),
+        re.compile(r"(做了什么|在干嘛|在干什么|值得分享)"),
+        re.compile(r"^(我|你|他|她)的(一天|日程|生活)"),
+        re.compile(r"现在.*(在哪|在干|怎么样)"),
+    )
+
+    def _query_is_searchable(self, query: str) -> bool:
+        q = (query or "").strip()
+        if len(q) < 4 or len(q) > 80:
+            return False
+        for pat in self._BAD_QUERY_PATTERNS:
+            if pat.search(q):
+                return False
+        # 至少像「实体/领域 + 信息意图」：含兴趣词或常见检索后缀
+        info_markers = (
+            "是什么", "百科", "设定", "剧情", "教程", "入门", "推荐", "新闻",
+            "热门", "历史", "背景", "玩法", "攻略", "评价", "百科", "wiki",
+            "2024", "2025", "2026", "最新", "B站", "bilibili",
+        )
+        interests = self.get_interest_keywords(limit=20)
+        if any(m in q for m in info_markers):
+            return True
+        if any(k and k in q for k in interests):
+            return True
+        # 含中英文专有名词形态（2+ 连续汉字或英文词）且非纯口语
+        if re.search(r"[A-Za-z]{3,}|\d{4}|[一-鿿]{2,}", q) and "？" not in q[-1:]:
+            # 拒绝纯人称+动词
+            if re.fullmatch(r"[一-鿿A-Za-z]{1,8}(今天|现在).+", q):
+                return False
+            return True
+        return False
+
+    def _fallback_explore_query(self, bits: Dict[str, Any]) -> Tuple[str, str]:
+        interests = list(bits.get("interests") or []) or ["B站", "动漫", "科技"]
+        name = bits.get("name") or "角色"
+        templates = [
+            ("{kw} 是什么 百科", "想搞清楚这个概念"),
+            ("{kw} 入门 推荐", "想找点靠谱的入门资料"),
+            ("{kw} 2025 最新 动态", "看看最近有没有新消息"),
+            ("{kw} B站 相关 讨论", "想知道大家怎么聊这个"),
+            ("{kw} 设定 背景", "补一点世界观/背景"),
+        ]
+        kw = random.choice(interests[:8])
+        # 避免把人设名单独当成「今天干了啥」
+        if kw in {name, "夏生"} and len(interests) > 1:
+            kw = random.choice([x for x in interests if x not in {name, "夏生"}] or interests)
+        tpl, motive = random.choice(templates)
+        return tpl.format(kw=kw), motive
+
     async def maybe_explore(self, force: bool = False) -> Optional[ExploreNote]:
         if not self.enabled or not self._cfg.exploration.enabled:
             return None
@@ -1087,7 +1162,6 @@ class CompanionLifeService:
                 self.web_search.is_scene_enabled("companion_exploration")
                 or self.web_search.is_scene_enabled("proactive_video")
             ):
-                # allow if scene matrix missing key — treat unknown as enabled when exploration flag on
                 scenes = getattr(self.web_search, "scenes", None)
                 if isinstance(scenes, dict) and "companion_exploration" in scenes:
                     if not scenes["companion_exploration"].get("enabled", False):
@@ -1095,23 +1169,37 @@ class CompanionLifeService:
 
         bits = self._persona_bits()
         state = self.store.get_life_state()
+        plan = self.store.get_daily_plan()
+        plan_sum = P.format_plan_summary([i.to_dict() for i in plan.items]) if plan.items else ""
         system, user = P.build_explore_query_prompt(
             persona_name=bits["name"],
             interests=bits.get("interests") or [],
             activity=state.activity,
             mood_bias=state.mood_bias,
             recent_topics=", ".join(self.get_topic_seeds()),
+            plan_summary=plan_sum,
         )
-        raw = await self._llm_text(system, user, max_tokens=200)
-        query, motive = "", "随便看看"
+        raw = await self._llm_text(system, user, max_tokens=220)
+        query, motive = "", "随便看看公开资料"
         if raw:
             data = _extract_json(raw)
             if isinstance(data, dict):
                 query = str(data.get("query") or "").strip()
                 motive = str(data.get("motive") or motive).strip()
-        if not query:
-            interests = bits.get("interests") or ["B站热门"]
-            query = random.choice(interests)
+
+        if not self._query_is_searchable(query):
+            logger.info(
+                "[%s] explore query rejected, fallback: %r",
+                self.account_id,
+                (query or "")[:80],
+            )
+            query, motive = self._fallback_explore_query(bits)
+
+        # 二次校验 fallback
+        if not self._query_is_searchable(query):
+            query, motive = "B站 科技区 热门 话题", "看看最近有什么热闹"
+
+        logger.info("[%s] explore query=%r motive=%r", self.account_id, query[:60], motive[:40])
 
         try:
             result = await self.web_search.search(
@@ -1123,15 +1211,17 @@ class CompanionLifeService:
                 result = await self.web_search.search(query)
             except Exception as e:
                 logger.warning("[%s] explore search failed: %s", self.account_id, e)
-                return None
+                result = None
         except Exception as e:
             logger.warning("[%s] explore search failed: %s", self.account_id, e)
-            return None
+            result = None
 
-        items = []
+        items: List[Any] = []
         results_text = ""
+        search_ok = False
         if isinstance(result, dict):
             items = result.get("items") or result.get("results") or []
+            search_ok = bool(items) or bool(result.get("answer") or result.get("content"))
             if hasattr(self.web_search, "format_reference_block"):
                 try:
                     results_text = self.web_search.format_reference_block(result) or ""
@@ -1141,10 +1231,16 @@ class CompanionLifeService:
                 lines = []
                 for it in items[: self._cfg.exploration.max_results]:
                     if isinstance(it, dict):
-                        lines.append(f"- {it.get('title') or ''}: {it.get('snippet') or it.get('content') or ''}")
+                        lines.append(
+                            f"- {it.get('title') or ''}: "
+                            f"{it.get('snippet') or it.get('content') or it.get('url') or ''}"
+                        )
                 results_text = "\n".join(lines)
         elif isinstance(result, str):
             results_text = result
+            search_ok = bool(result.strip())
+        if not results_text:
+            results_text = "（无结果/搜索失败）"
 
         system2, user2 = P.build_explore_note_prompt(
             query=query,
@@ -1153,13 +1249,19 @@ class CompanionLifeService:
             persona_prompt=bits["base_prompt"],
         )
         raw2 = await self._llm_text(system2, user2, max_tokens=500)
-        impression, self_link, should_share = "看了一些资料。", "", False
+        impression, self_link, should_share = (
+            ("没搜到什么有用的，下次换个关键词试试。" if not search_ok else "看了一些资料。"),
+            "",
+            False,
+        )
+        highlights: List[str] = []
         if raw2:
             data = _extract_json(raw2)
             if isinstance(data, dict):
                 impression = str(data.get("impression") or impression)
                 self_link = str(data.get("self_link") or "")
-                should_share = bool(data.get("should_share"))
+                should_share = bool(data.get("should_share")) and search_ok
+                highlights = [str(x) for x in (data.get("highlights") or []) if str(x).strip()][:5]
 
         note = ExploreNote(
             id=uuid.uuid4().hex[:12],
@@ -1172,9 +1274,13 @@ class CompanionLifeService:
             items=[x for x in (items or [])[: self._cfg.exploration.max_results] if isinstance(x, dict)],
             source="web_search",
         )
+        # stash highlights into first item-like meta via impression already; also runtime
         notes = [note] + self.store.get_explore_notes()
         self.store.save_explore_notes(notes[:40])
-        body = f"探索：{query}\n动机：{motive}\n{impression}\n关联：{self_link}"
+        body = (
+            f"探索：{query}\n动机：{motive}\n{impression}\n关联：{self_link}"
+            + (f"\n要点：{'；'.join(highlights)}" if highlights else "")
+        )
         await self._archive_text(
             source_type="web_reference",
             event_type="exploration",
@@ -1182,11 +1288,22 @@ class CompanionLifeService:
             title=f"探索 {query[:40]}",
             idempotency_key=f"explore:{note.id}",
             importance=0.5,
-            metadata={"query": query, "should_share": should_share},
+            metadata={
+                "query": query,
+                "should_share": should_share,
+                "search_ok": search_ok,
+                "highlights": highlights,
+            },
         )
-        if self._cfg.exploration.offer_dynamic_draft and should_share and impression:
-            self._offer_draft(f"【随便搜到】{impression[:500]}", created_by="companion_explore")
-        self.store.patch_runtime(last_explore_ts=time.time(), last_explore_query=query)
+        # 无结果不进草稿；有结果且模型认为可分享才进
+        if self._cfg.exploration.offer_dynamic_draft and should_share and impression and search_ok:
+            seed = f"【随便搜到】{query}\n{impression[:400]}"
+            self._offer_draft(seed, created_by="companion_explore")
+        self.store.patch_runtime(
+            last_explore_ts=time.time(),
+            last_explore_query=query,
+            last_explore_ok=search_ok,
+        )
         self.apply_activity_energy_delta(-2, "explore")
         return note
 
@@ -1212,14 +1329,19 @@ class CompanionLifeService:
 
         # maybe start new
         if len(drafting) < self._cfg.creative.max_active_projects:
-            last_create = max((p.created_at for p in projects), default="")
-            can_create = True
-            if last_create:
+            # 开新项目冷却：10 小时内不重复开书，避免刷 LLM
+            last_create_ts = 0.0
+            for p in projects:
                 try:
-                    # rough: if created today already many, still ok with probability
-                    pass
+                    # created_at is isoformat
+                    if p.created_at:
+                        last_create_ts = max(
+                            last_create_ts,
+                            datetime.fromisoformat(p.created_at).timestamp(),
+                        )
                 except Exception:
                     pass
+            can_create = (now - last_create_ts) >= 10 * 3600 if last_create_ts else True
             if can_create and (force or random.random() < self._cfg.creative.inspiration_probability):
                 diaries = self.store.get_diaries()
                 dream = self.store.get_latest_dream()
@@ -1254,6 +1376,7 @@ class CompanionLifeService:
                     projects = [proj] + projects
                     self.store.save_projects(projects[:20])
                     drafting = [p for p in projects if p.status == "drafting"]
+                    self.store.patch_runtime(last_creative_project_at=_now_iso())
 
         # advance one due project
         due = [p for p in drafting if force or (p.next_advance_at or 0) <= now]
@@ -1325,10 +1448,27 @@ class CompanionLifeService:
         result: Dict[str, Any] = {"enabled": self.enabled, "actions": []}
         if not self.enabled:
             return result
-        if self._tick_lock:
-            result["skipped"] = "busy"
-            return result
-        self._tick_lock = True
+
+        # Prefer asyncio.Lock across await boundaries
+        lock = self._tick_lock
+        if lock is None and asyncio is not None:
+            try:
+                self._tick_lock = asyncio.Lock()
+                lock = self._tick_lock
+            except Exception:
+                lock = None
+
+        if lock is not None:
+            if lock.locked():
+                result["skipped"] = "busy"
+                return result
+            await lock.acquire()
+        else:
+            if self._tick_busy:
+                result["skipped"] = "busy"
+                return result
+            self._tick_busy = True
+
         try:
             self.reload_config()
             if not self._cfg.enabled:
@@ -1376,4 +1516,10 @@ class CompanionLifeService:
             result["error"] = type(e).__name__
             return result
         finally:
-            self._tick_lock = False
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
+            else:
+                self._tick_busy = False

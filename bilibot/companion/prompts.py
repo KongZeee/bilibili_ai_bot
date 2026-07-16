@@ -160,17 +160,39 @@ def build_explore_query_prompt(
     activity: str,
     mood_bias: str,
     recent_topics: str,
+    plan_summary: str = "",
 ) -> tuple[str, str]:
-    system = "你为拟人角色决定「此刻想搜什么」。只输出 JSON。"
-    interest_line = "、".join(interests[:10]) if interests else "科技、动漫、日常生活"
+    system = (
+        "你为拟人角色生成「可联网检索」的搜索关键词。"
+        "只输出 JSON，不要解释。"
+    )
+    interest_line = "、".join(interests[:10]) if interests else "科技、动漫、B站、日常生活"
     user = f"""角色：{persona_name or "Bot"}
-兴趣：{interest_line}
-当前活动：{activity or "空闲"}
+兴趣方向：{interest_line}
+当前活动（仅作氛围，不要把虚构日常当事实去搜）：{activity or "空闲"}
 心情：{mood_bias or "平稳"}
-最近话题：{_clip(recent_topics, 400) or "无"}
+今日日程摘要：{_clip(plan_summary, 200) or "无"}
+最近念头/话题：{_clip(recent_topics, 300) or "无"}
 
-输出一个搜索 query（中文优先）和动机：
-{{"query":"...","motive":"一句话为什么想了解"}}
+硬性要求：
+1. query 必须是**公开信息/百科/新闻/作品/知识点**，搜索引擎能命中真实网页
+2. **禁止**虚构个人隐私或无法检索的句子，例如：
+   - 「XX今天做了什么」「XX现在在干嘛」
+   - 「我的日程」「值得分享的事」
+   - 只含角色私生活、无公开实体的问句
+3. 优先形式：
+   - 「作品名/题材 + 设定/百科/剧情/背景」
+   - 「兴趣领域 + 2024/2025/最新/入门/推荐」
+   - 「具体概念 + 是什么/怎么做」
+4. query 8–30 字为宜，中文优先，可带专有名词
+5. motive 用角色第一人称写「为什么想了解」（可带人设口吻），但 query 本身要可搜
+
+示例（仅示范风格，勿照抄）：
+- query:「ATRI 亚托莉 世界观设定 百科」 motive:「想再确认一下和夏生有关的背景」
+- query:「B站 2025 AI 区 热门话题」 motive:「看看最近大家在聊什么」
+
+输出：
+{{"query":"...","motive":"..."}}
 """
     return system, user
 
@@ -182,18 +204,22 @@ def build_explore_note_prompt(
     results_text: str,
     persona_prompt: str,
 ) -> tuple[str, str]:
-    system = "你是角色本人，读完搜索结果后写探索笔记。只输出 JSON。"
+    system = (
+        "你是角色本人，读完搜索结果后写探索笔记。"
+        "只输出 JSON。若结果为空或无关，诚实写没搜到，不要编造网页内容。"
+    )
     user = f"""人设：{_clip(persona_prompt, 300)}
 我搜了：{query}
 动机：{motive}
 结果：
-{_clip(results_text, 2000)}
+{_clip(results_text, 2000) or "（无结果/搜索失败）"}
 
 输出：
 {{
-  "impression": "我的观感 2-5 句",
-  "self_link": "与我兴趣/日程/创作的关联",
-  "should_share": true或false
+  "impression": "我的观感 2-5 句；无结果时说明没搜到",
+  "self_link": "与我兴趣/日程/创作的关联（可弱关联）",
+  "should_share": true或false,
+  "highlights": ["从结果摘到的要点1","要点2"]
 }}
 """
     return system, user

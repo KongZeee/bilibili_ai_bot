@@ -931,7 +931,7 @@ class MemoryProcessor:
                 persona_info = self.personality.get_personality_info(persona_id)
                 if persona_info:
                     system_prompt += f"\n\nBot人格: {persona_info}"
-            except:
+            except Exception:
                 pass
         
         # 调用LLM
@@ -1212,7 +1212,7 @@ class HybridRetriever:
         try:
             keywords = jieba.analyse.extract_tags(text, topK=8)
             return [k for k in keywords if len(k) >= 2]
-        except:
+        except Exception:
             pass
         
         # 降级：使用 jieba 基本分词
@@ -1832,7 +1832,7 @@ class KnowledgeBaseMemory:
     def __del__(self):
         try:
             self.close()
-        except:
+        except Exception:
             pass
 
 

@@ -112,10 +112,10 @@ export const TokenUsagePage = defineComponent({
                 }))),
             ];
             const dayOptions = [
-                { value: 1, label: '今天' },
-                { value: 7, label: '近 7 天' },
-                { value: 14, label: '近 14 天' },
-                { value: 30, label: '近 30 天' },
+                { value: '1', label: '今天' },
+                { value: '7', label: '近 7 天' },
+                { value: '14', label: '近 14 天' },
+                { value: '30', label: '近 30 天' },
             ];
 
             return h('div', { class: 'view-frame' }, [
@@ -132,7 +132,7 @@ export const TokenUsagePage = defineComponent({
                         h('p', { class: 'muted' }, '统计 chat / vision / embedding 等调用的 prompt、completion 与缓存命中（若提供方返回）。数据从本次部署起累计；历史调用不会回溯。'),
                         h('div', { class: 'flex gap-2 flex-wrap', style: 'margin-top:.8rem;' }, [
                             h(FormSelect, {
-                                modelValue: days.value,
+                                modelValue: String(days.value),
                                 'onUpdate:modelValue': (v) => { days.value = Number(v) || 7; },
                                 options: dayOptions,
                             }),

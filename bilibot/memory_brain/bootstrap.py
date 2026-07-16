@@ -186,22 +186,29 @@ def _cutover_health_check(
             )
 
         bvid = f"bv1v6{token[:12]}"
+        # 用 probe 专用中文片段；MATCH 用 bigram（unicode61+jieba 索引不保证整词命中）
+        chinese_token = f"切面探{token[:8]}"
         search_text = build_fts_text(
-            f"统一联想健康探针 {bvid}", stable_ids=(bvid,)
+            f"统一{chinese_token}健康探针 {bvid}", stable_ids=(bvid,)
         )
+        # bigrams from the unique probe prefix — present in build_fts_text output
+        chinese_match = '"切面" OR "面探"'
         conn.execute("SAVEPOINT cutover_fts")
         try:
             conn.execute(
                 "INSERT INTO memory_event_fts(event_id,search_text) VALUES(?,?)",
                 (fts_event_id, search_text),
             )
+            # 必须限定 event_id，否则库内其它命中会让 fetchone 拿到错误行
             chinese_hit = conn.execute(
-                "SELECT event_id FROM memory_event_fts WHERE memory_event_fts MATCH ?",
-                ('"联想"',),
+                "SELECT event_id FROM memory_event_fts "
+                "WHERE memory_event_fts MATCH ? AND event_id=? LIMIT 1",
+                (chinese_match, fts_event_id),
             ).fetchone()
             bvid_hit = conn.execute(
-                "SELECT event_id FROM memory_event_fts WHERE memory_event_fts MATCH ?",
-                (f'"{normalize_search_text(bvid)}"',),
+                "SELECT event_id FROM memory_event_fts "
+                "WHERE memory_event_fts MATCH ? AND event_id=? LIMIT 1",
+                (f'"{normalize_search_text(bvid)}"', fts_event_id),
             ).fetchone()
             conn.execute("DELETE FROM memory_event_fts WHERE event_id=?", (fts_event_id,))
             deleted = conn.execute(
