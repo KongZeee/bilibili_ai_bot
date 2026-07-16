@@ -436,8 +436,11 @@ export const CompanionPage = defineComponent({
 
         function renderNotes() {
             const list = notes.value || [];
-            const active = list.find(n => n.id === openNoteId.value) || list[0] || null;
-            if (active && active.id !== openNoteId.value) openNoteId.value = active.id;
+            // 不在 render 里写 ref（会触发 Vue 警告）；用计算后的有效 id
+            const activeId = openNoteId.value && list.some(n => n.id === openNoteId.value)
+                ? openNoteId.value
+                : (list[0] && list[0].id) || '';
+            const active = list.find(n => n.id === activeId) || null;
 
             return h('div', {
                 class: 'grid gap-3',
@@ -491,8 +494,10 @@ export const CompanionPage = defineComponent({
 
         function renderBook() {
             const list = projects.value || [];
-            const active = list.find(p => p.id === openBookId.value) || list[0] || null;
-            if (active && active.id !== openBookId.value) openBookId.value = active.id;
+            const activeId = openBookId.value && list.some(p => p.id === openBookId.value)
+                ? openBookId.value
+                : (list[0] && list[0].id) || '';
+            const active = list.find(p => p.id === activeId) || null;
             const chunks = (active && active.draft_chunks) || [];
             const fullText = chunks.map(c => c.text || '').join('\n\n');
 

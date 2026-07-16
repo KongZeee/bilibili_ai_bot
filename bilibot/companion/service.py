@@ -1151,16 +1151,17 @@ class CompanionLifeService:
         if not self.web_search or not getattr(self.web_search, "is_available", lambda: False)():
             logger.debug("[%s] exploration skipped: web_search unavailable", self.account_id)
             return None
-        # scene gate
+        # scene gate：未配置 companion_exploration 时回落到 DEFAULT（True）或 proactive_video
         if hasattr(self.web_search, "is_scene_enabled"):
             if not (
                 self.web_search.is_scene_enabled("companion_exploration")
                 or self.web_search.is_scene_enabled("proactive_video")
             ):
-                scenes = getattr(self.web_search, "scenes", None)
-                if isinstance(scenes, dict) and "companion_exploration" in scenes:
-                    if not scenes["companion_exploration"].get("enabled", False):
-                        return None
+                logger.debug(
+                    "[%s] exploration skipped: web_search scene companion_exploration disabled",
+                    self.account_id,
+                )
+                return None
 
         bits = self._persona_bits()
         state = self.store.get_life_state()

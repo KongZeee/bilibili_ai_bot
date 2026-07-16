@@ -263,20 +263,21 @@ class WebSearchService:
         """PRD V4 SEA-002：检查场景是否启用搜索"""
         if not self.is_available():
             return False
-        scene_cfg = self.scenes.get(scene, {}) or {}
-        # 场景未配置时使用默认值
-        if scene not in self.scenes:
-            default = DEFAULT_SCENES.get(scene, {})
-            return default.get("enabled", False)
-        return bool(scene_cfg.get("enabled", False))
+        # 配置里显式写了 scenes.X 则用配置；否则用 DEFAULT_SCENES；
+        # 两边都没有时默认 False（未知场景不悄悄开搜）
+        if scene in self.scenes:
+            scene_cfg = self.scenes.get(scene, {}) or {}
+            return bool(scene_cfg.get("enabled", False))
+        default = DEFAULT_SCENES.get(scene, {}) or {}
+        return bool(default.get("enabled", False))
 
     def should_redact_query(self, scene: str) -> bool:
         """PRD V4 SEA-003：私信场景是否需要脱敏查询"""
-        scene_cfg = self.scenes.get(scene, {}) or {}
-        if scene not in self.scenes:
-            default = DEFAULT_SCENES.get(scene, {})
-            return bool(default.get("redact_query", False))
-        return bool(scene_cfg.get("redact_query", False))
+        if scene in self.scenes:
+            scene_cfg = self.scenes.get(scene, {}) or {}
+            return bool(scene_cfg.get("redact_query", False))
+        default = DEFAULT_SCENES.get(scene, {}) or {}
+        return bool(default.get("redact_query", False))
 
     # ── 日预算 ──
 
