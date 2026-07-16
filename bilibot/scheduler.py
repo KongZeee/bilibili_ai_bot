@@ -6429,11 +6429,13 @@ class Scheduler:
                     )
 
             # 3. 调用 LLM
-            content = await self.llm.generate(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                max_tokens=200,
-            )
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="dynamic_post", account_id=self.account_id or ""):
+                content = await self.llm.generate(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=200,
+                )
 
             # LLM 失败时不再硬编码万能动态自动发布（PRD V3 §8.4）
             if not content:
@@ -7333,11 +7335,13 @@ class Scheduler:
                 )
 
             # 3. 调用 LLM
-            summary = await self.llm.generate(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                max_tokens=800,
-            )
+            from bilibot.services.token_usage import usage_context
+            with usage_context(scene="weekly_summary", account_id=self.account_id or ""):
+                summary = await self.llm.generate(
+                    prompt=user_prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=800,
+                )
 
             if not summary:
                 logger.warning("LLM生成周总结失败")
