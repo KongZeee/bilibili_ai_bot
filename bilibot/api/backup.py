@@ -435,7 +435,7 @@ def _backup_info(backup_dir: Path) -> dict:
         ts = datetime.fromtimestamp(backup_dir.stat().st_mtime).isoformat()
     return {
         "name": name,
-        "directory": str(backup_dir),
+        # 不返回绝对路径，避免泄露主机目录结构
         "backup_timestamp": ts,
         "file_count": _count_files(backup_dir),
     }
@@ -506,7 +506,6 @@ def create_backup_routes(
             return ok(
                 {
                     "name": backup_name,
-                    "directory": str(backup_dir),
                     "backup_timestamp": now.isoformat(),
                     "file_count": count,
                 },
@@ -673,10 +672,10 @@ def create_backup_routes(
                 return fail("INVALID_INPUT", "备份名称无效", status_code=400)
 
             backup_dir = backups_root / safe_name
-            if not backup_dir.is_dir():
+            if not await asyncio.to_thread(backup_dir.is_dir):
                 return fail_not_found(f"备份不存在: {safe_name}")
 
-            shutil.rmtree(backup_dir)
+            await asyncio.to_thread(shutil.rmtree, backup_dir)
             logger.info(f"已删除备份: {safe_name}")
             return ok({"deleted": safe_name}, message="备份已删除")
         except Exception as e:

@@ -170,6 +170,7 @@ class AccountManager:
                 "bili_jct": v1_bili.get("bili_jct", ""),
                 "dede_user_id": v1_bili.get("dede_user_id", ""),
                 "buvid3": v1_bili.get("buvid3", ""),
+                "buvid4": v1_bili.get("buvid4", ""),
                 "refresh_token": v1_bili.get("refresh_token", ""),
                 "persona_id": raw.get("persona_id", ""),
                 "llm_id": raw.get("llm_id", ""),
@@ -190,7 +191,7 @@ class AccountManager:
 
     def _create_instance(self, account_id: str, acc_config: dict) -> AccountInstance:
         """创建 AccountInstance"""
-        return AccountInstance(
+        inst = AccountInstance(
             account_id=account_id,
             account_config=acc_config,
             persona_store=self.persona_store,
@@ -202,6 +203,9 @@ class AccountManager:
             data_root=self.data_root,
             safety_checker=self.safety_checker,
         )
+        # 凭据回调写盘后同步 registry
+        inst.account_manager = self
+        return inst
 
     # ══════════════════════════════════════
     #  账号访问
@@ -237,12 +241,13 @@ class AccountManager:
             acc = self._accounts.get(acc_id)
             if acc:
                 # 运行时实例存在 → 用运行时状态
-                result.append(acc.get_status())
+                status = acc.get_status()
             else:
                 # 无运行时实例（禁用或初始化失败）→ 从配置构造状态
                 enabled = cfg.get("enabled", True)
-                result.append({
+                status = {
                     "account_id": acc_id,
+                    "id": acc_id,
                     "name": cfg.get("name", acc_id),
                     "enabled": enabled,
                     "running": False,
@@ -253,12 +258,15 @@ class AccountManager:
                     "available_personas": [],
                     "llm_id": cfg.get("llm_id", ""),
                     "uid": cfg.get("dede_user_id", ""),
+                    "dede_user_id": cfg.get("dede_user_id", ""),
                     "authenticated": bili_credentials_are_configured(
                         cfg.get("sessdata"), cfg.get("bili_jct")
                     ),
                     "has_llm": False,
                     "has_bili": False,
-                })
+                }
+            status["is_default"] = (acc_id == self._default_id)
+            result.append(status)
         return result
 
     def list_account_ids(self) -> List[str]:
@@ -405,15 +413,41 @@ class AccountManager:
     # ══════════════════════════════════════
 
     async def initialize_all(self):
-        """初始化所有账号（并发）"""
+        """初始化所有账号（并发）
+
+        B4：init 失败时 partial close 并从运行表移除，避免半初始化实例空转/泄漏。
+        配置注册表仍保留该账号（disabled/失败可在面板查看）。
+        """
         tasks = [acc.initialize() for acc in self._accounts.values()]
         if tasks:
+            # 固定顺序，避免 dict 视图与 gather 结果错位
+            items = list(self._accounts.items())
             results = await asyncio.gather(*tasks, return_exceptions=True)
-            for (acc_id, acc), result in zip(self._accounts.items(), results):
+            failed_ids = []
+            for (acc_id, acc), result in zip(items, results):
                 if isinstance(result, Exception):
                     logger.error(f"账号 {acc_id} 初始化失败: {result}", exc_info=result)
+                    failed_ids.append(acc_id)
+                    try:
+                        await acc.close()
+                    except Exception as close_err:
+                        logger.warning(
+                            f"账号 {acc_id} 初始化失败后 partial close 异常: {close_err}"
+                        )
                 else:
                     logger.info(f"账号 {acc_id} 初始化成功")
+            for acc_id in failed_ids:
+                self._accounts.pop(acc_id, None)
+                if self._default_id == acc_id:
+                    self._default_id = next(iter(self._accounts), "")
+                    if self._default_id:
+                        logger.warning(
+                            f"默认账号 {acc_id} 初始化失败，回退默认账号为 {self._default_id}"
+                        )
+                    else:
+                        logger.warning(
+                            f"默认账号 {acc_id} 初始化失败，当前无可用运行时账号"
+                        )
 
     async def start_all(self):
         """启动所有账号调度器（并发）
@@ -434,19 +468,39 @@ class AccountManager:
         logger.info("所有账号已停止")
 
     async def reload_all(self):
-        """PRD V3 §3.3：热重载所有账号凭据（不重启调度器）
+        """PRD V3 §3.3：热重载所有账号（凭据 + 运行时服务配置，不重启调度器）
 
-        Web 配置保存后调用，遍历所有 AccountInstance 调用 reload()。
+        Web 配置保存后调用：
+        - 同步注册表
+        - 运行中账号走 reload()（含 VU / web_search / interactions）
+        - 已加载但未 running 的实例也刷运行时服务，避免下次 start 用旧快照
         """
         # Generic config PATCH and QR login both mutate the application loader.
         # Refresh the registry/runtime copies before AccountInstance rebuilds its
         # account-scoped loader, otherwise reload() reuses stale credentials.
         self.sync_registry_from_config()
-        tasks = [acc.reload() for acc in self._accounts.values() if acc.is_running()]
-        if tasks:
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            success_count = sum(1 for r in results if not isinstance(r, Exception) and isinstance(r, dict) and r.get("reloaded"))
-            logger.info(f"热重载完成: {success_count}/{len(tasks)} 个账号成功")
+        running = [acc for acc in self._accounts.values() if acc.is_running()]
+        idle = [acc for acc in self._accounts.values() if not acc.is_running()]
+        if running:
+            results = await asyncio.gather(
+                *[acc.reload() for acc in running], return_exceptions=True
+            )
+            success_count = sum(
+                1
+                for r in results
+                if not isinstance(r, Exception)
+                and isinstance(r, dict)
+                and r.get("reloaded")
+            )
+            logger.info(f"热重载完成: {success_count}/{len(running)} 个运行中账号成功")
+        for acc in idle:
+            try:
+                # 未运行也刷新 config_loader 与服务快照，保证 start 时是新配置
+                acc.account_config_loader = acc._build_account_config_loader()
+                if hasattr(acc, "_reload_runtime_services"):
+                    acc._reload_runtime_services()
+            except Exception as e:
+                logger.warning(f"[{acc.account_id}] 空闲账号服务热重载失败: {e}")
 
     # ══════════════════════════════════════
     #  持久化
@@ -467,6 +521,7 @@ class AccountManager:
                 "bili_jct": cfg.get("bili_jct", ""),
                 "dede_user_id": cfg.get("dede_user_id", ""),
                 "buvid3": cfg.get("buvid3", ""),
+                "buvid4": cfg.get("buvid4", ""),
                 "refresh_token": cfg.get("refresh_token", ""),
                 # PRD V3 §7：profile_id 优先，向后兼容 persona_id
                 "profile_id": cfg.get("profile_id", ""),

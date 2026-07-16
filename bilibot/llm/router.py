@@ -67,9 +67,28 @@ class ModelRouter:
 
     def initialize(self):
         """从配置加载所有 Provider 并建立路由"""
+        # Close existing clients before dropping references (hot-reload safe).
+        old_providers = []
         for t in PROVIDER_TYPES:
+            old_providers.extend(list(self._pools[t].values()))
             self._pools[t].clear()
         self._routing = {t: "" for t in PROVIDER_TYPES}
+        for old in old_providers:
+            close = getattr(old, "aclose", None)
+            if close is None:
+                continue
+            try:
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None and loop.is_running():
+                    loop.create_task(close())
+                else:
+                    asyncio.run(close())
+            except Exception as e:
+                logger.warning(f"[router] close providers during initialize failed: {e}")
 
         if self._config_loader is None:
             logger.warning("ModelRouter 未绑定 config_loader，跳过初始化")
@@ -147,6 +166,63 @@ class ModelRouter:
             "rate_limit_cooldown_seconds": self._rate_limit_cooldown_seconds,
             "vision_max_concurrency_hard_cap": self._vision_max_concurrency_hard_cap,
         }
+
+    def reload_global_defaults(self, raw: Optional[dict] = None) -> dict:
+        """热重载 allow_llm_fallback / default_llm（配置页「全局默认」）。
+
+        只更新路由内存状态，不重建 Provider 池。default_llm 仅在对应 chat
+        Provider 已存在时写入 chat 路由，避免指向不存在的 id。
+        """
+        if raw is None:
+            if self._config_loader is None:
+                return {
+                    "allow_llm_fallback": self._allow_llm_fallback,
+                    "default_llm": self._routing.get(CHAT, ""),
+                }
+            raw = self._config_loader.get_raw_config()
+        raw = raw or {}
+        if "allow_llm_fallback" in raw:
+            self._allow_llm_fallback = bool(raw.get("allow_llm_fallback", False))
+        default_llm = str(raw.get("default_llm") or "").strip()
+        if default_llm:
+            # 仅当 chat 池中已有该 id 时切换路由，否则保留现路由
+            if default_llm in self._pools.get(CHAT, {}):
+                self._routing[CHAT] = default_llm
+            else:
+                logger.warning(
+                    "[router] default_llm=%s 不在 chat_providers 中，忽略路由切换",
+                    default_llm,
+                )
+        logger.info(
+            "[router] global defaults reloaded: allow_llm_fallback=%s chat_route=%s",
+            self._allow_llm_fallback,
+            self._routing.get(CHAT, ""),
+        )
+        return {
+            "allow_llm_fallback": self._allow_llm_fallback,
+            "default_llm": self._routing.get(CHAT, ""),
+        }
+
+    def reload_request_limits(self, raw: Optional[dict] = None) -> dict:
+        """热重载 model_request_limits 并应用到 Provider 闸门。
+
+        配置页修改并发/429 冷却/视觉硬顶后调用，无需重建全部 Provider。
+        """
+        if raw is None:
+            if self._config_loader is None:
+                return self.get_request_limits()
+            raw = self._config_loader.get_raw_config()
+        self._load_request_limits(raw or {})
+        self._apply_request_limits_to_providers()
+        self._configure_completion_gates()
+        logger.info(
+            "[router] request limits reloaded: per_key_concurrency=%s "
+            "rate_limit_cooldown=%gs vision_hard_cap=%s",
+            self._completion_max_concurrency,
+            self._rate_limit_cooldown_seconds,
+            self._vision_max_concurrency_hard_cap,
+        )
+        return self.get_request_limits()
 
     def vision_effective_concurrency(self, requested_window: int = 2) -> int:
         """Clamp vision window by hard cap and routed vision key budget."""
@@ -585,13 +661,21 @@ class ModelRouter:
     # ══════════════════════════════════════
 
     def resolve(self, ptype: str, provider_id: str = "") -> Optional[LLMProvider]:
-        """解析指定类型的 Provider"""
+        """解析指定类型的 Provider。
+
+        Explicit / routed ids must also be enabled; otherwise fall through so a
+        disabled provider cannot keep receiving production traffic.
+        """
         pool = self._pools.get(ptype, {})
         if provider_id and provider_id in pool:
-            return pool[provider_id]
+            p = pool[provider_id]
+            if p.enabled:
+                return p
         routed_id = self._routing.get(ptype, "")
         if routed_id and routed_id in pool:
-            return pool[routed_id]
+            p = pool[routed_id]
+            if p.enabled:
+                return p
         # 兜底：取第一个启用的
         for p in pool.values():
             if p.enabled:
@@ -630,6 +714,44 @@ class ModelRouter:
     @property
     def local_whisper(self) -> dict:
         return self._local_whisper
+
+    def reload_local_whisper_from_config(self, raw: Optional[dict] = None) -> dict:
+        """仅刷新 local_whisper 段（不重建 ASR Provider 池）。
+
+        视频理解页保存 local_whisper.enabled 后调用，使运行时能关掉本地 Whisper。
+        """
+        if raw is None:
+            if self._config_loader is None:
+                return dict(self._local_whisper or {})
+            raw = self._config_loader.get_raw_config()
+        self._local_whisper = {}
+        for item in (raw.get("asr_providers") or []):
+            if not isinstance(item, dict):
+                continue
+            if (
+                "model_size" in item
+                or "whisper_device" in item
+                or item.get("id") in ("local-whisper", "local_whisper")
+                or ("device" in item and "compute_type" in item and "api_key" not in item)
+            ):
+                self._local_whisper = dict(item)
+                break
+        if not self._local_whisper:
+            va = (raw.get("video_analysis") or {}) if isinstance(raw, dict) else {}
+            if isinstance(va, dict) and va.get("local_whisper_enabled"):
+                asr_old = va.get("asr") or {}
+                self._local_whisper = {
+                    "enabled": True,
+                    "model_size": asr_old.get("whisper_model_size", "base"),
+                    "device": asr_old.get("whisper_device", "cpu"),
+                    "compute_type": asr_old.get("whisper_compute_type", "int8"),
+                }
+        logger.info(
+            "[router] local_whisper reloaded: enabled=%s model_size=%s",
+            (self._local_whisper or {}).get("enabled"),
+            (self._local_whisper or {}).get("model_size"),
+        )
+        return dict(self._local_whisper or {})
 
     @property
     def allow_llm_fallback(self) -> bool:
@@ -740,6 +862,21 @@ class ModelRouter:
             new_config.setdefault("timeout", getattr(old, "timeout", 120))
         pool[pid] = LLMProvider(pid, new_config)
         self._configure_completion_gates()
+        # Close old clients after swap so in-flight requests keep working until replaced.
+        try:
+            close = getattr(old, "aclose", None)
+            if close is not None:
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None and loop.is_running():
+                    loop.create_task(close())
+                else:
+                    asyncio.run(close())
+        except Exception as e:
+            logger.warning(f"[router] close old provider clients failed ({pid}): {e}")
         logger.info(f"[router] 已更新 {ptype} Provider: {pid}")
         return True
 
@@ -747,10 +884,24 @@ class ModelRouter:
         pool = self._pools.get(ptype, {})
         if pid not in pool:
             return False
-        del pool[pid]
+        old = pool.pop(pid)
         if self._routing[ptype] == pid:
             self._routing[ptype] = next(iter(pool), "")
         self._configure_completion_gates()
+        try:
+            close = getattr(old, "aclose", None)
+            if close is not None:
+                import asyncio
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None and loop.is_running():
+                    loop.create_task(close())
+                else:
+                    asyncio.run(close())
+        except Exception as e:
+            logger.warning(f"[router] close removed provider clients failed ({pid}): {e}")
         logger.info(f"[router] 已删除 {ptype} Provider: {pid}")
         return True
 

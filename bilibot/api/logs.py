@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from pathlib import Path
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
@@ -18,6 +19,25 @@ from .responses import ok, fail
 logger = logging.getLogger("bilibot.api.logs")
 
 _TS_RE = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})')
+
+
+def _resolve_log_path(log_file: str, data_dir: str) -> str:
+    """将日志路径限制在 data_dir 下，防止路径穿越读取任意文件。"""
+    data_root = Path(data_dir or "./data").resolve()
+    candidate = Path(log_file or (data_root / "bililog.log"))
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(data_root)
+        return str(resolved)
+    except ValueError:
+        safe = data_root / "bililog.log"
+        logger.warning(
+            "日志路径 %s 不在 data_dir=%s 内，已回退为 %s",
+            log_file,
+            data_root,
+            safe,
+        )
+        return str(safe)
 
 
 def _read_log_tail(path: str, n: int = 200) -> list[str]:
@@ -85,7 +105,12 @@ def _read_log_file(path: str, level: str, keyword: str, limit: int) -> list[dict
     return list(reversed(results))
 
 
-def create_logs_routes(log_file: str = "./data/bililog.log"):
+def create_logs_routes(
+    log_file: str = "./data/bililog.log",
+    data_dir: str = "./data",
+):
+    safe_log_file = _resolve_log_path(log_file, data_dir)
+
     async def api_get_logs(request: Request) -> JSONResponse:
         level = request.query_params.get("level", "")
         keyword = request.query_params.get("keyword", "")
@@ -95,15 +120,18 @@ def create_logs_routes(log_file: str = "./data/bililog.log"):
             return fail("INVALID_INPUT", "limit 参数必须是整数", status_code=400)
         limit = min(limit, 2000)
 
-        lines = await asyncio.to_thread(_read_log_file, log_file, level, keyword, limit)
+        lines = await asyncio.to_thread(_read_log_file, safe_log_file, level, keyword, limit)
         return ok(lines)
 
     async def api_download_logs(request: Request) -> PlainTextResponse:
-        if not os.path.exists(log_file):
+        if not os.path.exists(safe_log_file):
             return PlainTextResponse("日志文件不存在", status_code=404)
         try:
-            with open(log_file, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read(10 * 1024 * 1024)
+            def _read():
+                with open(safe_log_file, "r", encoding="utf-8", errors="replace") as f:
+                    return f.read(10 * 1024 * 1024)
+
+            content = await asyncio.to_thread(_read)
         except Exception as e:
             logger.error(f"日志文件读取失败: {e}", exc_info=True)
             return PlainTextResponse("读取失败: 内部服务器错误", status_code=500)

@@ -237,11 +237,15 @@ export const PersonaListPage = defineComponent({
             testing.value = true;
             testReply.value = '';
             try {
-                const result = await api.personas.test(activePersonaId.value, {
+                const payload = {
                     input: testInput.value,
                     use_llm: true,
-                    llm_provider_id: selectedLlm.value,
-                });
+                };
+                // 空字符串不要传给后端（会走 resolve_chat("") 可能误报 LLM_NOT_CONFIGURED）
+                if (selectedLlm.value) {
+                    payload.llm_provider_id = selectedLlm.value;
+                }
+                const result = await api.personas.test(activePersonaId.value, payload);
                 testReply.value = result?.output || result?.reply || result?.response || result?.message || result?.content ||
                     (typeof result === 'string' ? result : (result ? JSON.stringify(result) : '（无回复）'));
             } catch (e) {

@@ -116,16 +116,14 @@ def _select_timeline_frames(frame_numbers: List[int], limit: int) -> List[int]:
     return sorted(selected)
 
 
-def _calculate_frame_count(duration: float) -> int:
-    """根据视频时长动态决定抽帧数量"""
-    if duration <= 60:
-        return 5
-    if duration <= 300:
-        return 10
-    if duration <= 1200:
-        return 20
-    # PRD 5.2：长视频帧数上限 30，避免帧数爆炸导致 Vision-LLM 调用过多
-    return min(int(duration / 60) * 2, 30)
+def _clamp_max_keyframes(value: int, *, default: int = 150) -> int:
+    """抽帧上限：镜头未超上限则全抽，超过则等距下采样。"""
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = default
+    # 硬夹紧：1～500，防止误配导致 Vision 调用爆炸
+    return max(1, min(n, 500))
 
 
 def _resize_image(image_path: str, max_size: int) -> str:
@@ -270,8 +268,21 @@ def _extract_frames_scenedetect(
             (start_frame.frame_num + end_frame.frame_num) // 2
             for start_frame, end_frame in scenes
         ]
-        # 镜头全送，不下采样；no_of_frames 仅用于下方"镜头过少时补充等间隔帧"的判断
-        selected_midpoints = scene_midpoints
+        # 规则：镜头数 ≤ 上限 → 按镜头全抽；超过 → 在镜头中点上等距抽上限张。
+        selected_midpoints = _select_timeline_frames(scene_midpoints, no_of_frames)
+        if len(scene_midpoints) > len(selected_midpoints):
+            logger.info(
+                "PySceneDetect 镜头 %s 个超过上限 %s，等距下采样为 %s 张",
+                len(scene_midpoints),
+                no_of_frames,
+                len(selected_midpoints),
+            )
+        else:
+            logger.info(
+                "PySceneDetect 镜头 %s 个未超上限 %s，按镜头数全抽",
+                len(scene_midpoints),
+                no_of_frames,
+            )
 
         for mid_frame in selected_midpoints:
             timestamp = mid_frame / fps if fps else 0.0
@@ -369,10 +380,16 @@ def _prepare_visual_frames(
     frame_extractor: str = "katna",
     scenedetect_threshold: float = 27.0,
     image_max_size: int = 768,
+    max_keyframes: int = 150,
 ) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], int]:
-    """CPU/ffmpeg-heavy keyframe extraction + resize (must not run on event loop)."""
-    no_of_frames = _calculate_frame_count(duration)
-    logger.info(f"目标抽帧数: {no_of_frames}")
+    """CPU/ffmpeg-heavy keyframe extraction + resize (must not run on event loop).
+
+    max_keyframes：抽帧上限（可配置，默认 150）。
+    - scenedetect：镜头数 ≤ 上限则全抽，否则在镜头中点上等距抽上限张
+    - katna/ffmpeg：直接以该上限为抽帧目标（无镜头列表时）
+    """
+    no_of_frames = _clamp_max_keyframes(max_keyframes)
+    logger.info(f"抽帧上限: {no_of_frames}")
 
     frames = extract_keyframes(
         video_path, output_dir, fps, duration, no_of_frames,
@@ -386,6 +403,64 @@ def _prepare_visual_frames(
         resized = _resize_image(path, image_max_size)
         resized_frames.append((frame_number, resized))
     return frames, resized_frames, no_of_frames
+
+
+def _is_transient_vision_error(exc: BaseException) -> bool:
+    """Connection / timeout / rate-limit failures that deserve per-frame retry."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    # Explicit RateLimitExhaustedError from llm.provider key pool.
+    if "ratelimitexhausted" in name:
+        return True
+    status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    try:
+        if int(status) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+    resp = getattr(exc, "response", None)
+    resp_status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    try:
+        if int(resp_status) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
+    transient_names = (
+        "apiconnectionerror",
+        "apitimeouterror",
+        "timeout",
+        "connecterror",
+        "connectionerror",
+        "remoteprotocolerror",
+        "readtimeout",
+        "writetimeout",
+        "pooltimeout",
+        "ratelimiterror",
+        "ratelimit",
+    )
+    if any(tok in name for tok in transient_names):
+        return True
+    transient_text = (
+        "connection error",
+        "connect error",
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "server disconnected",
+        "network is unreachable",
+        "name or service not known",
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "quota exceeded",
+        "http 429",
+        "status code 429",
+        "error code: 429",
+        "all api keys cooling",
+    )
+    return any(tok in text for tok in transient_text)
 
 
 async def describe_visual_track(
@@ -402,18 +477,31 @@ async def describe_visual_track(
     vision_prompt: str = None,
     request_pacer: Optional[VisionRequestPacer] = None,
     require_complete: bool = False,
+    frame_max_retries: int = 2,
+    frame_retry_backoff_seconds: float = 1.5,
+    min_success_ratio: float = 0.5,
+    max_keyframes: int = 150,
+    executor=None,
 ) -> Tuple[List[VisualEvent], bool]:
     """
     视觉轨处理入口
 
     Args:
         llm: 提供 `describe_image(image_path, prompt, max_tokens)` 方法的对象
+        require_complete: 需要足够可用的视觉描述（不是“每一帧都必须成功”）
+        frame_max_retries: 单帧瞬时故障（连接/超时）额外重试次数
+        frame_retry_backoff_seconds: 单帧重试退避基数（秒，线性：1x, 2x, ...）
+        min_success_ratio: require_complete 时最低成功帧比例（0~1）
 
     Returns:
         (视觉事件列表, 是否画面基本静止)
     """
     # Offload scenedetect/katna/ffmpeg/resize so the asyncio event loop (Web) stays responsive.
-    frames, resized_frames, no_of_frames = await asyncio.to_thread(
+    # Prefer the caller's dedicated executor so heavy extract does not starve the
+    # default pool used by Web/memory asyncio.to_thread handlers.
+    loop = asyncio.get_running_loop()
+    frames, resized_frames, no_of_frames = await loop.run_in_executor(
+        executor,
         _prepare_visual_frames,
         video_path,
         fps,
@@ -422,6 +510,7 @@ async def describe_visual_track(
         frame_extractor,
         scenedetect_threshold,
         image_max_size,
+        max_keyframes,
     )
     if not frames:
         logger.warning("未抽到任何关键帧")
@@ -444,40 +533,105 @@ async def describe_visual_track(
         )
     semaphore = asyncio.Semaphore(effective_window)
     pacer = request_pacer or VisionRequestPacer(vision_requests_per_minute)
+    retries = max(0, int(frame_max_retries))
+    backoff = max(0.0, float(frame_retry_backoff_seconds))
+    try:
+        ratio = float(min_success_ratio)
+    except (TypeError, ValueError):
+        ratio = 0.5
+    ratio = min(1.0, max(0.0, ratio))
     logger.info(
         f"Vision request budget: {vision_requests_per_minute:g}/min, "
-        f"concurrency={effective_window}, frames={len(resized_frames)}"
+        f"concurrency={effective_window}, frames={len(resized_frames)}, "
+        f"frame_retries={retries}, min_success_ratio={ratio:g}"
     )
 
     async def _describe_one(index: int, frame_number: int, image_path: str) -> Optional[VisualEvent]:
-        async with semaphore:
-            await pacer.wait_turn()
-            description = await llm.describe_image(image_path, prompt=vision_prompt or DEFAULT_VISION_PROMPT)
-        if not description:
-            return None
-        timestamp = round(frame_number / fps, 2) if fps else 0.0
-        return VisualEvent(
-            timestamp=timestamp, frame_number=frame_number,
-            image_path=image_path, description=description,
-        )
+        last_exc: Optional[BaseException] = None
+        attempts = retries + 1
+        for attempt in range(attempts):
+            try:
+                async with semaphore:
+                    await pacer.wait_turn()
+                    description = await llm.describe_image(
+                        image_path, prompt=vision_prompt or DEFAULT_VISION_PROMPT
+                    )
+                if not description:
+                    # Empty model reply: no point hammering retries hard, but allow one more.
+                    if attempt + 1 < attempts:
+                        await asyncio.sleep(backoff * (attempt + 1) if backoff else 0.2)
+                        continue
+                    logger.warning(
+                        f"Vision 返回空描述，跳过帧 frame={frame_number}"
+                    )
+                    return None
+                timestamp = round(frame_number / fps, 2) if fps else 0.0
+                return VisualEvent(
+                    timestamp=timestamp, frame_number=frame_number,
+                    image_path=image_path, description=description,
+                )
+            except Exception as e:
+                last_exc = e
+                transient = _is_transient_vision_error(e)
+                if transient and attempt + 1 < attempts:
+                    delay = backoff * (attempt + 1) if backoff else 0.5
+                    logger.warning(
+                        "Vision 瞬时失败 frame=%s attempt=%s/%s %s: %s；%.1fs 后重试",
+                        frame_number,
+                        attempt + 1,
+                        attempts,
+                        type(e).__name__,
+                        e,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                # Permanent error, or retries exhausted: skip this frame (do not kill whole video)
+                logger.warning(
+                    "Vision 描述失败，跳过帧 frame=%s after %s attempt(s): %s: %s",
+                    frame_number,
+                    attempt + 1,
+                    type(e).__name__,
+                    e,
+                )
+                return None
+        if last_exc is not None:
+            logger.warning(
+                "Vision 描述最终失败，跳过帧 frame=%s: %s",
+                frame_number,
+                type(last_exc).__name__,
+            )
+        return None
 
     tasks = [
         _describe_one(index, frame_number, path)
         for index, (frame_number, path) in enumerate(resized_frames)
     ]
+    # Per-frame failures are degraded to None; never cancel the whole batch on one bad frame.
     results = await asyncio.gather(*tasks)
     visual_events = [r for r in results if r is not None]
     visual_events.sort(key=lambda x: x.timestamp)
-    if require_complete and len(visual_events) != len(resized_frames):
-        raise VisionTrackIncompleteError(
-            "VISION_INCOMPLETE_DESCRIPTIONS",
-            (
-                f"described {len(visual_events)} of {len(resized_frames)} "
-                "extracted frames"
-            ),
-            expected=len(resized_frames),
-            completed=len(visual_events),
-        )
+
+    expected = len(resized_frames)
+    completed = len(visual_events)
+    if require_complete:
+        # Usable track, not perfect coverage: need at least one frame and enough ratio.
+        min_needed = max(1, int((expected * ratio) + 0.999999))  # ceil without math import
+        if completed < min_needed:
+            raise VisionTrackIncompleteError(
+                "VISION_INCOMPLETE_DESCRIPTIONS",
+                (
+                    f"described {completed} of {expected} extracted frames "
+                    f"(need >= {min_needed}, ratio={ratio:g})"
+                ),
+                expected=expected,
+                completed=completed,
+            )
+        if completed < expected:
+            logger.warning(
+                "Vision 部分帧失败但达到可用阈值: %s/%s (min=%s)",
+                completed, expected, min_needed,
+            )
 
     is_static = len(frames) == 1
     if is_static:

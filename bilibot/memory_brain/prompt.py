@@ -11,8 +11,8 @@ from typing import Any, Mapping, Sequence
 DEFAULT_MEMORY_PROMPT_BUDGET = 5000
 MAX_EVENTS = 5
 MAX_ASSOCIATIONS = 2
-MAX_CHUNKS_PER_EVENT = 2
-MAX_EVENT_CHARS = 1200
+MAX_CHUNKS_PER_EVENT = 3
+MAX_EVENT_CHARS = 2200
 
 _HEADER = (
     '<memory_evidence trust="untrusted-data">\n'
@@ -226,6 +226,25 @@ def _render_event(event: Mapping[str, Any], ordinal: int, limit: int) -> tuple[s
     source_type, title = _source_label(event)
     summary = _summary(event)
     chunks = _chunks(event, MAX_CHUNKS_PER_EVENT)
+    # If the event already carries a long video_detail digest as summary, avoid
+    # repeating the same text again as 证据N.
+    if summary and chunks:
+        summary_compact = " ".join(summary.split())
+        filtered: list[tuple[str, str]] = []
+        for chunk_id, text in chunks:
+            text_compact = " ".join(text.split())
+            if (
+                text_compact
+                and summary_compact
+                and (
+                    text_compact == summary_compact
+                    or text_compact in summary_compact
+                    or summary_compact in text_compact
+                )
+            ):
+                continue
+            filtered.append((chunk_id, text))
+        chunks = filtered
     if not summary and not chunks:
         return "", ()
 
@@ -239,12 +258,15 @@ def _render_event(event: Mapping[str, Any], ordinal: int, limit: int) -> tuple[s
     if source_type.casefold() in _USER_SOURCES and not bool(event.get("verified", False)):
         lines.append("事实边界: 这是某人当时说过的话，不是已验证事实。")
     if summary:
-        lines.append(f"摘要: {_escaped(summary, 500)}")
+        # Video detail digests can be up to ~2000 chars and are the main recall
+        # surface for "what is this video about?". Allow a larger summary window.
+        summary_limit = 1800 if len(summary) > 500 else 500
+        lines.append(f"摘要: {_escaped(summary, summary_limit)}")
     if _entities(event):
         lines.append("相关实体: " + "、".join(_escaped(name, 80) for name in _entities(event)))
     chunk_ids: list[str] = []
     for index, (chunk_id, text) in enumerate(chunks, start=1):
-        lines.append(f"证据{index}: {_escaped(text, 420)}")
+        lines.append(f"证据{index}: {_escaped(text, 700)}")
         if chunk_id:
             chunk_ids.append(chunk_id)
     if _conflicts(event):

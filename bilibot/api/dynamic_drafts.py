@@ -151,25 +151,38 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
             safety_snapshot = None
             if content is not None and content != draft.content:
                 checker = getattr(acc.scheduler, "safety_checker", None)
-                if checker is not None:
-                    try:
-                        passed, reason = await checker.check_content(
-                            content, scene="dynamic_post",
-                            persona_id=draft.persona_id,
-                            account_id=acc_id,
-                        )
-                        safety_snapshot = {
-                            "passed": passed,
-                            "reason": reason,
-                            "checked_at": datetime.now().isoformat(),
-                            "edited": True,
-                        }
-                    except Exception as e:
-                        safety_snapshot = {
-                            "passed": False,
-                            "reason": f"safety_check_exception: {e}",
-                            "edited": True,
-                        }
+                if checker is None:
+                    return fail(
+                        "NO_SAFETY_CHECKER",
+                        "安全检查器未初始化，拒绝更新草稿内容",
+                        status_code=503,
+                    )
+                try:
+                    passed, reason = await checker.check_content(
+                        content, scene="dynamic_post",
+                        persona_id=draft.persona_id,
+                        account_id=acc_id,
+                    )
+                    safety_snapshot = {
+                        "passed": passed,
+                        "reason": reason,
+                        "checked_at": datetime.now().isoformat(),
+                        "edited": True,
+                    }
+                except Exception as e:
+                    logger.error(f"草稿安全检查异常: {e}", exc_info=True)
+                    return fail(
+                        "SAFETY_CHECK_FAILED",
+                        "安全检查异常，拒绝更新草稿内容",
+                        status_code=503,
+                    )
+                if not passed:
+                    return fail(
+                        "SAFETY_REJECTED",
+                        f"内容未通过安全检查: {reason or 'blocked'}",
+                        status_code=400,
+                        details=safety_snapshot,
+                    )
 
             updated = store.update(
                 draft_id,
@@ -226,6 +239,16 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
                 expected_revision = int(expected_revision)
             except (ValueError, TypeError):
                 return fail("INVALID_INPUT", "expected_revision 必须是整数", status_code=400)
+
+            # 拒绝审核通过未通过安全检查的草稿（编辑后可能 snapshot.passed=False）
+            snap = draft.safety_snapshot or {}
+            if snap and snap.get("passed") is False:
+                return fail(
+                    "SAFETY_REJECTED",
+                    f"草稿未通过安全检查，无法审核通过: {snap.get('reason') or 'blocked'}",
+                    status_code=400,
+                    details=snap if isinstance(snap, dict) else {},
+                )
 
             reviewer_hash = _get_session_hash(request)
             approved = store.approve(

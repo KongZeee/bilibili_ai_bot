@@ -23,7 +23,7 @@ import time
 import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 
 logger = logging.getLogger("bilibot.proactive_comment_store")
 
@@ -294,6 +294,118 @@ class ProactiveCommentStore:
         finally:
             conn.close()
 
+    def delete(self, action_id: str) -> bool:
+        """删除一条动作记录（用于 failed 状态的手动重试，释放 claim 锁）"""
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "DELETE FROM proactive_comment_actions WHERE action_id=?",
+                (action_id,),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def reset_for_immediate_retry(self, action_id: str) -> bool:
+        """将 retry_wait 的动作重置为立即可重试（next_retry_at=0）。
+
+        result_unknown 需 force 时请用 schedule_manual_retry。
+        """
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE proactive_comment_actions "
+                "SET next_retry_at=0, updated_at=? "
+                "WHERE action_id=? AND status=?",
+                (time.time(), action_id, STATUS_RETRY_WAIT),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
+    def schedule_manual_retry(
+        self,
+        account_id: str,
+        bvid: str,
+        *,
+        force: bool = False,
+        generation_text: str = "",
+        persona_id: str = "",
+    ) -> Tuple[bool, str, Optional[str]]:
+        """控制台/API 手动重试：只改 store，不直接发帖（防与调度并发双发）。
+
+        Returns:
+            (ok, code, action_id)
+            code: scheduled | already_published | in_progress | needs_force |
+                  not_found | invalid
+        """
+        account_id = str(account_id or self.account_id or "")
+        bvid = str(bvid or "").strip()
+        if not account_id or not bvid:
+            return False, "invalid", None
+        now = time.time()
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM proactive_comment_actions "
+                "WHERE account_id=? AND bvid=? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (account_id, bvid),
+            ).fetchone()
+            if row is None:
+                conn.rollback()
+                return False, "not_found", None
+            status = row["status"]
+            action_id = row["action_id"]
+            if status == STATUS_PUBLISHED:
+                conn.rollback()
+                return True, "already_published", action_id
+            if status in (STATUS_CLAIMED, STATUS_PUBLISHING):
+                conn.rollback()
+                return False, "in_progress", action_id
+            if status == STATUS_RESULT_UNKNOWN and not force:
+                conn.rollback()
+                return False, "needs_force", action_id
+            # retry_wait / failed / result_unknown(+force) → retry_wait 立即拾取
+            if status not in (
+                STATUS_RETRY_WAIT, STATUS_FAILED, STATUS_RESULT_UNKNOWN,
+            ):
+                conn.rollback()
+                return False, "invalid", action_id
+            gen = generation_text or (row["generation_text"] or "")
+            gen_hash = compute_generation_hash(gen) if gen else (row["generation_hash"] or "")
+            persona = persona_id or (row["persona_id"] or "")
+            # failed 时抬高 max_attempts 以便再试一次
+            max_att = int(row["max_attempts"] or DEFAULT_MAX_ATTEMPTS)
+            attempt = int(row["attempt"] or 0)
+            if status == STATUS_FAILED and attempt >= max_att:
+                max_att = attempt + 1
+            conn.execute(
+                "UPDATE proactive_comment_actions SET "
+                "status=?, next_retry_at=0, updated_at=?, "
+                "generation_text=?, generation_hash=?, persona_id=?, "
+                "max_attempts=?, last_error_code='MANUAL_RETRY', last_error='manual_retry', "
+                "lease_until=NULL "
+                "WHERE action_id=? AND status=?",
+                (
+                    STATUS_RETRY_WAIT, now, gen, gen_hash, persona, max_att,
+                    action_id, status,
+                ),
+            )
+            conn.commit()
+            return True, "scheduled", action_id
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+
     def has_published(self, account_id: str, bvid: str) -> bool:
         """是否已存在 published 动作（同账号同视频最多一条成功）"""
         conn = self._get_conn()
@@ -403,42 +515,151 @@ class ProactiveCommentStore:
         finally:
             conn.close()
 
+    def ensure_published(
+        self,
+        account_id: str,
+        bvid: str,
+        *,
+        generation_text: str = "",
+        persona_id: str = "",
+        now: Optional[float] = None,
+    ) -> bool:
+        """手动重试成功后：确保同账号同视频存在 published 动作。
+
+        - 已有 published → 直接 True
+        - 已有其它状态记录 → 强制改为 published（不限来源状态）
+        - 无记录 → 插入一条 published 记录
+        注意：ux_pca_active 部分唯一索引下，若库中已有 published 而最新行是 failed，
+        直接 UPDATE failed→published 会 IntegrityError，需先 has_published。
+        """
+        now = now or time.time()
+        if self.has_published(account_id, bvid):
+            return True
+
+        existing = self.get_by_bvid(account_id, bvid)
+        if existing is not None:
+            if existing.status == STATUS_PUBLISHED:
+                return True
+            conn = self._get_conn()
+            try:
+                try:
+                    cur = conn.execute(
+                        "UPDATE proactive_comment_actions "
+                        "SET status=?, published_at=?, updated_at=?, "
+                        "last_error_code='', last_error='', next_retry_at=NULL, lease_until=NULL "
+                        "WHERE action_id=?",
+                        (STATUS_PUBLISHED, now, now, existing.action_id),
+                    )
+                    conn.commit()
+                    return cur.rowcount > 0 or self.has_published(account_id, bvid)
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    # 并发下已有另一条 published；当前行保持即可
+                    return self.has_published(account_id, bvid)
+            finally:
+                conn.close()
+
+        action_id = f"pca_{uuid.uuid4().hex[:16]}"
+        idem_key = default_idempotency_key(account_id, bvid)
+        gen_hash = compute_generation_hash(generation_text) if generation_text else ""
+        conn = self._get_conn()
+        try:
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO proactive_comment_actions
+                        (action_id, account_id, bvid, persona_id, task_id, status,
+                         generation_text, generation_hash, idempotency_key,
+                         attempt, max_attempts, last_error_code, last_error,
+                         created_at, updated_at, published_at, next_retry_at)
+                    VALUES (?, ?, ?, ?, '', ?, ?, ?, ?, 0, ?, '', '', ?, ?, ?, NULL)
+                    """,
+                    (
+                        action_id, account_id, bvid, persona_id,
+                        STATUS_PUBLISHED, generation_text or "", gen_hash, idem_key,
+                        DEFAULT_MAX_ATTEMPTS, now, now, now,
+                    ),
+                )
+                conn.commit()
+                return True
+            except sqlite3.IntegrityError:
+                conn.rollback()
+                again = self.get_by_bvid(account_id, bvid)
+                if again is None:
+                    return self.has_published(account_id, bvid)
+                if again.status == STATUS_PUBLISHED:
+                    return True
+                if self.has_published(account_id, bvid):
+                    return True
+                conn2 = self._get_conn()
+                try:
+                    try:
+                        cur = conn2.execute(
+                            "UPDATE proactive_comment_actions "
+                            "SET status=?, published_at=?, updated_at=?, "
+                            "last_error_code='', last_error='', next_retry_at=NULL, lease_until=NULL "
+                            "WHERE action_id=?",
+                            (STATUS_PUBLISHED, now, now, again.action_id),
+                        )
+                        conn2.commit()
+                        return cur.rowcount > 0 or self.has_published(account_id, bvid)
+                    except sqlite3.IntegrityError:
+                        conn2.rollback()
+                        return self.has_published(account_id, bvid)
+                finally:
+                    conn2.close()
+        finally:
+            conn.close()
+
     def mark_retry_wait(
         self, action_id: str, error_code: str, error: str,
         now: Optional[float] = None,
+        *,
+        increment_attempt: bool = True,
+        from_statuses: Optional[tuple] = None,
     ) -> bool:
-        """publishing → retry_wait（可重试失败，带指数退避）
+        """publishing/retry_wait → retry_wait（可重试失败，带指数退避）
 
         达到 max_attempts → 直接 failed。
+        increment_attempt=False：仅延期（如限流），不消耗 attempt 预算。
+        from_statuses：可选限制来源状态（默认不限制，兼容旧调用）。
         """
         now = now or time.time()
         conn = self._get_conn()
         try:
             row = conn.execute(
-                "SELECT attempt, max_attempts FROM proactive_comment_actions "
+                "SELECT attempt, max_attempts, status FROM proactive_comment_actions "
                 "WHERE action_id=?",
                 (action_id,),
             ).fetchone()
             if row is None:
                 return False
+            if from_statuses is not None and row["status"] not in from_statuses:
+                return False
             attempt = row["attempt"]
             max_att = row["max_attempts"]
 
-            if attempt + 1 >= max_att:
+            if increment_attempt:
+                new_attempt = attempt + 1
+            else:
+                new_attempt = attempt
+
+            if increment_attempt and new_attempt >= max_att:
                 # 达到上限 → failed
                 conn.execute(
                     "UPDATE proactive_comment_actions "
                     "SET status=?, attempt=?, last_error_code=?, last_error=?, "
                     "updated_at=?, next_retry_at=NULL, lease_until=NULL "
                     "WHERE action_id=?",
-                    (STATUS_FAILED, attempt + 1, error_code, error,
+                    (STATUS_FAILED, new_attempt, error_code, error,
                      now, action_id),
                 )
                 conn.commit()
                 return True
-            # 还能重试 → retry_wait（指数退避）
-            new_attempt = attempt + 1
-            base = min(2 ** new_attempt, DEFAULT_BACKOFF_CAP)
+            # 还能重试 → retry_wait（指数退避；限流延期用较小基数）
+            base = min(2 ** max(new_attempt, 1), DEFAULT_BACKOFF_CAP)
+            if not increment_attempt:
+                base = min(max(base, 30), 120)
             jitter = random.uniform(0, base * 0.1)
             next_retry_at = now + base + jitter
             conn.execute(

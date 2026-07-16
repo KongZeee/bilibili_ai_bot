@@ -19,6 +19,7 @@ PRD V4 ACC-003：二维码登录安全模型
 import asyncio
 import hashlib
 import logging
+import threading
 import time
 import uuid
 from starlette.routing import Route
@@ -31,26 +32,35 @@ logger = logging.getLogger("bilibot.api.accounts")
 
 
 _config_write_lock = None  # asyncio.Lock，延迟初始化（须在 event loop 中创建）
+_config_write_lock_guard = threading.Lock()
 
 
 def _get_config_write_lock() -> "asyncio.Lock":
     """延迟初始化配置写锁（首次调用须在 event loop 中）"""
     global _config_write_lock
-    if _config_write_lock is None:
-        _config_write_lock = asyncio.Lock()
-    return _config_write_lock
+    # Guard lock-table creation so concurrent first callers share one Lock.
+    with _config_write_lock_guard:
+        if _config_write_lock is None:
+            _config_write_lock = asyncio.Lock()
+        return _config_write_lock
 
 
 async def _save_accounts_to_config(config_loader, account_manager, config_path: str):
     """将账号配置持久化到 config.yaml（加锁防止并发读-改-写丢失修改）"""
     try:
         async with _get_config_write_lock():
-            raw = config_loader.get_raw_config()
-            accounts_dict = account_manager.save_to_config()
-            raw["accounts"] = accounts_dict["accounts"]
-            raw["default_account"] = accounts_dict["default_account"]
-            raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-            config_loader.save_config(raw, config_path)
+            def _mutate(raw: dict) -> None:
+                accounts_dict = account_manager.save_to_config()
+                raw["accounts"] = accounts_dict["accounts"]
+                raw["default_account"] = accounts_dict["default_account"]
+                raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
+
+            if hasattr(config_loader, "atomic_update"):
+                config_loader.atomic_update(config_path, _mutate)
+            else:
+                raw = config_loader.get_raw_config()
+                _mutate(raw)
+                config_loader.save_config(raw, config_path)
             return True
     except Exception as e:
         logger.error(f"持久化账号配置失败: {e}")
@@ -111,14 +121,16 @@ _QR_TERMINAL_STATUSES = ("confirmed", "expired", "cancelled")
 _QR_TERMINAL_RETENTION = 300  # 终态会话保留 5 分钟（用于 410 响应后清理）
 
 _qr_lock = None  # asyncio.Lock，延迟初始化（须在 event loop 中创建）
+_qr_lock_guard = threading.Lock()
 
 
 def _get_qr_lock() -> "asyncio.Lock":
     """延迟初始化 QR 会话锁（首次调用须在 event loop 中）"""
     global _qr_lock
-    if _qr_lock is None:
-        _qr_lock = asyncio.Lock()
-    return _qr_lock
+    with _qr_lock_guard:
+        if _qr_lock is None:
+            _qr_lock = asyncio.Lock()
+        return _qr_lock
 
 
 def _extract_admin_token(request: Request) -> str:
@@ -360,10 +372,18 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
 
     async def list_profiles(request: Request) -> JSONResponse:
         """列出所有 profile（含可用人格详情）"""
-        # 任意账号的 persona_store 都共享同一个 config_loader
+        # 优先用默认账号的 persona_store；无默认运行时实例时回退到任意实例
         acc = account_manager.get_default()
         if acc and acc.persona_store:
             return ok(acc.persona_store.list_profiles())
+        for acc_id in account_manager.list_account_ids():
+            other = account_manager.get_account(acc_id)
+            if other and getattr(other, "persona_store", None):
+                return ok(other.persona_store.list_profiles())
+        # 无任何运行时实例时，直接用应用级 persona_store（若注入到 manager）
+        store = getattr(account_manager, "persona_store", None)
+        if store is not None and hasattr(store, "list_profiles"):
+            return ok(store.list_profiles())
         return ok([])
 
     async def bind_llm(request: Request) -> JSONResponse:
@@ -905,6 +925,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
     return [
         Route("/api/accounts", list_accounts, methods=["GET"]),
         Route("/api/accounts", add_account, methods=["POST"]),
+        Route("/api/accounts/profiles", list_profiles, methods=["GET"]),  # BEFORE {id}
         Route("/api/accounts/{id}", get_account, methods=["GET"]),
         Route("/api/accounts/{id}", delete_account, methods=["DELETE"]),
         Route("/api/accounts/{id}", update_account, methods=["PATCH"]),
@@ -913,7 +934,6 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         # PRD V3 §7：切换激活人格 + 列出可用人格 + 列出所有 profile
         Route("/api/accounts/{id}/switch-persona", switch_persona, methods=["POST"]),
         Route("/api/accounts/{id}/personas", list_account_personas, methods=["GET"]),
-        Route("/api/accounts/profiles", list_profiles, methods=["GET"]),
         Route("/api/accounts/{id}/llm", bind_llm, methods=["POST"]),
         Route("/api/accounts/{id}/start", start_account, methods=["POST"]),
         Route("/api/accounts/{id}/stop", stop_account, methods=["POST"]),

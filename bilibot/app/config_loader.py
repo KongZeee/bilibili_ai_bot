@@ -11,8 +11,12 @@ import os
 import math
 import yaml
 import copy
+import logging
+import threading
 from dataclasses import dataclass, field
 from typing import Optional, Dict, Any, Mapping
+
+logger = logging.getLogger("bilibot.config")
 
 
 # 敏感字段列表（V1 精确路径）
@@ -20,6 +24,7 @@ SENSITIVE_PATHS = [
     "bilibili.sessdata",
     "bilibili.bili_jct",
     "bilibili.buvid3",
+    "bilibili.buvid4",
     "bilibili.refresh_token",
     "llm.api_key",
     "llm.vision.api_key",
@@ -34,12 +39,13 @@ SENSITIVE_LEAF_NAMES = {
     "sessdata",
     "bili_jct",
     "buvid3",
+    "buvid4",
     "refresh_token",
     "api_key",
     "api_keys",
     "secret_key",
     "admin_password",
-    "admin_username",
+    # admin_username 非密钥：脱敏后面板配置页无法显示/编辑用户名
 }
 
 SENSITIVE_PLACEHOLDER = "***已配置***"
@@ -72,6 +78,7 @@ class BiliConfig:
     bili_jct: str = ""
     dede_user_id: str = ""
     buvid3: str = ""
+    buvid4: str = ""
     refresh_token: str = ""
     
     @property
@@ -299,6 +306,8 @@ class ConfigLoader:
         self._original_config: Dict[str, Any] = copy.deepcopy(self._raw_config)
         # Task 23：记录配置文件路径，供 reload() 无参时从磁盘重新读取
         self.filepath = filepath
+        # 多账号凭据写盘串行化（buvid/cookie 刷新回调与 Web PATCH 共用）
+        self._write_lock = threading.RLock()
         self._apply_config()
     
     def _apply_config(self):
@@ -309,6 +318,7 @@ class ConfigLoader:
             bili_jct=bili.get("bili_jct", ""),
             dede_user_id=bili.get("dede_user_id", ""),
             buvid3=bili.get("buvid3", ""),
+            buvid4=bili.get("buvid4", ""),
             refresh_token=bili.get("refresh_token", ""),
         )
         
@@ -448,7 +458,7 @@ class ConfigLoader:
         self.data_dir = self._raw_config.get("data_dir", "./data")
     
     def get_raw_config(self) -> Dict[str, Any]:
-        """获取原始配置字典"""
+        """获取原始配置字典（深拷贝，调用方修改不影响内存配置）"""
         return copy.deepcopy(self._raw_config)
 
     def get(self, path: str, default: Any = None) -> Any:
@@ -463,6 +473,56 @@ class ConfigLoader:
                 return default
         return current
 
+    def patch_account_credentials(
+        self,
+        account_id: str,
+        patch: Dict[str, Any],
+        filepath: str = None,
+    ) -> bool:
+        """原子更新账号凭据并写盘（多账号安全）
+
+        在锁内直接改 _raw_config，再 save，避免 get_raw_config 深拷贝导致
+        并发刷新时后写覆盖先写。
+
+        Args:
+            account_id: 目标账号 id；空或找不到时写 V1 bilibili 段
+            patch: 要合并的字段（sessdata/bili_jct/buvid*/refresh_token 等）
+            filepath: 配置路径；默认 self.filepath 或 config.yaml
+
+        Returns:
+            True 如果至少写入了一个字段
+        """
+        if not isinstance(patch, dict) or not patch:
+            return False
+        path = filepath or self.filepath or "config.yaml"
+        with self._write_lock:
+            written = False
+            accounts = self._raw_config.get("accounts")
+            if account_id and isinstance(accounts, list):
+                for acc in accounts:
+                    if isinstance(acc, dict) and acc.get("id") == account_id:
+                        for k, v in patch.items():
+                            if v is None or v == "":
+                                continue
+                            acc[k] = v
+                            written = True
+                        break
+            if not written:
+                bili = self._raw_config.setdefault("bilibili", {})
+                if not isinstance(bili, dict):
+                    bili = {}
+                    self._raw_config["bilibili"] = bili
+                for k, v in patch.items():
+                    if v is None or v == "":
+                        continue
+                    bili[k] = v
+                    written = True
+            if not written:
+                return False
+            # 在锁内保存：传入当前内存配置的快照，避免 save 再被并发改
+            self.save_config(copy.deepcopy(self._raw_config), path)
+            return True
+
     def save_config(self, config: Dict[str, Any], filepath: str):
         """保存配置到文件（原子写入：先写临时文件再替换）
 
@@ -471,27 +531,45 @@ class ConfigLoader:
         - 若调用方未设置（如专用 API accounts/llm_providers/video_analysis 等），
           自动递增，确保所有配置变更都推进统一版本号，不绕过乐观锁。
         """
-        current_rev = self._raw_config.get("config_revision", 0)
-        new_rev = config.get("config_revision", current_rev)
-        if new_rev == current_rev:
-            config["config_revision"] = int(current_rev) + 1
+        with self._write_lock:
+            current_rev = self._raw_config.get("config_revision", 0)
+            new_rev = config.get("config_revision", current_rev)
+            if new_rev == current_rev:
+                config["config_revision"] = int(current_rev) + 1
 
-        os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
-        tmp_path = filepath + ".tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
-        # 原子替换（Windows 下 os.replace 同样可用）
-        os.replace(tmp_path, filepath)
-        # BUG A-003：限制配置文件权限，防止凭证泄露给同主机其他用户
-        try:
-            os.chmod(filepath, 0o600)
-        except Exception:
-            logger.warning("无法设置配置文件权限为 0o600，凭证可能被其他用户读取")
-        self._raw_config = config
-        self._original_config = copy.deepcopy(config)
-        # Task 23：同步记录配置文件路径，供后续 reload() 无参时从磁盘重新读取
-        self.filepath = filepath
-        self._apply_config()
+            os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+            tmp_path = filepath + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                yaml.dump(config, f, allow_unicode=True, default_flow_style=False)
+            # 原子替换（Windows 下 os.replace 同样可用）
+            os.replace(tmp_path, filepath)
+            # BUG A-003：限制配置文件权限，防止凭证泄露给同主机其他用户
+            try:
+                os.chmod(filepath, 0o600)
+            except Exception:
+                logger.warning("无法设置配置文件权限为 0o600，凭证可能被其他用户读取")
+            self._raw_config = config
+            self._original_config = copy.deepcopy(config)
+            # Task 23：同步记录配置文件路径，供后续 reload() 无参时从磁盘重新读取
+            self.filepath = filepath
+            self._apply_config()
+
+    def atomic_update(self, filepath: str, mutator) -> Dict[str, Any]:
+        """线程安全的读-改-写：在写锁内深拷贝 → mutator(raw) → save_config。
+
+        专用 API（video_analysis / model_routing / accounts 等）应使用本方法，
+        避免并发 PATCH 各自 get_raw_config 后后写覆盖先写导致配置段丢失。
+
+        mutator(raw) 可就地修改 raw。若 mutator 抛出异常，不写盘、不改内存。
+        返回最终写入的 raw 副本。
+        """
+        if not callable(mutator):
+            raise TypeError("mutator must be callable")
+        with self._write_lock:
+            raw = copy.deepcopy(self._raw_config)
+            mutator(raw)
+            self.save_config(raw, filepath)
+            return copy.deepcopy(self._raw_config)
 
     def reload(self, config: Dict[str, Any] = None):
         """热重载配置
@@ -552,7 +630,3 @@ class ConfigLoader:
             return data
 
         return mask_recursive(config)
-
-
-import logging
-logging.getLogger("bilibot")

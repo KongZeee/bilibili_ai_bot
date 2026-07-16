@@ -1323,9 +1323,14 @@ class MemoryBrainStore:
                 "ORDER BY event_id,ordinal",
                 ordered_ids,
             ).fetchall()
+            # Attach source_type so recall can prefer audiovisual evidence over
+            # raw metadata JSON / web_reference blobs.
             chunk_rows = conn.execute(
-                f"SELECT * FROM memory_chunks WHERE event_id IN ({placeholders}) "
-                "ORDER BY event_id,ordinal",
+                f"""SELECT c.*, s.source_type AS source_type
+                    FROM memory_chunks c
+                    LEFT JOIN memory_sources s ON s.id = c.source_id
+                    WHERE c.event_id IN ({placeholders})
+                    ORDER BY c.event_id, c.ordinal""",
                 ordered_ids,
             ).fetchall()
             mention_rows = conn.execute(
@@ -1482,8 +1487,10 @@ class MemoryBrainStore:
             rows = conn.execute(
                 """SELECT f.chunk_id,f.event_id,bm25(memory_chunk_fts) AS bm25,c.text,
                           f.search_text AS _fts_search_text,
-                          c.observation_id,c.ordinal
-                   FROM memory_chunk_fts f JOIN memory_chunks c ON c.id=f.chunk_id
+                          c.observation_id,c.ordinal,s.source_type AS source_type
+                   FROM memory_chunk_fts f
+                   JOIN memory_chunks c ON c.id=f.chunk_id
+                   LEFT JOIN memory_sources s ON s.id=c.source_id
                    WHERE memory_chunk_fts MATCH ? ORDER BY bm25(memory_chunk_fts),c.ordinal
                    LIMIT ?""",
                 (match, max(1, min(int(limit), 500))),
@@ -1820,15 +1827,16 @@ class MemoryBrainStore:
                 raise VectorDimensionError(
                     f"query dimension {len(query)} does not match model dimension {dimension}"
                 )
+            # Online recall searches only rows that already have embeddings.
+            # Full-index completeness belongs in health reports, not recall gates —
+            # partial embedding progress must still return partial hits.
             embedding_count: int | None = None
             if exact_model:
-                target_table = "memory_events" if target_type == "event" else "memory_chunks"
-                expected = conn.execute(f"SELECT count(*) FROM {target_table}").fetchone()[0]
                 indexed = conn.execute(
                     "SELECT count(*) FROM memory_embeddings WHERE model_id=? AND target_type=?",
                     (model_id, target_type),
                 ).fetchone()[0]
-                if indexed < expected:
+                if not indexed:
                     return []
                 embedding_count = int(indexed)
 
@@ -2311,8 +2319,9 @@ class MemoryBrainStore:
         current = time.time() if now is None else float(now)
         leased_until = current + max(1.0, float(lease_seconds))
         clauses = [
-            "attempts < max_attempts",
-            "((status IN ('pending','retry') AND available_at<=?) "
+            # pending/retry must still have attempt budget; expired processing
+            # leases are always reclaimable so we can bump attempts or dead-letter.
+            "((status IN ('pending','retry') AND available_at<=? AND attempts < max_attempts) "
             "OR (status='processing' AND leased_until<=?))",
         ]
         params: list[Any] = [current, current]
@@ -2332,13 +2341,37 @@ class MemoryBrainStore:
                 ).fetchall()
                 jobs: list[ClaimedJob] = []
                 for row in rows:
+                    # attempts counts starts (claim / reclaim), not only fail_job.
+                    # Worker crashes that never call fail_job still consume a slot and
+                    # eventually hit max_attempts. fail_job must NOT +1 again.
+                    next_attempts = int(row["attempts"]) + 1
+                    max_attempts = int(row["max_attempts"])
+                    if next_attempts > max_attempts:
+                        # Lease expired after attempt budget already consumed — dead-letter.
+                        conn.execute(
+                            """UPDATE brain_jobs SET status='dead',lease_owner=NULL,leased_until=NULL,
+                                last_error=CASE WHEN last_error='' OR last_error IS NULL
+                                    THEN 'reclaim exceeded max_attempts'
+                                    ELSE last_error END,
+                                updated_at=? WHERE id=? AND status='processing' AND leased_until<=?""",
+                            (current, row["id"], current),
+                        )
+                        continue
                     changed = conn.execute(
                         """UPDATE brain_jobs SET status='processing',lease_owner=?,leased_until=?,
-                            updated_at=? WHERE id=? AND (
+                            attempts=?,updated_at=? WHERE id=? AND (
                               (status IN ('pending','retry') AND available_at<=?) OR
                               (status='processing' AND leased_until<=?)
                             )""",
-                        (worker_id, leased_until, current, row["id"], current, current),
+                        (
+                            worker_id,
+                            leased_until,
+                            next_attempts,
+                            current,
+                            row["id"],
+                            current,
+                            current,
+                        ),
                     ).rowcount
                     if not changed:
                         continue
@@ -2348,8 +2381,8 @@ class MemoryBrainStore:
                             job_type=row["job_type"],
                             event_id=row["event_id"],
                             payload=_json_loads(row["payload_json"], {}),
-                            attempts=row["attempts"],
-                            max_attempts=row["max_attempts"],
+                            attempts=next_attempts,
+                            max_attempts=max_attempts,
                             lease_owner=worker_id,
                             leased_until=leased_until,
                         )
@@ -2448,15 +2481,15 @@ class MemoryBrainStore:
                 if not row:
                     conn.rollback()
                     return None
-                attempts = row["attempts"] + 1
+                # attempts already bumped on claim_jobs; do not double-count here.
+                attempts = int(row["attempts"])
                 status = "dead" if attempts >= row["max_attempts"] else "retry"
-                delay = 0.0 if status == "dead" else min(3600.0, 5.0 * (2 ** (attempts - 1)))
+                delay = 0.0 if status == "dead" else min(3600.0, 5.0 * (2 ** max(0, attempts - 1)))
                 conn.execute(
-                    """UPDATE brain_jobs SET status=?,attempts=?,available_at=?,lease_owner=NULL,
+                    """UPDATE brain_jobs SET status=?,available_at=?,lease_owner=NULL,
                         leased_until=NULL,last_error=?,updated_at=? WHERE id=?""",
                     (
                         status,
-                        attempts,
                         current + delay,
                         str(error)[:4000],
                         current,
@@ -2473,6 +2506,13 @@ class MemoryBrainStore:
                 conn.close()
 
     def unblock_blocked_jobs(self, job_types: Sequence[str] | None = None) -> int:
+        """Re-open blocked jobs when a provider becomes available.
+
+        P0-D: reset attempts to 0 on unblock. claim_jobs increments attempts on
+        every start; without a reset, a job that was blocked after several
+        claims can become pending forever (attempts >= max_attempts still
+        blocks claim).
+        """
         now = time.time()
         params: list[Any] = [now, now]
         where = "status='blocked'"
@@ -2484,7 +2524,8 @@ class MemoryBrainStore:
             conn = self._connect()
             try:
                 changed = conn.execute(
-                    f"""UPDATE brain_jobs SET status='pending',available_at=?,last_error='',
+                    f"""UPDATE brain_jobs SET status='pending',attempts=0,available_at=?,
+                        last_error='',lease_owner=NULL,leased_until=NULL,
                         updated_at=? WHERE {where}""",
                     params,
                 ).rowcount

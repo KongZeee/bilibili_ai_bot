@@ -16,8 +16,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-# 每段独立截断上限（防止 prompt 膨胀）
-_MAX_SECTION_CHARS = 2000
+# 各段独立截断上限（防止 prompt 膨胀）。
+# 视听 log 基于真实 memory_brain 样本：p50≈2.9k / p75≈10k，
+# 10000 可完整覆盖约 3/4 的 behavior_log；搜索只作弱参考，预算单独压小。
+_MAX_METADATA_CHARS = 2000
+_MAX_HOT_COMMENTS_CHARS = 2000
+_MAX_SEARCH_REFERENCE_CHARS = 800
+_MAX_AUDIOVISUAL_CHARS = 10000
+# 兼容旧测试/外部引用
+_MAX_SECTION_CHARS = _MAX_AUDIOVISUAL_CHARS
 
 # 搜索参考段页脚（不可信标注）
 _SEARCH_REFERENCE_FOOTER = (
@@ -70,13 +77,14 @@ class ProactiveVideoContext:
             if hc:
                 sections.append(hc)
 
-        sr = self._format_search_reference()
-        if sr:
-            sections.append(sr)
-
+        # 视听优先于搜索：评价/评论主要依赖 behavior_log，避免搜索抢额度。
         av = self._format_audiovisual()
         if av:
             sections.append(av)
+
+        sr = self._format_search_reference()
+        if sr:
+            sections.append(sr)
 
         if self.degradation_reasons:
             sections.append(self._format_degradation())
@@ -113,7 +121,7 @@ class ProactiveVideoContext:
         if tname:
             lines.append(f"分区: {tname}")
         text = "\n".join(lines)
-        return text[:_MAX_SECTION_CHARS]
+        return text[:_MAX_METADATA_CHARS]
 
     def _format_hot_comments(self) -> str:
         if not self.hot_comments:
@@ -132,7 +140,11 @@ class ProactiveVideoContext:
         if len(lines) <= 1:
             return ""
         text = "\n".join(lines)
-        return text[:_MAX_SECTION_CHARS]
+        return text[:_MAX_HOT_COMMENTS_CHARS]
+
+    def format_search_reference(self) -> str:
+        """公开：搜索结果始终以不可信 Reference Block 呈现。"""
+        return self._format_search_reference()
 
     def _format_search_reference(self) -> str:
         """搜索结果始终以不可信 Reference Block 呈现。"""
@@ -158,7 +170,9 @@ class ProactiveVideoContext:
             return ""
         # 先截断内容，再追加不可信页脚（页脚必须始终可见）
         body = "\n".join(lines)
-        budget = _MAX_SECTION_CHARS - len(_SEARCH_REFERENCE_FOOTER) - 1
+        budget = _MAX_SEARCH_REFERENCE_CHARS - len(_SEARCH_REFERENCE_FOOTER) - 1
+        if budget < 0:
+            return _SEARCH_REFERENCE_FOOTER
         if len(body) > budget:
             body = body[:budget]
         return body + "\n" + _SEARCH_REFERENCE_FOOTER
@@ -170,8 +184,11 @@ class ProactiveVideoContext:
         behavior_log = av.get("behavior_log", "") if isinstance(av, dict) else ""
         if not behavior_log:
             return ""
-        text = f"【视听分析】\n{behavior_log}"
-        return text[:_MAX_SECTION_CHARS]
+        header = "【视听分析】\n"
+        body_budget = max(0, _MAX_AUDIOVISUAL_CHARS - len(header))
+        if len(behavior_log) > body_budget:
+            behavior_log = behavior_log[:body_budget]
+        return header + behavior_log
 
     def _format_degradation(self) -> str:
         if not self.degradation_reasons:

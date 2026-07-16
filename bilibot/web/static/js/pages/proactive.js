@@ -12,17 +12,23 @@ export const ProactivePage = defineComponent({
         const loading = ref(false);
         const selectedAccount = ref('');
         const triggering = ref(false);
+        let loadSeq = 0;
 
         async function loadTasks() {
             if (!selectedAccount.value) return;
+            const seq = ++loadSeq;
             loading.value = true;
             try {
                 const data = await api.accounts.tasks(selectedAccount.value, { page_size: 100 });
+                if (seq !== loadSeq) return;
                 tasks.value = data.items || (Array.isArray(data) ? data : []);
             } catch (e) {
+                if (seq !== loadSeq) return;
                 showToast('加载任务列表失败: ' + e.message, 'error');
                 tasks.value = [];
-            } finally { loading.value = false; }
+            } finally {
+                if (seq === loadSeq) loading.value = false;
+            }
         }
 
         async function triggerVideo() {

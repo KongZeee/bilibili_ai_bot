@@ -328,6 +328,29 @@ class InteractionPolicyEngine:
             }
         return summary
 
+    async def evaluate_async(
+        self,
+        llm_suggestion: Union[Dict[str, Any], InteractionSuggestion, None],
+        score: float,
+        bvid: str,
+        oid: str = "",
+    ) -> Dict[str, Dict[str, Any]]:
+        """evaluate 的 async 包装：放线程池执行，避免阻塞事件循环
+
+        evaluate() 内部通过 _count_today / _count_for_video 做同步 SQLite 查询，
+        直接在 async 上下文调用会阻塞事件循环。
+        """
+        return await asyncio.to_thread(
+            self.evaluate, llm_suggestion, score, bvid, oid,
+        )
+
+    async def get_today_summary_async(self) -> Dict[str, Dict[str, int]]:
+        """get_today_summary 的 async 包装：放线程池执行，避免阻塞事件循环
+
+        内部通过 _count_today 做 4 次同步 SQLite 查询。
+        """
+        return await asyncio.to_thread(self.get_today_summary)
+
 
 # ═══════════════════════════════════════════
 #  主动评论策略（COM-002）
@@ -347,11 +370,18 @@ class CommentPolicy:
     # 默认主动评论日上限（显著低于回复上限 200）
     DEFAULT_MAX_PER_DAY = 10
 
-    def __init__(self, config: Optional[Dict] = None, data_dir: str = "./data",
-                 account_id: str = ""):
+    def __init__(
+        self,
+        config: Optional[Dict] = None,
+        data_dir: str = "./data",
+        account_id: str = "",
+        safety_checker=None,
+    ):
         self.config = config or {}
         self.data_dir = str(data_dir)
         self.account_id = account_id
+        # B7：全局/账号暂停闸门（可选注入；未注入时仅做预算/去重）
+        self.safety_checker = safety_checker
         self._interactions_cfg = self.config.get("interactions", {}) or {}
         self._db_path = str(Path(self.data_dir) / "interaction_budget.db")
         self._lock = threading.Lock()
@@ -360,6 +390,10 @@ class CommentPolicy:
     def reload_config(self, config: Dict):
         self.config = config or {}
         self._interactions_cfg = self.config.get("interactions", {}) or {}
+
+    def set_safety_checker(self, safety_checker) -> None:
+        """运行时注入/替换 SafetyChecker（账号 reload 时使用）。"""
+        self.safety_checker = safety_checker
 
     def _ensure_db(self):
         Path(self.data_dir).mkdir(parents=True, exist_ok=True)
@@ -462,6 +496,24 @@ class CommentPolicy:
             return False, "empty_content", {}
 
         c_hash = self.content_hash(content)
+
+        # 0. 全局/账号暂停（COM-002 / B-008：策略层必须 fail-closed）
+        sc = self.safety_checker
+        if sc is not None:
+            try:
+                if hasattr(sc, "is_paused") and sc.is_paused():
+                    return False, "global_paused", {"content_hash": c_hash}
+                if (
+                    self.account_id
+                    and hasattr(sc, "is_account_paused")
+                    and sc.is_account_paused(self.account_id)
+                ):
+                    return False, f"account_paused:{self.account_id}", {
+                        "content_hash": c_hash,
+                    }
+            except Exception as e:
+                logger.warning("CommentPolicy 暂停检查异常，fail-closed: %s", e)
+                return False, "safety_check_error", {"content_hash": c_hash}
 
         # 1. 日预算
         max_day = self._max_per_day()

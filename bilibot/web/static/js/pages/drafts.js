@@ -36,6 +36,7 @@ export const DraftsPage = {
         const pageSize = 20;
         const total = ref(0);
         let refreshTimer = null;
+        let loadSeq = 0;
 
         const editModal = reactive({
             visible: false,
@@ -65,6 +66,7 @@ export const DraftsPage = {
 
         async function refresh() {
             if (!selectedAccount.value) return;
+            const seq = ++loadSeq;
             loading.value = true;
             try {
                 const data = await api.dynamicDrafts.list(selectedAccount.value, {
@@ -72,12 +74,14 @@ export const DraftsPage = {
                     page: page.value,
                     page_size: pageSize,
                 });
+                if (seq !== loadSeq) return;
                 drafts.value = data.items || (Array.isArray(data) ? data : []);
                 total.value = data.total || drafts.value.length || 0;
             } catch (e) {
+                if (seq !== loadSeq) return;
                 appState.notify('加载草稿失败：' + (e.message || e), 'danger');
             } finally {
-                loading.value = false;
+                if (seq === loadSeq) loading.value = false;
             }
         }
 

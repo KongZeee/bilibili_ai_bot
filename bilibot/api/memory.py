@@ -155,24 +155,45 @@ def _event_dto(
     evidence_chunk_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     event_id = str(event.get("id") or event.get("event_id") or "")
-    summary = str(event.get("summary") or "")
-    title = str(event.get("title") or "")
-    content = summary or title
+    summary = str(event.get("summary") or "").strip()
+    title = str(event.get("title") or "").strip()
+    event_type = str(event.get("event_type") or "observation")
+    source_type = str(event.get("source_type") or "")
     sources = list(event.get("sources") or [])
+    # 列表预览：视频类事件必须能一眼看出「是哪支视频」。
+    # summary 常为 ≤2000 字 video_detail，不能单独当 content，否则标题丢失。
+    video_like = event_type in {
+        "video_observation",
+        "video_metadata_observation",
+        "bangumi_episode",
+    } or source_type in {"video", "video_metadata", "bangumi"}
+    if video_like and title and summary:
+        if title in summary or summary.startswith(f"《{title}"):
+            content = summary
+        else:
+            content = f"《{title}》\n{summary}"
+    else:
+        content = summary or title
     if not content and sources:
         content = str(sources[0].get("full_text") or "")
     chunks = list(event.get("chunks") or [])
     evidence_ids = {str(value) for value in evidence_chunk_ids if value}
+    # 方便前端单独渲染标题/摘要
+    metadata = event.get("metadata") or {}
+    if not isinstance(metadata, Mapping):
+        metadata = {}
+    bvid = str(metadata.get("bvid") or "")
+    owner = str(metadata.get("owner") or "")
     dto: dict[str, Any] = {
         "id": event_id,
         "event_id": event_id,
-        "event_type": str(event.get("event_type") or "observation"),
-        "category": str(event.get("event_type") or "observation"),
+        "event_type": event_type,
+        "category": event_type,
         "title": title,
         "summary": summary,
         "content": content,
-        "source_type": str(event.get("source_type") or ""),
-        "source": str(event.get("source_type") or ""),
+        "source_type": source_type,
+        "source": source_type,
         "index_status": str(event.get("index_status") or "pending"),
         "status": str(event.get("index_status") or "pending"),
         "importance": float(event.get("importance") or 0.0),
@@ -190,11 +211,13 @@ def _event_dto(
         "entity_count": len(event.get("entities") or []),
         "index_health": _job_index_health(event, jobs),
         "hit_channels": list(dict.fromkeys(str(item) for item in hit_channels if item)),
+        "bvid": bvid,
+        "owner": owner,
     }
     if include_full:
         dto.update(
             {
-                "metadata": _jsonable(event.get("metadata") or {}),
+                "metadata": _jsonable(metadata),
                 "sources": _jsonable(sources),
                 "observations": _jsonable(event.get("observations") or []),
                 "chunks": _jsonable(chunks),

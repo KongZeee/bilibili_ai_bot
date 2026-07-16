@@ -93,6 +93,12 @@ class VideoUnderstandingConfig:
         self.frame_extractor: str = va.get("frame_extractor", "katna")
         self.scenedetect_threshold: float = float(va.get("scenedetect_threshold", 27.0))
         self.image_max_size: int = int(va.get("image_max_size", 768))
+        # 抽帧上限：镜头未超则全抽，超过则等距下采样（配置页可改，默认 150）
+        try:
+            max_kf = int(va.get("max_keyframes", 150))
+        except (TypeError, ValueError):
+            max_kf = 150
+        self.max_keyframes: int = max(1, min(max_kf, 500))
         # Soft request from video_analysis; absolute clamp applied later via router hard cap.
         try:
             requested_vision_window = int(va.get("vision_window_size", 2))
@@ -106,6 +112,23 @@ class VideoUnderstandingConfig:
         self.vision_requests_per_minute: int = max(
             1, min(requested_vision_rate, 600)
         )
+
+        # Vision 单帧瞬时故障重试 + 可用成功率阈值（require_complete 时生效）
+        try:
+            frame_retries = int(va.get("vision_frame_max_retries", 2))
+        except (TypeError, ValueError):
+            frame_retries = 2
+        self.vision_frame_max_retries: int = max(0, min(frame_retries, 5))
+        try:
+            frame_backoff = float(va.get("vision_frame_retry_backoff_seconds", 1.5))
+        except (TypeError, ValueError):
+            frame_backoff = 1.5
+        self.vision_frame_retry_backoff_seconds: float = max(0.0, min(frame_backoff, 30.0))
+        try:
+            min_ratio = float(va.get("vision_min_success_ratio", 0.5))
+        except (TypeError, ValueError):
+            min_ratio = 0.5
+        self.vision_min_success_ratio: float = min(1.0, max(0.0, min_ratio))
 
         # PRD-V5 §8.2 VID-503：资源边界配置
         self.max_duration_seconds: int = int(va.get("max_duration_seconds", 600))
@@ -123,7 +146,19 @@ class VideoUnderstandingConfig:
         asr = va.get("asr", {})
         self.asr_model: str = asr.get("model", "")
         self.asr_api_key: str = asr.get("api_key", "")
+        raw_asr_keys = asr.get("api_keys") or []
+        if isinstance(raw_asr_keys, str):
+            raw_asr_keys = [k.strip() for k in raw_asr_keys.replace(",", "\n").splitlines() if k.strip()]
+        elif not isinstance(raw_asr_keys, list):
+            raw_asr_keys = []
+        self.asr_api_keys: list = [k for k in raw_asr_keys if isinstance(k, str) and k.strip()]
         self.asr_base_url: str = asr.get("base_url", "")
+        try:
+            self.asr_rate_limit_cooldown_seconds: float = float(
+                asr.get("rate_limit_cooldown_seconds", 30)
+            )
+        except (TypeError, ValueError):
+            self.asr_rate_limit_cooldown_seconds = 30.0
         self.whisper_model_size: str = asr.get("whisper_model_size", "base")
         self.whisper_device: str = asr.get("whisper_device", "cpu")
         self.whisper_compute_type: str = asr.get("whisper_compute_type", "int8")
@@ -191,22 +226,30 @@ class LLMVisionAdapter:
         self, image_path: str, prompt: str = VISION_SYSTEM_PROMPT, max_tokens: int = 250
     ) -> Optional[str]:
         try:
-            # L4：检查文件大小，超过 20MB 时跳过避免内存暴增
-            max_size = 20 * 1024 * 1024  # 20MB
-            file_size = os.path.getsize(image_path)
-            if file_size > max_size:
-                logger.warning(
-                    f"图片文件过大，跳过 vision 分析: {image_path} "
-                    f"({file_size / 1024 / 1024:.1f}MB > 20MB)"
-                )
+            # 同步读盘 + base64 绝不能堵事件循环（否则 Web 面板会卡死）。
+            data_url = await asyncio.to_thread(self._load_image_data_url, image_path)
+            if data_url is None:
                 return None
-            with open(image_path, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("utf-8")
-            data_url = f"data:image/jpeg;base64,{b64}"
             return await self.llm.vision_analyze(data_url, prompt, max_tokens)
         except Exception as e:
+            # 上抛临时故障，避免静默丢帧；调用方（visual_track）按 require_complete 决定是否降级
             logger.error(f"Vision 描述失败 ({image_path}): {e}")
+            raise
+
+    @staticmethod
+    def _load_image_data_url(image_path: str) -> Optional[str]:
+        """Read + base64-encode a local image off the event loop."""
+        max_size = 20 * 1024 * 1024  # 20MB
+        file_size = os.path.getsize(image_path)
+        if file_size > max_size:
+            logger.warning(
+                f"图片文件过大，跳过 vision 分析: {image_path} "
+                f"({file_size / 1024 / 1024:.1f}MB > 20MB)"
+            )
             return None
+        with open(image_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode("utf-8")
+        return f"data:image/jpeg;base64,{b64}"
 
     async def generate(
         self, prompt: str, system_prompt: str = "", max_tokens: int = 1024, temperature: float = 0.7
@@ -221,6 +264,7 @@ class VideoUnderstandingService:
 
     def __init__(self, llm_manager, config_loader):
         self.llm_manager = llm_manager
+        self._config_loader = config_loader
         raw = config_loader.get_raw_config() if hasattr(config_loader, "get_raw_config") else {}
         data_dir = config_loader.get("data_dir", "./data") if hasattr(config_loader, "get") else "./data"
         self.cfg = VideoUnderstandingConfig(raw, data_dir)
@@ -252,13 +296,24 @@ class VideoUnderstandingService:
                     self.cfg.asr_model = asr_p.model
                 if asr_p.api_key:
                     self.cfg.asr_api_key = asr_p.api_key
+                # Multi-key pool from LLMProvider when available
+                provider_keys = getattr(asr_p, "api_keys", None) or []
+                if provider_keys:
+                    self.cfg.asr_api_keys = list(provider_keys)
                 if asr_p.base_url:
                     self.cfg.asr_base_url = asr_p.base_url
+                cooldown = getattr(asr_p, "rate_limit_cooldown_seconds", None)
+                if cooldown is not None:
+                    try:
+                        self.cfg.asr_rate_limit_cooldown_seconds = float(cooldown)
+                    except (TypeError, ValueError):
+                        pass
         # local_whisper（property 返回 dict）
+        # 必须双向同步 enabled：只写 True 会导致 Web 关闭后运行时仍启用
         lw = getattr(self.llm_manager, "local_whisper", None)
-        if lw:
-            if lw.get("enabled"):
-                self.cfg.local_whisper_enabled = True
+        if isinstance(lw, dict) and lw:
+            if "enabled" in lw:
+                self.cfg.local_whisper_enabled = bool(lw.get("enabled"))
             if lw.get("model_size"):
                 self.cfg.whisper_model_size = lw["model_size"]
             if lw.get("device"):
@@ -266,10 +321,49 @@ class VideoUnderstandingService:
             if lw.get("compute_type"):
                 self.cfg.whisper_compute_type = lw["compute_type"]
 
+    def reload_config(self, config_loader=None) -> None:
+        """从最新 config 重建 VideoUnderstandingConfig（Web 保存后热生效）。
+
+        保留已创建的线程池与 adapter；仅刷新资源边界 / 抽帧 / ASR 路由覆盖。
+        """
+        if config_loader is not None:
+            self._config_loader = config_loader
+        loader = getattr(self, "_config_loader", None)
+        if loader is None:
+            return
+        raw = loader.get_raw_config() if hasattr(loader, "get_raw_config") else {}
+        data_dir = loader.get("data_dir", "./data") if hasattr(loader, "get") else "./data"
+        old_workers = int(getattr(self.cfg, "max_concurrent_per_account", 1) or 1)
+        self.cfg = VideoUnderstandingConfig(raw, data_dir)
+        self._apply_router_config()
+        # 并发变大时重建线程池；变小则保留（避免中断进行中任务）
+        new_workers = max(2, int(self.cfg.max_concurrent_per_account or 1))
+        if self._executor is not None and new_workers > max(2, old_workers):
+            try:
+                self._executor.shutdown(wait=False, cancel_futures=False)
+            except TypeError:
+                self._executor.shutdown(wait=False)
+            except Exception:
+                pass
+            self._executor = None
+        logger.info(
+            "视频理解配置已热重载: enabled=%s max_keyframes=%s vision_window=%s "
+            "local_whisper=%s rpm=%s",
+            self.cfg.enabled,
+            self.cfg.max_keyframes,
+            self.cfg.vision_window_size,
+            self.cfg.local_whisper_enabled,
+            self.cfg.vision_requests_per_minute,
+        )
+
     def _get_executor(self) -> ThreadPoolExecutor:
-        """获取或创建受控线程执行器（max_workers = max_concurrent_per_account）"""
+        """获取或创建受控线程执行器。
+
+        至少 2 个 worker：视觉抽帧与 ASR 会并行，不能只留 1 个线程，
+        否则会互相排队；也避免把重活挤回默认线程池拖死 Web。
+        """
         if self._executor is None:
-            workers = max(1, self.cfg.max_concurrent_per_account)
+            workers = max(2, int(self.cfg.max_concurrent_per_account or 1))
             self._executor = ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="video-prep"
             )
@@ -439,6 +533,11 @@ class VideoUnderstandingService:
                         vision_requests_per_minute=effective_rpm,
                         vision_prompt=vision_prompt,
                         require_complete=require_complete_visual,
+                        frame_max_retries=cfg.vision_frame_max_retries,
+                        frame_retry_backoff_seconds=cfg.vision_frame_retry_backoff_seconds,
+                        min_success_ratio=cfg.vision_min_success_ratio,
+                        max_keyframes=cfg.max_keyframes,
+                        executor=executor,
                     )
 
                 def _audio_task():
@@ -448,6 +547,10 @@ class VideoUnderstandingService:
                             asr_model=cfg.asr_model,
                             asr_api_key=cfg.asr_api_key,
                             asr_base_url=cfg.asr_base_url,
+                            asr_api_keys=getattr(cfg, "asr_api_keys", None) or None,
+                            rate_limit_cooldown_seconds=getattr(
+                                cfg, "asr_rate_limit_cooldown_seconds", 30.0
+                            ),
                             whisper_model_size=cfg.whisper_model_size,
                             whisper_device=cfg.whisper_device,
                             whisper_compute_type=cfg.whisper_compute_type,
@@ -508,7 +611,8 @@ class VideoUnderstandingService:
                             )
                         visual_events, is_static = await visual_future
                     else:
-                        audio_result = await asyncio.to_thread(_audio_task)
+                        # 用专用线程池跑 ASR，避免占满默认 to_thread 池导致 Web 无响应。
+                        audio_result = await loop.run_in_executor(executor, _audio_task)
                         audio_events = audio_result.events
                         visual_events, is_static = await visual_future
                 except Exception:
@@ -620,32 +724,26 @@ class VideoUnderstandingService:
                     ],
                 }
             except Exception as error:
-                if defer_cleanup:
-                    if isinstance(
-                        error, (ASRTranscriptionError, VisionTrackIncompleteError)
-                    ):
-                        error.work_dir = prep.work_dir
-                    else:
-                        try:
-                            error.work_dir = prep.work_dir
-                        except Exception:
-                            pass
-                    logger.warning(
-                        "视频提取未完成，保留处理目录等待重试: work_dir=%s error=%s",
-                        prep.work_dir,
-                        type(error).__name__,
-                    )
-                else:
-                    # 非归档调用保持原有异常清理策略。
-                    try:
-                        import shutil
-                        shutil.rmtree(prep.work_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                # 失败不再保留 work_dir：重试会重新下载/抽帧，残留只会占满磁盘。
+                # 仍把 work_dir 挂到异常上，方便调用方 finally 做幂等清理。
+                try:
+                    error.work_dir = prep.work_dir
+                except Exception:
+                    pass
+                try:
+                    import shutil
+                    shutil.rmtree(prep.work_dir, ignore_errors=True)
+                except Exception:
+                    pass
+                logger.warning(
+                    "视频提取未完成，已清理处理目录: work_dir=%s error=%s",
+                    prep.work_dir,
+                    type(error).__name__,
+                )
                 raise
             finally:
-                # V6 ingestion retains artifacts until the extracted observation
-                # commits. Other callers keep the existing delayed cleanup behavior.
+                # 成功且 defer_cleanup=True：由调用方在归档提交后再删（避免归档失败丢证据）。
+                # 其它成功路径：延迟清理，便于短时调试。
                 if not defer_cleanup:
                     schedule_cleanup([prep.work_dir], delay_seconds=1800)
 

@@ -1,7 +1,7 @@
 // components/memory/graph-3d-page.js - 3D 记忆图谱页（Golden Time 设计稿）
 const { defineComponent, h, ref, computed, onMounted, onUnmounted, watch, nextTick } = window.Vue;
 import { api } from '../../api.js';
-import { Button, Loading, EmptyState, Icon, HeroPanel } from '../common.js';
+import { Button, Loading, EmptyState, Icon } from '../common.js';
 import { appState, showToast } from '../../state.js';
 
 // 节点类型 → chart 色号映射（与 2D 版一致）
@@ -87,7 +87,8 @@ function compute3DPositions(nodes, layoutType) {
 
 function nodeRadius3D(node) {
     const deg = node.degree || 1;
-    return Math.max(8, Math.min(24, 8 + deg * 1.4));
+    // 略小于旧版（8–24），减少遮挡标签与边
+    return Math.max(6.5, Math.min(20, 6.5 + deg * 1.15));
 }
 
 // 动态加载 Three.js + OrbitControls（本地 vendor 文件）
@@ -112,6 +113,7 @@ export const MemoryGraph3DPage = defineComponent({
         const filterCategory = ref('');
         const searchQuery = ref('');
         const layout = ref('sphere'); // sphere / helix
+        const statsOpen = ref(false); // 统计信息面板（视图设置中切换）
         const canvasRef = ref(null);
         const threeReady = ref(false);
         const threeError = ref('');
@@ -179,8 +181,8 @@ export const MemoryGraph3DPage = defineComponent({
             return Math.max(...nodes.map(n => n.degree || 0));
         });
 
-        // ── 选中节点的关联节点 ──
-        const detailNode = computed(() => selectedNode.value || hoveredNode.value || null);
+        // ── 选中节点详情（侧栏仅跟随选中，不跟 hover，避免拖拽闪烁） ──
+        const detailNode = computed(() => selectedNode.value || null);
 
         const connectedNodes = computed(() => {
             if (!detailNode.value) return [];
@@ -292,6 +294,27 @@ export const MemoryGraph3DPage = defineComponent({
 
         function selectNode(node) {
             selectedNode.value = node;
+        }
+
+        function clearSelection() {
+            selectedNode.value = null;
+        }
+
+        function toggleStats() {
+            statsOpen.value = !statsOpen.value;
+        }
+
+        function onEscapeKey(e) {
+            if (e.key !== 'Escape') return;
+            const tag = (e.target && e.target.tagName) || '';
+            if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target?.isContentEditable) return;
+            if (statsOpen.value) {
+                statsOpen.value = false;
+                return;
+            }
+            if (selectedNode.value) {
+                clearSelection();
+            }
         }
 
         const layoutOptions = [
@@ -408,24 +431,93 @@ export const MemoryGraph3DPage = defineComponent({
             const nodeMeshes = [];
             const disposables = []; // { dispose } 资源
             let hoveredMesh = null;
+            let pointerDownPos = null;
+            let pointerDragged = false;
+            const DRAG_THRESHOLD = 4;
 
-            // ── 标签 Sprite ──
+            // 统一 mesh 视觉：hover > selected > base
+            function applyMeshVisual(mesh) {
+                if (!mesh || !mesh.material) return;
+                const isHovered = mesh === hoveredMesh;
+                const isSelected = selectedNode.value
+                    && mesh.userData
+                    && mesh.userData.id === selectedNode.value.id;
+                if (isHovered) {
+                    mesh.scale.set(1.35, 1.35, 1.35);
+                    mesh.material.emissiveIntensity = 0.65;
+                } else if (isSelected) {
+                    mesh.scale.set(1.22, 1.22, 1.22);
+                    mesh.material.emissiveIntensity = 0.5;
+                } else {
+                    mesh.scale.set(1, 1, 1);
+                    mesh.material.emissiveIntensity = 0.3;
+                }
+            }
+
+            function refreshSelectionVisuals() {
+                nodeMeshes.forEach(applyMeshVisual);
+            }
+
+            // ── 标签 Sprite（深色字 + 半透明底托，避免与浅色画布/节点糊成一团） ──
             function createLabel(text, colorIdx) {
                 const cv = document.createElement('canvas');
-                cv.width = 256;
-                cv.height = 64;
+                cv.width = 320;
+                cv.height = 72;
                 const ctx = cv.getContext('2d');
-                ctx.font = '600 26px Fraunces, ui-serif, serif';
-                const hsl = getChartHsl(colorIdx);
-                ctx.fillStyle = `hsl(${hsl})`;
-                ctx.textAlign = 'center';
+                const font = '600 26px Fraunces, ui-serif, Georgia, serif';
+                ctx.font = font;
+                const metrics = ctx.measureText(text);
+                const textW = Math.min(metrics.width, 280);
+                const padX = 18;
+                const padY = 10;
+                const pillW = textW + padX * 2 + 14; // 预留左侧色点
+                const pillH = 40;
+                const pillX = (cv.width - pillW) / 2;
+                const pillY = (cv.height - pillH) / 2;
+                const radius = 12;
+
+                // 底托：高不透明浅底 + 描边，确保亮/暗主题下都可读
+                ctx.beginPath();
+                const r = radius;
+                const x = pillX, y = pillY, w = pillW, h = pillH;
+                ctx.moveTo(x + r, y);
+                ctx.arcTo(x + w, y, x + w, y + h, r);
+                ctx.arcTo(x + w, y + h, x, y + h, r);
+                ctx.arcTo(x, y + h, x, y, r);
+                ctx.arcTo(x, y, x + w, y, r);
+                ctx.closePath();
+                ctx.fillStyle = 'hsla(40, 16%, 98%, 0.94)';
+                ctx.fill();
+                ctx.strokeStyle = 'hsla(37, 16%, 20%, 0.18)';
+                ctx.lineWidth = 1.5;
+                ctx.stroke();
+
+                // 类型色点
+                const chartHsl = getChartHsl(colorIdx) || '55 20% 50%';
+                const dotR = 5;
+                const dotCx = pillX + padX;
+                const dotCy = pillY + pillH / 2;
+                ctx.beginPath();
+                ctx.arc(dotCx, dotCy, dotR, 0, Math.PI * 2);
+                ctx.fillStyle = `hsl(${chartHsl})`;
+                ctx.fill();
+                ctx.strokeStyle = 'hsla(37, 16%, 20%, 0.25)';
+                ctx.lineWidth = 1;
+                ctx.stroke();
+
+                // 正文：固定深色，不随 chart 浅色变化
+                ctx.font = font;
+                ctx.fillStyle = 'hsl(37.5 15.7% 18%)';
+                ctx.textAlign = 'left';
                 ctx.textBaseline = 'middle';
-                ctx.fillText(text, 128, 32);
+                ctx.fillText(text, pillX + padX + 14, pillY + pillH / 2, 280);
+
                 const texture = new THREE.CanvasTexture(cv);
                 texture.minFilter = THREE.LinearFilter;
                 const material = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
                 const sprite = new THREE.Sprite(material);
-                sprite.scale.set(60, 15, 1);
+                // 略放大，配合更高分辨率 canvas
+                sprite.scale.set(72, 16, 1);
                 disposables.push(texture, material);
                 return sprite;
             }
@@ -500,7 +592,7 @@ export const MemoryGraph3DPage = defineComponent({
 
                     // hub 节点 halo
                     if (i === 0 || (node.degree || 0) > 5) {
-                        const haloGeo = new THREE.SphereGeometry(radius + 6, 32, 32);
+                        const haloGeo = new THREE.SphereGeometry(radius + 5, 32, 32);
                         const haloMat = new THREE.MeshBasicMaterial({
                             color: color,
                             transparent: true,
@@ -519,6 +611,18 @@ export const MemoryGraph3DPage = defineComponent({
                     label.position.set(node.x, node.y + radius + 8, node.z);
                     nodeGroup.add(label);
                 });
+
+                // 场景重建后：选中节点若已不在可见列表则清空，否则重应用高亮
+                if (selectedNode.value) {
+                    const stillVisible = nodeMeshes.some(
+                        m => m.userData && m.userData.id === selectedNode.value.id
+                    );
+                    if (!stillVisible) {
+                        selectedNode.value = null;
+                    } else {
+                        refreshSelectionVisuals();
+                    }
+                }
             }
 
             updateScene();
@@ -528,7 +632,19 @@ export const MemoryGraph3DPage = defineComponent({
             const raycaster = new THREE.Raycaster();
             const mouse = new THREE.Vector2();
 
+            function onPointerDown(e) {
+                pointerDownPos = { x: e.clientX, y: e.clientY };
+                pointerDragged = false;
+            }
+
             function onPointerMove(e) {
+                if (pointerDownPos) {
+                    const dx = e.clientX - pointerDownPos.x;
+                    const dy = e.clientY - pointerDownPos.y;
+                    if ((dx * dx + dy * dy) > (DRAG_THRESHOLD * DRAG_THRESHOLD)) {
+                        pointerDragged = true;
+                    }
+                }
                 const rect = renderer.domElement.getBoundingClientRect();
                 mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
                 mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -538,21 +654,18 @@ export const MemoryGraph3DPage = defineComponent({
                     const hit = intersects[0].object;
                     const node = hit.userData;
                     if (hoveredMesh !== hit) {
-                        if (hoveredMesh) {
-                            hoveredMesh.scale.set(1, 1, 1);
-                            hoveredMesh.material.emissiveIntensity = 0.3;
-                        }
+                        const prev = hoveredMesh;
                         hoveredMesh = hit;
-                        hoveredMesh.scale.set(1.35, 1.35, 1.35);
-                        hoveredMesh.material.emissiveIntensity = 0.65;
+                        if (prev) applyMeshVisual(prev);
+                        applyMeshVisual(hoveredMesh);
                     }
                     hoveredNode.value = node;
                     renderer.domElement.style.cursor = 'pointer';
                 } else {
                     if (hoveredMesh) {
-                        hoveredMesh.scale.set(1, 1, 1);
-                        hoveredMesh.material.emissiveIntensity = 0.3;
+                        const prev = hoveredMesh;
                         hoveredMesh = null;
+                        applyMeshVisual(prev);
                     }
                     hoveredNode.value = null;
                     renderer.domElement.style.cursor = 'grab';
@@ -560,16 +673,24 @@ export const MemoryGraph3DPage = defineComponent({
             }
 
             function onPointerLeave() {
+                pointerDownPos = null;
                 if (hoveredMesh) {
-                    hoveredMesh.scale.set(1, 1, 1);
-                    hoveredMesh.material.emissiveIntensity = 0.3;
+                    const prev = hoveredMesh;
                     hoveredMesh = null;
+                    applyMeshVisual(prev);
                 }
                 hoveredNode.value = null;
                 renderer.domElement.style.cursor = 'grab';
             }
 
             function onClick(e) {
+                // 拖拽旋转后的 click 不改选中
+                if (pointerDragged) {
+                    pointerDragged = false;
+                    pointerDownPos = null;
+                    return;
+                }
+                pointerDownPos = null;
                 const rect = renderer.domElement.getBoundingClientRect();
                 mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
                 mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
@@ -577,7 +698,10 @@ export const MemoryGraph3DPage = defineComponent({
                 const intersects = raycaster.intersectObjects(nodeMeshes);
                 if (intersects.length > 0) {
                     selectedNode.value = intersects[0].object.userData;
+                } else {
+                    selectedNode.value = null;
                 }
+                refreshSelectionVisuals();
             }
 
             function onResize() {
@@ -588,6 +712,7 @@ export const MemoryGraph3DPage = defineComponent({
                 renderer.setSize(nw, nh);
             }
 
+            renderer.domElement.addEventListener('pointerdown', onPointerDown);
             renderer.domElement.addEventListener('pointermove', onPointerMove);
             renderer.domElement.addEventListener('pointerleave', onPointerLeave);
             renderer.domElement.addEventListener('click', onClick);
@@ -610,7 +735,8 @@ export const MemoryGraph3DPage = defineComponent({
                 THREE, OrbitControls, scene, camera, renderer, controls,
                 container,
                 nodeMeshes, nodeGroup, edgeGroup, disposables, updateScene,
-                listeners: { onPointerMove, onPointerLeave, onClick, onResize, onControlsStart },
+                refreshSelectionVisuals,
+                listeners: { onPointerDown, onPointerMove, onPointerLeave, onClick, onResize, onControlsStart },
                 autoRotateTimer, animationId,
             };
 
@@ -620,6 +746,7 @@ export const MemoryGraph3DPage = defineComponent({
                 if (animationId) cancelAnimationFrame(animationId);
 
                 controls.removeEventListener('start', onControlsStart);
+                renderer.domElement.removeEventListener('pointerdown', onPointerDown);
                 renderer.domElement.removeEventListener('pointermove', onPointerMove);
                 renderer.domElement.removeEventListener('pointerleave', onPointerLeave);
                 renderer.domElement.removeEventListener('click', onClick);
@@ -652,17 +779,20 @@ export const MemoryGraph3DPage = defineComponent({
 
         onMounted(async () => {
             mounted = true;
+            document.addEventListener('keydown', onEscapeKey);
             await loadData();
         });
 
         onUnmounted(() => {
             mounted = false;
+            document.removeEventListener('keydown', onEscapeKey);
             destroyThree();
         });
 
         // 筛选/布局变化时更新场景
         watch([filteredNodes, filteredEdges, layout], async () => {
             if (filteredNodes.value.length === 0) {
+                selectedNode.value = null;
                 destroyThree();
                 return;
             }
@@ -675,9 +805,216 @@ export const MemoryGraph3DPage = defineComponent({
             }
         });
 
+        // 选中变化时刷新 3D 高亮
+        watch(selectedNode, () => {
+            threeCtx?.refreshSelectionVisuals?.();
+        });
+
+        // 注意：不要在 statsOpen 时调用 resize。
+        // 统计改为画布浮层后布局尺寸不变；误触发 setSize 会让节点看起来突然放大。
+
         watch(() => appState.currentAccountId, (newId) => {
             if (newId) loadData();
         });
+
+        function renderNodeDetail(node) {
+            if (!node) return null;
+            const colorIdx = TYPE_COLOR_INDEX[node.type] || 2;
+            return h('div', { class: 'memory-node-sidebar-body' }, [
+                // 分类标签
+                h('div', {
+                    class: 'inline-flex items-center gap-2 w-fit',
+                    style: `padding: calc(var(--spacing) * 1.2) calc(var(--spacing) * 2.5); border-radius: 999px; background: hsl(var(--chart-${colorIdx}) / 0.18); border: 1px solid hsl(var(--chart-${colorIdx}) / 0.35);`,
+                }, [
+                    h('span', {
+                        style: `width: 0.7rem; height: 0.7rem; border-radius: 999px; background: hsl(var(--chart-${colorIdx}));`,
+                    }),
+                    h('span', { style: 'font-size: 0.88rem; font-weight: 500;' },
+                        TYPE_LABELS[node.type] || node.type || '未分类'),
+                ]),
+                // 节点名称
+                h('h3', {
+                    class: 'm-0',
+                    style: 'font-size: 1.15rem; line-height: 1.3; word-break: break-all;',
+                }, node.label || String(node.id)),
+                // 记忆详情（仅 event 节点）
+                selectedMemory.value
+                    ? h('p', {
+                        class: 'm-0',
+                        style: 'line-height: 1.6; font-size: 0.95rem; color: hsl(var(--foreground));',
+                    }, selectedMemory.value.content || selectedMemory.value.summary || '-')
+                    : null,
+                // 数据行
+                h('div', {
+                    class: 'grid gap-2',
+                    style: 'grid-template-columns: 1fr 1fr 1fr; padding: calc(var(--spacing) * 3) 0; border-top: 1px solid hsl(var(--border)); border-bottom: 1px solid hsl(var(--border));',
+                }, [
+                    h('div', { class: 'grid gap-1' }, [
+                        h('span', { class: 'muted', style: 'font-size: 0.78rem;' }, '节点类型'),
+                        h('span', { style: 'font-size: 0.95rem; font-weight: 500;' },
+                            TYPE_LABELS[node.type] || node.type || '-'),
+                    ]),
+                    h('div', { class: 'grid gap-1' }, [
+                        h('span', { class: 'muted', style: 'font-size: 0.78rem;' }, '关联数'),
+                        h('span', { style: 'font-size: 0.95rem; font-weight: 500;' },
+                            String(node.degree || 0)),
+                    ]),
+                    h('div', { class: 'grid gap-1' }, [
+                        h('span', { class: 'muted', style: 'font-size: 0.78rem;' }, '权重'),
+                        h('span', { style: 'font-size: 0.95rem; font-weight: 500;' },
+                            (node.weight || 0).toFixed(2)),
+                    ]),
+                ]),
+                // 关联节点
+                h('div', { class: 'grid gap-2' }, [
+                    h('span', { class: 'eyebrow' }, '关联节点'),
+                    connectedNodes.value.length === 0
+                        ? h('p', { class: 'muted m-0', style: 'font-size: 0.92rem;' }, '无关联节点')
+                        : h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' },
+                            connectedNodes.value.slice(0, 12).map(n => h(Button, {
+                                key: `cn-${n.id}`,
+                                type: 'ghost',
+                                size: 'sm',
+                                ariaLabel: `${RELATION_LABELS[n.relation_type] || n.relation_type}: ${n.label || n.id}`,
+                                onClick: () => selectNode(n),
+                            }, () => [
+                                h('span', {
+                                    style: `display:inline-block; width:0.6rem; height:0.6rem; border-radius:999px; background: hsl(var(--chart-${TYPE_COLOR_INDEX[n.type] || 2}));`,
+                                }),
+                                `${(n.label || String(n.id)).slice(0, 12)} · ${RELATION_LABELS[n.relation_type] || n.relation_type}`,
+                            ]))
+                        ),
+                ]),
+            ]);
+        }
+
+        function renderNodeSidebar() {
+            const node = selectedNode.value;
+            if (!node) return null;
+            return h('aside', {
+                class: 'memory-node-sidebar',
+                'data-open': 'true',
+                role: 'complementary',
+                'aria-label': '节点详情',
+                onClick: (e) => e.stopPropagation(),
+            }, [
+                h('div', { class: 'memory-node-sidebar-header' }, [
+                    h('div', { class: 'grid gap-1 min-w-0' }, [
+                        h('span', { class: 'eyebrow' }, '节点详情'),
+                        h('h2', {
+                            class: 'm-0',
+                            style: 'font-size: 1.15rem; line-height: 1.15; word-break: break-all;',
+                        }, '选中节点'),
+                    ]),
+                    h('button', {
+                        type: 'button',
+                        class: 'modal-close',
+                        'aria-label': '关闭节点详情',
+                        onClick: clearSelection,
+                    }, '×'),
+                ]),
+                renderNodeDetail(node),
+            ]);
+        }
+
+        function renderStatsPanel() {
+            // 浮层挂在画布左上角：不改变左右栏布局，不触发 3D resize，不挡拖拽（仅面板自身可点）
+            return h('aside', {
+                class: 'memory-graph-stats-float',
+                'data-open': statsOpen.value ? 'true' : 'false',
+                role: 'complementary',
+                'aria-label': '图谱统计信息',
+                onClick: (e) => e.stopPropagation(),
+                onPointerdown: (e) => e.stopPropagation(),
+                onWheel: (e) => e.stopPropagation(),
+            }, [
+                h('div', { class: 'memory-node-sidebar-header' }, [
+                    h('div', { class: 'grid gap-1 min-w-0' }, [
+                        h('span', { class: 'eyebrow' }, '图谱分析'),
+                        h('div', {
+                            class: 'm-0',
+                            style: 'font-size: 1rem; font-weight: 600; line-height: 1.2;',
+                        }, '统计信息'),
+                    ]),
+                    h('button', {
+                        type: 'button',
+                        class: 'modal-close',
+                        'aria-label': '关闭统计信息',
+                        onClick: () => { statsOpen.value = false; },
+                    }, '×'),
+                ]),
+                h('div', { class: 'memory-graph-stats-float-body' }, [
+                    h('div', { class: 'grid gap-0', style: 'min-width: 0;' },
+                        (categoryStats.value.length === 0
+                            ? [h('p', { class: 'muted m-0', style: 'font-size: 0.88rem;' }, '暂无分类数据')]
+                            : categoryStats.value.map(cat => h('div', {
+                                key: cat.key,
+                                class: 'memory-graph-stats-row',
+                                style: filterCategory.value === cat.key
+                                    ? 'background: hsl(var(--accent) / 0.12);'
+                                    : '',
+                                onClick: () => filterByCategory(cat.key),
+                            }, [
+                                h('div', { class: 'memory-graph-stats-row-main' }, [
+                                    h('span', {
+                                        style: `width: 0.7rem; height: 0.7rem; margin-top: 0.28rem; border-radius: 999px; background: hsl(var(--chart-${cat.colorIndex})); flex: 0 0 auto;`,
+                                    }),
+                                    h('span', { class: 'memory-graph-stats-row-label' }, cat.label),
+                                ]),
+                                h('div', { class: 'memory-graph-stats-row-meta' }, [
+                                    h('span', { style: 'font-size: 0.95rem; font-weight: 600;' }, String(cat.count)),
+                                    h('span', {
+                                        style: 'color: hsl(var(--accent-foreground)); font-size: 0.78rem; font-weight: 500;',
+                                    }, `${cat.percent}%`),
+                                ]),
+                            ]))
+                        ),
+                    ),
+                    h('div', { class: 'grid gap-2', style: 'min-width: 0;' }, [
+                        h('span', { class: 'eyebrow' }, '关系类型'),
+                        relationStats.value.length
+                            ? h('div', {
+                                class: 'flex gap-2',
+                                style: 'flex-wrap: wrap; min-width: 0;',
+                            }, relationStats.value.map(relation =>
+                                h('span', {
+                                    key: relation.key,
+                                    class: 'badge badge-info',
+                                    style: 'white-space: normal; overflow-wrap: anywhere; max-width: 100%;',
+                                }, `${relation.label} ${relation.count}`)
+                            ))
+                            : h('p', { class: 'muted m-0', style: 'font-size: .88rem;' }, '暂无关系数据'),
+                    ]),
+                    h('div', {
+                        class: 'grid gap-2',
+                        style: 'padding: calc(var(--spacing) * 2); background: hsl(var(--muted) / 0.3); border-radius: calc(var(--radius) * 0.76); border: 1px solid hsl(var(--border)); min-width: 0;',
+                    }, [
+                        h('span', { class: 'eyebrow' }, '图谱统计'),
+                        h('div', {
+                            class: 'grid gap-2',
+                            style: 'grid-template-columns: 1fr 1fr; min-width: 0;',
+                        }, [
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'muted', style: 'font-size: 0.75rem;' }, '总节点数'),
+                                h('span', { style: 'font-size: 1.1rem; font-weight: 600;' }, String(nodeCount.value)),
+                            ]),
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'muted', style: 'font-size: 0.75rem;' }, '总边数'),
+                                h('span', { style: 'font-size: 1.1rem; font-weight: 600;' }, String(edgeCount.value)),
+                            ]),
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'muted', style: 'font-size: 0.75rem;' }, '平均度数'),
+                                h('span', { style: 'font-size: 1.1rem; font-weight: 600;' }, avgDegree.value),
+                            ]),
+                            h('div', { class: 'grid gap-1' }, [
+                                h('span', { class: 'muted', style: 'font-size: 0.75rem;' }, '最大度数'),
+                                h('span', { style: 'font-size: 1.1rem; font-weight: 600;' }, String(maxDegree.value)),
+                            ]),
+                        ]),
+                    ]),
+                ]),
+            ]);
+        }
 
         return () => {
             // 无账号
@@ -697,126 +1034,101 @@ export const MemoryGraph3DPage = defineComponent({
 
             const hasGraph = filteredNodes.value.length > 0;
             const memoryCount = totalCounts.value.memories || (graphData.value.memories || []).length;
-            const heroTitle = `${memoryCount.toLocaleString()} 个经历 · ${nodeCount.value.toLocaleString()} 个节点 · ${edgeCount.value.toLocaleString()} 条关系`;
+            const toolbarMeta = `${memoryCount.toLocaleString()} 经历 · ${filteredNodes.value.length}/${nodeCount.value} 节点 · ${edgeCount.value.toLocaleString()} 关系`;
 
-            return h('div', { class: 'view-frame' }, [
-                // ═══════ Section 1: hero-band — 统计面板 + 图谱控制 ═══════
-                h('section', {
-                    class: 'grid gap-3',
-                    style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));',
+            return h('div', { class: 'memory-graph-page' }, [
+                // ═══════ 左侧：视图设置 ═══════
+                h('aside', {
+                    class: 'memory-graph-sidebar',
+                    'aria-label': '视图设置',
+                    // 统计展开后 wheel 只滚左侧，避免冒泡导致页面/3D 抢滚动
+                    onWheel: (e) => e.stopPropagation(),
                 }, [
-                    // 左：统计面板（hero-panel accent 背景）
-                    h(HeroPanel, {
-                        eyebrow: '记忆图谱 3D',
-                        title: heroTitle,
-                        badge: '3D 视图',
-                        badgeType: 'info',
-                    }, () => h('div', {
-                        class: 'flex items-baseline gap-2 flex-wrap',
-                    }, [
-                        h('span', {
-                            style: 'font-size: 2.4rem; line-height: 1; font-weight: 700; color: hsl(var(--accent-foreground));',
-                        }, nodeCount.value.toLocaleString()),
-                        h('span', {
-                            class: 'muted',
-                            style: 'font-size: 0.92rem;',
-                        }, `个真实节点 · ${edgeCount.value.toLocaleString()} 条关系`),
-                    ])),
-
-                    // 右：图谱控制面板
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
-                    }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '图谱控制'),
-                            h('h2', {
-                                class: 'm-0',
-                                style: 'font-size: 1.35rem; line-height: 1.08;',
-                            }, '视图设置'),
-                        ]),
-                        // 分类筛选
-                        h('div', { class: 'flex items-center gap-2', style: 'flex-wrap: wrap;' }, [
-                            h(Button, {
-                                type: 'ghost',
-                                onClick: () => filterCategory.value = '',
-                            }, () => [
-                                h(Icon, { name: 'tag', size: '0.9rem' }),
-                                filterCategory.value ? (TYPE_LABELS[filterCategory.value] || filterCategory.value) : '全部分类',
-                                h(Icon, { name: 'chevron-down', size: '0.75rem' }),
-                            ]),
-                        ]),
-                        // 布局切换
+                    h('div', { class: 'memory-graph-toolbar-title' }, [
+                        h('span', { class: 'eyebrow' }, '记忆图谱 · 可旋转视图'),
+                        h('h1', '3D 关系图谱'),
+                        h('div', { class: 'memory-graph-toolbar-meta' }, toolbarMeta),
+                    ]),
+                    // 布局
+                    h('div', { class: 'memory-graph-sidebar-section' }, [
+                        h('span', { class: 'memory-graph-sidebar-label' }, '布局'),
                         h('div', {
-                            class: 'inline-flex',
-                            style: 'border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.76); overflow: hidden;',
+                            class: 'memory-graph-seg',
+                            role: 'group',
+                            'aria-label': '布局',
                         }, layoutOptions.map(opt => h('button', {
                             key: opt.key,
                             type: 'button',
-                            class: 'btn',
-                            style: `min-height: 2.5rem; padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 3); font-size: 0.88rem; border: 0; border-radius: 0; box-shadow: none; ${
-                                layout.value === opt.key
-                                    ? 'background: hsl(var(--primary)); color: hsl(var(--primary-foreground));'
-                                    : 'background: transparent; color: hsl(var(--accent-foreground));'
-                            }${opt.key !== 'sphere' ? ' border-left: 1px solid hsl(var(--border));' : ''}`,
-                            onClick: () => layout.value = opt.key,
+                            'data-active': layout.value === opt.key ? 'true' : 'false',
+                            onClick: () => { layout.value = opt.key; },
                         }, opt.label))),
-                        // 搜索框
+                    ]),
+                    // 视图设置：统计信息开关
+                    h('div', { class: 'memory-graph-sidebar-section' }, [
+                        h('span', { class: 'memory-graph-sidebar-label' }, '视图设置'),
+                        h('div', {
+                            class: 'memory-graph-seg',
+                            role: 'group',
+                            'aria-label': '统计信息',
+                        }, [
+                            h('button', {
+                                type: 'button',
+                                'data-active': statsOpen.value ? 'true' : 'false',
+                                'aria-pressed': statsOpen.value ? 'true' : 'false',
+                                onClick: toggleStats,
+                            }, statsOpen.value ? '关闭统计' : '统计信息'),
+                        ]),
+                    ]),
+                    // 搜索
+                    h('div', { class: 'memory-graph-sidebar-section' }, [
+                        h('span', { class: 'memory-graph-sidebar-label' }, '搜索'),
                         h('label', {
-                            class: 'field-wrap',
-                            style: 'width: 100%; min-width: 0;',
+                            class: 'field-wrap memory-graph-search',
                             'aria-label': '搜索节点',
                         }, [
                             h(Icon, { name: 'funnel', size: '1.05rem' }),
                             h('input', {
                                 class: 'field',
                                 type: 'text',
-                                placeholder: '搜索节点名称...',
+                                placeholder: '搜索节点...',
                                 value: searchQuery.value,
-                                onInput: (e) => searchQuery.value = e.target.value,
+                                onInput: (e) => { searchQuery.value = e.target.value; },
                                 onKeyup: (e) => { if (e.key === 'Enter') searchGraph(); },
                             }),
                         ]),
-                        h('p', {
-                            class: 'muted m-0',
-                            style: 'font-size: 0.82rem; line-height: 1.5;',
-                        }, `${(graphData.value.summary?.relation_breakdown?.mentions || 0)} 条实体引用`),
+                    ]),
+                    // 筛选操作
+                    h('div', { class: 'memory-graph-sidebar-actions' }, [
+                        filterCategory.value
+                            ? h(Button, {
+                                type: 'ghost',
+                                size: 'sm',
+                                onClick: () => { filterCategory.value = ''; },
+                            }, () => [
+                                h(Icon, { name: 'tag', size: '0.85rem' }),
+                                TYPE_LABELS[filterCategory.value] || filterCategory.value,
+                                ' ×',
+                            ])
+                            : null,
+                        (filterCategory.value || searchQuery.value)
+                            ? h(Button, {
+                                size: 'sm',
+                                type: 'ghost',
+                                onClick: clearFilters,
+                            }, () => '清除筛选')
+                            : null,
                     ]),
                 ]),
 
-                // ═══════ Section 2: Three.js 3D 画布 ═══════
-                h('section', {}, [
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'padding: calc(var(--spacing) * 2) 0 0;',
-                    }, [
-                        // 面板头
-                        h('div', {
-                            class: 'flex items-end justify-between gap-3',
-                            style: 'flex-wrap: wrap;',
-                        }, [
-                            h('div', { class: 'grid gap-1 min-w-0' }, [
-                                h('span', { class: 'eyebrow' }, '3D 关系图谱'),
-                                h('h2', {
-                                    class: 'm-0',
-                                    style: 'font-size: 1.35rem; line-height: 1.08;',
-                                }, '可旋转视图'),
-                            ]),
-                            h('div', { class: 'flex items-center gap-2', style: 'flex-wrap: wrap;' }, [
-                                h('span', {
-                                    style: 'font-size: 0.88rem; color: hsl(var(--muted-foreground));',
-                                }, `显示 ${filteredNodes.value.length} / ${nodeCount.value} 节点`),
-                                ...(filterCategory.value || searchQuery.value
-                                    ? [h(Button, { size: 'sm', type: 'ghost', onClick: clearFilters }, () => '清除筛选')]
-                                    : []),
-                            ]),
-                        ]),
-                        // 3D 画布容器 / 空状态
-                        hasGraph
-                            ? h('div', {
+                // ═══════ 右侧：整页 3D 画布 ═══════
+                h('div', { class: 'memory-graph-stage' }, [
+                    hasGraph
+                        ? h('div', { class: 'memory-graph-canvas' }, [
+                            h('div', {
                                 ref: canvasRef,
-                                class: 'memory-graph-canvas',
-                            }, threeError.value
+                                class: 'memory-graph-three-host',
+                            }),
+                            threeError.value
                                 ? h('div', { class: 'memory-graph-overlay', role: 'alert' }, [
                                     h(EmptyState, {
                                         icon: 'triangle-alert',
@@ -828,194 +1140,26 @@ export const MemoryGraph3DPage = defineComponent({
                                 ])
                                 : !threeReady.value
                                     ? h('div', { class: 'memory-graph-overlay muted' }, '正在加载 3D 场景...')
-                                    : null)
-                            : h('div', {
-                                class: 'grid',
-                                style: 'padding: calc(var(--spacing) * 6) 0; justify-items: center; border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82);',
-                            }, [h(EmptyState, {
-                                icon: loadError.value ? 'triangle-alert' : 'folder',
-                                title: loadError.value ? '图谱加载失败' : '暂无图谱数据',
-                                desc: loadError.value || ((filterCategory.value || searchQuery.value)
-                                    ? '当前筛选条件下无匹配节点。'
-                                    : '记忆库中还没有可显示的事件或实体。'),
-                            }, loadError.value ? {
-                                default: () => h(Button, { type: 'ghost', size: 'sm', onClick: loadData }, () => '重新加载'),
-                            } : undefined)]),
-                    ]),
-                ]),
-
-                // ═══════ Section 3: split grid — 分类图例/统计 + 选中节点详情 ═══════
-                h('section', {
-                    class: 'grid gap-3',
-                    style: 'grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr));',
-                }, [
-                    // 左：分类图例 + 图谱统计
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
-                    }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '图谱分析'),
-                            h('h2', {
-                                class: 'm-0',
-                                style: 'font-size: 1.35rem; line-height: 1.08;',
-                            }, '统计信息'),
-                        ]),
-                        // 分类图例
-                        h('div', { class: 'grid gap-0' },
-                            (categoryStats.value.length === 0
-                                ? [h('p', { class: 'muted m-0', style: 'font-size: 0.92rem;' }, '暂无分类数据')]
-                                : categoryStats.value.map(cat => h('div', {
-                                    key: cat.key,
-                                    class: 'flex items-center justify-between gap-2',
-                                    style: `padding: calc(var(--spacing) * 2.2) calc(var(--spacing) * 1.5); border-bottom: 1px solid hsl(var(--border)); cursor: pointer; border-radius: calc(var(--radius) * 0.3);${filterCategory.value === cat.key ? ' background: hsl(var(--accent) / 0.12);' : ''}`,
-                                    onClick: () => filterByCategory(cat.key),
-                                }, [
-                                    h('div', { class: 'flex items-center gap-2' }, [
-                                        h('span', {
-                                            style: `width: 0.85rem; height: 0.85rem; border-radius: 999px; background: hsl(var(--chart-${cat.colorIndex})); flex: 0 0 auto;`,
-                                        }),
-                                        h('span', { style: 'font-size: 0.98rem;' }, cat.label),
-                                    ]),
-                                    h('div', { class: 'flex items-baseline gap-1' }, [
-                                        h('span', { style: 'font-size: 1.1rem; font-weight: 600;' }, String(cat.count)),
-                                        h('span', { class: 'muted', style: 'font-size: 0.85rem;' }, '节点'),
-                                        h('span', { style: 'color: hsl(var(--muted-foreground)); font-size: 0.85rem;' }, '·'),
-                                        h('span', {
-                                            style: 'color: hsl(var(--accent-foreground)); font-size: 0.88rem; font-weight: 500;',
-                                        }, `${cat.percent}%`),
-                                    ]),
-                                ]))
-                            ),
-                        ),
-                        h('div', { class: 'grid gap-2' }, [
-                            h('span', { class: 'eyebrow' }, '关系类型'),
-                            relationStats.value.length
-                                ? h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' }, relationStats.value.map(relation =>
-                                    h('span', { key: relation.key, class: 'badge badge-info' }, `${relation.label} ${relation.count}`)
-                                ))
-                                : h('p', { class: 'muted m-0', style: 'font-size: .92rem;' }, '暂无关系数据'),
-                        ]),
-                        // 图谱统计
-                        h('div', {
-                            class: 'grid gap-2',
-                            style: 'padding: calc(var(--spacing) * 3); background: hsl(var(--muted) / 0.3); border-radius: calc(var(--radius) * 0.76); border: 1px solid hsl(var(--border));',
-                        }, [
-                            h('span', { class: 'eyebrow' }, '图谱统计'),
-                            h('div', {
-                                class: 'grid gap-2',
-                                style: 'grid-template-columns: 1fr 1fr;',
-                            }, [
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', { class: 'muted', style: 'font-size: 0.82rem;' }, '总节点数'),
-                                    h('span', { style: 'font-size: 1.4rem; font-weight: 600;' }, String(nodeCount.value)),
-                                ]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', { class: 'muted', style: 'font-size: 0.82rem;' }, '总边数'),
-                                    h('span', { style: 'font-size: 1.4rem; font-weight: 600;' }, String(edgeCount.value)),
-                                ]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', { class: 'muted', style: 'font-size: 0.82rem;' }, '平均度数'),
-                                    h('span', { style: 'font-size: 1.4rem; font-weight: 600;' }, avgDegree.value),
-                                ]),
-                                h('div', { class: 'grid gap-1' }, [
-                                    h('span', { class: 'muted', style: 'font-size: 0.82rem;' }, '最大度数'),
-                                    h('span', { style: 'font-size: 1.4rem; font-weight: 600;' }, String(maxDegree.value)),
-                                ]),
-                            ]),
-                        ]),
-                    ]),
-
-                    // 右：选中/悬停节点详情
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
-                    }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '节点详情'),
-                            h('h2', {
-                                class: 'm-0',
-                                style: 'font-size: 1.35rem; line-height: 1.08;',
-                            }, selectedNode.value ? '选中节点' : (hoveredNode.value ? '悬停节点' : '选中节点')),
-                        ]),
-                        (detailNode.value
-                            ? (() => {
-                                const node = detailNode.value;
-                                const colorIdx = TYPE_COLOR_INDEX[node.type] || 2;
-                                return h('div', { class: 'grid gap-3' }, [
-                                    // 分类标签
-                                    h('div', {
-                                        class: 'inline-flex items-center gap-2 w-fit',
-                                        style: `padding: calc(var(--spacing) * 1.2) calc(var(--spacing) * 2.5); border-radius: 999px; background: hsl(var(--chart-${colorIdx}) / 0.18); border: 1px solid hsl(var(--chart-${colorIdx}) / 0.35);`,
-                                    }, [
-                                        h('span', {
-                                            style: `width: 0.7rem; height: 0.7rem; border-radius: 999px; background: hsl(var(--chart-${colorIdx}));`,
-                                        }),
-                                        h('span', { style: 'font-size: 0.88rem; font-weight: 500;' },
-                                            TYPE_LABELS[node.type] || node.type || '未分类'),
-                                    ]),
-                                    // 节点名称
-                                    h('h3', {
-                                        class: 'm-0',
-                                        style: 'font-size: 1.15rem; line-height: 1.3; word-break: break-all;',
-                                    }, node.label || String(node.id)),
-                                    // 记忆详情（仅 summary 节点）
-                                    selectedMemory.value
-                                        ? h('p', {
-                                            class: 'm-0',
-                                            style: 'line-height: 1.6; font-size: 0.95rem; color: hsl(var(--foreground));',
-                                        }, selectedMemory.value.content || selectedMemory.value.summary || '-')
-                                        : null,
-                                    // 数据行
-                                    h('div', {
-                                        class: 'grid gap-2',
-                                        style: 'grid-template-columns: 1fr 1fr 1fr; padding: calc(var(--spacing) * 3) 0; border-top: 1px solid hsl(var(--border)); border-bottom: 1px solid hsl(var(--border));',
-                                    }, [
-                                        h('div', { class: 'grid gap-1' }, [
-                                            h('span', { class: 'muted', style: 'font-size: 0.78rem;' }, '节点类型'),
-                                            h('span', { style: 'font-size: 0.95rem; font-weight: 500;' },
-                                                TYPE_LABELS[node.type] || node.type || '-'),
-                                        ]),
-                                        h('div', { class: 'grid gap-1' }, [
-                                            h('span', { class: 'muted', style: 'font-size: 0.78rem;' }, '关联数'),
-                                            h('span', { style: 'font-size: 0.95rem; font-weight: 500;' },
-                                                String(node.degree || 0)),
-                                        ]),
-                                        h('div', { class: 'grid gap-1' }, [
-                                            h('span', { class: 'muted', style: 'font-size: 0.78rem;' }, '权重'),
-                                            h('span', { style: 'font-size: 0.95rem; font-weight: 500;' },
-                                                (node.weight || 0).toFixed(2)),
-                                        ]),
-                                    ]),
-                                    // 关联节点
-                                    h('div', { class: 'grid gap-2' }, [
-                                        h('span', { class: 'eyebrow' }, '关联节点'),
-                                        connectedNodes.value.length === 0
-                                            ? h('p', { class: 'muted m-0', style: 'font-size: 0.92rem;' }, '无关联节点')
-                                            : h('div', { class: 'flex gap-2', style: 'flex-wrap: wrap;' },
-                                                connectedNodes.value.slice(0, 12).map(n => h(Button, {
-                                                    key: `cn-${n.id}`,
-                                                    type: 'ghost',
-                                                    size: 'sm',
-                                                    ariaLabel: `${RELATION_LABELS[n.relation_type] || n.relation_type}: ${n.label || n.id}`,
-                                                    onClick: () => selectNode(n),
-                                                }, () => [
-                                                    h('span', {
-                                                        style: `display:inline-block; width:0.6rem; height:0.6rem; border-radius:999px; background: hsl(var(--chart-${TYPE_COLOR_INDEX[n.type] || 2}));`,
-                                                    }),
-                                                    `${(n.label || String(n.id)).slice(0, 12)} · ${RELATION_LABELS[n.relation_type] || n.relation_type}`,
-                                                ]))
-                                            ),
-                                    ]),
-                                ]);
-                            })()
-                            : h(EmptyState, {
-                                icon: 'circle-question-mark',
-                                title: '未选中节点',
-                                desc: '点击 3D 图谱中的节点以查看详情。',
-                            })
-                        ),
-                    ]),
+                                    : null,
+                            threeReady.value && !threeError.value
+                                ? h('span', { class: 'memory-graph-hint' }, '拖拽旋转 · 滚轮缩放 · 点击节点')
+                                : null,
+                            // 统计浮层：不改变布局尺寸，不影响 3D 缩放
+                            renderStatsPanel(),
+                            renderNodeSidebar(),
+                        ])
+                        : h('div', {
+                            class: 'grid',
+                            style: 'height: 100%; min-height: inherit; place-items: center; padding: calc(var(--spacing) * 6);',
+                        }, [h(EmptyState, {
+                            icon: loadError.value ? 'triangle-alert' : 'folder',
+                            title: loadError.value ? '图谱加载失败' : '暂无图谱数据',
+                            desc: loadError.value || ((filterCategory.value || searchQuery.value)
+                                ? '当前筛选条件下无匹配节点。'
+                                : '记忆库中还没有可显示的事件或实体。'),
+                        }, loadError.value ? {
+                            default: () => h(Button, { type: 'ghost', size: 'sm', onClick: loadData }, () => '重新加载'),
+                        } : undefined)]),
                 ]),
             ]);
         };

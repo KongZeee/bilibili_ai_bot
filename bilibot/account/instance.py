@@ -74,6 +74,8 @@ class AccountInstance:
         self.data_root = data_root
         # PRD V4 BOOT-003：应用级 SafetyChecker，传入 Scheduler
         self.safety_checker = safety_checker
+        # AccountManager 在 _create_instance 后注入，用于凭据回调同步 registry
+        self.account_manager = None
 
         # 账号配置字段
         self.name: str = account_config.get("name", account_id)
@@ -128,6 +130,7 @@ class AccountInstance:
             "bili_jct": self.account_config.get("bili_jct", ""),
             "dede_user_id": self.account_config.get("dede_user_id", ""),
             "buvid3": self.account_config.get("buvid3", ""),
+            "buvid4": self.account_config.get("buvid4", ""),
             "refresh_token": self.account_config.get("refresh_token", ""),
         }
         # 合并：共享配置 + 账号 bilibili + 账号 data_dir
@@ -187,7 +190,13 @@ class AccountInstance:
         from bilibot.bilibili_api import BilibiliAPI
         if self.account_config_loader.bilibili.is_authenticated:
             self.bili = BilibiliAPI(self.account_config_loader)
+            self.bili.set_credential_update_callback(self._on_bili_credentials_updated)
             logger.info(f"[{self.account_id}] B站 API 已初始化 (uid={self.account_config_loader.bilibili.dede_user_id})")
+            # 设备指纹：无 buvid3 时自动领取（失败不阻断）
+            try:
+                await self.bili.ensure_buvid()
+            except Exception as e:
+                logger.warning(f"[{self.account_id}] ensure_buvid 失败: {e}")
         else:
             logger.warning(f"[{self.account_id}] B站凭据未配置，跳过 API 初始化")
 
@@ -358,6 +367,58 @@ class AccountInstance:
         self._started = False
         logger.info(f"[{self.account_id}] 账号已停止")
 
+    def _on_bili_credentials_updated(self, updates: dict) -> None:
+        """BilibiliAPI 刷新/领取凭据后的持久化回调（同步，由 API 层调用）
+
+        - 更新内存 account_config + 账号级 BiliConfig dataclass
+        - 原子写盘（ConfigLoader.patch_account_credentials，多账号锁）
+        - 同步 AccountConfigRegistry（面板/列表一致）
+        """
+        if not isinstance(updates, dict) or not updates:
+            return
+        allowed = (
+            "sessdata", "bili_jct", "dede_user_id",
+            "buvid3", "buvid4", "refresh_token",
+        )
+        patch = {k: str(v) for k, v in updates.items() if k in allowed and v}
+        if not patch:
+            return
+        # 1) 更新内存账号配置（运行时权威）
+        self.account_config.update(patch)
+        # 2) 只更新账号级 ConfigLoader 的 dataclass（请求头读这里）；
+        #    勿 mutate get_raw_config() 的深拷贝（无效）
+        if self.account_config_loader is not None:
+            try:
+                for k, v in patch.items():
+                    if hasattr(self.account_config_loader.bilibili, k):
+                        setattr(self.account_config_loader.bilibili, k, v)
+            except Exception as e:
+                logger.warning(f"[{self.account_id}] 同步账号 BiliConfig 失败: {e}")
+        # 3) 原子写盘（应用级锁，防多账号互盖）
+        try:
+            path = getattr(self.app_config_loader, "filepath", None) or "config.yaml"
+            ok = self.app_config_loader.patch_account_credentials(
+                self.account_id, patch, filepath=path,
+            )
+            if ok:
+                logger.info(
+                    f"[{self.account_id}] 凭据已持久化: {', '.join(sorted(patch.keys()))}"
+                )
+        except Exception as e:
+            logger.error(
+                f"[{self.account_id}] 凭据写盘失败: {e}",
+                exc_info=True,
+            )
+        # 4) 同步配置注册表（Web 列表/状态）
+        try:
+            mgr = self.account_manager
+            if mgr is not None and hasattr(mgr, "config_registry"):
+                reg = mgr.config_registry
+                if reg is not None and reg.has(self.account_id):
+                    reg.update(self.account_id, patch)
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 同步配置注册表失败: {e}")
+
     async def close(self):
         """关闭账号
 
@@ -389,6 +450,21 @@ class AccountInstance:
                 logger.warning(f"[{self.account_id}] 关闭 V6 记忆大脑超时")
             except Exception as e:
                 logger.warning(f"[{self.account_id}] 关闭 V6 记忆大脑失败: {e}")
+        # B3：关闭视频理解（线程池 / Whisper / 临时目录 / 定时清理）
+        vu = getattr(self, "video_understanding", None)
+        if vu is not None:
+            try:
+                try:
+                    from bilibot.video_understanding.cleanup import cancel_all_scheduled
+                    cancel_all_scheduled()
+                except Exception as ce:
+                    logger.debug(f"[{self.account_id}] cancel video cleanup timers: {ce}")
+                shutdown = getattr(vu, "shutdown", None)
+                if callable(shutdown):
+                    await asyncio.to_thread(shutdown)
+            except Exception as e:
+                logger.warning(f"[{self.account_id}] 关闭视频理解服务失败: {e}")
+            self.video_understanding = None
         # 关闭 B站 session
         if self.bili is not None:
             try:
@@ -435,6 +511,7 @@ class AccountInstance:
             state = "stopped"
         return {
             "account_id": self.account_id,
+            "id": self.account_id,  # 前端兼容别名
             "name": self.name,
             "enabled": self.enabled,
             "running": self.is_running(),
@@ -449,6 +526,7 @@ class AccountInstance:
             "effective_llm_id": self._effective_llm_id,
             "fallback_reason": self._fallback_reason,
             "uid": self.account_config.get("dede_user_id", ""),
+            "dede_user_id": self.account_config.get("dede_user_id", ""),
             "authenticated": bili_credentials_are_configured(
                 self.account_config.get("sessdata"),
                 self.account_config.get("bili_jct"),
@@ -533,11 +611,17 @@ class AccountInstance:
             bili_was_none = self.bili is None
             if self.bili is not None:
                 self.bili.reload_credentials(self.account_config_loader)
+                self.bili.set_credential_update_callback(self._on_bili_credentials_updated)
                 logger.info(f"[{self.account_id}] BilibiliAPI 凭据已热重载")
             elif self.account_config_loader.bilibili.is_authenticated:
                 # 之前未初始化（凭据缺失），现在有了 → 创建 BilibiliAPI
                 from bilibot.bilibili_api import BilibiliAPI
                 self.bili = BilibiliAPI(self.account_config_loader)
+                self.bili.set_credential_update_callback(self._on_bili_credentials_updated)
+                try:
+                    await self.bili.ensure_buvid()
+                except Exception as e:
+                    logger.warning(f"[{self.account_id}] ensure_buvid 失败: {e}")
                 logger.info(f"[{self.account_id}] BilibiliAPI 已创建（凭据补齐）")
 
             if self.scheduler is not None:
@@ -550,10 +634,151 @@ class AccountInstance:
             if bili_was_none and self.bili is not None:
                 self._rebuild_bili_dependents()
 
+            # 配置段热重载：视频理解 / 联网搜索 / 互动预算（不重启调度器）
+            self._reload_runtime_services()
+
             return {"reloaded": True, "message": "凭据已热重载"}
         except Exception as e:
             logger.error(f"[{self.account_id}] 热重载失败: {e}", exc_info=True)
             return {"reloaded": False, "message": str(e)}
+
+    def _reload_runtime_services(self) -> None:
+        """热重载账号运行时服务配置（VU / web_search / interactions）。
+
+        在 config.yaml 被 PATCH 或磁盘 reload 后调用，使 Web 保存立即进入运行中的
+        Scheduler / VideoUnderstandingService，而不必重启账号。
+        """
+        raw = {}
+        try:
+            raw = (
+                self.account_config_loader.get_raw_config()
+                if self.account_config_loader is not None
+                else {}
+            )
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 读取配置失败，跳过服务热重载: {e}")
+            return
+
+        # 1) 视频理解：重建 cfg 快照
+        try:
+            vu = self.video_understanding
+            if vu is not None and hasattr(vu, "reload_config"):
+                vu.reload_config(self.account_config_loader)
+            elif vu is None and self.llm_manager is not None:
+                va = raw.get("video_analysis") or {}
+                if isinstance(va, dict) and va.get("enabled"):
+                    from bilibot.video_understanding import VideoUnderstandingService
+                    self.video_understanding = VideoUnderstandingService(
+                        self.llm_manager, self.account_config_loader
+                    )
+                    logger.info(f"[{self.account_id}] 视频理解服务已按配置新建")
+            # 同步 scheduler / bangumi 上的 VU 引用
+            if self.scheduler is not None:
+                self.scheduler.video_understanding = self.video_understanding
+                bangumi = getattr(self.scheduler, "bangumi_service", None)
+                if bangumi is not None and hasattr(bangumi, "video_service"):
+                    bangumi.video_service = self.video_understanding
+                if bangumi is not None and hasattr(bangumi, "config"):
+                    bangumi.config = self.account_config_loader
+                # 兼容若未来改名 config_loader
+                if bangumi is not None and hasattr(bangumi, "config_loader"):
+                    bangumi.config_loader = self.account_config_loader
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 视频理解热重载失败: {e}")
+
+        # 2) 联网搜索：已有实例 reload；新启用则创建
+        try:
+            sched = self.scheduler
+            if sched is not None:
+                ws_cfg = raw.get("web_search") or {}
+                # 仅以 web_search.enabled 为准（features.web_search 已废弃双读）
+                ws_enabled = bool(
+                    isinstance(ws_cfg, dict) and ws_cfg.get("enabled", False)
+                )
+                existing = getattr(sched, "web_search", None)
+                if existing is not None and hasattr(existing, "reload_config"):
+                    existing.reload_config(raw)
+                elif ws_enabled and existing is None:
+                    from bilibot.services.web_search import WebSearchService
+                    sched.web_search = WebSearchService(
+                        raw,
+                        llm_provider=getattr(sched, "llm", None),
+                        data_store=getattr(sched, "ds", None),
+                        audit_store=getattr(sched, "audit_store", None),
+                        account_id=self.account_id,
+                    )
+                    logger.info(f"[{self.account_id}] 联网搜索服务已按配置新建")
+                # 同步 reply / comment_context 上的引用（构造时一次性注入，必须再绑一次）
+                reply_gen = getattr(sched, "reply_gen", None)
+                if reply_gen is not None and hasattr(reply_gen, "web_search"):
+                    reply_gen.web_search = getattr(sched, "web_search", None)
+                if reply_gen is not None and hasattr(reply_gen, "config"):
+                    reply_gen.config = self.account_config_loader
+                ccs = self.comment_context_service
+                if ccs is not None and hasattr(ccs, "web_search"):
+                    ccs.web_search = getattr(sched, "web_search", None)
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 联网搜索热重载失败: {e}")
+
+        # 3) 互动预算 / 主动评论策略
+        try:
+            sched = self.scheduler
+            if sched is not None:
+                policy = getattr(sched, "interaction_policy", None)
+                if policy is not None and hasattr(policy, "reload_config"):
+                    policy.reload_config(raw)
+                comment_policy = getattr(sched, "comment_policy", None)
+                if comment_policy is not None and hasattr(comment_policy, "reload_config"):
+                    comment_policy.reload_config(raw)
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 互动策略热重载失败: {e}")
+
+        # 4) PersonalitySystem / UserStateSystem 持有旧 ConfigLoader，必须换新
+        try:
+            if self.personality is not None and hasattr(self.personality, "config"):
+                self.personality.config = self.account_config_loader
+            sched = self.scheduler
+            if sched is not None:
+                personality = getattr(sched, "personality", None)
+                if personality is not None and hasattr(personality, "config"):
+                    personality.config = self.account_config_loader
+            if self.user_state is not None and hasattr(self.user_state, "config"):
+                self.user_state.config = self.account_config_loader
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] Personality/UserState 配置热重载失败: {e}")
+
+        # 5) features.bangumi 开关：新建或清空 BangumiService
+        try:
+            sched = self.scheduler
+            if sched is not None:
+                want_bangumi = bool((raw.get("features") or {}).get("bangumi", False))
+                existing_bg = getattr(sched, "bangumi_service", None)
+                if want_bangumi and existing_bg is None:
+                    from bilibot.bangumi import BangumiService
+                    data_dir = raw.get("data_dir", self.account_data_dir) or self.account_data_dir
+                    sched.bangumi_service = BangumiService(
+                        bili_api=self.bili,
+                        llm_manager=self.llm_manager or getattr(sched, "llm", None),
+                        video_service=self.video_understanding,
+                        config_loader=self.account_config_loader,
+                        data_dir=data_dir,
+                        memory_brain=getattr(self, "memory_brain", None)
+                        or getattr(sched, "memory_brain", None),
+                        account_id=self.account_id,
+                    )
+                    logger.info(f"[{self.account_id}] 番剧追番服务已按配置新建")
+                elif not want_bangumi and existing_bg is not None:
+                    sched.bangumi_service = None
+                    logger.info(f"[{self.account_id}] 番剧追番服务已按配置关闭")
+                elif want_bangumi and existing_bg is not None:
+                    if hasattr(existing_bg, "config"):
+                        existing_bg.config = self.account_config_loader
+                    if hasattr(existing_bg, "config_loader"):
+                        existing_bg.config_loader = self.account_config_loader
+                    if hasattr(existing_bg, "video_service"):
+                        existing_bg.video_service = self.video_understanding
+        except Exception as e:
+            logger.warning(f"[{self.account_id}] 番剧服务热重载失败: {e}")
 
     def __repr__(self) -> str:
         return f"<AccountInstance id={self.account_id!r} name={self.name!r} running={self._started}>"

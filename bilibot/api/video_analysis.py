@@ -47,28 +47,40 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
 
     # 顶层标量字段
     for key in ("enabled", "frame_extractor", "scenedetect_threshold",
-                "image_max_size", "vision_window_size",
+                "image_max_size", "max_keyframes", "vision_window_size",
                 "vision_requests_per_minute", "temp_dir",
                 # CFG-604：VID-503 资源边界配置
                 "max_duration_seconds", "max_download_bytes",
                 "max_concurrent_global", "max_concurrent_per_account",
                 "download_timeout_seconds", "preprocess_timeout_seconds",
                 "analysis_timeout_seconds", "local_whisper_enabled",
-                "max_local_whisper_workers", "temp_disk_quota_bytes"):
+                "max_local_whisper_workers", "temp_disk_quota_bytes",
+                # 视觉轨重试 / 成功率（运行时 VideoUnderstandingConfig 读取）
+                "vision_frame_max_retries", "vision_frame_retry_backoff_seconds",
+                "vision_min_success_ratio"):
         if key in updates:
             val = updates[key]
             if key in ("enabled", "local_whisper_enabled"):
                 val = bool(val)
-            elif key in ("scenedetect_threshold",):
+            elif key in ("scenedetect_threshold", "vision_frame_retry_backoff_seconds",
+                         "vision_min_success_ratio"):
                 val = float(val)
-            elif key in ("image_max_size", "vision_window_size",
+                if key == "vision_min_success_ratio":
+                    val = max(0.0, min(val, 1.0))
+                if key == "vision_frame_retry_backoff_seconds":
+                    val = max(0.0, min(val, 30.0))
+            elif key in ("image_max_size", "max_keyframes", "vision_window_size",
                           "vision_requests_per_minute",
                           "max_duration_seconds", "max_download_bytes",
                           "max_concurrent_global", "max_concurrent_per_account",
                           "download_timeout_seconds", "preprocess_timeout_seconds",
                           "analysis_timeout_seconds", "max_local_whisper_workers",
-                          "temp_disk_quota_bytes"):
+                          "temp_disk_quota_bytes", "vision_frame_max_retries"):
                 val = int(val)
+                if key == "max_keyframes":
+                    val = max(1, min(val, 500))
+                if key == "vision_frame_max_retries":
+                    val = max(0, min(val, 5))
             va[key] = val
 
     # ASR 子段
@@ -93,10 +105,17 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
         asr_providers = raw.get("asr_providers", [])
         if not isinstance(asr_providers, list):
             asr_providers = []
-        # 查找现有 local_whisper 项（含 model_size 或 whisper_device 键的 dict）
+        # 查找现有 local_whisper 项（含 model_size / device+compute_type / 固定 id）
         lw_index = None
         for i, item in enumerate(asr_providers):
-            if isinstance(item, dict) and ("model_size" in item or "whisper_device" in item):
+            if not isinstance(item, dict):
+                continue
+            if (
+                "model_size" in item
+                or "whisper_device" in item
+                or item.get("id") in ("local-whisper", "local_whisper")
+                or ("device" in item and "compute_type" in item and "api_key" not in item)
+            ):
                 lw_index = i
                 break
         if lw_index is not None:
@@ -108,18 +127,23 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
                     if k == "enabled":
                         val = bool(val)
                     merged_lw[k] = val
+            # 同步顶层 local_whisper_enabled，避免双轨不一致
+            if "enabled" in lw_updates:
+                va["local_whisper_enabled"] = bool(lw_updates["enabled"])
             asr_providers[lw_index] = merged_lw
         else:
             # 新建 local_whisper 项
-            new_lw = {}
+            new_lw = {"id": "local-whisper"}
             for k in ("enabled", "model_size", "device", "compute_type"):
                 if k in lw_updates:
                     val = lw_updates[k]
                     if k == "enabled":
                         val = bool(val)
                     new_lw[k] = val
-            if new_lw:
+            if len(new_lw) > 1:
                 asr_providers = list(asr_providers) + [new_lw]
+                if "enabled" in new_lw:
+                    va["local_whisper_enabled"] = bool(new_lw["enabled"])
         raw["asr_providers"] = asr_providers
 
     raw["video_analysis"] = va
@@ -155,16 +179,48 @@ async def _archive_test_analysis(acc, *, bvid: str, vinfo: dict, result: dict) -
     else:
         tags = []
     account_id = str(getattr(acc, "account_id", "") or "default")
+    title = str(vinfo.get("title") or "")
+    owner = str((vinfo.get("owner") or {}).get("name") or "")
+    behavior_log = ""
+    if isinstance(result, dict):
+        behavior_log = str(result.get("behavior_log") or "")
+    video_detail = ""
+    if behavior_log:
+        try:
+            from bilibot.memory_brain.gateway import MemoryModelGateway
+
+            gateway = None
+            brain = getattr(acc, "memory_brain", None)
+            if brain is not None and getattr(brain, "gateway", None) is not None:
+                gateway = brain.gateway
+            else:
+                gateway = MemoryModelGateway()
+            video_detail = await gateway.summarize_video_detail(
+                title=title,
+                owner=owner,
+                behavior_log=behavior_log,
+                max_chars=2000,
+            )
+        except Exception:
+            from bilibot.memory_brain.gateway import MemoryModelGateway
+
+            video_detail = MemoryModelGateway.heuristic_video_detail(
+                title=title,
+                owner=owner,
+                behavior_log=behavior_log,
+                max_chars=2000,
+            )
     envelope = video_observation(
         account_id=account_id,
         observation_key=f"manual-test:{bvid}:draft",
         bvid=bvid,
         oid=str(vinfo.get("aid") or bvid),
-        title=str(vinfo.get("title") or ""),
-        owner=str((vinfo.get("owner") or {}).get("name") or ""),
+        title=title,
+        owner=owner,
         context={"metadata": vinfo, "audiovisual": result},
         tags=tags,
         persona_id=str(getattr(acc, "persona_id", "") or ""),
+        video_detail=video_detail,
     )
     canonical = {
         "metadata": envelope.metadata,
@@ -234,16 +290,56 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             return fail_internal()
 
     async def update_video_analysis(request: Request) -> JSONResponse:
-        """更新视频理解配置"""
+        """更新视频理解配置，并热重载运行中账号的 VU / local_whisper。"""
         try:
             body = await request.json()
-            raw = config_loader.get_raw_config()
-            raw = _merge_video_analysis(raw, body)
-            raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-            config_loader.save_config(raw, config_path)
-            va = raw.get("video_analysis", {})
-            logger.info(f"视频理解配置已更新: enabled={va.get('enabled')}, frame_extractor={va.get('frame_extractor')}")
-            return ok(_mask_config(va))
+            if not isinstance(body, dict):
+                return fail_invalid_input("请求体必须是 JSON 对象")
+
+            def _mutate(raw: dict) -> None:
+                _merge_video_analysis(raw, body)
+                raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
+
+            if hasattr(config_loader, "atomic_update"):
+                raw = config_loader.atomic_update(config_path, _mutate)
+            else:
+                raw = config_loader.get_raw_config()
+                _mutate(raw)
+                config_loader.save_config(raw, config_path)
+
+            va = raw.get("video_analysis", {}) if isinstance(raw, dict) else {}
+
+            # 刷新 ModelRouter 的 local_whisper 缓存（关本地 Whisper 依赖此路径）
+            try:
+                llm_mgr = None
+                if account_manager is not None:
+                    llm_mgr = getattr(account_manager, "llm_manager", None)
+                if llm_mgr is not None and hasattr(llm_mgr, "reload_local_whisper_from_config"):
+                    llm_mgr.reload_local_whisper_from_config(raw)
+            except Exception as e:
+                logger.warning(f"刷新 local_whisper 路由缓存失败: {e}")
+
+            # App 级全局并发 semaphore（启动时配置一次，保存后必须再刷）
+            try:
+                from bilibot.video_understanding import configure_global_semaphore
+                max_g = int((va or {}).get("max_concurrent_global", 1) or 1)
+                configure_global_semaphore(max(1, max_g))
+            except Exception as e:
+                logger.warning(f"刷新视频分析全局并发失败: {e}")
+
+            # 账号运行时 VU 热重载
+            if account_manager is not None and hasattr(account_manager, "reload_all"):
+                try:
+                    await account_manager.reload_all()
+                except Exception as e:
+                    logger.warning(f"视频理解保存后账号热重载失败: {e}")
+
+            logger.info(
+                f"视频理解配置已更新: enabled={va.get('enabled')}, "
+                f"frame_extractor={va.get('frame_extractor')}, "
+                f"max_keyframes={va.get('max_keyframes')}"
+            )
+            return ok(_mask_config(va if isinstance(va, dict) else {}))
         except Exception as e:
             logger.error(f"更新视频理解配置失败: {e}", exc_info=True)
             return fail_internal()
@@ -251,10 +347,14 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
     async def test_video_analysis(request: Request) -> JSONResponse:
         """测试视频理解：下载视频并执行视听双轨分析
 
-        Body: { "video_url": "BVxxxxxx 或完整 URL", "config": {...可选覆盖} }
+        Body: { "video_url": "BVxxxxxx 或完整 URL" }
+        说明：不接受未保存的 config 覆盖；请先保存视频理解配置再测试，
+        避免「表单临时值」与运行时快照不一致。
         """
         try:
             body = await request.json()
+            if isinstance(body, dict) and body.get("config"):
+                logger.info("[test] 忽略未保存的 config 覆盖，请先保存视频理解配置")
             video_url = body.get("video_url") or body.get("url") or ""
             bvid = _extract_bvid(video_url)
             if not bvid:
@@ -312,59 +412,63 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
 
             logger.info(f"[test] 视频已下载: {video_file}, 开始分析...")
 
-            # 3. 执行视频理解
-            result = await asyncio.wait_for(
-                vu.understand(
-                    video_file,
-                    defer_cleanup=True,
-                    require_complete_audio=True,
-                    require_complete_visual=True,
-                ),
-                timeout=600,
-            )
-            if not isinstance(result, dict):
-                raise RuntimeError("视频理解返回了无效结果")
-
-            behavior_log = result.get("behavior_log", "")
-            degradation = result.get("degradation_reason", "")
-
-            if degradation:
-                logger.warning(
-                    "[test] 视频提取未完成，保留媒体与处理目录: %s",
-                    degradation,
+            result = None
+            try:
+                # 3. 执行视频理解
+                result = await asyncio.wait_for(
+                    vu.understand(
+                        video_file,
+                        defer_cleanup=True,
+                        require_complete_audio=True,
+                        require_complete_visual=True,
+                    ),
+                    timeout=600,
                 )
+                if not isinstance(result, dict):
+                    raise RuntimeError("视频理解返回了无效结果")
+
+                behavior_log = result.get("behavior_log", "")
+                degradation = result.get("degradation_reason", "")
+
+                if degradation:
+                    logger.warning(
+                        "[test] 视频提取降级，返回元数据并清理临时文件: %s",
+                        degradation,
+                    )
+                    return ok({
+                        "title": title,
+                        "owner": owner,
+                        "duration": duration,
+                        "bvid": bvid,
+                        "degradation_reason": degradation,
+                        "description": f"视频因资源限制降级为元数据分析: {degradation}",
+                        "frames": [],
+                    })
+
+                # 4. 完整提取内容提交到账号脑库后，再清理媒体与处理目录。
+                await _archive_test_analysis(
+                    acc,
+                    bvid=bvid,
+                    vinfo=vinfo,
+                    result=result,
+                )
+
+                # 截取行为日志前 2000 字作为描述
+                desc = behavior_log[:2000] if behavior_log else "（未生成行为日志）"
+
                 return ok({
                     "title": title,
                     "owner": owner,
                     "duration": duration,
                     "bvid": bvid,
+                    "description": desc,
+                    "behavior_log": behavior_log,
                     "degradation_reason": degradation,
-                    "description": f"视频因资源限制降级为元数据分析: {degradation}",
                     "frames": [],
                 })
-
-            # 4. 完整提取内容提交到账号脑库后，才允许清理媒体与处理目录。
-            await _archive_test_analysis(
-                acc,
-                bvid=bvid,
-                vinfo=vinfo,
-                result=result,
-            )
-            _cleanup_test_analysis_artifacts(video_file, result)
-
-            # 截取行为日志前 2000 字作为描述
-            desc = behavior_log[:2000] if behavior_log else "（未生成行为日志）"
-
-            return ok({
-                "title": title,
-                "owner": owner,
-                "duration": duration,
-                "bvid": bvid,
-                "description": desc,
-                "behavior_log": behavior_log,
-                "degradation_reason": degradation,
-                "frames": [],
-            })
+            finally:
+                # 成功 / 失败 / 超时：一律清理，避免 test_ 前缀视频堆积
+                _cleanup_test_analysis_artifacts(video_file, result or {})
 
         except asyncio.TimeoutError:
             return fail("ANALYSIS_TIMEOUT", "视频分析超时（超过 10 分钟）")

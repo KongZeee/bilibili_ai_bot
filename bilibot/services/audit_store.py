@@ -393,6 +393,7 @@ class AuditStore:
         published: bool = True,
         target: Optional[Dict[str, Any]] = None,
         failure_reason: Optional[str] = None,
+        status: Optional[str] = None,
     ) -> bool:
         """更新审计记录的发布状态（PRD V4 §4.5.1）
 
@@ -400,12 +401,14 @@ class AuditStore:
         - published=True  -> status='published'
         - published=False 且有 failure_reason -> status='failed'
         - published=False 且无 failure_reason -> status 保持不变（视为回退）
+        - 显式传入 status 时优先使用（如 result_unknown）
 
         Args:
             audit_id: 审计 id
             published: 是否已发布
             target: 可选，合并到现有 target JSON 中（覆盖同 key）
             failure_reason: 可选，发布失败原因（写入 target.failure_reason）
+            status: 可选，覆盖语义化状态（须在 STATUS_VALUES 内）
 
         Returns:
             True 表示更新成功，False 表示记录不存在或写入失败
@@ -426,7 +429,13 @@ class AuditStore:
             patch_json = json.dumps(patch, ensure_ascii=False)
 
             # OBS-501：根据发布结果推导语义化状态
-            if published:
+            if status:
+                if status not in STATUS_VALUES:
+                    logger.warning(f"mark_published: 未知 status={status}，忽略显式 status")
+                    status = None
+            if status:
+                new_status = status
+            elif published:
                 new_status = "published"
             elif failure_reason:
                 new_status = "failed"

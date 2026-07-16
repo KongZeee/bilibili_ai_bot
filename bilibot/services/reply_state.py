@@ -6,10 +6,10 @@
     context_building → generation_pending | deferred
     generation_pending → safety_pending | deferred
     safety_pending → publish_pending | rejected | deferred
-    publish_pending → published | retry_wait
+    publish_pending → published | retry_wait | result_unknown
     retry_wait → publish_pending | failed
 
-终态（不再处理）：published, published_legacy, ignored, rejected, failed
+终态（不再处理）：published, published_legacy, ignored, rejected, failed, result_unknown
 非终态（可恢复）：deferred, retry_wait, 以及所有中间态
 
 幂等键：account_id + comment_type + source_rpid + generation_revision
@@ -35,7 +35,10 @@ logger = logging.getLogger("bilibot.reply_state")
 
 # 终态集合
 # PRD V4 MIG-003：published_legacy 是旧 replied.json 迁移的终态，不再重试
-TERMINAL_STATES = frozenset({"published", "published_legacy", "ignored", "rejected", "failed"})
+# result_unknown：平台结果不确定，不自动重发（防超时双发）
+TERMINAL_STATES = frozenset({
+    "published", "published_legacy", "ignored", "rejected", "failed", "result_unknown",
+})
 
 # 可重试状态（非终态，可恢复）
 RETRYABLE_STATES = frozenset({"deferred", "retry_wait"})
@@ -204,7 +207,9 @@ class ReplyStateStore:
     def upsert(self, comment_type: int, source_rpid: str, state: str,
                notification: Dict = None, persona_id: str = "",
                metadata: Dict = None, error: str = "", error_code: str = "",
-               generation_result: str = "") -> Dict:
+               generation_result: str = "",
+               *,
+               increment_attempt: bool = True) -> Dict:
         """创建或更新状态记录
 
         PRD V4 §9.1：
@@ -215,30 +220,62 @@ class ReplyStateStore:
         - deferred → 临时依赖失败（LLM超时、搜索失败、限流、安全异常）
         - retry_wait → 发布失败，等待重试
         - failed → 超过重试上限
+
+        increment_attempt=False：条件性延期（限流/安全未就绪/归档临时失败等）
+        不消耗 attempt 预算，避免 3 次条件失败后永久 failed。
+        真实发布失败（post_comment False）应保持默认 True。
+
+        Read-modify-write of attempts is done under a single BEGIN IMMEDIATE
+        connection to avoid concurrent workers under-counting attempts.
         """
         now = time.time()
-        existing = self.get_state(comment_type, source_rpid)
-        attempts = (existing["attempts"] if existing else 0)
-        max_att = (existing["max_attempts"] if existing else self.max_attempts)
-
-        # 状态递增 attempts（retry_wait 和 deferred 都递增，防止无限重试）
-        if state in ("retry_wait", "deferred"):
-            attempts += 1
-            # 超过重试上限 → failed（终态）
-            if attempts >= max_att:
-                state = "failed"
-
-        # BUG A-005：计算 next_retry_at（指数退避 + 抖动）
-        # retry_wait 和 deferred 均使用 attempts 计算退避，避免每 60s 固定间隔立即重发
-        next_retry_at = None
-        if state in ("retry_wait", "deferred"):
-            import random
-            base = min(2 ** max(attempts, 1), 300)  # 2, 4, 8... 最大 300 秒
-            jitter = random.uniform(0, base * 0.1)
-            next_retry_at = now + base + jitter
+        notif_json = json.dumps(notification, ensure_ascii=False) if notification else ""
+        # metadata=None means "leave existing metadata alone" on conflict
+        meta_json = (
+            json.dumps(metadata, ensure_ascii=False)
+            if metadata is not None
+            else None
+        )
+        ct = int(comment_type)
+        rpid = str(source_rpid)
 
         conn = self._get_conn()
         try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM reply_states "
+                "WHERE account_id=? AND comment_type=? AND source_rpid=?",
+                (self.account_id, ct, rpid),
+            ).fetchone()
+            existing = dict(row) if row else None
+            attempts = (existing["attempts"] if existing else 0)
+            max_att = (existing["max_attempts"] if existing else self.max_attempts)
+
+            # retry_wait / deferred：默认递增 attempts；条件失败可关闭
+            if state in ("retry_wait", "deferred") and increment_attempt:
+                attempts += 1
+                # 超过重试上限 → failed（终态）
+                if attempts >= max_att:
+                    state = "failed"
+
+            # BUG A-005：计算 next_retry_at（指数退避 + 抖动）
+            # 条件失败（不烧 attempt）用更长底数，限流尤其拉长
+            next_retry_at = None
+            if state in ("retry_wait", "deferred"):
+                import random
+                base = min(2 ** max(attempts, 1), 300)  # 2, 4, 8... 最大 300 秒
+                if not increment_attempt:
+                    code = (error_code or "").upper()
+                    if code in ("RATE_LIMIT", "RATE_LIMITED", "PM_RATE_LIMITED"):
+                        # S9：评论限流更长退避（2~5 分钟）
+                        base = min(max(base, 120), 300)
+                    else:
+                        # 其它条件失败：30~120s，避免热循环
+                        base = min(max(base, 30), 120)
+                jitter = random.uniform(0, base * 0.1)
+                next_retry_at = now + base + jitter
+
+            insert_meta = meta_json if meta_json is not None else "{}"
             conn.execute("""
                 INSERT INTO reply_states
                     (account_id, comment_type, source_rpid, state, attempts, max_attempts,
@@ -255,23 +292,34 @@ class ReplyStateStore:
                     persona_id=COALESCE(NULLIF(excluded.persona_id, ''), reply_states.persona_id),
                     updated_at=excluded.updated_at,
                     next_retry_at=excluded.next_retry_at,
-                    metadata=excluded.metadata
+                    metadata=CASE
+                        WHEN excluded.metadata IS NULL OR excluded.metadata = ''
+                             OR excluded.metadata = '{}'
+                        THEN reply_states.metadata
+                        ELSE excluded.metadata
+                    END
             """, (
-                self.account_id, int(comment_type), str(source_rpid),
+                self.account_id, ct, rpid,
                 state, attempts, max_att,
                 error, error_code,
-                json.dumps(notification, ensure_ascii=False) if notification else "",
+                notif_json,
                 generation_result,
                 persona_id,
                 existing["created_at"] if existing else now,
                 now, next_retry_at,
-                json.dumps(metadata or {}, ensure_ascii=False),
+                insert_meta if meta_json is not None else (existing.get("metadata") if existing else "{}"),
             ))
             conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
         finally:
             conn.close()
 
-        return self.get_state(comment_type, source_rpid)
+        return self.get_state(ct, rpid)
 
     # ───────────────────────────────────────────────────────
     # PRD-V5 §6.2 / REP-502：生成文本持久化
@@ -437,22 +485,159 @@ class ReplyStateStore:
         return self.upsert(comment_type, source_rpid, "rejected",
                            error=reason, error_code="SAFETY_REJECT")
 
-    def mark_deferred(self, comment_type: int, source_rpid: str,
-                      reason: str = "", error_code: str = "TEMP_FAILURE") -> Dict:
-        """标记为延迟（非终态 - 临时失败，可恢复）"""
-        return self.upsert(comment_type, source_rpid, "deferred",
-                           error=reason, error_code=error_code)
+    def mark_failed(
+        self,
+        comment_type: int,
+        source_rpid: str,
+        reason: str = "",
+        error_code: str = "FAILED",
+    ) -> Dict:
+        """标记为失败（终态 - 配置/永久生成错误，非安全策略拒绝）
 
-    def mark_retry_wait(self, comment_type: int, source_rpid: str,
-                        reason: str = "", error_code: str = "PUBLISH_FAILED") -> Dict:
+        与 mark_rejected 区分：rejected = SAFETY_REJECT；failed = 无法恢复的业务/配置失败。
+        """
+        return self.upsert(
+            comment_type,
+            source_rpid,
+            "failed",
+            error=reason,
+            error_code=error_code or "FAILED",
+            increment_attempt=False,
+        )
+
+    def mark_deferred(
+        self,
+        comment_type: int,
+        source_rpid: str,
+        reason: str = "",
+        error_code: str = "TEMP_FAILURE",
+        *,
+        increment_attempt: bool = True,
+    ) -> Dict:
+        """标记为延迟（非终态 - 临时失败，可恢复）
+
+        increment_attempt=False：条件失败（限流/安全未就绪/归档临时失败等），
+        不消耗 attempt 预算。
+        """
+        return self.upsert(
+            comment_type, source_rpid, "deferred",
+            error=reason, error_code=error_code,
+            increment_attempt=increment_attempt,
+        )
+
+    def mark_retry_wait(
+        self,
+        comment_type: int,
+        source_rpid: str,
+        reason: str = "",
+        error_code: str = "PUBLISH_FAILED",
+        *,
+        increment_attempt: bool = True,
+    ) -> Dict:
         """标记为等待重试（非终态 - 发布失败，将重试）
 
         PRD-V5 §6.2 / REP-502：generation_result / generation_hash /
         generation_revision 等字段由 upsert 的 ON CONFLICT 子句自动保留
         （不在 SET 列表中的列保持原值），重试时可读出原始文本。
+
+        increment_attempt=False：仅延期不烧 attempt（与 proactive 一致）。
+        真实 post_comment False 应保持默认 True。
         """
-        return self.upsert(comment_type, source_rpid, "retry_wait",
-                           error=reason, error_code=error_code)
+        return self.upsert(
+            comment_type, source_rpid, "retry_wait",
+            error=reason, error_code=error_code,
+            increment_attempt=increment_attempt,
+        )
+
+    def mark_manual_retry(
+        self,
+        comment_type: int,
+        source_rpid: str,
+        reason: str = "manual_retry",
+        error_code: str = "MANUAL_RETRY",
+    ) -> Dict:
+        """UI 手动重试：设为 retry_wait 且立即可调度，不消耗 attempts 预算。
+
+        与 mark_retry_wait 区别：
+        - 不递增 attempts（避免一点就变 failed）
+        - next_retry_at = now（下一轮主循环立即拾取）
+        - 允许从 failed / result_unknown 拉回（人工覆盖）
+        """
+        now = time.time()
+        ct = int(comment_type)
+        rpid = str(source_rpid)
+        conn = self._get_conn()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM reply_states "
+                "WHERE account_id=? AND comment_type=? AND source_rpid=?",
+                (self.account_id, ct, rpid),
+            ).fetchone()
+            existing = dict(row) if row else None
+            attempts = int(existing["attempts"]) if existing else 0
+            max_att = int(existing["max_attempts"]) if existing else self.max_attempts
+            # 若已达上限，手动重试时抬高 max_attempts，允许再试一次
+            if attempts >= max_att:
+                max_att = attempts + 1
+            created_at = float(existing["created_at"]) if existing else now
+            meta = (existing.get("metadata") if existing else None) or "{}"
+            gen = (existing.get("generation_result") if existing else None) or ""
+            persona = (existing.get("persona_id") if existing else None) or ""
+            notif = (existing.get("notification_json") if existing else None) or ""
+            conn.execute(
+                """
+                INSERT INTO reply_states
+                    (account_id, comment_type, source_rpid, state, attempts, max_attempts,
+                     last_error, last_error_code, notification_json, generation_result,
+                     persona_id, created_at, updated_at, next_retry_at, metadata)
+                VALUES (?, ?, ?, 'retry_wait', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(account_id, comment_type, source_rpid) DO UPDATE SET
+                    state='retry_wait',
+                    max_attempts=excluded.max_attempts,
+                    last_error=excluded.last_error,
+                    last_error_code=excluded.last_error_code,
+                    updated_at=excluded.updated_at,
+                    next_retry_at=excluded.next_retry_at
+                """,
+                (
+                    self.account_id, ct, rpid,
+                    attempts, max_att,
+                    reason, error_code,
+                    notif, gen, persona,
+                    created_at, now, now,  # next_retry_at = now → 立即可调度
+                    meta,
+                ),
+            )
+            conn.commit()
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise
+        finally:
+            conn.close()
+        return self.get_state(ct, rpid) or {}
+
+    def mark_result_unknown(
+        self,
+        comment_type: int,
+        source_rpid: str,
+        reason: str = "",
+        error_code: str = "RESULT_UNKNOWN",
+    ) -> Dict:
+        """平台结果不确定（超时/网络/5xx）→ 终态，不自动重发，防双发。
+
+        generation_* 字段保留，便于人工对账 / 楼中楼幂等确认。
+        """
+        return self.upsert(
+            comment_type,
+            source_rpid,
+            "result_unknown",
+            error=reason,
+            error_code=error_code,
+        )
 
     def get_retryable(self, now: float = None) -> List[Dict]:
         """获取可重试的回复（retry_wait/deferred 且 next_retry_at <= now）
@@ -518,19 +703,37 @@ class ReplyStateStore:
             recovered = []
             for row in rows:
                 r = dict(row)
-                # 转为 deferred，next_retry_at 设为当前时间立即可被拾取。
-                # attempts/max_attempts/generation_* 字段保持原值。
-                conn.execute(
-                    "UPDATE reply_states SET "
-                    "  state='deferred', next_retry_at=?, updated_at=?, "
-                    "  last_error_code='STUCK_RECOVERY' "
-                    "WHERE account_id=? AND comment_type=? AND source_rpid=? "
-                    "  AND state IN ('generation_pending','safety_pending',"
-                    "               'publish_pending','context_building')",
-                    (now, now,
-                     self.account_id, r["comment_type"], r["source_rpid"])
-                )
-                r["state"] = "deferred"
+                prev_state = r.get("state") or ""
+                gen_result = (r.get("generation_result") or "").strip()
+                # publish_pending + 已有生成文本：优先进 retry_wait 复用原文，
+                # 避免 deferred 全量重生后二次 post_comment 造成重复回复。
+                if prev_state == "publish_pending" and gen_result:
+                    conn.execute(
+                        "UPDATE reply_states SET "
+                        "  state='retry_wait', next_retry_at=?, updated_at=?, "
+                        "  last_error_code='STUCK_PUBLISH_PENDING', "
+                        "  last_error=? "
+                        "WHERE account_id=? AND comment_type=? AND source_rpid=? "
+                        "  AND state='publish_pending'",
+                        (now, now, "stuck recovery from publish_pending",
+                         self.account_id, r["comment_type"], r["source_rpid"])
+                    )
+                    r["state"] = "retry_wait"
+                    r["last_error_code"] = "STUCK_PUBLISH_PENDING"
+                else:
+                    # 其它中间态 / 无生成文本：deferred 重新生成
+                    conn.execute(
+                        "UPDATE reply_states SET "
+                        "  state='deferred', next_retry_at=?, updated_at=?, "
+                        "  last_error_code='STUCK_RECOVERY' "
+                        "WHERE account_id=? AND comment_type=? AND source_rpid=? "
+                        "  AND state IN ('generation_pending','safety_pending',"
+                        "               'publish_pending','context_building')",
+                        (now, now,
+                         self.account_id, r["comment_type"], r["source_rpid"])
+                    )
+                    r["state"] = "deferred"
+                    r["last_error_code"] = "STUCK_RECOVERY"
                 r["next_retry_at"] = now
                 r["updated_at"] = now
                 recovered.append(r)
@@ -577,8 +780,13 @@ class ReplyStateStore:
             # 默认 comment_type=1（视频评论），无法从旧格式确定
             if not self.is_processed(1, rpid_str):
                 # PRD V4 MIG-003：使用 published_legacy 而非 published
-                self.upsert(1, rpid_str, "published_legacy",
-                            rule="legacy_migration")
+                self.upsert(
+                    1,
+                    rpid_str,
+                    "published_legacy",
+                    error="legacy_migration",
+                    error_code="LEGACY_MIGRATION",
+                )
                 migrated += 1
         if migrated:
             logger.info(f"从 replied.json 迁移 {migrated} 条记录为 published_legacy")

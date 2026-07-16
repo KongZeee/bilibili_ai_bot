@@ -14,9 +14,14 @@ import os
 import subprocess
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
-from bilibot.llm.provider import ASRResponseError, extract_asr_transcript
+from bilibot.llm.provider import (
+    ASRResponseError,
+    RateLimitExhaustedError,
+    _is_rate_limit_error,
+    extract_asr_transcript,
+)
 
 logger = logging.getLogger("bilibot.video_u.audio")
 
@@ -154,16 +159,48 @@ def _convert_to_mp3(audio_path: str) -> str:
     return mp3_path
 
 
-def _transcribe_with_api(audio_path: str, asr_model: str, asr_api_key: str, asr_base_url: str) -> List[AudioEvent]:
-    """通过 OpenAI 兼容 ASR API 转写音频"""
+def _normalize_asr_keys(
+    asr_api_key: str = "",
+    asr_api_keys: Optional[Sequence[str]] = None,
+) -> List[str]:
+    """Merge asr_api_key + asr_api_keys into a de-duplicated ordered list."""
+    keys: List[str] = []
+    if asr_api_keys:
+        for item in asr_api_keys:
+            if isinstance(item, str) and item.strip():
+                keys.append(item.strip())
+    if isinstance(asr_api_key, str) and asr_api_key.strip():
+        keys.append(asr_api_key.strip())
+    seen = set()
+    ordered: List[str] = []
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
+        ordered.append(key)
+    return ordered
+
+
+def _transcribe_with_api(
+    audio_path: str,
+    asr_model: str,
+    asr_api_key: str,
+    asr_base_url: str,
+    asr_api_keys: Optional[Sequence[str]] = None,
+    rate_limit_cooldown_seconds: float = 30.0,
+) -> List[AudioEvent]:
+    """通过 OpenAI 兼容 ASR API 转写音频（多 key 轮转 + 429 冷却）。"""
     try:
         from openai import AsyncOpenAI
     except ImportError as e:
         raise RuntimeError(f"openai 未安装: {e}")
 
     import asyncio
+    import time as _time
 
-    client = AsyncOpenAI(api_key=asr_api_key, base_url=asr_base_url)
+    keys = _normalize_asr_keys(asr_api_key, asr_api_keys)
+    if not keys:
+        raise RuntimeError("ASR api_key 未配置")
 
     upload_path = audio_path
     mime_type = "audio/wav"
@@ -174,7 +211,12 @@ def _transcribe_with_api(audio_path: str, asr_model: str, asr_api_key: str, asr_
     with open(upload_path, "rb") as f:
         audio_base64 = base64.b64encode(f.read()).decode("utf-8")
 
-    async def _request():
+    cooldown_seconds = max(1.0, float(rate_limit_cooldown_seconds or 30.0))
+    # per-key cooldown end (monotonic); module-level not needed — one call retries within itself
+    key_cooldown_until = {k: 0.0 for k in keys}
+
+    async def _request_with_key(api_key: str):
+        client = AsyncOpenAI(api_key=api_key, base_url=asr_base_url)
         # PRD 4.2：确保 AsyncOpenAI 客户端在请求结束后被关闭，避免资源泄漏
         try:
             response = await client.chat.completions.create(
@@ -201,7 +243,44 @@ def _transcribe_with_api(audio_path: str, asr_model: str, asr_api_key: str, asr_
             except Exception:
                 pass
 
-    response = asyncio.run(_request())
+    async def _request_with_failover():
+        last_exc: Optional[BaseException] = None
+        attempts = max(1, min(len(keys), 4))
+        rr = 0
+        for _ in range(attempts):
+            now = _time.monotonic()
+            ready = [k for k in keys if key_cooldown_until.get(k, 0.0) <= now]
+            if not ready:
+                wait = min(
+                    max(0.0, key_cooldown_until.get(k, 0.0) - now) for k in keys
+                )
+                raise RateLimitExhaustedError(
+                    f"ASR all API keys cooling; retry_after≈{wait:.1f}s",
+                    retry_after=wait,
+                    pool_name="asr",
+                )
+            key = ready[rr % len(ready)]
+            rr += 1
+            try:
+                return await _request_with_key(key)
+            except Exception as exc:
+                last_exc = exc
+                if _is_rate_limit_error(exc):
+                    key_cooldown_until[key] = _time.monotonic() + cooldown_seconds
+                    logger.warning(
+                        "ASR key cooling %.0fs after rate limit; failover",
+                        cooldown_seconds,
+                    )
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RateLimitExhaustedError(
+            "ASR all API keys cooling or unavailable",
+            pool_name="asr",
+        )
+
+    response = asyncio.run(_request_with_failover())
     events: List[AudioEvent] = []
 
     try:
@@ -285,6 +364,8 @@ def transcribe_audio(
     asr_model: str = "",
     asr_api_key: str = "",
     asr_base_url: str = "",
+    asr_api_keys: Optional[Sequence[str]] = None,
+    rate_limit_cooldown_seconds: float = 30.0,
     whisper_model_size: str = "base",
     whisper_device: str = "cpu",
     whisper_compute_type: str = "int8",
@@ -300,6 +381,7 @@ def transcribe_audio(
     Args:
         audio_path: 音频文件路径
         asr_model: API ASR 模型名（非空则用 API）
+        asr_api_keys: 可选多 API Key 列表（与 asr_api_key 合并轮转，429 冷却）
         local_whisper_enabled: 是否启用本地 faster-whisper（默认 False）
         max_local_whisper_workers: 本地 Whisper 工作池大小
         whisper_timeout: 本地 Whisper 超时秒数
@@ -338,7 +420,12 @@ def transcribe_audio(
             logger.info(f"使用 API ASR 模型: {asr_model}")
             try:
                 events = _transcribe_with_api(
-                    audio_path, asr_model, asr_api_key, asr_base_url
+                    audio_path,
+                    asr_model,
+                    asr_api_key,
+                    asr_base_url,
+                    asr_api_keys=asr_api_keys,
+                    rate_limit_cooldown_seconds=rate_limit_cooldown_seconds,
                 )
             except Exception as api_error:
                 if not local_whisper_enabled:

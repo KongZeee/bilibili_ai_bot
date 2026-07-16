@@ -597,13 +597,42 @@ class HumanizedCommentGenerator:
     #  主动看视频：评价 + 评论生成
     # ══════════════════════════════════════
 
+    @staticmethod
+    def _format_hot_comments_for_prompt(hot_comments) -> str:
+        """Render hot comments whether they are str or structured dict rows."""
+        lines: list[str] = []
+        for item in (hot_comments or [])[:5]:
+            if isinstance(item, dict):
+                user = (
+                    item.get("name")
+                    or item.get("uname")
+                    or item.get("username")
+                    or ""
+                )
+                content = (
+                    item.get("content")
+                    or item.get("message")
+                    or item.get("text")
+                    or ""
+                )
+                content = str(content).strip()
+                if not content:
+                    continue
+                prefix = f"[{user}] " if user else ""
+                lines.append(f"  - {prefix}{content}")
+            else:
+                text = str(item or "").strip()
+                if text:
+                    lines.append(f"  - {text}")
+        return "\n".join(lines) if lines else "无"
+
     async def evaluate_video(
         self,
         title: str,
         owner: str,
         desc: str,
         tags: List[str],
-        hot_comments: List[str] = None,
+        hot_comments: List = None,
         video_content: str = "",
     ) -> Optional[Dict]:
         """
@@ -611,6 +640,7 @@ class HumanizedCommentGenerator:
 
         Args:
             video_content: 视频理解服务生成的视听行为日志（Markdown），为空则只用元数据
+            hot_comments: list[str] 或 list[dict]（含 content/name/mid/rpid）
 
         Returns:
             {
@@ -640,19 +670,35 @@ class HumanizedCommentGenerator:
         # 构建视频信息文本
         tags_text = "、".join(tags[:8]) if tags else "无"
         desc_text = desc[:300] if desc else "无"
-        hot_comments_text = "\n".join(f"  - {c}" for c in (hot_comments or [])[:5]) if hot_comments else "无"
+        hot_comments_text = self._format_hot_comments_for_prompt(hot_comments)
 
-        # 视频内容段落（AI 视听分析）
+        # 视频内容：优先传入 ≤2000 字的 video_detail 摘要（主动看视频链路已生成），
+        # 否则才是分段原始视听上下文。不要再二次硬截断。
+        # 注意：digest 后可能再拼【网络搜索参考】，总长会 >2200，不能用总长判类型。
         video_content_section = ""
         if video_content:
-            # 截断过长的行为日志，避免 prompt 膨胀
-            truncated = video_content[:2000]
+            head = video_content[:200]
+            is_digest = (
+                "【网络搜索参考】" in video_content
+                or "【视频详细内容】" in head
+                or (
+                    "【听到声音】" not in head
+                    and "【视听分析】" not in head
+                    and "### 视频结构化行为日志" not in head
+                )
+            )
+            content_label = (
+                "【视频详细内容】（观看后整理，≤2000字；可含不可信搜索参考）"
+                if is_digest
+                else "【视频内容】（AI 视听分析）"
+            )
             video_content_section = f"""
-【视频内容】（AI 视听分析）
-{truncated}
+{content_label}
+{video_content}
 """
 
         prompt = f"""请评价以下B站视频，以你的角色视角观看后给出真实反馈。
+评论和评价要基于【视频详细内容/视频内容】里的具体信息，不要只复读标题。
 
 【视频信息】
 标题: {title}
@@ -669,8 +715,8 @@ UP主: {owner}
 {{
   "score": 1-10的整数评分,
   "mood": "看完后的心情(开心/平静/无聊/感动/好笑/震撼/困惑)",
-  "comment": "15-30字的评论区留言，像真人随手打的",
-  "review": "50字以内的视频评价",
+  "comment": "15-30字的评论区留言，像真人随手打的，可点到视频里的具体细节",
+  "review": "50字以内的视频评价，概括你看懂的内容",
   "want_like": true/false,
   "want_coin": true/false,
   "want_favorite": true/false,
@@ -681,38 +727,63 @@ UP主: {owner}
         if personality_info:
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
 
-        try:
-            response = await self.llm.generate(
-                prompt, system_prompt=system_prompt, max_tokens=300
-            )
-            if not response:
-                return None
+        # 长 digest + 搜索参考时 300 tokens 容易截断 JSON；放宽并允许一次重试。
+        max_tokens = 500
+        last_error = ""
+        for attempt in range(1, 3):
+            try:
+                response = await self.llm.generate(
+                    prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=max_tokens,
+                )
+                if not response:
+                    last_error = "empty_response"
+                    continue
 
-            # 提取JSON（PRD 4.10：支持嵌套对象的平衡括号匹配）
-            result = _extract_json_object(response)
-            if result is None:
-                logger.warning(f"无法解析评价JSON: {response[:200]}")
-                return None
+                # 提取JSON（PRD 4.10：支持嵌套对象的平衡括号匹配）
+                result = _extract_json_object(response)
+                if result is None:
+                    last_error = "json_parse_failed"
+                    logger.warning(
+                        "无法解析评价JSON attempt=%s/2: %s",
+                        attempt,
+                        response[:200],
+                    )
+                    # 第二次用更短的硬性指令再要一次 JSON
+                    if attempt == 1:
+                        prompt = (
+                            prompt
+                            + "\n\n上一次输出无法解析。请只输出一个合法 JSON 对象，"
+                            "不要 markdown，不要解释。"
+                        )
+                    continue
 
-            # VID-501：互动意图字段契约归一化
-            # 通过 InteractionSuggestion.from_dict 做严格类型校验 + 迁移适配器
-            # （want_fav → want_favorite）。归一化后写回 result，保证下游策略引擎
-            # 拿到的永远是 want_favorite（合法 bool），且不再残留 want_fav。
-            from bilibot.models.interaction import InteractionSuggestion
-            suggestion = InteractionSuggestion.from_dict(result)
-            result["want_like"] = suggestion.want_like
-            result["want_coin"] = suggestion.want_coin
-            result["want_favorite"] = suggestion.want_favorite
-            result["want_comment"] = suggestion.want_comment
-            # 移除旧字段，防止 want_fav 泄漏到下游
-            result.pop("want_fav", None)
+                # VID-501：互动意图字段契约归一化
+                # 通过 InteractionSuggestion.from_dict 做严格类型校验 + 迁移适配器
+                # （want_fav → want_favorite）。归一化后写回 result，保证下游策略引擎
+                # 拿到的永远是 want_favorite（合法 bool），且不再残留 want_fav。
+                from bilibot.models.interaction import InteractionSuggestion
+                suggestion = InteractionSuggestion.from_dict(result)
+                result["want_like"] = suggestion.want_like
+                result["want_coin"] = suggestion.want_coin
+                result["want_favorite"] = suggestion.want_favorite
+                result["want_comment"] = suggestion.want_comment
+                # 移除旧字段，防止 want_fav 泄漏到下游
+                result.pop("want_fav", None)
 
-            logger.info(f"视频评价: score={result.get('score')}, mood={result.get('mood')}, comment={result.get('comment')}")
-            return result
+                logger.info(
+                    f"视频评价: score={result.get('score')}, mood={result.get('mood')}, "
+                    f"comment={result.get('comment')}"
+                )
+                return result
 
-        except Exception as e:
-            logger.error(f"视频评价失败: {e}")
-            return None
+            except Exception as e:
+                last_error = type(e).__name__
+                logger.error(f"视频评价失败 attempt={attempt}/2: {e}")
+
+        logger.warning("视频评价最终失败: %s", last_error or "unknown")
+        return None
 
     async def generate_proactive_comment(
         self,
@@ -742,11 +813,21 @@ UP主: {owner}
         tags_text = "、".join(tags[:5]) if tags else "无"
         desc_text = desc[:200] if desc else "无"
 
-        # 视频内容段落
+        # 优先使用观看后整理的 video_detail；否则才是原始视听上下文。
+        # digest 后可能附带搜索参考，不能用总长度判断。
         video_content_section = ""
         if video_content:
-            truncated = video_content[:1500]
-            video_content_section = f"\n【视频内容】\n{truncated}\n"
+            head = video_content[:200]
+            is_digest = (
+                "【网络搜索参考】" in video_content
+                or (
+                    "【听到声音】" not in head
+                    and "【视听分析】" not in head
+                    and "### 视频结构化行为日志" not in head
+                )
+            )
+            label = "【视频详细内容】" if is_digest else "【视频内容】"
+            video_content_section = f"\n{label}\n{video_content}\n"
 
         prompt = f"""你刚看完一个B站视频，想发一条评论。
 
@@ -759,6 +840,7 @@ UP主: {owner}
 请发一条评论，要求：
 - 像真人随手打的，不要客套话
 - ≤40字
+- 尽量点到视频里的具体内容（情节/知识点/画面/槽点），不要只会夸“好看/不错”
 - 可以用网络用语、emoji
 - 不要@UP主
 - 只输出评论内容，不要其他文字"""

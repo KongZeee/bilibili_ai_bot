@@ -490,9 +490,10 @@ class BangumiService:
             retained_work_dir = getattr(e, "work_dir", "")
             if retained_work_dir and not analysis_result.get("work_dir"):
                 analysis_result["work_dir"] = retained_work_dir
-            self._preserve_episode_artifacts(ep_id, video_path, analysis_result)
+            # 失败不再保留媒体：重试会重新下载，残留只会占满磁盘
+            self._cleanup_episode_artifacts(ep_id, video_path, analysis_result)
             logger.error(
-                "番剧视频提取未完成，保留临时媒体并等待后续重试: sid=%s ep=%s",
+                "番剧视频提取未完成，已清理临时媒体并等待后续重试: sid=%s ep=%s",
                 season_info.get("season_id", 0),
                 ep_id,
                 exc_info=True,
@@ -574,9 +575,9 @@ class BangumiService:
                 },
             )
         except Exception:
-            self._preserve_episode_artifacts(ep_id, video_path, analysis_result)
+            self._cleanup_episode_artifacts(ep_id, video_path, analysis_result)
             logger.error(
-                "番剧完整档案提交失败，保留临时媒体并延后处理: sid=%s ep=%s",
+                "番剧完整档案提交失败，已清理临时媒体并延后处理: sid=%s ep=%s",
                 season_info.get("season_id", 0),
                 ep_id,
                 exc_info=True,
@@ -817,7 +818,8 @@ class BangumiService:
                     ep_info,
                     action_type="like",
                     label="点赞",
-                    operation=lambda: self.bili.like_reply(aid, action=1),
+                    # aid 是稿件 id，必须走视频点赞接口，不是评论 like_reply
+                    operation=lambda: self.bili.like_video(aid, like=1),
                 )
             )
         if score >= 6 and comment_enabled:
@@ -864,7 +866,13 @@ class BangumiService:
     ) -> dict[str, Any]:
         error = ""
         try:
-            success = bool(await operation())
+            raw = await operation()
+            # Optional[bool]: None means transport uncertainty — not a clean success
+            if raw is None:
+                success = False
+                error = "RESULT_UNKNOWN"
+            else:
+                success = bool(raw)
         except Exception as exc:
             success = False
             error = type(exc).__name__

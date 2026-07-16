@@ -497,6 +497,20 @@ class TaskRunStore:
         finally:
             conn.close()
 
+    def update_input(self, task_id: str, input_data: Dict[str, Any]) -> bool:
+        """更新任务的 input_json（用于在视频选定后持久化 bvid 等信息）"""
+        input_json = json.dumps(input_data, ensure_ascii=False)
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE task_runs SET input_json=?, updated_at=? WHERE task_id=?",
+                (input_json, time.time(), task_id),
+            )
+            conn.commit()
+            return cur.rowcount > 0
+        finally:
+            conn.close()
+
     def succeed(
         self, task_id: str, result: Optional[Dict[str, Any]] = None,
         now: Optional[float] = None,

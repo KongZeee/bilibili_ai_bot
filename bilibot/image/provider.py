@@ -48,7 +48,17 @@ class ImageProvider:
         self.model: str = config.get("model", "agnes-image-2.1-flash")
         self.default_size: str = config.get("default_size", "1024x768")
         self.timeout: int = int(config.get("timeout", 120))
+        try:
+            self.rate_limit_cooldown_seconds: float = float(
+                config.get("rate_limit_cooldown_seconds", 30)
+            )
+        except (TypeError, ValueError):
+            self.rate_limit_cooldown_seconds = 30.0
+        self.rate_limit_cooldown_seconds = max(1.0, min(self.rate_limit_cooldown_seconds, 600.0))
         self._rr = 0
+        self._rr_lock = asyncio.Lock()
+        # per-key 429 cooldown (monotonic timestamps)
+        self._key_cooldown_until: dict = {}
         self._session: Optional[aiohttp.ClientSession] = None
         self._session_lock = asyncio.Lock()
 
@@ -56,13 +66,40 @@ class ImageProvider:
         # PRD 3.14：必须 enabled=True 且配置了 api_key 和 model
         return bool(self.enabled and (self.api_key or self.api_keys) and self.model)
 
-    def _next_key(self) -> str:
+    async def _next_key(self) -> str:
+        """Pick next ready key (not cooling). Raises when all keys are hot."""
+        import time as _time
         keys = self.api_keys or ([self.api_key] if self.api_key else [])
         if not keys:
             return ""
-        key = keys[self._rr % len(keys)]
-        self._rr += 1
-        return key
+        now = _time.monotonic()
+        async with self._rr_lock:
+            ready = [
+                k for k in keys
+                if float(self._key_cooldown_until.get(k, 0.0) or 0.0) <= now
+            ]
+            if not ready:
+                # Do not force a still-cooling key — that turns 429 into a tight storm.
+                soonest = min(
+                    float(self._key_cooldown_until.get(k, 0.0) or 0.0) for k in keys
+                )
+                wait = max(0.0, soonest - now)
+                raise RuntimeError(
+                    f"文生图所有密钥均在冷却（约 {wait:.0f}s 后可重试）"
+                )
+            # round-robin among ready keys
+            start = self._rr % len(ready)
+            self._rr += 1
+            return ready[start]
+
+    def _mark_rate_limited(self, key: str) -> None:
+        import time as _time
+        if not key:
+            return
+        self._key_cooldown_until[key] = _time.monotonic() + self.rate_limit_cooldown_seconds
+        logger.warning(
+            "文生图密钥冷却 %.0fs after 429", self.rate_limit_cooldown_seconds
+        )
 
     async def _get_session(self, api_key: str = "") -> aiohttp.ClientSession:
         key = api_key or self.api_key
@@ -98,13 +135,21 @@ class ImageProvider:
         keys = self.api_keys or ([self.api_key] if self.api_key else [])
         last_err = None
         for _ in range(max(1, min(len(keys), 4))):
-            key = self._next_key()
+            try:
+                key = await self._next_key()
+            except RuntimeError as exc:
+                last_err = exc
+                logger.warning("%s", exc)
+                break
+            if not key:
+                break
             session = await self._get_session(key)
             try:
                 async with session.post(url, json=body) as resp:
                     if resp.status == 429:
                         text = await resp.text()
                         last_err = f"HTTP 429: {text[:200]}"
+                        self._mark_rate_limited(key)
                         logger.warning(f"文生图 429，切换密钥重试: {text[:120]}")
                         continue
                     if resp.status != 200:

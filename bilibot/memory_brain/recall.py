@@ -43,6 +43,46 @@ _BVID_RE = re.compile(r"(?i)\bBV[0-9A-Za-z]{10}\b")
 _STABLE_ID_RE = re.compile(r"(?i)\b(?:evt|event|mem|memory)_[0-9A-Za-z_-]{4,}\b")
 _QUOTED_RE = re.compile(r"[\"'“‘《]([^\"'”’》]{1,80})[\"'”’》]")
 
+# Prefer content that helps answer "what is this video about?" over raw API
+# metadata JSON / search blobs when a video event is only hit by title/id.
+_PREFERRED_EVIDENCE_SOURCE_TYPES: Mapping[str, int] = {
+    "video_detail": 200,
+    "behavior_log": 100,
+    "asr": 90,
+    "subtitle": 90,
+    "visual_description": 80,
+    "ocr": 70,
+    "video_hot_comments": 40,
+    "hot_comments": 40,
+    "comment_thread": 30,
+    "comment": 30,
+    "web_reference": 10,
+    "video_metadata": 0,
+    "video": 20,
+    "video_experience": 50,
+}
+_LOW_VALUE_EVIDENCE_SOURCE_TYPES = frozenset(
+    {
+        "video_metadata",
+        "web_reference",
+    }
+)
+_VIDEO_LIKE_EVENT_TYPES = frozenset(
+    {
+        "video_observation",
+        "video_metadata_observation",
+        "bot_experience",
+    }
+)
+_VIDEO_LIKE_SOURCE_TYPES = frozenset(
+    {
+        "video",
+        "video_metadata",
+        "video_experience",
+    }
+)
+_JSONISH_PREFIX_RE = re.compile(r"^\s*[\{\[]")
+
 
 @runtime_checkable
 class RecallStore(Protocol):
@@ -311,6 +351,138 @@ def _calibrate_rrf(rrf_score: float) -> float:
     # strong lexical/ID evidence above fallback gates while recency/graph-only
     # noise remains below them.  Ranking itself is still entirely weighted RRF.
     return min(1.0, max(0.0, 1.0 - math.exp(-90.0 * max(0.0, rrf_score))))
+
+
+def _chunk_source_type(chunk: Mapping[str, Any]) -> str:
+    return str(
+        chunk.get("source_type")
+        or chunk.get("chunk_source_type")
+        or ""
+    ).strip()
+
+
+def _chunk_text(chunk: Mapping[str, Any]) -> str:
+    return str(chunk.get("text") or chunk.get("content") or chunk.get("chunk_text") or "").strip()
+
+
+def _chunk_id_of(chunk: Mapping[str, Any]) -> str:
+    return str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
+
+
+def _is_video_like_event(event: Mapping[str, Any] | None, source_type: str = "") -> bool:
+    if not event and not source_type:
+        return False
+    event_type = str((event or {}).get("event_type") or "").strip()
+    src = str((event or {}).get("source_type") or source_type or "").strip()
+    return event_type in _VIDEO_LIKE_EVENT_TYPES or src in _VIDEO_LIKE_SOURCE_TYPES
+
+
+def _looks_like_json_blob(text: str) -> bool:
+    if not text or not _JSONISH_PREFIX_RE.match(text):
+        return False
+    # Metadata / search archives are stored as pretty JSON; audiovisual logs are not.
+    sample = text[:240]
+    return ('"' in sample and (":" in sample or "{" in sample)) or sample.lstrip().startswith("[")
+
+
+def _evidence_source_rank(source_type: str, text: str = "") -> int:
+    base = int(_PREFERRED_EVIDENCE_SOURCE_TYPES.get(source_type, 25))
+    if source_type in _LOW_VALUE_EVIDENCE_SOURCE_TYPES:
+        return base
+    if _looks_like_json_blob(text):
+        return min(base, 5)
+    # Prefer denser natural-language audiovisual snippets.
+    if source_type in {"behavior_log", "asr", "subtitle", "visual_description", "ocr"}:
+        return base + min(20, max(0, len(text) // 80))
+    return base
+
+
+def _select_evidence_chunks(
+    chunks: Sequence[Mapping[str, Any]],
+    *,
+    preferred_ids: Sequence[str] | set[str] | None = None,
+    limit: int = 2,
+    video_like: bool = False,
+) -> list[Mapping[str, Any]]:
+    """Pick up to ``limit`` evidence chunks, preferring audiovisual content.
+
+    Title/id hits often only know the event id.  Without this ranking the store
+    returns chunks in ordinal order and the first ones are usually raw
+    ``video_metadata`` JSON — useless for answering "what is this video about?".
+    """
+
+    if limit <= 0:
+        return []
+    preferred = {str(item).strip() for item in (preferred_ids or ()) if str(item).strip()}
+    ranked: list[tuple[tuple[int, int, int, int], Mapping[str, Any]]] = []
+    for index, chunk in enumerate(chunks or ()):
+        if not isinstance(chunk, Mapping):
+            continue
+        chunk_id = _chunk_id_of(chunk)
+        text = _chunk_text(chunk)
+        if not chunk_id or not text:
+            continue
+        source_type = _chunk_source_type(chunk)
+        source_rank = _evidence_source_rank(source_type, text)
+        preferred_rank = 1 if chunk_id in preferred else 0
+        # For video events, actively demote metadata/search JSON even if they
+        # were the only preferred ids left from a weak hit path.
+        if video_like and source_type in _LOW_VALUE_EVIDENCE_SOURCE_TYPES:
+            preferred_rank = 0
+            source_rank = min(source_rank, 1)
+        if video_like and _looks_like_json_blob(text) and source_type not in {
+            "video_detail",
+            "behavior_log",
+            "asr",
+            "subtitle",
+            "visual_description",
+            "ocr",
+        }:
+            source_rank = min(source_rank, 1)
+            preferred_rank = 0
+        # Higher is better; keep original order as a stable tie-breaker.
+        key = (preferred_rank, source_rank, min(len(text), 2000), -index)
+        ranked.append((key, chunk))
+    ranked.sort(key=lambda item: item[0], reverse=True)
+
+    selected: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
+    # If a dedicated video_detail exists, prefer a single strong digest first.
+    for _key, chunk in ranked:
+        if _chunk_source_type(chunk) == "video_detail":
+            chunk_id = _chunk_id_of(chunk)
+            if chunk_id:
+                selected.append(chunk)
+                seen.add(chunk_id)
+            break
+    for _key, chunk in ranked:
+        chunk_id = _chunk_id_of(chunk)
+        if not chunk_id or chunk_id in seen:
+            continue
+        # Once we have a video_detail digest, only add more if room remains and
+        # the extra chunk is also high-value audiovisual content.
+        if selected and _chunk_source_type(selected[0]) == "video_detail":
+            st = _chunk_source_type(chunk)
+            if st not in {"behavior_log", "asr", "subtitle", "visual_description", "ocr"}:
+                continue
+            # Keep total evidence short when digest already covers the video.
+            if len(selected) >= min(limit, 2):
+                break
+        selected.append(chunk)
+        seen.add(chunk_id)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _seed_video_evidence_ids(event: Mapping[str, Any]) -> list[str]:
+    """When a video event is only title/id-hit, seed high-value chunk ids."""
+
+    chunks = event.get("chunks") or ()
+    if not isinstance(chunks, Sequence) or isinstance(chunks, (str, bytes, bytearray)):
+        return []
+    selected = _select_evidence_chunks(chunks, preferred_ids=(), limit=2, video_like=True)
+    return [_chunk_id_of(chunk) for chunk in selected if _chunk_id_of(chunk)]
 
 
 class RecallEngine:
@@ -695,25 +867,39 @@ class RecallEngine:
                 80,
             )
             chunks = event.get("chunks") or ()
+            video_like = _is_video_like_event(event, candidate.source_type)
             if isinstance(chunks, Sequence) and not isinstance(chunks, (str, bytes, bytearray)):
-                matched: list[tuple[str, str]] = []
-                first_valid: tuple[str, str] | None = None
-                for chunk in chunks:
-                    if isinstance(chunk, Mapping):
-                        chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
-                        chunk_text = str(chunk.get("text") or chunk.get("content") or "").strip()
-                        if not chunk_id or not chunk_text:
-                            continue
-                        if first_valid is None:
-                            first_valid = (chunk_id, chunk_text)
-                        if chunk_id in candidate.evidence_ids and len(matched) < 2:
-                            matched.append((chunk_id, chunk_text))
-                if not matched and first_valid is not None:
-                    candidate.evidence_ids.add(first_valid[0])
-                    matched.append(first_valid)
+                # Title/id-only hits often carry no chunk evidence ids. Seed
+                # audiovisual chunks so rerank/fallback can actually quote them.
+                if video_like and not any(
+                    cid != candidate.event_id and not str(cid).startswith("link_")
+                    for cid in candidate.evidence_ids
+                ):
+                    for chunk_id in _seed_video_evidence_ids(event):
+                        candidate.evidence_ids.add(chunk_id)
+
+                selected_chunks = _select_evidence_chunks(
+                    chunks,
+                    preferred_ids=candidate.evidence_ids,
+                    limit=3 if video_like else 2,
+                    video_like=video_like,
+                )
+                if not selected_chunks:
+                    # Last resort: first non-empty chunk, still ranked.
+                    selected_chunks = _select_evidence_chunks(
+                        chunks,
+                        preferred_ids=(),
+                        limit=1,
+                        video_like=video_like,
+                    )
+                for chunk in selected_chunks:
+                    chunk_id = _chunk_id_of(chunk)
+                    if chunk_id:
+                        candidate.evidence_ids.add(chunk_id)
                 candidate.evidence_snippets = [
-                    (chunk_id, _short(chunk_text, 420))
-                    for chunk_id, chunk_text in matched[:2]
+                    (_chunk_id_of(chunk), _short(_chunk_text(chunk), 700))
+                    for chunk in selected_chunks
+                    if _chunk_text(chunk)
                 ]
                 if not candidate.summary and candidate.evidence_snippets:
                     candidate.summary = _short(candidate.evidence_snippets[0][1], 500)
@@ -803,7 +989,7 @@ class RecallEngine:
                 "allowed_evidence_ids": sorted(item.evidence_ids),
                 "evidence": [
                     {"evidence_id": evidence_id, "text": text}
-                    for evidence_id, text in item.evidence_snippets[:2]
+                    for evidence_id, text in item.evidence_snippets[:3]
                 ],
             }
             for item in candidates
@@ -1014,20 +1200,30 @@ class RecallEngine:
             value = dict(row)
             value["_recall_kind"] = candidate.kind
             allowed = set(candidate.selected_evidence_ids or ())
-            selected_chunks: list[Mapping[str, Any]] = []
             chunks = row.get("chunks") or ()
+            video_like = _is_video_like_event(row, candidate.source_type)
+            selected_chunks: list[Mapping[str, Any]] = []
             if isinstance(chunks, Sequence) and not isinstance(
                 chunks, (str, bytes, bytearray)
             ):
-                for chunk in chunks:
-                    if not isinstance(chunk, Mapping):
-                        continue
-                    chunk_id = str(chunk.get("chunk_id") or chunk.get("id") or "").strip()
-                    if chunk_id in allowed:
-                        selected_chunks.append(dict(chunk))
-                    if len(selected_chunks) >= 2:
-                        break
+                # Prefer reranker-chosen ids, but re-rank so metadata JSON never
+                # crowds out audiovisual evidence for video events.
+                preferred = allowed or set(candidate.evidence_ids)
+                selected_chunks = [
+                    dict(chunk)
+                    for chunk in _select_evidence_chunks(
+                        chunks,
+                        preferred_ids=preferred,
+                        limit=3 if video_like else 2,
+                        video_like=video_like,
+                    )
+                ]
             value["chunks"] = selected_chunks
+            # Keep selected_evidence_ids aligned with what we actually inject.
+            if selected_chunks:
+                candidate.selected_evidence_ids = tuple(
+                    _chunk_id_of(chunk) for chunk in selected_chunks if _chunk_id_of(chunk)
+                )
             result.append(value)
         # Preserve the selected score order even if the store returns another order.
         order = {candidate.event_id: index for index, candidate in enumerate(selected)}

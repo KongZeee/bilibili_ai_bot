@@ -175,9 +175,29 @@ export const ConfigPage = defineComponent({
                     }
                 }
                 const nested = unflattenConfig(filtered);
-                if (version.value > 0) nested._expected_revision = version.value;
-                await api.config.patch(nested);
-                showToast('配置保存成功', 'success');
+                // Always send optimistic lock, including revision 0 on fresh installs
+                if (version.value !== null && version.value !== undefined) {
+                    nested._expected_revision = version.value;
+                }
+                const result = await api.config.patch(nested);
+                // 展示热重载契约摘要：哪些字段需重启 / 下个任务周期才生效
+                const applied = result?.applied || result?.resp?.applied || {};
+                const needsRestart = Object.entries(applied)
+                    .filter(([, info]) => info?.status === 'requires_restart')
+                    .map(([k]) => k);
+                const pendingNext = Object.entries(applied)
+                    .filter(([, info]) => info?.status === 'pending_next_task')
+                    .map(([k]) => k);
+                if (needsRestart.length) {
+                    showToast(
+                        `配置已保存；以下字段需重启后生效：${needsRestart.slice(0, 4).join(', ')}${needsRestart.length > 4 ? '…' : ''}`,
+                        'warning',
+                    );
+                } else if (pendingNext.length) {
+                    showToast('配置已保存；部分字段将在下个任务周期生效', 'success');
+                } else {
+                    showToast('配置保存成功', 'success');
+                }
                 lastSaved.value = new Date().toLocaleString();
                 await loadData();
             } catch (e) {
@@ -193,14 +213,29 @@ export const ConfigPage = defineComponent({
             }
         }
 
-        async function reload() {
+        async function doReloadFromDisk() {
             try {
                 await api.config.reload();
-                showToast('配置已重载', 'success');
+                showToast('配置已从磁盘重载', 'success');
                 await loadData();
             } catch (e) {
                 showToast('重载失败: ' + e.message, 'error');
             }
+        }
+
+        async function reload() {
+            // 有未保存修改时先确认：重载会丢弃表单本地改动
+            if (isDirty.value) {
+                showConfirm({
+                    title: '确认重载配置',
+                    message: '当前有未保存的修改，从磁盘重载将丢弃这些改动。是否继续？',
+                    confirmText: '丢弃并重载',
+                    danger: true,
+                    action: () => { doReloadFromDisk(); },
+                });
+                return;
+            }
+            await doReloadFromDisk();
         }
 
         // Task 32.2：放弃修改，恢复到加载时状态

@@ -119,8 +119,9 @@ accounts:
     sessdata: ""
     bili_jct: ""
     dede_user_id: ""
-    buvid3: ""
-    refresh_token: ""
+    buvid3: ""                     # 设备指纹；空则启动时自动领取
+    buvid4: ""                     # 新版设备指纹；空则与 buvid3 一并领取
+    refresh_token: ""              # 扫码登录后写入；用于 SESSDATA 自动刷新
     profile_id: default            # 引用人格组（优先于 persona_id）
     persona_id: default            # 向后兼容：未配 profile_id 时使用单个人格
     chat_provider_id: ""           # 绑定的对话 Provider ID（留空用 model_routing.chat）
@@ -193,6 +194,8 @@ features:
   web_search: false          # 联网搜索
   affection: true            # 好感度系统
   mood: true                 # 心情系统
+  # B站 Cookie 自动检查间隔（小时）；账号级 ConfigLoader 会覆盖 bilibili 段，故放 features
+  cookie_check_interval_hours: 6
 
 # ── 动态发布（PRD §5.2 / §5.6）──
 dynamic_publish:
@@ -328,10 +331,18 @@ video_analysis:
   frame_extractor: "ffmpeg"
   scenedetect_threshold: 27.0
   image_max_size: 768
+  # 抽帧上限：镜头数 ≤ 本值则按镜头全抽；超过则在镜头中点上等距抽本值张（默认 150）
+  max_keyframes: 150
   # 视觉并发窗口（期望值）；实际并发 = min(本值, 视觉硬顶, 密钥数×每密钥并发)
   vision_window_size: 2
   # 视觉请求起步速率（每分钟）；多 key 时运行时按密钥数线性放大
   vision_requests_per_minute: 10
+  # 单帧 Vision 瞬时故障（连接错误/超时）额外重试次数
+  vision_frame_max_retries: 2
+  # 单帧重试退避基数（秒）：第 n 次等待 n * 该值
+  vision_frame_retry_backoff_seconds: 1.5
+  # require_complete 时最低成功帧比例（0~1）；达到即可继续，不必 100% 帧都成功
+  vision_min_success_ratio: 0.5
   # 临时目录（留空则用 {data_dir}/video_temp）
   temp_dir: ""
 
@@ -353,13 +364,18 @@ memory:
   vector_batch_size: 2048
 
 # ── Web 管理面板 ──
+# 安全建议：
+# - host 默认仅本机；需要远程访问时再改为 0.0.0.0，并务必改掉默认密码 + 前置反向代理/HTTPS
+# - admin_password 为默认 admin123（明文或 bcrypt 哈希匹配）且 host 非 localhost 时，进程将拒绝启动 Web
+# - 会话为进程内存储，仅支持单进程（workers=1），勿多副本横向扩展 Web
 web:
   enabled: true
-  host: "0.0.0.0"
+  host: "127.0.0.1"  # 推荐本机；仅在确知风险时改为 0.0.0.0
   port: 8080
   secret_key: "change-this-to-a-random-string"  # 会话签名密钥，生产环境务必修改
   admin_username: "admin"
-  admin_password: "admin123"  # 默认密码，生产环境务必修改
+  # 默认弱口令！生产必须修改；可用 bcrypt 哈希（$2b$...），勿保留 admin123
+  admin_password: "admin123"
   # 会话 TTL（秒），超时自动登出
   session_ttl_seconds: 3600
   # CORS 允许来源，留空表示不开放任意跨域（生产建议保持空）

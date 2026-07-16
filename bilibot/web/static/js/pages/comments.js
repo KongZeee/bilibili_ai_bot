@@ -1,5 +1,5 @@
 // pages/comments.js - 评论回复审计页（Golden Time 设计稿）
-const { defineComponent, h, ref, onMounted } = window.Vue;
+const { defineComponent, h, ref, onMounted, onUnmounted } = window.Vue;
 import { api } from '../api.js';
 import { showToast } from '../state.js';
 import { Button, Badge, FormInput, Loading, EmptyState, Icon, Pagination } from '../components/common.js';
@@ -20,14 +20,18 @@ function replyStatusLabel(r) {
     if (r.status === 'published' || r.published) {
         return isProactiveComment(r) ? '已发布' : '已回复';
     }
+    if (r.status === 'result_unknown') return '结果未知';
     if (target.failure_reason || r.status === 'failed') return '失败';
+    if (r.status === 'publishing' || r.status === 'retry_wait') return '处理中';
     return auditStatusLabel(r.status, { published: r.published });
 }
 
 function replyBadgeType(r) {
     const target = parseTarget(r.target);
     if (r.status === 'published' || r.published) return 'success';
+    if (r.status === 'result_unknown') return 'warning';
     if (target.failure_reason || r.status === 'failed') return 'danger';
+    if (r.status === 'publishing' || r.status === 'retry_wait') return 'warning';
     return auditStatusBadgeType(r.status, { published: r.published });
 }
 
@@ -41,6 +45,9 @@ export const CommentsPage = defineComponent({
         const page = ref(1);
         const pageSize = 20;
         const total = ref(0);
+        const retryingId = ref('');
+        let loadSeq = 0;
+        let pollTimer = null;
 
         const filters = [
             { value: 'all', label: '全部' },
@@ -49,8 +56,9 @@ export const CommentsPage = defineComponent({
             { value: 'failed', label: '失败' },
         ];
 
-        async function load() {
-            loading.value = true;
+        async function load({ silent = false } = {}) {
+            const seq = ++loadSeq;
+            if (!silent) loading.value = true;
             try {
                 const data = await api.replies({
                     page: page.value,
@@ -58,11 +66,16 @@ export const CommentsPage = defineComponent({
                     status: filter.value === 'all' ? undefined : filter.value,
                     keyword: keyword.value || undefined,
                 });
+                // 丢弃过期响应，避免快切筛选时旧数据覆盖新数据
+                if (seq !== loadSeq) return;
                 replies.value = data.items || [];
                 total.value = data.total || 0;
             } catch (e) {
-                showToast('加载失败: ' + e.message, 'error');
-            } finally { loading.value = false; }
+                if (seq !== loadSeq) return;
+                if (!silent) showToast('加载失败: ' + e.message, 'error');
+            } finally {
+                if (seq === loadSeq && !silent) loading.value = false;
+            }
         }
 
         function setFilter(v) {
@@ -71,9 +84,75 @@ export const CommentsPage = defineComponent({
             load();
         }
 
-        onMounted(load);
+        function onVisibilityChange() {
+            if (document.visibilityState === 'visible') {
+                load({ silent: true });
+            }
+        }
 
-        const tableGrid = 'minmax(8rem, 0.9fr) minmax(7rem, 0.7fr) minmax(8rem, 0.8fr) minmax(0, 1.6fr) 7rem';
+        function onFocus() {
+            load({ silent: true });
+        }
+
+        async function retryReply(replyId, force = false) {
+            if (!replyId || retryingId.value) return;
+            const row = replies.value.find(r => r.id === replyId);
+            // result_unknown：平台可能已发出，需二次确认
+            if (row && row.status === 'result_unknown' && !force) {
+                const ok = window.confirm(
+                    '该评论状态为「结果未知」，B站可能已经发出。\n\n'
+                    + '请先到 B 站确认是否已有该评论。\n'
+                    + '确认未发出后，点「确定」强制重试。'
+                );
+                if (!ok) return;
+                force = true;
+            }
+            retryingId.value = replyId;
+            try {
+                const result = await api.retryReply(replyId, force);
+                showToast(result?.message || '重试成功', 'success');
+                await load({ silent: true });
+            } catch (e) {
+                showToast('重试失败: ' + e.message, 'error');
+            } finally {
+                retryingId.value = '';
+            }
+        }
+
+        function canRetry(r) {
+            if (r.published || r.status === 'published') return false;
+            // result_unknown 仍显示按钮，但点击需二次确认
+            if (r.status === 'result_unknown') return true;
+            if (r.status === 'retry_wait' || r.status === 'publishing') return false;
+            const target = parseTarget(r.target);
+            return !!(
+                r.status === 'failed' ||
+                target.failure_reason
+            );
+        }
+
+        onMounted(() => {
+            load();
+            // 主动评论持续写入时，页面常开也能看到新记录
+            pollTimer = window.setInterval(() => {
+                if (document.visibilityState === 'visible') {
+                    load({ silent: true });
+                }
+            }, 30000);
+            document.addEventListener('visibilitychange', onVisibilityChange);
+            window.addEventListener('focus', onFocus);
+        });
+
+        onUnmounted(() => {
+            if (pollTimer) {
+                window.clearInterval(pollTimer);
+                pollTimer = null;
+            }
+            document.removeEventListener('visibilitychange', onVisibilityChange);
+            window.removeEventListener('focus', onFocus);
+        });
+
+        const tableGrid = 'minmax(8rem, 0.9fr) minmax(7rem, 0.7fr) minmax(8rem, 0.8fr) minmax(0, 1.6fr) 7rem 5rem';
 
         return () => loading.value && replies.value.length === 0
             ? h(Loading)
@@ -125,6 +204,10 @@ export const CommentsPage = defineComponent({
                                 }, () => '查询'),
                                 h(Button, {
                                     type: 'ghost',
+                                    onClick: () => load(),
+                                }, () => '刷新'),
+                                h(Button, {
+                                    type: 'ghost',
                                     onClick: () => {
                                         keyword.value = '';
                                         filter.value = 'all';
@@ -171,6 +254,7 @@ export const CommentsPage = defineComponent({
                                 h('span', { class: 'whitespace-nowrap' }, '视频'),
                                 h('span', { class: 'whitespace-nowrap' }, '内容'),
                                 h('span', { class: 'whitespace-nowrap' }, '状态'),
+                                h('span', { class: 'whitespace-nowrap' }, '操作'),
                             ]),
                             // 数据行
                             ...replies.value.map(r => {
@@ -215,6 +299,17 @@ export const CommentsPage = defineComponent({
                                         class: `badge badge-${badge}`,
                                         title: target.failure_reason || r.status || '',
                                     }, replyStatusLabel(r)),
+                                    h('div', { class: 'flex items-center gap-1' },
+                                        canRetry(r) ? h('button', {
+                                            class: 'btn btn-sm ghost',
+                                            style: 'padding: 2px 8px; font-size: 0.78rem; min-height: auto;',
+                                            disabled: retryingId.value === r.id,
+                                            onClick: (e) => {
+                                                e.stopPropagation();
+                                                retryReply(r.id);
+                                            },
+                                        }, retryingId.value === r.id ? '重试中...' : '重试') : null,
+                                    ),
                                 ]);
                             }),
                         ]),

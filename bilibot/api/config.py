@@ -28,6 +28,7 @@ SENSITIVE_FIELDS = {
     "bilibili.sessdata",
     "bilibili.bili_jct",
     "bilibili.buvid3",
+    "bilibili.buvid4",
     "bilibili.refresh_token",
     "llm.api_key",
     "llm.vision.api_key",
@@ -41,6 +42,15 @@ SENSITIVE_FIELDS = {
 }
 
 SENSITIVE_PLACEHOLDER = "***已配置***"
+
+
+class ConfigRevisionConflict(Exception):
+    """乐观锁冲突：mutator 内检测到 revision 不匹配时抛出，atomic_update 不写盘。"""
+
+    def __init__(self, expected: int, actual: int):
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"expected {expected}, actual {actual}")
 
 
 class ConfigValidationError(ValueError):
@@ -68,7 +78,8 @@ RELOAD_CONTRACT = {
     "dynamic_publish": "immediate",
     "memory": "next_task",
     "proactive": "next_task",
-    "video_analysis": "next_task",
+    # 视频理解：保存后由 video_analysis API / account reload 热刷 cfg
+    "video_analysis": "immediate",
     "image_generation": "next_task",
     "accounts": "restart_account",
     "llm_providers": "restart_account",
@@ -78,7 +89,12 @@ RELOAD_CONTRACT = {
     "logging": "immediate",
     "llm": "immediate",
     "bilibili": "immediate",
-    "model_request_limits": "next_task",
+    # 模型请求限制：ModelRouter.reload_request_limits 热生效
+    "model_request_limits": "immediate",
+    # 全局默认：allow_llm_fallback / default_llm 热写入 ModelRouter
+    "global_defaults": "immediate",
+    "allow_llm_fallback": "immediate",
+    "default_llm": "immediate",
 }
 
 # accounts 子字段级别的特殊契约（覆盖 accounts 整体的 restart_account）
@@ -87,6 +103,7 @@ ACCOUNT_FIELD_CONTRACT = {
     "sessdata": "immediate",
     "bili_jct": "immediate",
     "buvid3": "immediate",
+    "buvid4": "immediate",
     "refresh_token": "immediate",
     "llm_id": "restart_account",
     "persona_id": "restart_account",
@@ -103,7 +120,8 @@ WEB_FIELD_CONTRACT = {
     "admin_username": "restart_app",
     "admin_password": "restart_app",
     "session_ttl_seconds": "restart_app",
-    "cors_origins": "immediate",
+    # CORS 中间件在 create_web_app 时固定，改 origins 必须重启
+    "cors_origins": "restart_app",
     "secure_cookies": "restart_app",
 }
 
@@ -194,6 +212,59 @@ MEMORY_CONFIG_FIELD_MAP = {
         "test_id": "test_v6_vector_batches",
     },
 }
+
+
+def _normalize_safety_for_api(config: dict) -> dict:
+    """将 safety 扁平内容长度键映射为 schema 使用的 content.min/max_length。
+
+    历史 YAML 使用 min_content_length / max_content_length；
+    Web schema 与 build_safety_config 新路径使用 safety.content.{min_length,max_length}。
+    若不在 GET 时补齐，系统页「安全配置」长度字段会空白，保存时也写不回正确位置。
+    """
+    if not isinstance(config, dict):
+        return config
+    safety = config.get("safety")
+    if not isinstance(safety, dict):
+        return config
+    safety = dict(safety)
+    content = safety.get("content") if isinstance(safety.get("content"), dict) else {}
+    content = dict(content)
+    if content.get("min_length") is None and safety.get("min_content_length") is not None:
+        content["min_length"] = safety.get("min_content_length")
+    if content.get("max_length") is None and safety.get("max_content_length") is not None:
+        content["max_length"] = safety.get("max_content_length")
+    if content:
+        safety["content"] = content
+    out = dict(config)
+    out["safety"] = safety
+    return out
+
+
+def _sync_safety_content_fields(config: dict) -> dict:
+    """保存时同步 safety.content ↔ 扁平 min/max_content_length，保持双读路径一致。"""
+    if not isinstance(config, dict):
+        return config
+    safety = config.get("safety")
+    if not isinstance(safety, dict):
+        return config
+    safety = dict(safety)
+    content = safety.get("content") if isinstance(safety.get("content"), dict) else {}
+    content = dict(content)
+    # 嵌套优先；若仅有扁平则回填嵌套
+    if content.get("min_length") is None and safety.get("min_content_length") is not None:
+        content["min_length"] = safety.get("min_content_length")
+    if content.get("max_length") is None and safety.get("max_content_length") is not None:
+        content["max_length"] = safety.get("max_content_length")
+    # 嵌套写回扁平，兼容旧读取路径与现有 YAML 习惯
+    if content.get("min_length") is not None:
+        safety["min_content_length"] = content["min_length"]
+    if content.get("max_length") is not None:
+        safety["max_content_length"] = content["max_length"]
+    if content:
+        safety["content"] = content
+    out = dict(config)
+    out["safety"] = safety
+    return out
 
 
 def increment_config_revision(config_loader, config_path: str) -> int:
@@ -776,7 +847,12 @@ def _build_config_schema() -> dict:
             "type": "object",
             "label": "评论回复",
             "fields": {
-                "auto_reply": {"type": "boolean", "label": "自动回复"},
+                # 运行时以 features.reply_comment 为准；保留字段仅兼容旧 YAML，UI 已 deprecated 过滤
+                "auto_reply": {
+                    "type": "boolean",
+                    "label": "自动回复(已迁移到功能开关·评论回复)",
+                    "deprecated": True,
+                },
                 "batch_size": {"type": "number", "label": "每批处理条数"},  # PRD 6.2：新增
                 "block_keywords": {"type": "array", "itemType": "string", "label": "屏蔽关键词"},
                 "min_comment_length": {"type": "number", "label": "最小评论长度"},
@@ -803,10 +879,24 @@ def _build_config_schema() -> dict:
                 "video_count": {"type": "number", "label": "每日看视频次数"},
                 # PRD 6.3：video_times/dynamic_times 已废弃，从 schema 移除
                 "dynamic_count": {"type": "number", "label": "每日发动态次数"},
-                "interest_keywords": {"type": "array", "itemType": "string", "label": "兴趣关键词"},  # PRD 6.2：新增
-                # CFG-604：番剧追更 / 特别关注（V2 中为 bool 类型）
-                "bangumi": {"type": "boolean", "label": "番剧追更"},
-                "special_follow": {"type": "boolean", "label": "特别关注"},
+                # 无运行时消费者；保留键兼容旧 YAML，UI 不渲染
+                "interest_keywords": {
+                    "type": "array",
+                    "itemType": "string",
+                    "label": "兴趣关键词(暂未接入推荐)",
+                    "deprecated": True,
+                },
+                # 运行时以 features.bangumi 为准
+                "bangumi": {
+                    "type": "boolean",
+                    "label": "番剧追更(已迁移到功能开关)",
+                    "deprecated": True,
+                },
+                "special_follow": {
+                    "type": "boolean",
+                    "label": "特别关注(暂未实现)",
+                    "deprecated": True,
+                },
                 # CFG-604：TASK-501 TaskRun 持久化生命周期
                 "grace_window_seconds": {"type": "number", "label": "默认迟到窗口 (秒)"},
                 "scenes": {
@@ -941,6 +1031,9 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
             "default_llm": masked_config.get("default_llm", ""),
             "default_account": masked_config.get("default_account", ""),
         }
+        # safety：YAML 常见扁平 min/max_content_length，schema/UI 用 content.min/max_length
+        # 读取时补齐嵌套字段，避免系统页安全配置长度项空白、保存时写丢
+        masked_config = _normalize_safety_for_api(masked_config)
         return JSONResponse({
             "success": True,
             "data": masked_config,
@@ -988,20 +1081,48 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
             "reload_failed" — reload_config 抛异常
         """
         try:
-            if field_key == "safety" and safety_checker is not None:
+            if field_key in ("safety", "reply") and safety_checker is not None:
+                # reply.block_keywords 也喂给 SafetyChecker 敏感词表
                 from ..services.safety import build_safety_config
                 safety_checker.reload_config(build_safety_config(config))
+                if field_key == "safety":
+                    return "applied"
+                # reply 其余字段由 scheduler 每轮读读；敏感词已刷
+            if field_key == "logging":
+                from ..app.app import setup_logging
+                setup_logging(config)
                 return "applied"
-            if field_key == "web_search" and web_search_service is not None:
-                web_search_service.reload_config(config)
-                return "applied"
-            if field_key == "interactions" and policy_engine is not None:
-                policy_engine.reload_config(config)
-                return "applied"
+            if field_key == "model_request_limits":
+                llm_mgr = None
+                if account_manager is not None:
+                    llm_mgr = getattr(account_manager, "llm_manager", None)
+                if llm_mgr is not None and hasattr(llm_mgr, "reload_request_limits"):
+                    llm_mgr.reload_request_limits(config)
+                    return "applied"
+                return "applied_via_config_loader"
+            if field_key in ("global_defaults", "allow_llm_fallback", "default_llm"):
+                llm_mgr = None
+                if account_manager is not None:
+                    llm_mgr = getattr(account_manager, "llm_manager", None)
+                if llm_mgr is not None and hasattr(llm_mgr, "reload_global_defaults"):
+                    llm_mgr.reload_global_defaults(config)
+                    return "applied"
+                return "applied_via_config_loader"
+            if field_key in ("web_search", "interactions", "video_analysis", "features", "personality"):
+                # 每账号 Scheduler / VU / bangumi / user_state 由 account_manager.reload_all() 统一刷
+                if account_manager is not None:
+                    return "applied"
+                if field_key == "web_search" and web_search_service is not None:
+                    web_search_service.reload_config(config)
+                    return "applied"
+                if field_key == "interactions" and policy_engine is not None:
+                    policy_engine.reload_config(config)
+                    return "applied"
+                return "applied_via_config_loader"
             if field_key == "accounts" and sub_field in ACCOUNT_FIELD_CONTRACT:
                 # accounts.*.cookie 等 immediate 子字段由 account_manager.reload_all() 处理
                 return "applied"
-            # 无专用组件持有的 immediate 字段（reply/personality/features 等）
+            # 无专用组件持有的 immediate 字段（personality/features 等）
             # config_loader.reload() 已在 PATCH 主流程中调用，统一生效
             return "applied_via_config_loader"
         except Exception as e:
@@ -1011,12 +1132,29 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
     async def patch_config(request: Request) -> JSONResponse:
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return JSONResponse({
+                    "success": False,
+                    "error": {
+                        "code": "INVALID_INPUT",
+                        "message": "请求体必须是 JSON 对象",
+                        "details": {},
+                    },
+                }, status_code=400)
             schema = _build_config_schema()
+
+            # 乐观锁 revision 仅用于冲突检测，绝不能写入 YAML（曾误落盘为顶层 _expected_revision）
+            expected_revision = body.pop("_expected_revision", None)
+            # 丢弃其它以下划线开头的元字段，避免污染配置文件
+            body = {
+                key: value
+                for key, value in body.items()
+                if not str(key).startswith("_")
+            }
 
             # PRD V4 CFG-005：config_revision 冲突检测
             raw_config = config_loader.get_raw_config()
             current_revision = int(raw_config.get("config_revision", 0) or 0)
-            expected_revision = body.get("_expected_revision")
             if expected_revision is not None:
                 if int(expected_revision) != current_revision:
                     return JSONResponse({
@@ -1081,19 +1219,58 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
             except Exception as e:
                 logger.warning(f"admin_password 哈希化失败: {e}")
 
-            merged = _merge_with_preserved_sensitive(raw_config, normalized)
-            try:
-                validate_memory_config_values(merged.get("memory", {}))
-            except ValueError as exc:
-                raise ConfigValidationError(str(exc)) from exc
+            # 在写锁内完成：再读 revision → 合并 → 写盘，避免与专用 API 并发丢段
+            merged_holder = {"merged": None}
 
-            # PRD V4 CFG-005：递增 config_revision
-            merged["config_revision"] = current_revision + 1
+            def _mutate_locked(raw: dict) -> None:
+                cur = int(raw.get("config_revision", 0) or 0)
+                if expected_revision is not None and int(expected_revision) != cur:
+                    raise ConfigRevisionConflict(int(expected_revision), cur)
+                m = _merge_with_preserved_sensitive(raw, normalized)
+                for meta_key in list(m.keys()):
+                    if str(meta_key).startswith("_"):
+                        m.pop(meta_key, None)
+                m = _sync_safety_content_fields(m)
+                try:
+                    validate_memory_config_values(m.get("memory", {}))
+                except ValueError as exc:
+                    raise ConfigValidationError(str(exc)) from exc
+                m["config_revision"] = cur + 1
+                raw.clear()
+                raw.update(m)
+                merged_holder["merged"] = m
 
-            # 4. 保存（ConfigLoader 内部使用原子写入）
-            config_loader.save_config(merged, config_file_path)
+            if hasattr(config_loader, "atomic_update"):
+                try:
+                    config_loader.atomic_update(config_file_path, _mutate_locked)
+                except ConfigRevisionConflict as conflict:
+                    return JSONResponse({
+                        "success": False,
+                        "error": {
+                            "code": "CONFIG_REVISION_CONFLICT",
+                            "message": "配置已被其他会话修改，请刷新后重试",
+                            "retryable": False,
+                            "details": {
+                                "expected": conflict.expected,
+                                "actual": conflict.actual,
+                            },
+                        },
+                    }, status_code=409)
+                merged = merged_holder["merged"] or config_loader.get_raw_config()
+            else:
+                merged = _merge_with_preserved_sensitive(raw_config, normalized)
+                for meta_key in list(merged.keys()):
+                    if str(meta_key).startswith("_"):
+                        merged.pop(meta_key, None)
+                merged = _sync_safety_content_fields(merged)
+                try:
+                    validate_memory_config_values(merged.get("memory", {}))
+                except ValueError as exc:
+                    raise ConfigValidationError(str(exc)) from exc
+                merged["config_revision"] = current_revision + 1
+                config_loader.save_config(merged, config_file_path)
 
-            # 5. 热重载
+            # 4. 热重载
             reload_result = {"reloaded": False}
             try:
                 config_loader.reload(merged)
@@ -1102,12 +1279,27 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 logger.warning(f"热重载失败: {e}")
                 reload_result = {"reloaded": False, "warning": str(e)}
 
-            # PRD V3 §3.3：热重载后触发账号凭据更新（不重启调度器）
+            # PRD V3 §3.3：热重载后触发账号凭据 + 运行时服务更新
             if account_manager is not None:
                 try:
                     await account_manager.reload_all()
                 except Exception as e:
                     logger.warning(f"账号凭据热重载失败: {e}")
+
+            # model_request_limits / global_defaults 兜底
+            try:
+                if "model_request_limits" in normalized or "allow_llm_fallback" in normalized or "default_llm" in normalized:
+                    llm_mgr = getattr(account_manager, "llm_manager", None) if account_manager else None
+                    if llm_mgr is not None:
+                        if "model_request_limits" in normalized and hasattr(llm_mgr, "reload_request_limits"):
+                            llm_mgr.reload_request_limits(merged)
+                        if (
+                            "allow_llm_fallback" in normalized
+                            or "default_llm" in normalized
+                        ) and hasattr(llm_mgr, "reload_global_defaults"):
+                            llm_mgr.reload_global_defaults(merged)
+            except Exception as e:
+                logger.warning(f"model_request_limits/global_defaults 热重载失败: {e}")
 
             # PRD V5 CFG-502 §11.3：构建逐字段热重载状态
             applied = _build_applied_response(raw_config, merged)
@@ -1132,10 +1324,10 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 },
             }, status_code=400)
         except Exception as e:
-            logger.error(f"保存配置失败: {e}")
+            logger.error(f"保存配置失败: {e}", exc_info=True)
             return JSONResponse({
                 "success": False,
-                "error": {"code": "SAVE_FAILED", "message": str(e), "details": {}},
+                "error": {"code": "SAVE_FAILED", "message": "配置保存失败，请检查日志", "details": {}},
             }, status_code=500)
 
     async def validate_config(request: Request) -> JSONResponse:
@@ -1180,21 +1372,80 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 "data": {"valid": valid, "errors": errors, "warnings": warnings},
             })
         except Exception as e:
-            logger.error(f"验证配置失败: {e}")
+            logger.error(f"验证配置失败: {e}", exc_info=True)
             return JSONResponse({
                 "success": False,
-                "error": {"code": "VALIDATION_FAILED", "message": str(e), "details": {}},
+                "error": {"code": "VALIDATION_FAILED", "message": "配置验证失败，请检查日志", "details": {}},
             }, status_code=500)
 
     async def reload_config(request: Request) -> JSONResponse:
         try:
             config_loader.reload()
-            return JSONResponse({"success": True, "message": "配置已热重载"})
+            raw = config_loader.get_raw_config()
+            # 与 PATCH 一致：磁盘重载后把 immediate 组件也刷一遍
+            applied = {}
+            for field_key in (
+                "safety", "web_search", "interactions", "reply",
+                "features", "logging", "model_request_limits", "video_analysis",
+            ):
+                if field_key not in raw and field_key not in (
+                    "model_request_limits", "video_analysis", "logging"
+                ):
+                    continue
+                status = _apply_immediate_reload(field_key, "", raw)
+                applied[field_key] = {"level": "immediate", "status": status}
+            # logging / model_request_limits 兜底（字段可能为空 dict 仍需应用）
+            try:
+                from ..app.app import setup_logging
+                setup_logging(raw)
+                applied["logging"] = {"level": "immediate", "status": "applied"}
+            except Exception as e:
+                logger.warning(f"磁盘重载后 logging 应用失败: {e}")
+                applied["logging"] = {"level": "immediate", "status": "reload_failed"}
+            try:
+                llm_mgr = getattr(account_manager, "llm_manager", None) if account_manager else None
+                if llm_mgr is not None:
+                    if hasattr(llm_mgr, "reload_request_limits"):
+                        llm_mgr.reload_request_limits(raw)
+                        applied["model_request_limits"] = {
+                            "level": "immediate", "status": "applied"
+                        }
+                    if hasattr(llm_mgr, "reload_global_defaults"):
+                        llm_mgr.reload_global_defaults(raw)
+                        applied["global_defaults"] = {
+                            "level": "immediate", "status": "applied"
+                        }
+            except Exception as e:
+                logger.warning(f"磁盘重载后 model/global defaults 应用失败: {e}")
+            # 视频分析全局并发
+            try:
+                from bilibot.video_understanding import configure_global_semaphore
+                va = raw.get("video_analysis") or {}
+                max_g = int(va.get("max_concurrent_global", 1) or 1) if isinstance(va, dict) else 1
+                configure_global_semaphore(max(1, max_g))
+                applied["video_analysis.max_concurrent_global"] = {
+                    "level": "immediate", "status": "applied"
+                }
+            except Exception as e:
+                logger.warning(f"磁盘重载后全局并发应用失败: {e}")
+            if account_manager is not None:
+                try:
+                    await account_manager.reload_all()
+                    applied["accounts"] = {"level": "immediate", "status": "applied"}
+                except Exception as e:
+                    logger.warning(f"重载后账号凭据同步失败: {e}")
+                    applied["accounts"] = {"level": "immediate", "status": "reload_failed"}
+            return JSONResponse({
+                "success": True,
+                "message": "配置已热重载",
+                "config_revision": int(raw.get("config_revision", 0) or 0),
+                "applied": applied,
+            })
         except Exception as e:
-            logger.error(f"热重载失败: {e}")
+            logger.error(f"热重载失败: {e}", exc_info=True)
             return JSONResponse({
                 "success": False,
-                "error": {"code": "RELOAD_FAILED", "message": str(e), "details": {}},
+                "error": {"code": "RELOAD_FAILED", "message": "配置热重载失败，请检查日志", "details": {}},
             }, status_code=500)
 
     return [

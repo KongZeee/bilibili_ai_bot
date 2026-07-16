@@ -11,8 +11,6 @@ B站 API 适配器
 - 动态管理
 - 搜索
 
-TODO(M3): download_video 使用同步文件写入（with open + f.write），
-大文件下载时会阻塞事件循环，后续应引入 aiofiles 改为异步写入。
 """
 import asyncio
 import hashlib
@@ -20,6 +18,7 @@ import hmac
 import json
 import os
 import random
+import re
 import time
 import base64
 import urllib.parse
@@ -32,6 +31,41 @@ import aiohttp
 from io import BytesIO
 
 logger = logging.getLogger("bilibot.bilibili")
+
+
+async def _stream_download_to_file(
+    session: aiohttp.ClientSession,
+    url: str,
+    path: str,
+    headers: Dict[str, str],
+    *,
+    timeout: int = 600,
+    chunk_size: int = 256 * 1024,
+) -> bool:
+    """Stream HTTP body to disk without buffering the whole file in memory.
+
+    Returns True on HTTP 200 + complete write; False on non-200.
+    Propagates network/IO exceptions to the caller.
+    """
+    async with session.get(
+        url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+    ) as resp:
+        if resp.status != 200:
+            logger.warning(f"下载失败: HTTP {resp.status} for {url[:120]}")
+            return False
+
+        def _open_out():
+            return open(path, "wb")
+
+        out = await asyncio.to_thread(_open_out)
+        try:
+            async for chunk in resp.content.iter_chunked(chunk_size):
+                if not chunk:
+                    continue
+                await asyncio.to_thread(out.write, chunk)
+        finally:
+            await asyncio.to_thread(out.close)
+        return True
 
 # WBI混键表
 MIXIN_KEY_ENC_TAB = [
@@ -67,6 +101,11 @@ class BilibiliAPI:
         self._wbi_mixkey: Optional[str] = None
         # M4：WBI 混键缓存时间戳，24 小时过期刷新
         self._wbi_mixkey_ts: float = 0
+        # WBI 连续获取失败计数 + 退避截止时间（避免 nav API 暂时不可用时反复重试）
+        self._wbi_fail_count: int = 0
+        self._wbi_backoff_until: float = 0.0
+        # 与 session 相同：并发 miss 时只允许一个协程刷新 mixkey
+        self._wbi_lock = asyncio.Lock()
         self._csrf_token: str = config.bilibili.bili_jct or ""
         # PRD 4.9：记录最近 API 错误码，scheduler 据此判断风控
         self.last_api_code: int = 0
@@ -77,12 +116,20 @@ class BilibiliAPI:
         # after Bilibili reports -101. Public APIs remain available.
         self._auth_failure_count: int = 0
         self._auth_backoff_until: float = 0.0
+        # 凭据变更回调：refresh_cookie / ensure_buvid 写回 config 后通知 AccountInstance
+        self._credential_update_cb = None
+        self._cookie_refresh_lock = asyncio.Lock()
+        self._last_cookie_check_ts: float = 0.0
+
+    def set_credential_update_callback(self, cb) -> None:
+        """Register callback(updates: dict) after SESSDATA/buvid/etc. change."""
+        self._credential_update_cb = cb
 
     def reload_credentials(self, config=None):
         """PRD V3 §3.3：热重载凭据（不重建 session）
 
         Web 配置保存后调用，避免重启账号即可更新 cookie。
-        注意：_get_headers 每次都从 self.config 读取 sessdata/dede_user_id/buvid3，
+        注意：_get_headers 每次都从 self.config 读取 sessdata/dede_user_id/buvid*，
         所以只需更新 config 引用 + _csrf_token。
         """
         if config is not None:
@@ -106,26 +153,36 @@ class BilibiliAPI:
         return max(0.0, self._auth_backoff_until - current)
 
     def _record_authenticated_response(self, data: Optional[Dict]) -> None:
-        """Update authenticated-poll backoff from an auth-required API response."""
+        """Update authenticated-poll backoff from an auth-required API response.
+
+        Counter updates are guarded by a threading.Lock so concurrent polls
+        cannot race failure count / backoff window mutations.
+        """
         if not isinstance(data, dict):
             return
         code = data.get("code")
-        if code == AUTH_REQUIRED_CODE:
-            self._auth_failure_count += 1
-            delay = min(
-                AUTH_BACKOFF_MAX_SECONDS,
-                AUTH_BACKOFF_BASE_SECONDS
-                * (2 ** min(self._auth_failure_count - 1, 4)),
-            )
-            self._auth_backoff_until = time.monotonic() + delay
-            logger.info(
-                "B站认证轮询暂停 %d 秒（连续 -101 次数=%d），重新加载凭据后会立即恢复",
-                delay,
-                self._auth_failure_count,
-            )
-        elif code == 0:
-            self.clear_auth_backoff()
-    
+        if not hasattr(self, "_auth_counter_lock"):
+            import threading
+            self._auth_counter_lock = threading.Lock()
+        with self._auth_counter_lock:
+            if code == AUTH_REQUIRED_CODE:
+                self._auth_failure_count += 1
+                delay = min(
+                    AUTH_BACKOFF_MAX_SECONDS,
+                    AUTH_BACKOFF_BASE_SECONDS
+                    * (2 ** min(self._auth_failure_count - 1, 4)),
+                )
+                self._auth_backoff_until = time.monotonic() + delay
+                logger.warning(
+                    "Bilibili auth poll paused %d s (consecutive -101 count=%d)",
+                    int(delay),
+                    self._auth_failure_count,
+                )
+            elif code == 0:
+                if self._auth_failure_count or self._auth_backoff_until:
+                    self._auth_failure_count = 0
+                    self._auth_backoff_until = 0.0
+
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建aiohttp会话"""
         # M2：double-check 模式，避免并发创建多个 session
@@ -150,6 +207,8 @@ class BilibiliAPI:
         async with self._session_lock:
             if self.session and not self.session.closed:
                 await self.session.close()
+            # 清空引用，避免 close 后误用旧 session；_get_session 会按需重建
+            self.session = None
     
     def _get_headers(self, extra_cookies: Optional[Dict[str, str]] = None) -> Dict[str, str]:
         """获取请求头，包含Cookie"""
@@ -166,11 +225,14 @@ class BilibiliAPI:
             cookies += f"; DedeUserID={self.config.bilibili.dede_user_id}"
         if self.config.bilibili.buvid3:
             cookies += f"; buvid3={self.config.bilibili.buvid3}"
-        
+        buvid4 = getattr(self.config.bilibili, "buvid4", "") or ""
+        if buvid4:
+            cookies += f"; buvid4={buvid4}"
+
         if extra_cookies:
             for k, v in extra_cookies.items():
                 cookies += f"; {k}={v}"
-        
+
         headers["Cookie"] = cookies
         return headers
     
@@ -229,7 +291,14 @@ class BilibiliAPI:
             return None, str(e)
     
     async def _http_post(self, url: str, data: Optional[Dict] = None, timeout: int = 10) -> Tuple[Optional[Dict], Optional[str]]:
-        """HTTP POST请求"""
+        """HTTP POST请求。
+
+        Returns (json, error). error prefixes:
+        - ``timeout:`` / ``network:`` / ``http_5xx:`` / ``empty_body:`` / ``non_json:``
+          → transport uncertainty (platform may have accepted the write)
+        - ``http_4xx:`` → likely definitive client/request failure
+        - other → treat as uncertain when used by publish helpers
+        """
         session = await self._get_session()
         try:
             async with session.post(
@@ -240,6 +309,8 @@ class BilibiliAPI:
             ) as resp:
                 if resp.status == 200:
                     text = await resp.text()
+                    if not (text or "").strip():
+                        return None, "empty_body: empty HTTP 200 body"
                     try:
                         resp_data = json.loads(text)
                         # MISC-601：所有 POST API 调用统一记录返回码，供风控检测（-352）使用
@@ -248,53 +319,89 @@ class BilibiliAPI:
                             self.last_api_code = (resp_data or {}).get("code", -1)
                         return resp_data, None
                     except json.JSONDecodeError:
-                        return None, text
-                else:
-                    return None, f"HTTP {resp.status}"
+                        return None, f"non_json: {text[:200]}"
+                if 500 <= resp.status <= 599:
+                    return None, f"http_5xx: HTTP {resp.status}"
+                if 400 <= resp.status <= 499:
+                    return None, f"http_4xx: HTTP {resp.status}"
+                return None, f"http: HTTP {resp.status}"
+        except asyncio.TimeoutError:
+            logger.error(f"POST请求超时: {url}")
+            return None, "timeout: request timed out"
+        except aiohttp.ClientError as e:
+            logger.error(f"POST网络错误: {e}")
+            return None, f"network: {type(e).__name__}: {e}"
         except Exception as e:
             logger.error(f"POST请求失败: {e}")
-            return None, str(e)
+            return None, f"network: {type(e).__name__}: {e}"
     
     # ══════════════════════════════════════
     #  WBI 签名
     # ══════════════════════════════════════
     
     async def _get_wbi_mixkey(self) -> Optional[str]:
-        """获取WBI混键"""
+        """获取WBI混键（double-checked lock + 指数退避，避免并发 stampede）"""
         # M4：缓存 24 小时内有效，过期则刷新
         if self._wbi_mixkey and (time.time() - self._wbi_mixkey_ts < 86400):
             return self._wbi_mixkey
 
-        session = await self._get_session()
-        try:
-            async with session.get(
-                "https://api.bilibili.com/x/web-interface/nav",
-                headers=self._get_headers(),
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    # B站 nav API 字段为 wbi_img（单数），非 wbi_imgs
-                    imgs = data.get("data", {}).get("wbi_img", {}) or data.get("data", {}).get("wbi_imgs", {})
-                    img_url = imgs.get("img_url", "")
-                    sub_url = imgs.get("sub_url", "")
+        # 退避期内不重试，直接返回缓存（可能过期但仍比 None 好）
+        now = time.time()
+        if self._wbi_fail_count > 0 and now < self._wbi_backoff_until:
+            return self._wbi_mixkey  # 过期但可用的缓存，或 None
 
-                    if not img_url or not sub_url:
-                        logger.warning("nav API 未返回 wbi_img，WBI 签名不可用")
-                        return None
+        async with self._wbi_lock:
+            # 等待锁期间可能已被其他协程刷新
+            if self._wbi_mixkey and (time.time() - self._wbi_mixkey_ts < 86400):
+                return self._wbi_mixkey
+            if self._wbi_fail_count > 0 and time.time() < self._wbi_backoff_until:
+                return self._wbi_mixkey
 
-                    # 从 URL 中提取文件名（去掉扩展名）
-                    img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
-                    sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
-                    mix_key = img_key + sub_key
-                    self._wbi_imgs = imgs
-                    self._wbi_mixkey = self._encrypt_mixkey(mix_key)
-                    # M4：更新缓存时间戳
-                    self._wbi_mixkey_ts = time.time()
-                    return self._wbi_mixkey
-        except Exception as e:
-            logger.error(f"获取WBI混键失败: {e}")
-        return None
+            session = await self._get_session()
+            try:
+                async with session.get(
+                    "https://api.bilibili.com/x/web-interface/nav",
+                    headers=self._get_headers(),
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # B站 nav API 字段为 wbi_img（单数），非 wbi_imgs
+                        imgs = data.get("data", {}).get("wbi_img", {}) or data.get("data", {}).get("wbi_imgs", {})
+                        img_url = imgs.get("img_url", "")
+                        sub_url = imgs.get("sub_url", "")
+
+                        if not img_url or not sub_url:
+                            logger.warning("nav API 未返回 wbi_img，WBI 签名不可用")
+                            self._record_wbi_failure()
+                            return self._wbi_mixkey
+
+                        # 从 URL 中提取文件名（去掉扩展名）
+                        img_key = img_url.rsplit("/", 1)[-1].split(".")[0]
+                        sub_key = sub_url.rsplit("/", 1)[-1].split(".")[0]
+                        mix_key = img_key + sub_key
+                        self._wbi_imgs = imgs
+                        self._wbi_mixkey = self._encrypt_mixkey(mix_key)
+                        # M4：更新缓存时间戳
+                        self._wbi_mixkey_ts = time.time()
+                        # 成功：重置退避状态
+                        self._wbi_fail_count = 0
+                        self._wbi_backoff_until = 0.0
+                        return self._wbi_mixkey
+            except Exception as e:
+                logger.error(f"获取WBI混键失败: {e}")
+            self._record_wbi_failure()
+            return self._wbi_mixkey
+
+    def _record_wbi_failure(self) -> None:
+        """记录 WBI 获取失败，指数退避（30s → 60s → 120s → … 最大 1h）"""
+        self._wbi_fail_count += 1
+        delay = min(30 * (2 ** (self._wbi_fail_count - 1)), 3600)
+        self._wbi_backoff_until = time.time() + delay
+        logger.warning(
+            "WBI 混键获取失败，退避 %d 秒（连续失败 %d 次）",
+            delay, self._wbi_fail_count,
+        )
     
     def _encrypt_mixkey(self, mix_key: str) -> str:
         """加密混键"""
@@ -314,10 +421,16 @@ class BilibiliAPI:
             
         Returns:
             带签名的参数字典
+
+        Raises:
+            RuntimeError: WBI 混键不可用（nav API 连续失败、退避中）
         """
         mix_key = await self._get_wbi_mixkey()
         if not mix_key:
-            return params
+            raise RuntimeError(
+                f"WBI mix_key 不可用（连续失败 {self._wbi_fail_count} 次），"
+                f"无法签名请求。退避至 {self._wbi_backoff_until:.0f}"
+            )
 
         # 添加timestamp（wts 必须参与签名计算）
         params = dict(params)  # 拷贝避免修改入参
@@ -333,6 +446,279 @@ class BilibiliAPI:
 
         return params
     
+    # ══════════════════════════════════════
+    #  buvid 设备指纹 + Cookie 自动刷新
+    #  （对齐 astrbot_plugin_bilibili_ai_bot）
+    # ══════════════════════════════════════
+
+    def _apply_local_credential_updates(self, updates: Dict[str, str]) -> None:
+        """Write credential fields into in-memory config (bilibili section + BiliConfig)."""
+        if not updates:
+            return
+        bili = self.config.bilibili
+        raw = None
+        try:
+            raw = self.config.get_raw_config()
+        except Exception:
+            raw = None
+        bili_raw = None
+        if isinstance(raw, dict):
+            bili_raw = raw.setdefault("bilibili", {})
+
+        field_map = {
+            "sessdata": "sessdata",
+            "bili_jct": "bili_jct",
+            "dede_user_id": "dede_user_id",
+            "buvid3": "buvid3",
+            "buvid4": "buvid4",
+            "refresh_token": "refresh_token",
+        }
+        for src, attr in field_map.items():
+            if src not in updates:
+                continue
+            val = str(updates[src] or "")
+            if not val:
+                continue
+            if hasattr(bili, attr):
+                setattr(bili, attr, val)
+            if isinstance(bili_raw, dict):
+                bili_raw[attr] = val
+            if attr == "bili_jct":
+                self._csrf_token = val
+
+    def _notify_credential_update(self, updates: Dict[str, str]) -> None:
+        cb = self._credential_update_cb
+        if not cb or not updates:
+            return
+        try:
+            cb(dict(updates))
+        except Exception as e:
+            logger.warning("凭据回调失败: %s", type(e).__name__)
+
+    async def ensure_buvid(self, force: bool = False) -> bool:
+        """领取并缓存 buvid3/buvid4（设备指纹，降低风控概率）
+
+        GET https://api.bilibili.com/x/frontend/finger/spi
+        → data.b_3 / data.b_4
+
+        已有 buvid3 且非 force 时跳过。失败不阻断主流程。
+        """
+        if not force and (self.config.bilibili.buvid3 or ""):
+            return True
+        try:
+            data, err = await self._http_get(
+                "https://api.bilibili.com/x/frontend/finger/spi",
+                timeout=10,
+            )
+            if not data or data.get("code") != 0:
+                logger.warning(
+                    "获取 buvid 失败: %s",
+                    (data or {}).get("message") or err or "unknown",
+                )
+                return False
+            payload = data.get("data") or {}
+            buvid3 = str(payload.get("b_3") or "").strip()
+            buvid4 = str(payload.get("b_4") or "").strip()
+            if not buvid3 and not buvid4:
+                logger.warning("finger/spi 未返回 buvid")
+                return False
+            updates: Dict[str, str] = {}
+            if buvid3:
+                updates["buvid3"] = buvid3
+            if buvid4:
+                updates["buvid4"] = buvid4
+            self._apply_local_credential_updates(updates)
+            self._notify_credential_update(updates)
+            logger.info(
+                "已获取设备指纹 buvid3=%s... buvid4=%s",
+                (buvid3[:16] + "...") if buvid3 else "-",
+                "yes" if buvid4 else "no",
+            )
+            return True
+        except Exception as e:
+            logger.warning("获取 buvid 异常（不影响基本功能）: %s", e)
+            return False
+
+    async def check_need_cookie_refresh(self) -> Tuple[bool, str]:
+        """查询登录 Cookie 是否需要刷新。
+
+        GET passport.../cookie/info?csrf=
+        → data.refresh == True 表示需要刷新
+        """
+        if not self.config.bilibili.is_authenticated:
+            return False, "未登录"
+        csrf = self._csrf_token or self.config.bilibili.bili_jct or ""
+        try:
+            data, err = await self._http_get(
+                "https://passport.bilibili.com/x/passport-login/web/cookie/info",
+                params={"csrf": csrf},
+                timeout=10,
+            )
+            if not data:
+                return False, f"检查失败: {err or 'empty'}"
+            if data.get("code") != 0:
+                return False, f"检查失败: {data.get('message', data.get('code'))}"
+            need = bool((data.get("data") or {}).get("refresh", False))
+            return (True, "需要刷新") if need else (False, "Cookie 仍然有效")
+        except Exception as e:
+            return False, f"检查出错: {e}"
+
+    def _generate_correspond_path(self, ts_ms: int) -> str:
+        """RSA-OAEP 加密 refresh_{ts} 得到 correspond path（Cookie 刷新协议）"""
+        from cryptography.hazmat.primitives.asymmetric import padding
+        from cryptography.hazmat.primitives import hashes, serialization
+
+        pk = serialization.load_pem_public_key(BILI_RSA_PUBLIC_KEY.encode())
+        return pk.encrypt(
+            f"refresh_{ts_ms}".encode(),
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None,
+            ),
+        ).hex()
+
+    async def _http_get_text(self, url: str, timeout: int = 10) -> Tuple[str, Optional[str]]:
+        """GET 返回纯文本（Cookie 刷新取 refresh_csrf 用）"""
+        session = await self._get_session()
+        try:
+            async with session.get(
+                url,
+                headers=self._get_headers(),
+                timeout=aiohttp.ClientTimeout(total=timeout),
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    return text, f"HTTP {resp.status}"
+                return text, None
+        except Exception as e:
+            return "", str(e)
+
+    async def refresh_cookie(self, force: bool = False) -> Tuple[bool, str]:
+        """使用 refresh_token 刷新 SESSDATA / bili_jct（官方 Web 协议）
+
+        流程：
+        1. cookie/info 判断是否需要刷新（force=True 跳过）
+        2. RSA 加密时间戳 → correspond 页提取 refresh_csrf
+        3. POST cookie/refresh
+        4. POST confirm/refresh（旧 refresh_token）
+        5. 写回本地 config + 凭据回调
+        """
+        rt = (self.config.bilibili.refresh_token or "").strip()
+        if not rt:
+            return False, "没有 refresh_token（请重新扫码登录）"
+        if not self.config.bilibili.sessdata:
+            return False, "SESSDATA 为空"
+        bjct = self._csrf_token or self.config.bilibili.bili_jct or ""
+
+        async with self._cookie_refresh_lock:
+            try:
+                if not force:
+                    need, msg = await self.check_need_cookie_refresh()
+                    if not need:
+                        return True, msg
+
+                ts_ms = int(time.time() * 1000)
+                cp = self._generate_correspond_path(ts_ms)
+                html, herr = await self._http_get_text(
+                    f"https://www.bilibili.com/correspond/1/{cp}", timeout=15,
+                )
+                if herr and not html:
+                    return False, f"无法获取 correspond 页: {herr}"
+                m = re.search(r'<div\s+id="1-name"\s*>([^<]+)</div>', html or "")
+                if not m:
+                    return False, "无法提取 refresh_csrf"
+
+                refresh_csrf = m.group(1).strip()
+                session = await self._get_session()
+                async with session.post(
+                    "https://passport.bilibili.com/x/passport-login/web/cookie/refresh",
+                    headers=self._get_headers(),
+                    data={
+                        "csrf": bjct,
+                        "refresh_csrf": refresh_csrf,
+                        "source": "main_web",
+                        "refresh_token": rt,
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                ) as resp:
+                    try:
+                        result = await resp.json(content_type=None)
+                    except Exception:
+                        body = await resp.text()
+                        return False, f"刷新响应非 JSON: {body[:200]}"
+                    if not isinstance(result, dict) or result.get("code") != 0:
+                        return False, (
+                            f"刷新失败: "
+                            f"{(result or {}).get('message', (result or {}).get('code', resp.status))}"
+                        )
+                    updates: Dict[str, str] = {}
+                    nrt = (result.get("data") or {}).get("refresh_token") or ""
+                    if nrt:
+                        updates["refresh_token"] = str(nrt)
+                    for k, cookie in resp.cookies.items():
+                        name = getattr(cookie, "key", None) or k
+                        val = getattr(cookie, "value", None) or str(cookie)
+                        if name == "SESSDATA" and val:
+                            updates["sessdata"] = val
+                        elif name == "bili_jct" and val:
+                            updates["bili_jct"] = val
+                        elif name == "DedeUserID" and val:
+                            updates["dede_user_id"] = val
+                        elif name == "buvid3" and val:
+                            updates["buvid3"] = val
+                        elif name == "buvid4" and val:
+                            updates["buvid4"] = val
+
+                if "sessdata" not in updates:
+                    return False, "刷新响应中未找到新 SESSDATA"
+
+                # confirm 使用旧 refresh_token
+                try:
+                    new_jct = updates.get("bili_jct", bjct)
+                    confirm_headers = dict(self._get_headers())
+                    confirm_headers["Cookie"] = (
+                        f"SESSDATA={updates['sessdata']}; bili_jct={new_jct}"
+                    )
+                    await self._http_post(
+                        "https://passport.bilibili.com/x/passport-login/web/confirm/refresh",
+                        data={"csrf": new_jct, "refresh_token": rt},
+                        timeout=10,
+                    )
+                except Exception as ce:
+                    logger.warning("confirm/refresh 失败（可忽略）: %s", ce)
+
+                self._apply_local_credential_updates(updates)
+                self.clear_auth_backoff()
+                self._notify_credential_update(updates)
+                self._last_cookie_check_ts = time.time()
+                logger.info("B站 Cookie 刷新成功")
+                return True, "Cookie 刷新成功"
+            except Exception as e:
+                logger.error("Cookie 刷新异常: %s", e, exc_info=True)
+                return False, f"刷新出错: {e}"
+
+    async def maybe_refresh_cookie(self, interval_hours: float = 6.0) -> Tuple[bool, str]:
+        """主循环节流入口：默认每 interval_hours 检查一次是否需要刷新 Cookie。"""
+        now = time.time()
+        interval = max(300.0, float(interval_hours) * 3600.0)
+        if self._last_cookie_check_ts and (now - self._last_cookie_check_ts) < interval:
+            return True, "skip"
+        self._last_cookie_check_ts = now
+        if not self.config.bilibili.is_authenticated:
+            return False, "未登录"
+        # 先看登录是否还活着
+        try:
+            nav = await self.get_nav_status()
+            if not nav or nav.get("code") != 0:
+                # 登录可能已失效，尝试 refresh
+                if self.config.bilibili.refresh_token:
+                    return await self.refresh_cookie(force=True)
+                return False, "Cookie 可能已失效且无 refresh_token"
+        except Exception:
+            pass
+        return await self.refresh_cookie(force=False)
+
     # ══════════════════════════════════════
     #  用户信息
     # ══════════════════════════════════════
@@ -428,18 +814,61 @@ class BilibiliAPI:
             add_tag(info.get(field))
         return tags
     
-    async def get_hot_comments(self, oid: int, limit: int = 5) -> List[str]:
-        """获取热门评论"""
+    async def get_hot_comments(self, oid: int, limit: int = 5) -> List[Dict]:
+        """获取热门评论（结构化）。
+
+        Returns list of dicts so archive/memory can keep mid/rpid, while
+        prompt builders still accept plain strings for backward compatibility::
+
+            {
+              "rpid": str,
+              "mid": str,
+              "name": str,
+              "content": str,   # alias: message / text
+              "like": int,
+            }
+        """
         data, _ = await self._http_get(
             "https://api.bilibili.com/x/v2/reply/hot",
             params={"oid": oid, "pn": 1, "ps": limit, "type": 1},
         )
-        if data and data.get("data") and data["data"].get("replies"):
-            return [
-                reply.get("content", {}).get("message", "")
-                for reply in data["data"]["replies"][:limit]
-            ]
-        return []
+        if not (data and data.get("data") and data["data"].get("replies")):
+            return []
+        rows: List[Dict] = []
+        for reply in data["data"]["replies"][:limit]:
+            if not isinstance(reply, dict):
+                continue
+            content = reply.get("content") or {}
+            if not isinstance(content, dict):
+                content = {}
+            member = reply.get("member") or {}
+            if not isinstance(member, dict):
+                member = {}
+            message = str(content.get("message") or "").strip()
+            if not message:
+                continue
+            mid = str(member.get("mid") or reply.get("mid") or "")
+            name = str(
+                member.get("uname")
+                or member.get("name")
+                or reply.get("uname")
+                or ""
+            )
+            rpid = str(reply.get("rpid") or reply.get("id") or "")
+            rows.append(
+                {
+                    "rpid": rpid,
+                    "mid": mid,
+                    "user_id": mid,
+                    "name": name,
+                    "uname": name,
+                    "content": message,
+                    "message": message,
+                    "text": message,
+                    "like": int(reply.get("like") or 0),
+                }
+            )
+        return rows
     
     async def get_video_subtitles(self, bvid: str, cid: int) -> Optional[str]:
         """获取视频字幕"""
@@ -558,25 +987,30 @@ class BilibiliAPI:
 
         session = await self._get_session()
 
-        # 下载视频流
+        # 下载视频流（流式写盘，避免整文件进内存）
         try:
-            async with session.get(video_url, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"下载视频流失败: HTTP {resp.status}")
-                    return None
-                buf = []
-                async for chunk in resp.content.iter_chunked(1024 * 256):
-                    buf.append(chunk)
-
-                def _write_video():
-                    with open(video_file, "wb") as f:
-                        for c in buf:
-                            f.write(c)
-
-                await asyncio.to_thread(_write_video)
+            ok = await _stream_download_to_file(
+                session, video_url, video_file, headers, timeout=600
+            )
+            if not ok:
+                # 清理可能的部分下载文件
+                for tmp in [video_file]:
+                    try:
+                        if os.path.exists(tmp):
+                            os.remove(tmp)
+                    except Exception:
+                        pass
+                return None
             logger.info(f"视频流下载完成: {video_file}")
         except Exception as e:
             logger.error(f"下载视频流异常: {e}")
+            # 清理可能的部分下载文件
+            for tmp in [video_file]:
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
             return None
 
         # 下载音频流（可选，失败不影响）
@@ -585,18 +1019,12 @@ class BilibiliAPI:
             audio_url = audios[0].get("baseUrl") or audios[0].get("base_url") or audios[0].get("url")
             if audio_url:
                 try:
-                    async with session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                        if resp.status == 200:
-                            abuf = []
-                            async for chunk in resp.content.iter_chunked(1024 * 256):
-                                abuf.append(chunk)
-                            def _write_audio():
-                                with open(audio_file, "wb") as f:
-                                    for c in abuf:
-                                        f.write(c)
-                            await asyncio.to_thread(_write_audio)
-                            audio_downloaded = True
-                            logger.info(f"音频流下载完成: {audio_file}")
+                    ok = await _stream_download_to_file(
+                        session, audio_url, audio_file, headers, timeout=300
+                    )
+                    if ok:
+                        audio_downloaded = True
+                        logger.info(f"音频流下载完成: {audio_file}")
                 except Exception as e:
                     logger.warning(f"下载音频流失败（不影响视频分析）: {e}")
 
@@ -681,14 +1109,18 @@ class BilibiliAPI:
             return data
 
         logger.debug(f"评论主列表接口失败，尝试 wbi/main: {err or data}")
-        wbi_params = await self.sign_wbi({
-            "oid": oid,
-            "type": comment_type,
-            "mode": 3,
-            "pagination_str": json.dumps({"offset": ""}, separators=(",", ":")),
-            "plat": 1,
-            "web_location": 1315875,
-        })
+        try:
+            wbi_params = await self.sign_wbi({
+                "oid": oid,
+                "type": comment_type,
+                "mode": 3,
+                "pagination_str": json.dumps({"offset": ""}, separators=(",", ":")),
+                "plat": 1,
+                "web_location": 1315875,
+            })
+        except RuntimeError as e:
+            logger.warning(f"WBI 签名不可用，评论列表获取失败: {e}")
+            return data  # 返回第一次非 WBI 请求的结果（可能为 None）
         data, _ = await self._http_get(
             "https://api.bilibili.com/x/v2/reply/wbi/main",
             params=wbi_params,
@@ -696,6 +1128,21 @@ class BilibiliAPI:
         )
         return data
     
+    @staticmethod
+    def _is_uncertain_transport_error(err: Optional[str]) -> bool:
+        """True when the write may have succeeded on Bilibili despite local failure."""
+        if not err:
+            return False
+        e = err.lower()
+        return e.startswith((
+            "timeout:",
+            "network:",
+            "http_5xx:",
+            "empty_body:",
+            "non_json:",
+            "http:",  # unexpected status class
+        ))
+
     async def post_comment(
         self,
         oid: int,
@@ -704,20 +1151,14 @@ class BilibiliAPI:
         rpid: int = 0,
         parent: int = 0,
         plat: int = 1,
-    ) -> bool:
+    ) -> Optional[bool]:
         """
         发表评论
 
-        Args:
-            oid: 目标评论区id
-            content: 评论内容
-            comment_type: 评论类型 (1=视频, 11=文章, 17=动态)
-            rpid: 根评论ID (root)，0=主评论
-            parent: 父评论ID (要回复的那条评论)，0=同 rpid
-            plat: 平台 (1=web, 2=安卓, 3=iOS)
-
         Returns:
-            是否成功
+            True  — 明确成功 (code==0)
+            False — 明确失败 (业务 code!=0 或未登录/4xx)
+            None  — 结果不确定 (超时/网络/5xx/非JSON)，调用方不得自动重发
         """
         if not self.config.bilibili.is_authenticated:
             logger.error("未登录B站")
@@ -747,11 +1188,15 @@ class BilibiliAPI:
                 self.last_api_code = 0
             logger.info(f"评论成功: oid={oid}")
             return True
-        else:
+        if data is None and self._is_uncertain_transport_error(err):
             async with self._api_code_lock:
-                self.last_api_code = (data or {}).get("code", -1)
-            logger.error(f"评论失败: {err or data}")
-            return False
+                self.last_api_code = -1
+            logger.error(f"评论结果不确定（不自动重发）: {err}")
+            return None
+        async with self._api_code_lock:
+            self.last_api_code = (data or {}).get("code", -1)
+        logger.error(f"评论失败: {err or data}")
+        return False
 
     async def get_comment_replies(self, oid: int, root: int, comment_type: int = 1,
                                    ps: int = 20, pn: int = 1) -> Optional[Dict]:
@@ -780,23 +1225,39 @@ class BilibiliAPI:
         )
         return data
 
-    async def like_reply(self, rpid: int, action: int = 1) -> bool:
+    async def like_reply(
+        self,
+        rpid: int,
+        action: int = 1,
+        *,
+        oid: Optional[int] = None,
+        comment_type: int = 1,
+    ) -> bool:
         """
-        点赞/取消点赞评论
-        
+        点赞/取消点赞评论（/x/v2/reply/action）
+
         Args:
-            rpid: 评论ID
-            action: 1=点赞, 2=取消点赞
+            rpid: 评论 rpid
+            action: 1=点赞, 0=取消点赞（兼容旧调用传入 2 时按取消处理）
+            oid: 评论所属资源 id（视频 aid / 动态 id 等）；缺省时接口会失败
+            comment_type: 评论区类型，视频=1
         """
+        if action == 2:
+            action = 0
+        if not oid:
+            logger.warning("like_reply 需要 oid（评论所属资源 id）")
+            return False
         data, _ = await self._http_post(
-            "https://api.bilibili.com/x/reply/list/report",
+            "https://api.bilibili.com/x/v2/reply/action",
             data={
+                "oid": oid,
+                "type": comment_type,
                 "rpid": rpid,
                 "action": action,
                 "csrf": self._csrf_token,
             },
         )
-        return data and data.get("code") == 0
+        return bool(data and data.get("code") == 0)
     
     # ══════════════════════════════════════
     #  私信管理
@@ -818,30 +1279,48 @@ class BilibiliAPI:
         self._record_authenticated_response(data)
         return data
 
-    async def get_session_messages(self, sender_uid: int, receiver_uid: int,
-                                    next_seq: int = 0, limit: int = 20) -> Optional[Dict]:
-        """获取会话消息"""
+    async def get_session_messages(
+        self,
+        talker_id: Optional[int] = None,
+        session_type: int = 1,
+        size: int = 20,
+        begin_seqno: int = 0,
+        *,
+        sender_uid: Optional[int] = None,
+        receiver_uid: Optional[int] = None,
+        next_seq: int = 0,
+        limit: Optional[int] = None,
+    ) -> Optional[Dict]:
+        """Fetch session messages via web IM fetch_session_msgs.
+
+        Bilibili expects talker_id / session_type / size / begin_seqno.
+        Legacy kwargs sender_uid/receiver_uid/next_seq/limit are mapped.
+        """
+        if not talker_id:
+            talker_id = sender_uid or receiver_uid or 0
+        if limit is not None:
+            size = limit
+        if next_seq and not begin_seqno:
+            begin_seqno = next_seq
         data, _ = await self._http_get(
             "https://api.vc.bilibili.com/svr_sync/v1/svr_sync/fetch_session_msgs",
             params={
-                "sender_uid_id": sender_uid,
-                "receiver_uid_id": receiver_uid,
-                "sender_seq": 0,
-                "receiver_seq": 0,
+                "talker_id": talker_id,
+                "session_type": session_type,
+                "size": size,
+                "begin_seqno": begin_seqno,
                 "build": 0,
                 "mobi_app": "web",
             },
         )
+        self._record_authenticated_response(data)
         return data
-    
-    async def send_private_message(self, receiver_id: int, msg: str, msg_type: int = 1) -> bool:
+
+    async def send_private_message(self, receiver_id: int, msg: str, msg_type: int = 1) -> Optional[bool]:
         """
         发送私信（web端）
 
-        Args:
-            receiver_id: 接收者UID
-            msg: 消息内容
-            msg_type: 1=文本, 2=图片
+        Returns True/False/None (None = transport uncertainty, do not auto-resend).
         """
         if not self.config.bilibili.is_authenticated:
             logger.error("未登录B站")
@@ -885,24 +1364,45 @@ class BilibiliAPI:
         if data and data.get("code") == 0:
             logger.info(f"私信发送成功 -> {receiver_id}")
             return True
-        else:
-            logger.error(f"私信发送失败: {err or data}")
-            return False
+        if data is None and self._is_uncertain_transport_error(err):
+            logger.error(f"私信结果不确定（不自动重发）: {err}")
+            return None
+        logger.error(f"私信发送失败: {err or data}")
+        return False
     
-    async def ack_session(self, sender_uid: int, receiver_uid: int) -> bool:
-        """标记私信已读"""
-        data, _ = await self._http_post(
+    async def ack_session(
+        self,
+        talker_id: int,
+        session_type: int = 1,
+        ack_seqno: int = 0,
+        *,
+        sender_uid: Optional[int] = None,
+        receiver_uid: Optional[int] = None,
+    ) -> bool:
+        """标记私信会话已读（web IM update_ack）。
+
+        兼容旧调用 ack_session(sender_uid, receiver_uid)：
+        将 sender_uid 视为 talker_id。
+        """
+        if not talker_id and sender_uid:
+            talker_id = sender_uid
+        data, err = await self._http_post(
             "https://api.vc.bilibili.com/session_svr/v1/session_svr/update_ack",
             data={
-                "sender_uid_id": sender_uid,
-                "receiver_uid_id": receiver_uid,
+                "talker_id": talker_id,
+                "session_type": session_type,
+                "ack_seqno": ack_seqno,
                 "build": 0,
                 "mobi_app": "web",
                 "csrf_token": self._csrf_token,
+                "csrf": self._csrf_token,
             },
         )
-        return data and data.get("code") == 0
-    
+        ok = bool(data and data.get("code") == 0)
+        if not ok:
+            logger.debug("ack_session failed talker_id=%s err=%s data=%s", talker_id, err, data)
+        return ok
+
     # ══════════════════════════════════════
     #  动态管理
     # ══════════════════════════════════════
@@ -1014,7 +1514,7 @@ class BilibiliAPI:
             logger.error(f"图片上传异常: {e}")
             return None
 
-    async def post_dynamic_text(self, content: str, images: Optional[List[Dict]] = None) -> bool:
+    async def post_dynamic_text(self, content: str, images: Optional[List[Dict]] = None) -> Optional[bool]:
         """
         发布动态（支持纯文字和图文）
 
@@ -1072,16 +1572,28 @@ class BilibiliAPI:
                     headers=headers,
                     timeout=aiohttp.ClientTimeout(total=30),
                 ) as resp:
-                    text = await resp.text()
+                    body = await resp.text()
+                    if resp.status != 200:
+                        if 500 <= resp.status <= 599:
+                            return None, f"http_5xx: HTTP {resp.status}"
+                        if 400 <= resp.status <= 499:
+                            return None, f"http_4xx: HTTP {resp.status}"
+                        return None, f"http: HTTP {resp.status}"
+                    if not (body or "").strip():
+                        return None, "empty_body: empty HTTP 200 body"
                     try:
-                        resp_data = json.loads(text)
+                        resp_data = json.loads(body)
                     except json.JSONDecodeError:
-                        return None, text[:200]
+                        return None, f"non_json: {body[:200]}"
                     async with self._api_code_lock:
                         self.last_api_code = (resp_data or {}).get("code", -1)
                     return resp_data, None
+            except asyncio.TimeoutError:
+                return None, "timeout: request timed out"
+            except aiohttp.ClientError as exc:
+                return None, f"network: {type(exc).__name__}: {exc}"
             except Exception as exc:
-                return None, str(exc)
+                return None, f"network: {type(exc).__name__}: {exc}"
 
         if images:
             logger.info(f"发布图文动态: {len(images)} 张配图")
@@ -1093,6 +1605,13 @@ class BilibiliAPI:
                 self.last_api_code = 0
             logger.info(f"动态发布成功: {content[:50]}...")
             return True
+
+        # Uncertain new-path failure: never fall back to old create (double-dynamic risk).
+        if data is None and self._is_uncertain_transport_error(err):
+            async with self._api_code_lock:
+                self.last_api_code = -1
+            logger.error(f"新版动态结果不确定，不回退旧接口: {err}")
+            return None
 
         logger.warning(f"新版动态发布失败，尝试旧接口兜底: {err or data}")
 
@@ -1125,11 +1644,15 @@ class BilibiliAPI:
                 self.last_api_code = 0
             logger.info(f"动态发布成功(旧接口兜底): {content[:50]}...")
             return True
-        else:
+        if data is None and self._is_uncertain_transport_error(err):
             async with self._api_code_lock:
-                self.last_api_code = (data or {}).get("code", -1)
-            logger.error(f"动态发布失败: {err or data}")
-            return False
+                self.last_api_code = -1
+            logger.error(f"动态发布结果不确定（不自动重发）: {err}")
+            return None
+        async with self._api_code_lock:
+            self.last_api_code = (data or {}).get("code", -1)
+        logger.error(f"动态发布失败: {err or data}")
+        return False
     
     async def get_user_dynamics(self, host_uid: int, offset: int = 0, limit: int = 20) -> Optional[Dict]:
         """获取用户动态"""
@@ -1212,17 +1735,22 @@ class BilibiliAPI:
     #  互动操作
     # ══════════════════════════════════════
     
-    async def like_video(self, oid: int) -> bool:
-        """点赞视频"""
+    async def like_video(self, oid: int, like: int = 1) -> bool:
+        """点赞/取消点赞视频
+
+        Args:
+            oid: 视频 aid
+            like: 1=点赞, 2=取消点赞（B站 archive/like 约定）
+        """
         data, _ = await self._http_post(
-            "https://api.bilibili.com/x/web-interface/like/archive",
+            "https://api.bilibili.com/x/web-interface/archive/like",
             data={
                 "aid": oid,
-                "like_state": 1,
+                "like": like,
                 "csrf": self._csrf_token,
             },
         )
-        return data and data.get("code") == 0
+        return bool(data and data.get("code") == 0)
     
     async def coin_video(self, oid: int, num: int = 1) -> bool:
         """
@@ -1501,22 +2029,13 @@ class BilibiliAPI:
 
         session = await self._get_session()
 
-        # 下载视频流
+        # 下载视频流（流式写盘，避免整文件进内存）
         try:
-            async with session.get(video_url, headers=headers, timeout=aiohttp.ClientTimeout(total=600)) as resp:
-                if resp.status != 200:
-                    logger.warning(f"下载番剧视频流失败: HTTP {resp.status}")
-                    return None
-                vbuf = []
-                async for chunk in resp.content.iter_chunked(1024 * 256):
-                    vbuf.append(chunk)
-
-                def _write_v():
-                    with open(video_file, "wb") as f:
-                        for c in vbuf:
-                            f.write(c)
-
-                await asyncio.to_thread(_write_v)
+            ok = await _stream_download_to_file(
+                session, video_url, video_file, headers, timeout=600
+            )
+            if not ok:
+                return None
             logger.info(f"番剧视频流下载完成: {video_file}")
         except Exception as e:
             logger.error(f"下载番剧视频流异常: {e}")
@@ -1528,20 +2047,12 @@ class BilibiliAPI:
             audio_url = audios[0].get("baseUrl") or audios[0].get("base_url") or audios[0].get("url")
             if audio_url:
                 try:
-                    async with session.get(audio_url, headers=headers, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                        if resp.status == 200:
-                            abuf = []
-                            async for chunk in resp.content.iter_chunked(1024 * 256):
-                                abuf.append(chunk)
-
-                            def _write_a():
-                                with open(audio_file, "wb") as f:
-                                    for c in abuf:
-                                        f.write(c)
-
-                            await asyncio.to_thread(_write_a)
-                            audio_downloaded = True
-                            logger.info(f"番剧音频流下载完成: {audio_file}")
+                    ok = await _stream_download_to_file(
+                        session, audio_url, audio_file, headers, timeout=300
+                    )
+                    if ok:
+                        audio_downloaded = True
+                        logger.info(f"番剧音频流下载完成: {audio_file}")
                 except Exception as e:
                     logger.warning(f"下载番剧音频流失败（不影响视频分析）: {e}")
 

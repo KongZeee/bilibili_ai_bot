@@ -66,18 +66,47 @@ export const LogsPage = defineComponent({
 
         async function download() {
             try {
-                const resp = await fetch('/api/logs/download', { credentials: 'same-origin' });
+                const resp = await fetch('/api/logs/download', {
+                    credentials: 'same-origin',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                });
                 if (resp.status === 401) {
                     window.location.href = '/login';
                     return;
                 }
+                if (!resp.ok) {
+                    let msg = `下载失败: HTTP ${resp.status}`;
+                    const ct = (resp.headers.get('content-type') || '').toLowerCase();
+                    if (ct.includes('application/json')) {
+                        try {
+                            const data = await resp.json();
+                            msg = data?.error?.message || data?.message || msg;
+                        } catch (_) { /* ignore */ }
+                    }
+                    throw new Error(msg);
+                }
                 const blob = await resp.blob();
+                // 防止把 JSON 错误体当日志文件保存
+                if ((blob.type || '').includes('json') || blob.size < 8) {
+                    const text = await blob.text();
+                    try {
+                        const data = JSON.parse(text);
+                        if (data && data.success === false) {
+                            throw new Error(data?.error?.message || data?.message || '下载失败');
+                        }
+                    } catch (parseErr) {
+                        if (parseErr.message && parseErr.message !== 'Unexpected end of JSON input') {
+                            // rethrow real error messages; ignore pure parse failures on binary logs
+                            if (!(parseErr instanceof SyntaxError)) throw parseErr;
+                        }
+                    }
+                }
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url; a.download = 'bililog.txt'; a.click();
                 URL.revokeObjectURL(url);
                 showToast('日志已下载', 'success');
-            } catch (e) { showToast('下载失败', 'error'); }
+            } catch (e) { showToast(e.message || '下载失败', 'error'); }
         }
 
         function setLevel(v) {

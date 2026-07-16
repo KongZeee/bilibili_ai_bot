@@ -7,6 +7,7 @@ LLM 提供商 — 封装单个 OpenAI 兼容 API 调用
 import base64
 import asyncio
 import hashlib
+import inspect
 import logging
 import re
 import json
@@ -108,32 +109,72 @@ class _KeySlot:
 
 
 def _is_rate_limit_error(exc: BaseException) -> bool:
+    """Prefer structured HTTP status; fall back to body/message tokens carefully.
+
+    Avoid bare substring matches like ``tpm``/``rpm`` alone — those appear in
+    normal config/error text and caused false cooldown storms.
+    """
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
     if status == 429:
         return True
+    # OpenAI-compatible error objects may nest response.status_code
+    resp = getattr(exc, "response", None)
+    resp_status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    try:
+        if int(resp_status) == 429:
+            return True
+    except (TypeError, ValueError):
+        pass
     text = str(exc).lower()
-    return any(
-        token in text
-        for token in (
-            "429",
-            "rate limit",
-            "rate_limit",
-            "too many requests",
-            "quota exceeded",
-            "tpm",
-            "rpm",
-        )
+    # Strong phrases only — no bare "tpm"/"rpm"/"429" digit-in-config matches
+    strong = (
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "quota exceeded",
+        "exceeded your current quota",
+        "requests per minute",
+        "tokens per minute",
+        "http 429",
+        "status code 429",
+        "error code: 429",
+        "\"code\":429",
+        "'code':429",
     )
+    return any(token in text for token in strong)
 
 
 def _is_auth_error(exc: BaseException) -> bool:
     status = getattr(exc, "status_code", None) or getattr(exc, "status", None)
+    try:
+        status = int(status) if status is not None else None
+    except (TypeError, ValueError):
+        status = None
     if status in (401, 403):
         return True
+    resp = getattr(exc, "response", None)
+    resp_status = getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    try:
+        if int(resp_status) in (401, 403):
+            return True
+    except (TypeError, ValueError):
+        pass
     text = str(exc).lower()
     return any(
         token in text
-        for token in ("unauthorized", "invalid api key", "invalid_api_key", "authentication")
+        for token in (
+            "unauthorized",
+            "invalid api key",
+            "invalid_api_key",
+            "incorrect api key",
+            "authentication failed",
+            "authentication error",
+        )
     )
 
 
@@ -167,29 +208,40 @@ class ApiKeyPool:
         for slot in self.slots:
             slot.gate = resolve_gate(base_url, slot.api_key)
 
+    def earliest_ready_in(self) -> float:
+        """Seconds until any non-disabled key leaves cooldown (0 if one is ready)."""
+        if not self.slots:
+            return 0.0
+        now = time.monotonic()
+        waits: List[float] = []
+        for s in self.slots:
+            if s.disabled:
+                continue
+            waits.append(max(0.0, float(s.cooldown_until) - now))
+        if not waits:
+            return 0.0
+        return min(waits)
+
     async def acquire(self) -> Optional[_KeySlot]:
         if not self.slots:
             return None
         async with self._lock:
             now = time.monotonic()
-            # Clients may be lazy-created after acquire; select by key availability.
+            # Only select keys that are not disabled and not cooling.
+            # Never hand out a still-cooling key — that turns 429 into a tight retry storm.
             ready = [
                 s for s in self.slots
                 if not s.disabled and s.cooldown_until <= now
             ]
             if not ready:
-                candidates = [s for s in self.slots if not s.disabled]
-                if not candidates:
-                    return None
-                slot = min(candidates, key=lambda s: (s.cooldown_until, s.inflight))
-            else:
-                ready.sort(key=lambda s: (s.inflight, self.slots.index(s)))
-                # round-robin among least-inflight ties
-                min_inflight = ready[0].inflight
-                ties = [s for s in ready if s.inflight == min_inflight]
-                idx = self._rr % len(ties)
-                self._rr += 1
-                slot = ties[idx]
+                return None
+            ready.sort(key=lambda s: (s.inflight, self.slots.index(s)))
+            # round-robin among least-inflight ties
+            min_inflight = ready[0].inflight
+            ties = [s for s in ready if s.inflight == min_inflight]
+            idx = self._rr % len(ties)
+            self._rr += 1
+            slot = ties[idx]
             slot.inflight += 1
             return slot
 
@@ -230,6 +282,21 @@ class ApiKeyPool:
             raise
         finally:
             await self.release(slot, rate_limited=rate_limited, auth_failed=auth_failed)
+
+
+class RateLimitExhaustedError(RuntimeError):
+    """All API keys in the pool are cooling down / disabled; no request was sent."""
+
+    def __init__(
+        self,
+        message: str = "all API keys are rate-limited or unavailable",
+        *,
+        retry_after: float = 0.0,
+        pool_name: str = "",
+    ):
+        self.retry_after = max(0.0, float(retry_after or 0.0))
+        self.pool_name = pool_name or ""
+        super().__init__(message)
 
 
 class ASRResponseError(ValueError):
@@ -467,6 +534,31 @@ class LLMProvider:
                 )
             return slot.client
 
+    async def aclose(self) -> None:
+        """Close all lazy AsyncOpenAI clients (chat/vision/embedding pools).
+
+        Call on provider replace/remove and app shutdown to avoid FD/socket leaks.
+        """
+        pools = (self._chat_pool, self._vision_pool, self._embedding_pool)
+        clients = []
+        with self._client_lock:
+            for pool in pools:
+                for slot in getattr(pool, "slots", []) or []:
+                    client = getattr(slot, "client", None)
+                    if client is not None:
+                        clients.append(client)
+                        slot.client = None
+        for client in clients:
+            close = getattr(client, "close", None)
+            if close is None:
+                continue
+            try:
+                result = close()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning(f"[{self.llm_id}] close LLM client failed: {e}")
+
     def _primary_client(self, pool: ApiKeyPool, base_url: str):
         slot = pool.primary()
         if slot is None:
@@ -560,6 +652,16 @@ class LLMProvider:
             return len(self.vision_api_keys)
         return 1 if self.vision_api_key else 0
 
+    def _raise_pool_exhausted(self, pool: ApiKeyPool) -> None:
+        retry_after = pool.earliest_ready_in()
+        name = pool.name or self.llm_id
+        raise RateLimitExhaustedError(
+            f"[{name}] all API keys cooling or disabled"
+            + (f"; retry_after≈{retry_after:.1f}s" if retry_after > 0 else ""),
+            retry_after=retry_after,
+            pool_name=name,
+        )
+
     async def _chat_with_pool(self, call):
         """Run call(client) with key pool + limited 429 failover."""
         if not self._chat_pool.slots:
@@ -583,7 +685,8 @@ class LLMProvider:
                     raise
         if last_exc is not None:
             raise last_exc
-        return None
+        # All keys cooling/disabled with no request exception — do not silent-None.
+        self._raise_pool_exhausted(self._chat_pool)
 
     async def generate(
         self,
@@ -645,10 +748,10 @@ class LLMProvider:
             # Streaming holds one connection; pick one key without mid-stream switch.
             async with self._chat_pool.checkout() as slot:
                 if slot is None:
-                    return
+                    self._raise_pool_exhausted(self._chat_pool)
                 client = self._ensure_client(slot, self.base_url)
                 if client is None:
-                    return
+                    self._raise_pool_exhausted(self._chat_pool)
                 stream = await client.chat.completions.create(
                     model=self.model,
                     messages=messages,
@@ -713,11 +816,13 @@ class LLMProvider:
                         raise
             if last_exc is not None:
                 raise last_exc
-            return None
+            self._raise_pool_exhausted(pool)
 
         except Exception as e:
+            # 与 generate() 一致：网络/429/5xx 必须向上抛，供调用方分类重试。
+            # 吞掉异常会把临时故障伪装成「空描述」，导致视频理解静默丢帧。
             logger.error(f"[{self.llm_id}] Vision 分析失败: {e}")
-            return None
+            raise
 
     async def get_embedding(self, text: str) -> Optional[List[float]]:
         """获取文本的 embedding 向量"""
@@ -754,10 +859,11 @@ class LLMProvider:
                         raise
             if last_exc is not None:
                 raise last_exc
-            return None
+            self._raise_pool_exhausted(pool)
         except Exception as e:
+            # 与 generate() 一致：临时故障上抛，避免记忆索引把 429/超时当「无向量」永久跳过
             logger.error(f"[{self.llm_id}] Embedding 获取失败: {e}")
-            return None
+            raise
 
     async def get_embeddings(
         self, texts: Sequence[str]
@@ -813,11 +919,11 @@ class LLMProvider:
                         raise
             if last_exc is not None:
                 raise last_exc
-            return None
+            self._raise_pool_exhausted(pool)
 
         except Exception as e:
             logger.error(f"[{self.llm_id}] Embedding 批量获取失败: {e}")
-            return None
+            raise
 
     async def test(self) -> Tuple[bool, str]:
         """测试对话连接，返回 (是否成功, 错误信息)"""
@@ -945,7 +1051,12 @@ class LLMProvider:
 
             async with self._chat_pool.checkout() as slot:
                 if slot is None:
-                    return False, "客户端未初始化（api_key 为空或 openai 库未安装）"
+                    retry_after = self._chat_pool.earliest_ready_in()
+                    return (
+                        False,
+                        f"RateLimitExhaustedError: all keys cooling"
+                        + (f" (retry_after≈{retry_after:.1f}s)" if retry_after > 0 else ""),
+                    )
                 client = self._ensure_client(slot, self.base_url)
                 if client is None:
                     return False, "客户端未初始化（api_key 为空或 openai 库未安装）"
@@ -1035,14 +1146,18 @@ class LLMProvider:
 
     @staticmethod
     def repair_json(text: str) -> str:
-        """修复 LLM 返回的 JSON"""
+        """修复 LLM 返回的 JSON（对象或数组）"""
         if not text:
             return ""
         text = re.sub(r'^```(?:json)?\s*', '', text.strip())
         text = re.sub(r'\s*```$', '', text.strip())
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            text = match.group()
+        # Prefer array slice when the payload is list-shaped (entity extraction etc.)
+        arr_match = re.search(r'\[.*\]', text, re.DOTALL)
+        obj_match = re.search(r'\{.*\}', text, re.DOTALL)
+        if arr_match and (not obj_match or arr_match.start() <= obj_match.start()):
+            text = arr_match.group()
+        elif obj_match:
+            text = obj_match.group()
         text = re.sub(r',\s*([}\]])', r'\1', text)
         return text
 

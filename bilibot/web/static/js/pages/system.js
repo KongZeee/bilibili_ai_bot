@@ -238,7 +238,7 @@ export const SystemPage = {
                 const url = URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url;
-                a.download = `${backup.name}.tar.gz`;
+                a.download = `${backup.name}.zip`;
                 a.click();
                 URL.revokeObjectURL(url);
             } catch (e) {
@@ -301,9 +301,23 @@ export const SystemPage = {
                     }
                 }
                 const nested = unflattenConfig(filtered);
-                if (configVersion.value > 0) nested._expected_revision = configVersion.value;
-                await api.config.patch(nested);
-                appState.notify('配置已保存', 'success');
+                // Always send optimistic lock, including revision 0 on fresh installs
+                if (configVersion.value !== null && configVersion.value !== undefined) {
+                    nested._expected_revision = configVersion.value;
+                }
+                const result = await api.config.patch(nested);
+                const applied = result?.applied || {};
+                const needsRestart = Object.entries(applied)
+                    .filter(([, info]) => info?.status === 'requires_restart')
+                    .map(([k]) => k);
+                if (needsRestart.length) {
+                    appState.notify(
+                        `配置已保存；以下字段需重启后生效：${needsRestart.slice(0, 4).join(', ')}${needsRestart.length > 4 ? '…' : ''}`,
+                        'warning',
+                    );
+                } else {
+                    appState.notify('配置已保存', 'success');
+                }
                 await loadConfigData();
             } catch (e) {
                 const msg = e.message || String(e);
@@ -325,10 +339,36 @@ export const SystemPage = {
         const safetySchema = schemaByCategory('safety');
         const webSchema = schemaByCategory('web');
 
-        // Task 28：配置 dirty 检测
-        const configIsDirty = computed(() =>
-            JSON.stringify(configLocalModel.value) !== JSON.stringify(configOriginalModel.value)
-        );
+        // 按 category 的 dirty 检测：避免在「安全配置」改了却锁住「面板配置」保存按钮
+        function isCategoryDirty(category) {
+            const keys = configSchema.value
+                .filter(f => f.category === category)
+                .map(f => f.key);
+            for (const key of keys) {
+                const a = configLocalModel.value[key];
+                const b = configOriginalModel.value[key];
+                if (JSON.stringify(a) !== JSON.stringify(b)) return true;
+            }
+            return false;
+        }
+        const safetyIsDirty = computed(() => isCategoryDirty('safety'));
+        const webIsDirty = computed(() => isCategoryDirty('web'));
+
+        function refreshConfigData() {
+            // 有未保存修改时确认，避免点「刷新」静默丢改动
+            const dirty = safetyIsDirty.value || webIsDirty.value;
+            if (dirty) {
+                showConfirm({
+                    title: '确认刷新配置',
+                    message: '当前有未保存的修改，刷新将丢弃这些改动。是否继续？',
+                    confirmText: '丢弃并刷新',
+                    danger: true,
+                    action: () => { loadConfigData(); },
+                });
+                return;
+            }
+            loadConfigData();
+        }
 
         onMounted(() => {
             loadPauseStatus();
@@ -521,14 +561,14 @@ export const SystemPage = {
                                 h(Button, {
                                     type: 'ghost',
                                     size: 'sm',
-                                    onClick: loadConfigData,
+                                    onClick: refreshConfigData,
                                 }, () => '刷新'),
                                 h(Button, {
                                     type: 'primary',
                                     size: 'sm',
                                     onClick: () => saveConfigSection('safety'),
                                     loading: configSaving.value,
-                                    disabled: !configIsDirty.value,
+                                    disabled: !safetyIsDirty.value,
                                 }, () => '保存'),
                             ]),
                         ]),
@@ -561,14 +601,14 @@ export const SystemPage = {
                                 h(Button, {
                                     type: 'ghost',
                                     size: 'sm',
-                                    onClick: loadConfigData,
+                                    onClick: refreshConfigData,
                                 }, () => '刷新'),
                                 h(Button, {
                                     type: 'primary',
                                     size: 'sm',
                                     onClick: () => saveConfigSection('web'),
                                     loading: configSaving.value,
-                                    disabled: !configIsDirty.value,
+                                    disabled: !webIsDirty.value,
                                 }, () => '保存'),
                             ]),
                         ]),

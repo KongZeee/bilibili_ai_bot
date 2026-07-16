@@ -561,20 +561,131 @@ tr:hover td { background: hsl(var(--accent) / 0.12); }
     font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
     font-size: 0.78rem;
 }
+/* 记忆图谱整页：左侧窄栏视图设置 + 右侧全高 3D 画布（无整页纵向滚动） */
+.memory-graph-page {
+    display: grid;
+    grid-template-columns: minmax(11.5rem, 13rem) minmax(0, 1fr);
+    gap: calc(var(--spacing) * 1.5);
+    align-items: stretch;
+    height: 100%;
+    min-height: 0;
+    max-height: 100%;
+    overflow: hidden;
+}
+.memory-graph-sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--spacing) * 2);
+    padding: calc(var(--spacing) * 2.25);
+    background: hsl(var(--card));
+    border: 1px solid hsl(var(--border));
+    border-radius: calc(var(--radius) * 0.82);
+    min-height: 0;
+    max-height: 100%;
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    /* 统计展开时只滚左侧栏，不把 wheel 传给页面/3D */
+    touch-action: pan-y;
+}
+.memory-graph-toolbar-title {
+    display: grid;
+    gap: 0.1rem;
+    min-width: 0;
+}
+.memory-graph-toolbar-title h1 {
+    margin: 0;
+    font-size: 1rem;
+    line-height: 1.15;
+    font-weight: 600;
+}
+.memory-graph-toolbar-meta {
+    font-size: 0.74rem;
+    color: hsl(var(--muted-foreground));
+    line-height: 1.4;
+}
+.memory-graph-sidebar-section {
+    display: grid;
+    gap: calc(var(--spacing) * 1);
+}
+.memory-graph-sidebar-label {
+    font-size: 0.72rem;
+    font-weight: 500;
+    letter-spacing: 0.02em;
+    color: hsl(var(--muted-foreground));
+}
+.memory-graph-seg {
+    display: inline-flex;
+    width: 100%;
+    border: 1px solid hsl(var(--border));
+    border-radius: calc(var(--radius) * 0.76);
+    overflow: hidden;
+}
+.memory-graph-seg > button {
+    flex: 1 1 0;
+    min-height: 2.1rem;
+    padding: calc(var(--spacing) * 0.9) calc(var(--spacing) * 1.1);
+    font-size: 0.8rem;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+    background: transparent;
+    color: hsl(var(--accent-foreground));
+    cursor: pointer;
+}
+.memory-graph-seg > button + button {
+    border-left: 1px solid hsl(var(--border));
+}
+.memory-graph-seg > button[data-active="true"] {
+    background: hsl(var(--primary));
+    color: hsl(var(--primary-foreground));
+}
+.memory-graph-sidebar-actions {
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--spacing) * 1);
+}
+.memory-graph-search {
+    width: 100%;
+    min-width: 0;
+}
+.memory-graph-search .field {
+    min-height: 2.1rem;
+    font-size: 0.82rem;
+}
+.memory-graph-stage {
+    position: relative;
+    min-width: 0;
+    min-height: 0;
+    height: 100%;
+    border: 1px solid hsl(var(--border));
+    border-radius: calc(var(--radius) * 0.82);
+    overflow: hidden;
+    background: hsl(var(--muted) / 0.28);
+    /* 保证 3D 区域可接收指针事件，不被其它层挡住 */
+    isolation: isolate;
+}
 .memory-graph-canvas {
     width: 100%;
-    height: min(68vh, 720px);
-    min-height: 360px;
+    height: 100%;
+    min-height: 0;
     position: relative;
     overflow: hidden;
-    background: hsl(var(--muted) / 0.3);
-    border-top: 1px solid hsl(var(--border));
-    border-bottom: 1px solid hsl(var(--border));
 }
-.memory-graph-canvas > canvas {
+.memory-graph-three-host {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    /* 关键：canvas 始终可接收拖拽，不被侧栏/统计抢事件 */
+    pointer-events: auto;
+    touch-action: none;
+}
+.memory-graph-canvas > canvas,
+.memory-graph-three-host > canvas {
     display: block;
     width: 100% !important;
     height: 100% !important;
+    touch-action: none;
 }
 .memory-graph-overlay {
     position: absolute;
@@ -588,15 +699,181 @@ tr:hover td { background: hsl(var(--accent) / 0.12); }
     text-align: center;
     font-size: 0.92rem;
 }
+.memory-graph-hint {
+    position: absolute;
+    left: calc(var(--spacing) * 3);
+    bottom: calc(var(--spacing) * 2.5);
+    z-index: 2;
+    pointer-events: none;
+    font-size: 0.78rem;
+    color: hsl(var(--muted-foreground));
+    padding: 0.35rem 0.7rem;
+    border-radius: 999px;
+    background: hsl(var(--card) / 0.82);
+    border: 1px solid hsl(var(--border));
+}
+/* 统计面板：画布左上角浮层，不改变布局、不触发 3D resize */
+.memory-graph-stats-float {
+    position: absolute;
+    top: calc(var(--spacing) * 2);
+    left: calc(var(--spacing) * 2);
+    z-index: 4;
+    width: min(20rem, calc(100% - 2rem));
+    max-width: calc(100% - 2rem);
+    max-height: min(78%, calc(100% - 3rem));
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--spacing) * 2);
+    padding: calc(var(--spacing) * 3);
+    background: hsl(var(--card) / 0.96);
+    border: 1px solid hsl(var(--border));
+    border-radius: calc(var(--radius) * 0.82);
+    box-shadow: 0 10px 28px hsl(var(--foreground) / 0.1);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    pointer-events: auto;
+    transform: translateY(0);
+    opacity: 1;
+    transition: opacity 0.18s ease, transform 0.18s ease;
+    scrollbar-gutter: stable;
+}
+.memory-graph-stats-float[data-open="false"] {
+    opacity: 0;
+    pointer-events: none;
+    transform: translateY(-6px);
+}
+.memory-graph-stats-float-body {
+    display: grid;
+    gap: calc(var(--spacing) * 2.2);
+    min-width: 0;
+    width: 100%;
+    overflow-x: hidden;
+}
+.memory-graph-stats-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: calc(var(--spacing) * 2);
+    min-width: 0;
+    padding: calc(var(--spacing) * 1.5) calc(var(--spacing) * 0.6);
+    border-bottom: 1px solid hsl(var(--border));
+    border-radius: calc(var(--radius) * 0.3);
+    cursor: pointer;
+}
+.memory-graph-stats-row-main {
+    display: flex;
+    align-items: flex-start;
+    gap: calc(var(--spacing) * 1.5);
+    min-width: 0;
+    flex: 1 1 auto;
+}
+.memory-graph-stats-row-label {
+    min-width: 0;
+    flex: 1 1 auto;
+    font-size: 0.88rem;
+    line-height: 1.35;
+    white-space: normal;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+}
+.memory-graph-stats-row-meta {
+    display: flex;
+    align-items: baseline;
+    gap: 0.25rem;
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+
+/* 3D 图谱选中节点详情侧栏（非 modal，不挡 OrbitControls） */
+.memory-node-sidebar {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: min(20rem, 42%);
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    gap: calc(var(--spacing) * 3);
+    padding: calc(var(--spacing) * 4);
+    background: hsl(var(--card) / 0.96);
+    border-left: 1px solid hsl(var(--border));
+    box-shadow: -8px 0 24px hsl(var(--foreground) / 0.08);
+    overflow-y: auto;
+    pointer-events: auto;
+    transform: translateX(0);
+    opacity: 1;
+    transition: transform 0.22s ease, opacity 0.22s ease;
+}
+.memory-node-sidebar[data-open="false"] {
+    transform: translateX(100%);
+    opacity: 0;
+    pointer-events: none;
+}
+.memory-node-sidebar-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: calc(var(--spacing) * 2);
+}
+.memory-node-sidebar-body {
+    display: grid;
+    gap: calc(var(--spacing) * 3);
+    min-height: 0;
+}
+
+@media (max-width: 900px) {
+    .memory-graph-page {
+        grid-template-columns: 1fr;
+        height: auto;
+        max-height: none;
+        overflow: visible;
+    }
+    .memory-graph-sidebar {
+        max-height: 40vh;
+    }
+    .memory-graph-stage {
+        min-height: 55vh;
+        height: 55vh;
+    }
+}
+
+@media (max-width: 720px) {
+    .memory-graph-stage {
+        min-height: 52vh;
+        height: 52vh;
+    }
+    .memory-node-sidebar {
+        top: auto;
+        left: 0;
+        right: 0;
+        bottom: 0;
+        width: 100%;
+        max-height: 48%;
+        border-left: 0;
+        border-top: 1px solid hsl(var(--border));
+        box-shadow: 0 -8px 24px hsl(var(--foreground) / 0.08);
+        transform: translateY(0);
+    }
+    .memory-node-sidebar[data-open="false"] {
+        transform: translateY(100%);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .memory-node-sidebar {
+        transition: none;
+    }
+}
 
 @media (max-width: 600px) {
     .memory-detail-scroll {
         max-height: 76vh;
         padding-right: 0;
     }
-    .memory-graph-canvas {
-        height: 56vh;
-        min-height: 300px;
-        max-height: 560px;
+    .memory-graph-sidebar {
+        padding: calc(var(--spacing) * 2);
     }
+}
 }

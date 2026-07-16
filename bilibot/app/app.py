@@ -30,31 +30,111 @@ console = Console()
 logger = logging.getLogger("bilibot")
 
 
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+_LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
+# 记录当前文件 handler 路径，热更 level 时复用；路径变更则替换 handler
+_logging_file_path: Optional[str] = None
+
+
+def _resolve_log_file_path(log_file: str, data_dir: str) -> str:
+    """将 logging.file 规范到 data_dir 内，防止路径穿越写出系统文件。"""
+    data_root = Path(data_dir or "./data").resolve()
+    candidate = Path(log_file or "./data/bililog.log")
+    if not candidate.is_absolute():
+        # 相对路径：相对 CWD 解析后再校验；越界则落到 data_dir 默认名
+        resolved = candidate.resolve()
+    else:
+        resolved = candidate.resolve()
+    try:
+        resolved.relative_to(data_root)
+        return str(resolved)
+    except ValueError:
+        safe = data_root / "bililog.log"
+        logger.warning(
+            "logging.file=%s 不在 data_dir=%s 内，已回退为 %s",
+            log_file,
+            data_root,
+            safe,
+        )
+        return str(safe)
+
+
 def setup_logging(config: dict):
-    """配置日志系统"""
-    log_level = config.get("logging", {}).get("level", "INFO")
-    log_file = config.get("logging", {}).get("file", "./data/bililog.log")
-    max_bytes = config.get("logging", {}).get("max_bytes", 10485760)
-    backup_count = config.get("logging", {}).get("backup_count", 5)
+    """配置 / 热重载日志系统。
+
+    - 首次调用：basicConfig 建 Stream + RotatingFileHandler
+    - 再次调用：更新 root/bilibot 与各 handler 的 level；
+      若 file 路径变化则替换 FileHandler（max_bytes/backup 变更亦重建文件 handler）
+    - logging.file 必须 resolve 后位于 data_dir 下
+    """
+    global _logging_file_path
+    log_cfg = (config or {}).get("logging", {}) or {}
+    log_level = str(log_cfg.get("level", "INFO") or "INFO").upper()
+    data_dir = (config or {}).get("data_dir", "./data") or "./data"
+    log_file = _resolve_log_file_path(
+        log_cfg.get("file", "./data/bililog.log") or "./data/bililog.log",
+        data_dir,
+    )
+    max_bytes = int(log_cfg.get("max_bytes", 10485760) or 10485760)
+    backup_count = int(log_cfg.get("backup_count", 5) or 5)
+    level = getattr(logging, log_level, logging.INFO)
 
     log_dir = os.path.dirname(log_file)
     if log_dir:
         os.makedirs(log_dir, exist_ok=True)
 
-    logging.basicConfig(
-        level=getattr(logging, log_level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.handlers.RotatingFileHandler(
+    root = logging.getLogger()
+    # 首次：尚无 handler 时用 basicConfig
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format=_LOG_FORMAT,
+            datefmt=_LOG_DATEFMT,
+            handlers=[
+                logging.StreamHandler(sys.stdout),
+                logging.handlers.RotatingFileHandler(
+                    log_file,
+                    maxBytes=max_bytes,
+                    backupCount=backup_count,
+                    encoding="utf-8",
+                ),
+            ],
+        )
+        _logging_file_path = os.path.abspath(log_file)
+    else:
+        root.setLevel(level)
+        for handler in list(root.handlers):
+            handler.setLevel(level)
+        # 文件路径或滚动参数变更 → 替换 RotatingFileHandler
+        need_new_file = True
+        for handler in list(root.handlers):
+            if isinstance(handler, logging.handlers.RotatingFileHandler):
+                same_path = os.path.abspath(getattr(handler, "baseFilename", "") or "") == os.path.abspath(log_file)
+                same_roll = (
+                    getattr(handler, "maxBytes", None) == max_bytes
+                    and getattr(handler, "backupCount", None) == backup_count
+                )
+                if same_path and same_roll:
+                    need_new_file = False
+                else:
+                    root.removeHandler(handler)
+                    try:
+                        handler.close()
+                    except Exception:
+                        pass
+        if need_new_file:
+            fh = logging.handlers.RotatingFileHandler(
                 log_file,
                 maxBytes=max_bytes,
                 backupCount=backup_count,
                 encoding="utf-8",
-            ),
-        ],
-    )
+            )
+            fh.setLevel(level)
+            fh.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt=_LOG_DATEFMT))
+            root.addHandler(fh)
+            _logging_file_path = os.path.abspath(log_file)
+
+    logging.getLogger("bilibot").setLevel(level)
 
 
 class BiliBotApp:
@@ -222,16 +302,18 @@ class BiliBotApp:
             # 同步 self.config 供后续 start() 读取
             self.config = self.config_loader.get_raw_config()
 
-        # admin_password 仍为默认值时告警；非本地监听则拒绝启动 Web 面板
-        if self.config_loader.web.admin_password == "admin123":
+        # admin_password 为弱口令（明文 admin123 或 bcrypt 哈希匹配）时告警；
+        # 非本地监听则拒绝启动 Web 面板
+        from bilibot.web.panel import is_weak_admin_password
+        if is_weak_admin_password(self.config_loader.web.admin_password):
             logger.warning(
-                "⚠️ 检测到 web.admin_password 仍为默认值 'admin123'，"
+                "⚠️ 检测到 web.admin_password 仍为默认弱口令 'admin123'（明文或 bcrypt），"
                 "存在被接管风险，请尽快修改！"
             )
             if (self.config_loader.web.enabled
-                    and self.config_loader.web.host not in ("127.0.0.1", "localhost")):
+                    and self.config_loader.web.host not in ("127.0.0.1", "localhost", "::1")):
                 logger.error(
-                    "拒绝启动 Web 面板：admin_password 为默认值且监听非本地地址 "
+                    "拒绝启动 Web 面板：admin_password 为默认弱口令且监听非本地地址 "
                     f"({self.config_loader.web.host})，请修改 config.yaml 中 "
                     "web.admin_password 后重试"
                 )

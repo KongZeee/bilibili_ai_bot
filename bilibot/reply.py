@@ -289,8 +289,14 @@ class ReplyGenerator:
                 target={
                     "oid": str(oid),
                     "thread_id": str(thread_id),
+                    # 与 reply_state 幂等键对齐，供评论页重试使用
+                    "rpid": str(thread_id),
+                    "source_rpid": str(thread_id),
+                    "comment_type": int(comment_type or 1),
                     "user_id": str(user_id),
                     "username": username,
+                    "account_id": self.account_id or "",
+                    "kind": scene or "reply_comment",
                 },
             )
 
@@ -510,7 +516,14 @@ def _classify_exception(e: Exception) -> Tuple[str, Optional[float]]:
         return (LLM_TIMEOUT, retry_after)
     if "Connection" in cls_name or "Connect" in cls_name:
         return (LLM_CONNECTION_ERROR, retry_after)
-    if "RateLimit" in cls_name or "429" in msg:
+    # RateLimitExhaustedError (all keys cooling) + OpenAI RateLimitError / HTTP 429
+    if (
+        "RateLimit" in cls_name
+        or cls_name == "RateLimitExhaustedError"
+        or "rate-limited" in msg_lower
+        or "rate limited" in msg_lower
+        or "429" in msg
+    ):
         return (LLM_RATE_LIMITED, retry_after)
     if "InternalServer" in cls_name or "ServerError" in cls_name:
         return (LLM_SERVER_ERROR, retry_after)
@@ -526,11 +539,13 @@ def _extract_retry_after(e: Exception) -> Optional[float]:
 
     openai.RateLimitError 可能携带 retry_after 属性或 response.headers。
     """
-    # openai 异常可能直接暴露 retry_after
+    # openai / RateLimitExhaustedError 可能直接暴露 retry_after
     ra = getattr(e, "retry_after", None)
     if ra is not None:
         try:
-            return float(ra)
+            val = float(ra)
+            if val > 0:
+                return val
         except (TypeError, ValueError):
             pass
     # 从 response.headers 提取

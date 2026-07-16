@@ -7,7 +7,7 @@ import inspect
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from .models import ProviderNotConfigured, VectorDimensionError
 
@@ -202,16 +202,42 @@ class MemoryModelGateway:
             timeout=timeout,
         )
         cleaned = _FENCE_RE.sub("", raw).strip()
-        # 容错：LLM 可能返回带前后多余文本、尾随逗号、单引号等非标准 JSON
+        # 容错：LLM 可能返回带前后多余文本、尾随逗号、单引号、数组 JSON 等
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
-            # 尝试提取第一个 { 到最后一个 } 之间的内容
-            start = cleaned.find("{")
-            end = cleaned.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return json.loads(cleaned[start : end + 1])
-            raise
+            pass
+
+        # Prefer full array when present (entity/link jobs expect list payloads).
+        # Do not collapse an array to a single object by taking first `{`…last `}`.
+        candidates: list[str] = []
+        arr_start = cleaned.find("[")
+        arr_end = cleaned.rfind("]")
+        if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+            candidates.append(cleaned[arr_start : arr_end + 1])
+        obj_start = cleaned.find("{")
+        obj_end = cleaned.rfind("}")
+        if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+            candidates.append(cleaned[obj_start : obj_end + 1])
+
+        last_err: Optional[Exception] = None
+        for candidate in candidates:
+            try:
+                return json.loads(candidate)
+            except json.JSONDecodeError as exc:
+                last_err = exc
+                # Reuse provider-side repair if available (trailing commas etc.)
+                try:
+                    from bilibot.llm.provider import LLMProvider
+
+                    repaired = LLMProvider.repair_json(candidate)
+                    if repaired and repaired != candidate:
+                        return json.loads(repaired)
+                except Exception as repair_exc:
+                    last_err = repair_exc
+        if last_err is not None:
+            raise last_err
+        raise json.JSONDecodeError("No JSON object/array found", cleaned, 0)
 
     async def embed_texts(
         self, texts: Sequence[str], *, timeout: float = 60.0
@@ -369,9 +395,257 @@ class MemoryModelGateway:
                     )
         return text or original
 
+    VIDEO_DETAIL_MAX_CHARS = 2000
+
+    @staticmethod
+    def _prefer_audiovisual_source_text(sources: Sequence[Any], limit: int = 12000) -> str:
+        """Prefer behavior_log / asr / visual over metadata JSON for summarization."""
+
+        preferred_order = (
+            "video_detail",
+            "behavior_log",
+            "asr",
+            "subtitle",
+            "visual_description",
+            "ocr",
+            "video_hot_comments",
+            "web_reference",
+            "video_metadata",
+        )
+        by_type: dict[str, list[str]] = {}
+        for item in sources or ():
+            if not isinstance(item, Mapping):
+                continue
+            source_type = str(item.get("source_type") or "").strip() or "unknown"
+            text = str(item.get("full_text") or item.get("text") or "").strip()
+            if not text:
+                continue
+            by_type.setdefault(source_type, []).append(text)
+        parts: list[str] = []
+        used = 0
+        for source_type in preferred_order:
+            for text in by_type.get(source_type, ()):
+                remaining = max(0, int(limit) - used)
+                if remaining <= 0:
+                    break
+                piece = text if len(text) <= remaining else text[:remaining]
+                parts.append(f"[{source_type}]\n{piece}")
+                used += len(piece)
+            if used >= int(limit):
+                break
+        # Any leftover source types not listed above.
+        for source_type, texts in by_type.items():
+            if source_type in preferred_order:
+                continue
+            for text in texts:
+                remaining = max(0, int(limit) - used)
+                if remaining <= 0:
+                    break
+                piece = text if len(text) <= remaining else text[:remaining]
+                parts.append(f"[{source_type}]\n{piece}")
+                used += len(piece)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def heuristic_video_detail(
+        *,
+        title: str = "",
+        owner: str = "",
+        behavior_log: str = "",
+        max_chars: int = 2000,
+    ) -> str:
+        """Deterministic \u2264max_chars digest when the chat model is unavailable."""
+
+        budget = max(200, int(max_chars))
+        header_bits = []
+        if title:
+            header_bits.append(f"\u89c6\u9891\u300a{title}\u300b")
+        if owner:
+            header_bits.append(f"UP\u4e3b {owner}")
+        header = "\uff0c".join(header_bits)
+        body = " ".join(str(behavior_log or "").split())
+        if not body:
+            return (header or "\u89c6\u9891\u89c2\u5bdf")[:budget]
+        # Head / mid / tail sampling keeps late plot points without dumping JSON.
+        if len(body) <= budget - len(header) - 4:
+            text = f"{header}\u3002{body}" if header else body
+            return text[:budget]
+        avail = max(80, budget - len(header) - 20)
+        head_n = avail // 2
+        mid_n = avail // 4
+        tail_n = avail - head_n - mid_n
+        mid_start = max(0, (len(body) - mid_n) // 2)
+        pieces = [
+            body[:head_n].rstrip(),
+            body[mid_start : mid_start + mid_n].strip(),
+            body[-tail_n:].lstrip(),
+        ]
+        body_text = " \u2026 ".join(p for p in pieces if p)
+        text = f"{header}\u3002{body_text}" if header else body_text
+        return text[:budget]
+
+    async def summarize_video_detail(
+        self,
+        *,
+        title: str = "",
+        owner: str = "",
+        behavior_log: str = "",
+        extra_context: str = "",
+        max_chars: int = VIDEO_DETAIL_MAX_CHARS,
+        allow_heuristic: bool = True,
+    ) -> str:
+        """Compress a raw audiovisual log into a recall-ready video detail note.
+
+        Target length is ``max_chars`` (default 2000). The result should let a later
+        reply answer "what is this video about?" without re-reading the full log.
+
+        When ``allow_heuristic`` is False, model failures return "" so the caller can
+        retry or skip the video instead of silently using a low-quality truncation.
+        """
+
+        budget = max(400, min(int(max_chars), 2000))
+        log = str(behavior_log or "").strip()
+        if not log and not extra_context:
+            if allow_heuristic:
+                return self.heuristic_video_detail(
+                    title=title, owner=owner, behavior_log="", max_chars=budget
+                )
+            return ""
+        # Cap model input; long logs still retain head/mid/tail.
+        # Real behavior_log p75≈10k / max≈24k — 12k keeps more mid-plot signal.
+        log_for_model = log
+        input_budget = 12000
+        if len(log_for_model) > input_budget:
+            log_for_model = self.heuristic_video_detail(
+                title="", owner="", behavior_log=log, max_chars=input_budget
+            )
+        system = (
+            "\u4f60\u662f\u89c6\u9891\u5185\u5bb9\u6574\u7406\u5668\u3002\u6839\u636e\u89c6\u542c\u5206\u6790\u65e5\u5fd7\u5199\u4e00\u4efd\u4e2d\u6587\u300c\u89c6\u9891\u8be6\u7ec6\u5185\u5bb9\u300d\u7b14\u8bb0\uff0c"
+            "\u4f9b\u65e5\u540e\u56de\u5fc6\u4f7f\u7528\u3002\u53ea\u8f93\u51fa\u6b63\u6587\uff0c\u4e0d\u8981\u6807\u9898\u524d\u7f00\uff0c\u4e0d\u8981 markdown \u4ee3\u7801\u5757\u3002"
+        )
+        prompt = (
+            f"\u8bf7\u628a\u4e0b\u9762\u7684\u89c6\u9891\u89c6\u542c\u65e5\u5fd7\u6574\u7406\u6210\u4e0d\u8d85\u8fc7 {budget} \u5b57\u7684\u4e2d\u6587\u8be6\u7ec6\u5185\u5bb9\u3002"
+            "\u8981\u6c42\uff1a\n"
+            "1) \u8bf4\u660e\u89c6\u9891\u4e3b\u9898\u3001\u5173\u952e\u60c5\u8282/\u77e5\u8bc6\u70b9/\u6b65\u9aa4\u3001\u91cd\u8981\u53f0\u8bcd\u6216\u5b57\u5e55\u3001\u753b\u9762\u91cc\u7684\u5173\u952e\u4fe1\u606f\uff1b\n"
+            "2) \u6309\u65f6\u95f4\u987a\u5e8f\u6216\u903b\u8f91\u987a\u5e8f\u7ec4\u7ec7\uff0c\u53ef\u5206\u77ed\u6bb5\u843d\uff1b\n"
+            "3) \u4e0d\u8981\u5199\u6210\u5f39\u5e55\u53e3\u543b\uff0c\u4e0d\u8981\u7f16\u9020\u65e5\u5fd7\u91cc\u6ca1\u6709\u7684\u4fe1\u606f\uff1b\n"
+            "4) \u8fd9\u662f Bot \u89c2\u770b/\u5206\u6790\u522b\u4eba\u7684\u89c6\u9891\uff0c\u7981\u6b62\u5199\u300c\u53d1\u5e03\u4e86/\u4e0a\u4f20\u4e86/\u6295\u7a3f\u4e86\u89c6\u9891\u300d\uff1b\n"
+            f"5) \u603b\u5b57\u6570\u5fc5\u987b \u2264 {budget}\u3002\n\n"
+            f"\u6807\u9898\uff1a{title or '\u672a\u77e5'}\n"
+            f"UP\u4e3b\uff1a{owner or '\u672a\u77e5'}\n"
+        )
+        if extra_context:
+            prompt += f"\n\u8865\u5145\u4e0a\u4e0b\u6587\uff1a\n{str(extra_context)[:1500]}\n"
+        prompt += f"\n\u89c6\u542c\u65e5\u5fd7\uff1a\n{log_for_model}"
+        try:
+            raw = await self.generate(
+                prompt,
+                system_prompt=system,
+                max_tokens=min(1400, max(400, budget // 1 + 200)),
+                temperature=0.1,
+                timeout=120.0,
+            )
+        except Exception:
+            if allow_heuristic:
+                return self.heuristic_video_detail(
+                    title=title, owner=owner, behavior_log=log, max_chars=budget
+                )
+            return ""
+        # Preserve paragraph structure for recall readability; only collapse
+        # runs of spaces/tabs and trim empty lines \u2014 do NOT flatten newlines.
+        raw_text = str(raw or "").replace("\r\n", "\n").replace("\r", "\n")
+        lines = []
+        for line in raw_text.split("\n"):
+            cleaned = " ".join(line.split())
+            if cleaned:
+                lines.append(cleaned)
+        text = "\n".join(lines).strip()
+        if not text:
+            if allow_heuristic:
+                return self.heuristic_video_detail(
+                    title=title, owner=owner, behavior_log=log, max_chars=budget
+                )
+            return ""
+        # Soft re-cap; keep sentence/paragraph boundary when possible.
+        if len(text) > budget:
+            cut = text[:budget]
+            for sep in ("\u3002", "\uff01", "\uff1f", "\n", "\uff1b", " "):
+                pos = cut.rfind(sep)
+                if pos >= int(budget * 0.7):
+                    cut = cut[: pos + (0 if sep == " " else 1)]
+                    break
+            text = cut.rstrip()
+        # Reject model outputs that just dump the raw structured log.
+        if self.looks_like_heuristic_video_detail(text):
+            if allow_heuristic:
+                return self.heuristic_video_detail(
+                    title=title, owner=owner, behavior_log=log, max_chars=budget
+                )
+            return ""
+        return text
+
+    @staticmethod
+    def looks_like_heuristic_video_detail(text: str) -> bool:
+        """Detect raw log slices that are not a real natural-language digest."""
+        sample = str(text or "")
+        if not sample:
+            return True
+        if "### \u89c6\u9891\u7ed3\u6784\u5316\u884c\u4e3a\u65e5\u5fd7" in sample:
+            return True
+        if sample.count("\u3010\u542c\u5230\u58f0\u97f3\u3011") >= 4:
+            return True
+        if sample.count("\u3010\u770b\u5230\u753b\u9762\u3011") >= 4 and "\u4e3b\u9898" not in sample[:120]:
+            return True
+        # Dense timestamp / bracket markers \u21d2 still a structured log dump.
+        ts_hits = len(re.findall(r"\d{1,2}:\d{2}(?::\d{2})?", sample))
+        bracket_hits = sample.count("\u3010")
+        if ts_hits >= 8 and bracket_hits >= 4:
+            return True
+        if bracket_hits >= 10 and len(sample) > 400:
+            # High density of \u3010\u2026\u3011 markers without prose framing.
+            return True
+        return False
+
     async def summarize_event(self, event: Mapping[str, Any]) -> str:
         sources = event.get("sources") or []
-        source = "\n\n".join(str(item.get("full_text") or "") for item in sources)
+        event_type = str(event.get("event_type") or "")
+        source_type = str(event.get("source_type") or "")
+        is_video_watch = (
+            event_type in {"video_observation", "video_metadata_observation", "bangumi_episode"}
+            or source_type in {"video", "video_metadata"}
+        )
+        # Video watches: produce a \u22642000-char detailed content note that recall
+        # can inject as the primary evidence instead of raw metadata/log slices.
+        if is_video_watch:
+            behavior_parts = []
+            for item in sources:
+                if not isinstance(item, Mapping):
+                    continue
+                st = str(item.get("source_type") or "")
+                text = str(item.get("full_text") or "").strip()
+                if not text:
+                    continue
+                if st in {"behavior_log", "asr", "subtitle", "visual_description", "video_detail"}:
+                    behavior_parts.append(text)
+            behavior_log = "\n\n".join(behavior_parts)
+            # Prefer existing dedicated video_detail source if present.
+            for item in sources:
+                if isinstance(item, Mapping) and item.get("source_type") == "video_detail":
+                    existing = str(item.get("full_text") or "").strip()
+                    if existing:
+                        return self._sanitize_event_summary(event, existing[: self.VIDEO_DETAIL_MAX_CHARS])
+            metadata = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+            detail = await self.summarize_video_detail(
+                title=str(event.get("title") or ""),
+                owner=str((metadata or {}).get("owner") or ""),
+                behavior_log=behavior_log or self._prefer_audiovisual_source_text(sources),
+                max_chars=self.VIDEO_DETAIL_MAX_CHARS,
+            )
+            return self._sanitize_event_summary(event, detail)
+
+        source = self._prefer_audiovisual_source_text(sources) or "\n\n".join(
+            str(item.get("full_text") or "") for item in sources if isinstance(item, Mapping)
+        )
         source_meta = [
             {
                 "source_type": item.get("source_type"),
@@ -391,8 +665,6 @@ class MemoryModelGateway:
             "metadata": event.get("metadata") or {},
             "sources": source_meta,
         }
-        event_type = str(event.get("event_type") or "")
-        source_type = str(event.get("source_type") or "")
         prompt = (
             "Summarize this observed event faithfully in concise Chinese. "
             "Treat user claims as reported statements, not verified facts. "

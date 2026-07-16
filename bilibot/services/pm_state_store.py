@@ -61,7 +61,8 @@ _VALID_TRANSITIONS: Dict[str, frozenset] = {
         "generation_pending", "deferred", "ignored",
     }),
     "generation_pending": frozenset({
-        "safety_pending", "deferred", "ignored",
+        # rejected/failed: LLM permanent (LLM_NOT_CONFIGURED 等)
+        "safety_pending", "deferred", "ignored", "rejected", "failed",
     }),
     "safety_pending": frozenset({
         "publish_pending", "rejected", "deferred",
@@ -70,10 +71,16 @@ _VALID_TRANSITIONS: Dict[str, frozenset] = {
         "published", "retry_wait", "result_unknown", "failed",
     }),
     "retry_wait": frozenset({
-        "publish_pending", "failed",
+        # safety_pending: 重试发送前需再过安全检查
+        "publish_pending", "failed", "deferred", "safety_pending",
     }),
     "deferred": frozenset({
-        "discovered", "context_building", "generation_pending", "failed",
+        "discovered", "context_building", "generation_pending",
+        "safety_pending", "publish_pending", "retry_wait", "failed",
+        # ignored/rejected: deferred 重生 skip / permanent / 安全拒绝
+        "ignored", "rejected",
+        # 自转移：临时失败再次 deferred 时刷新 next_retry_at / last_error
+        "deferred",
     }),
     # 终态不再转移
     "published": frozenset(),
@@ -297,12 +304,14 @@ class PrivateMessageStateStore:
         account_id: str,
         platform_message_id: str,
         talker_id: str,
+        incoming_text: str = "",
     ) -> PrivateMessageState:
         """幂等发现私信（PRD-V5 §6.3 / PM-501）
 
         - 同一 (account_id, platform_message_id) 只创建一条记录
         - 已存在则返回原记录（不覆盖 status / generation_text 等）
         - 新记录 status='discovered'
+        - incoming_text（脱敏后的用户消息）写入 metadata，供 deferred 重生使用
         """
         if not platform_message_id:
             raise ValueError("platform_message_id 不能为空（PM-501 幂等键依赖平台消息 ID）")
@@ -310,19 +319,43 @@ class PrivateMessageStateStore:
         platform_message_id = str(platform_message_id)
         talker_id = str(talker_id or "")
         now = time.time()
+        meta = {}
+        if incoming_text:
+            # 仅存截断脱敏文本，避免无界膨胀
+            meta["incoming_text"] = str(incoming_text)[:2000]
 
         conn = self._get_conn()
         try:
+            import json as _json
             conn.execute("""
                 INSERT INTO pm_states
                     (account_id, platform_message_id, talker_id, status,
-                     attempt, max_attempts, created_at, updated_at)
-                VALUES (?, ?, ?, 'discovered', 0, ?, ?, ?)
+                     attempt, max_attempts, created_at, updated_at, metadata)
+                VALUES (?, ?, ?, 'discovered', 0, ?, ?, ?, ?)
                 ON CONFLICT(account_id, platform_message_id) DO NOTHING
             """, (
                 account_id, platform_message_id, talker_id,
                 self.max_attempts, now, now,
+                _json.dumps(meta, ensure_ascii=False),
             ))
+            # If row existed without incoming_text, best-effort fill once
+            if incoming_text:
+                row = conn.execute(
+                    "SELECT id, metadata FROM pm_states "
+                    "WHERE account_id=? AND platform_message_id=?",
+                    (account_id, platform_message_id),
+                ).fetchone()
+                if row is not None:
+                    try:
+                        existing_meta = _json.loads(row["metadata"] or "{}")
+                    except Exception:
+                        existing_meta = {}
+                    if not existing_meta.get("incoming_text"):
+                        existing_meta["incoming_text"] = meta["incoming_text"]
+                        conn.execute(
+                            "UPDATE pm_states SET metadata=?, updated_at=? WHERE id=?",
+                            (_json.dumps(existing_meta, ensure_ascii=False), now, row["id"]),
+                        )
             conn.commit()
         finally:
             conn.close()
@@ -531,7 +564,11 @@ class PrivateMessageStateStore:
     def mark_deferred(
         self, state_id: int, reason: str = "", error_code: str = "PM_TEMP_FAILURE",
     ) -> PrivateMessageState:
-        """标记为延迟（非终态 - 临时失败，可恢复）"""
+        """标记为延迟（非终态 - 临时失败，可恢复）
+
+        已是 deferred 时允许自转移，刷新 next_retry_at 与错误信息
+        （重生失败 / 限流 / 安全异常等再次延迟场景）。
+        """
         now = time.time()
         return self.update_status(
             state_id, "deferred",
@@ -550,27 +587,96 @@ class PrivateMessageStateStore:
 
         PRD-V5 §6.3 / PM-501：PM 独立退避，与评论回复列表互不影响。
         """
+        return self.list_retryable(account_id=account_id, now=now, statuses=("retry_wait",))
+
+    def list_retryable(
+        self,
+        account_id: str = "",
+        now: float = None,
+        statuses: tuple = ("retry_wait", "deferred"),
+    ) -> List[PrivateMessageState]:
+        """获取可重试私信：retry_wait ∪ deferred（到期后可恢复）。
+
+        deferred 常见于 NO_SAFETY_CHECKER / rate limit / archive fail / hash mismatch；
+        若只扫 retry_wait，这些会话会永久沉没。
+        """
         now = now or time.time()
         acc = str(account_id or self.account_id)
+        wanted = tuple(statuses) or ("retry_wait", "deferred")
+        placeholders = ",".join("?" for _ in wanted)
         conn = self._get_conn()
         try:
             if acc:
                 rows = conn.execute(
-                    "SELECT * FROM pm_states "
-                    "WHERE account_id=? AND status='retry_wait' "
-                    "AND next_retry_at IS NOT NULL AND next_retry_at <= ? "
-                    "ORDER BY next_retry_at ASC LIMIT 50",
-                    (acc, now),
+                    f"SELECT * FROM pm_states "
+                    f"WHERE account_id=? AND status IN ({placeholders}) "
+                    f"AND next_retry_at IS NOT NULL AND next_retry_at <= ? "
+                    f"ORDER BY next_retry_at ASC LIMIT 50",
+                    (acc, *wanted, now),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM pm_states "
-                    "WHERE status='retry_wait' "
-                    "AND next_retry_at IS NOT NULL AND next_retry_at <= ? "
-                    "ORDER BY next_retry_at ASC LIMIT 50",
-                    (now,),
+                    f"SELECT * FROM pm_states "
+                    f"WHERE status IN ({placeholders}) "
+                    f"AND next_retry_at IS NOT NULL AND next_retry_at <= ? "
+                    f"ORDER BY next_retry_at ASC LIMIT 50",
+                    (*wanted, now),
                 ).fetchall()
             return [self._row_to_state(r) for r in rows]
+        finally:
+            conn.close()
+
+    def recover_stuck_intermediate(
+        self,
+        account_id: str = "",
+        timeout_minutes: int = 10,
+        now: float = None,
+    ) -> int:
+        """Recover PMs stuck in intermediate states after crash.
+
+        publish_pending with generation_text → retry_wait (reuse text).
+        other intermediate → deferred (regenerate).
+        """
+        now = now or time.time()
+        threshold = now - max(1, int(timeout_minutes)) * 60
+        acc = str(account_id or self.account_id)
+        conn = self._get_conn()
+        recovered = 0
+        try:
+            if acc:
+                rows = conn.execute(
+                    "SELECT id, status, generation_text FROM pm_states "
+                    "WHERE account_id=? AND status IN "
+                    "('context_building','generation_pending','safety_pending','publish_pending') "
+                    "AND updated_at < ?",
+                    (acc, threshold),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, status, generation_text FROM pm_states "
+                    "WHERE status IN "
+                    "('context_building','generation_pending','safety_pending','publish_pending') "
+                    "AND updated_at < ?",
+                    (threshold,),
+                ).fetchall()
+            for row in rows:
+                sid = row["id"]
+                status = row["status"]
+                gen = (row["generation_text"] or "").strip()
+                if status == "publish_pending" and gen:
+                    new_status = "retry_wait"
+                    err_code = "STUCK_PUBLISH_PENDING"
+                else:
+                    new_status = "deferred"
+                    err_code = "STUCK_RECOVERY"
+                cur = conn.execute(
+                    "UPDATE pm_states SET status=?, next_retry_at=?, updated_at=?, "
+                    "last_error_code=?, last_error=? WHERE id=? AND status=?",
+                    (new_status, now, now, err_code, f"stuck recovery from {status}", sid, status),
+                )
+                recovered += cur.rowcount
+            conn.commit()
+            return recovered
         finally:
             conn.close()
 

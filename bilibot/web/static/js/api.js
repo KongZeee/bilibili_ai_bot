@@ -142,7 +142,8 @@ export const api = {
         schema: () => api.get('/api/config/schema'),
         full: () => api.get('/api/config/full'),
         fullWithMeta: () => request('/api/config/full', { method: 'GET', returnEnvelope: true }),
-        patch: (data) => api.patch('/api/config', data),
+        // 返回完整响应 envelope（含 applied / config_revision），便于前端展示热重载契约
+        patch: (data) => request('/api/config', { method: 'PATCH', body: data, returnEnvelope: true }),
         validate: () => api.post('/api/config/validate'),
         reload: () => api.post('/api/config/reload'),
         // 别名（Phase 5 页面使用）
@@ -154,11 +155,15 @@ export const api = {
             ]);
             return { data: { schema, config, version: 0 } };
         },
-        update: (data) => api.patch('/api/config', data),
+        update: (data) => request('/api/config', { method: 'PATCH', body: data, returnEnvelope: true }),
     },
 
     // 其他
     replies: (params) => api.get(`/api/replies?${buildQuery(params)}`),
+    retryReply: (replyId, force = false) => api.post(
+        `/api/replies/${replyId}/retry`,
+        force ? { force: true } : {},
+    ),
     audits: (params) => api.get(`/api/audit/generations?${buildQuery(params)}`),
     logs: (params) => api.get(`/api/logs?${buildQuery(params)}`),
     status: () => api.get('/api/status'),

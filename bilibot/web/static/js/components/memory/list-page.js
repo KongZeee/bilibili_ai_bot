@@ -62,6 +62,47 @@ function sourceLabel(src) {
     return SOURCE_LABELS[src] || src || '-';
 }
 
+/** 列表「内容」列预览：视频类优先露出《标题》，再跟摘要。 */
+function contentPreview(mem) {
+    const title = (mem.title || '').trim();
+    const summary = (mem.summary || '').trim();
+    const content = (mem.content || '').trim();
+    const cat = mem.category || mem.event_type || '';
+    const videoLike = [
+        'video_observation',
+        'video_metadata_observation',
+        'bangumi_episode',
+    ].includes(cat) || ['video', 'video_metadata', 'bangumi'].includes(mem.source_type || mem.source || '');
+
+    let text = content;
+    if (videoLike && title) {
+        const head = `《${title}》`;
+        if (summary && !summary.includes(title)) {
+            text = `${head} ${summary}`;
+        } else if (content.startsWith(head) || content.includes(title)) {
+            text = content;
+        } else {
+            text = summary ? `${head} ${summary}` : head;
+        }
+        if (mem.owner) {
+            // 标题旁附带 UP，方便区分同主题视频
+            text = text.replace(head, `${head}（UP：${mem.owner}）`);
+        }
+    }
+    if (!text) text = '-';
+    return text.length > 72 ? text.slice(0, 72) + '...' : text;
+}
+
+function contentTitleAttr(mem) {
+    const title = (mem.title || '').trim();
+    const summary = (mem.summary || '').trim();
+    const content = (mem.content || '').trim();
+    if (title && summary && !summary.includes(title)) {
+        return `《${title}》\n${summary}`;
+    }
+    return content || summary || title || '';
+}
+
 const STATUS_LABELS = {
     ready: '索引就绪',
     pending: '处理中',
@@ -137,12 +178,15 @@ export const MemoryListPage = defineComponent({
 
         const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize.value) || 1));
 
+        let loadSeq = 0;
+
         async function loadData() {
             accountId.value = appState.currentAccountId || appState.accounts[0]?.id;
             if (!accountId.value) {
                 loading.value = false;
                 return;
             }
+            const seq = ++loadSeq;
             loading.value = true;
             try {
                 const [statsData, listData, jobsData] = await Promise.all([
@@ -158,14 +202,16 @@ export const MemoryListPage = defineComponent({
                         ...(jobFilter.value ? { status: jobFilter.value } : {}),
                     }).catch(() => ({ items: [] })),
                 ]);
+                if (seq !== loadSeq) return;
                 stats.value = statsData || { total: 0, categories: {} };
                 memories.value = listData?.items || [];
                 total.value = listData?.total || 0;
                 jobs.value = jobsData?.items || [];
             } catch (e) {
+                if (seq !== loadSeq) return;
                 showToast('加载失败: ' + e.message, 'error');
             } finally {
-                loading.value = false;
+                if (seq === loadSeq) loading.value = false;
             }
         }
 
@@ -538,11 +584,9 @@ export const MemoryListPage = defineComponent({
                                             type: 'button',
                                             class: 'btn btn-ghost',
                                             style: 'justify-content: flex-start; min-width: 0; padding: 0; font-size: 0.96rem; color: hsl(var(--foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 0; box-shadow: none;',
-                                            title: mem.content || '',
+                                            title: contentTitleAttr(mem),
                                             onClick: () => openDetail(mem.id),
-                                        }, (mem.content && mem.content.length > 60)
-                                            ? mem.content.slice(0, 60) + '...'
-                                            : (mem.content || '-')),
+                                        }, contentPreview(mem)),
                                         // 来源
                                         h('span', {
                                             style: 'font-size: 0.92rem; color: hsl(var(--muted-foreground)); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;',
@@ -812,7 +856,9 @@ export const MemoryListPage = defineComponent({
 
                 h(Modal, {
                     modelValue: detailVisible.value,
-                    title: selectedMemory.value?.title || selectedMemory.value?.summary || '记忆详情',
+                    title: selectedMemory.value?.title
+                        || selectedMemory.value?.summary
+                        || '记忆详情',
                     width: 'min(920px, 94vw)',
                     'onUpdate:modelValue': (value) => detailVisible.value = value,
                 }, {
@@ -826,8 +872,35 @@ export const MemoryListPage = defineComponent({
                                         h('span', { class: `badge ${selectedMemory.value.index_health?.healthy ? 'badge-success' : 'badge-warning'}` }, statusLabel(selectedMemory.value.index_status)),
                                         h('span', { class: 'badge badge-info' }, `${selectedMemory.value.chunk_count || 0} 分块`),
                                         h('span', { class: 'badge badge-info' }, `${selectedMemory.value.entity_count || 0} 实体`),
+                                        selectedMemory.value.bvid
+                                            ? h('span', { class: 'badge badge-info' }, selectedMemory.value.bvid)
+                                            : null,
                                     ]),
-                                    h('p', { class: 'm-0', style: 'line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere;' }, selectedMemory.value.summary || selectedMemory.value.content || '-'),
+                                    // 视频类：标题单独一行，摘要再展示
+                                    selectedMemory.value.title
+                                        ? h('h3', {
+                                            class: 'm-0',
+                                            style: 'font-size: 1.1rem; line-height: 1.4; font-weight: 600;',
+                                        }, `《${selectedMemory.value.title}》`)
+                                        : null,
+                                    (selectedMemory.value.owner || selectedMemory.value.bvid)
+                                        ? h('p', {
+                                            class: 'm-0 muted',
+                                            style: 'font-size: 0.88rem;',
+                                        }, [
+                                            selectedMemory.value.owner
+                                                ? `UP主：${selectedMemory.value.owner}`
+                                                : '',
+                                            selectedMemory.value.owner && selectedMemory.value.bvid
+                                                ? ' · '
+                                                : '',
+                                            selectedMemory.value.bvid || '',
+                                        ].join(''))
+                                        : null,
+                                    h('p', {
+                                        class: 'm-0',
+                                        style: 'line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere;',
+                                    }, selectedMemory.value.summary || selectedMemory.value.content || '-'),
                                     h('div', { class: 'grid gap-1', style: 'grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); font-size: 0.84rem; color: hsl(var(--muted-foreground));' }, [
                                         h('span', `事件 ID: ${selectedMemory.value.id}`),
                                         h('span', `全文索引: ${selectedMemory.value.index_health?.fts || '-'}`),

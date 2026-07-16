@@ -112,11 +112,12 @@ class CommentContextService:
         bot_thread_replies = self._get_bot_thread_replies(rpid=rpid, oid=oid)
 
         # 6. 同视频下的相关历史互动
-        # 召回 query 拼入视频标题，让向量检索能命中该视频的观察记录（视听分析/评价等），
-        # 而不是只召回与评论文本语义相似的其他评论
+        # 召回 query 拼入真实视频标题，让向量/FTS 能命中该视频观察记录。
+        # 禁止把「评论对话上下文」等占位标题拼进 query（会污染 title_entity 通道）。
         recall_message = comment_text
-        if video and video.title:
-            recall_message = f"视频《{video.title}》\n{comment_text}".strip()
+        video_title = (video.title or "").strip() if video else ""
+        if video_title and video_title not in self._PLACEHOLDER_TITLES:
+            recall_message = f"视频《{video_title}》\n{comment_text}".strip()
         memory_evidence = await self._get_related_memory(
             message=recall_message,
             oid=oid,
@@ -157,10 +158,11 @@ class CommentContextService:
         if comment_type != 1:
             return None, False
 
-        # 优先复用当前账号 V6 brain 中的完整视频观察。
+        # 优先复用当前账号 V6 brain 中的视频观察。
+        # complete=True 仅当缓存含视听/摘要；纯元数据不得冒充「看过细节」。
         cached = await self._get_cached_video_memory(oid, persona_id)
         if cached is not None:
-            return cached, True
+            return cached
 
         # 调用 BilibiliAPI
         if self.bili is None:
@@ -180,15 +182,24 @@ class CommentContextService:
             if self._memory_archive_required:
                 from bilibot.memory_brain.ingestion import video_metadata_observation
 
-                await self._archive_context_required(
-                    video_metadata_observation(
-                        account_id=str(getattr(self.memory_brain, "account_id", "") or "default"),
-                        oid=str(oid),
-                        metadata=info,
-                        persona_id=persona_id,
+                try:
+                    await self._archive_context_required(
+                        video_metadata_observation(
+                            account_id=str(getattr(self.memory_brain, "account_id", "") or "default"),
+                            oid=str(oid),
+                            metadata=info,
+                            persona_id=persona_id,
+                        )
                     )
-                )
+                except ContextArchiveError as archive_exc:
+                    # 元数据归档失败不应阻断评论回复：仍返回标题/UP，complete=False。
+                    logger.warning(
+                        "视频元数据归档失败，降级为不完整上下文 oid=%s: %s",
+                        oid,
+                        type(archive_exc).__name__,
+                    )
 
+            # 仅元数据：可回填标题/UP，但禁止模型编造视听细节。
             return VideoContext(
                 oid=str(oid),
                 bvid=info.get("bvid", "") or "",
@@ -199,8 +210,9 @@ class CommentContextService:
                 tags=tags,
                 category=str(info.get("tid", "") or ""),
                 publish_time=str(info.get("pubdate", "") or ""),
-            ), True
+            ), False
         except ContextArchiveError:
+            # 不应再到达：上面已吞掉 metadata 归档错误。
             raise
         except Exception as e:
             logger.warning(f"获取视频信息失败 oid={oid}: {e}")
@@ -215,16 +227,106 @@ class CommentContextService:
                 raise RuntimeError("V6 context source commit was not confirmed")
             return result
         except Exception as exc:
+            # 同 key 同内容会 soft success；不同内容冲突 / tombstone 对「仅元数据」
+            # 不应抬成致命错误——调用方已 complete=False 降级。
+            try:
+                from bilibot.memory_brain.models import (
+                    IdempotencyConflictError,
+                    ReingestBlockedError,
+                )
+                if isinstance(exc, IdempotencyConflictError):
+                    logger.info(
+                        "context archive idempotent conflict treated as ready: %s",
+                        getattr(envelope, "idempotency_key", ""),
+                    )
+                    return {"source_committed": True, "idempotent_hit": True}
+                if isinstance(exc, ReingestBlockedError):
+                    logger.warning(
+                        "context archive blocked by tombstone: %s",
+                        getattr(envelope, "idempotency_key", ""),
+                    )
+                    return {"source_committed": False, "blocked": True}
+            except Exception:
+                pass
             raise ContextArchiveError("required model context archive failed") from exc
 
-    async def _get_cached_video_memory(self, oid: str, persona_id: str = "") -> Optional[VideoContext]:
-        """Reuse a validated V6 video event by OID/BVID within this account."""
+    # find_by_identifiers 会按 metadata.oid 命中 comment_thread 等非视频事件；
+    # 它们的 event_title 固定为「评论对话上下文」，绝不能当成视频标题喂给召回。
+    _VIDEO_EVENT_TYPES = frozenset(
+        {
+            "video_observation",
+            "video_metadata_observation",
+            "bot_experience",
+        }
+    )
+    _VIDEO_SOURCE_TYPES = frozenset(
+        {
+            "video",
+            "video_metadata",
+            "video_experience",
+        }
+    )
+    _PLACEHOLDER_TITLES = frozenset(
+        {
+            "评论对话上下文",
+            "未知视频",
+            "",
+        }
+    )
+
+    _FULL_AV_SOURCE_TYPES = frozenset(
+        {
+            "video_detail",
+            "behavior_log",
+            "asr",
+            "subtitle",
+            "visual_description",
+        }
+    )
+
+    @classmethod
+    def _event_has_full_audiovisual(cls, event: Optional[dict]) -> bool:
+        """True only when the event carries real watch/digest evidence."""
+        if not isinstance(event, dict):
+            return False
+        event_type = str(event.get("event_type") or "")
+        source_type = str(event.get("source_type") or "")
+        if event_type not in {"video_observation"} and source_type not in {"video"}:
+            return False
+        event_meta = event.get("metadata") or {}
+        if isinstance(event_meta, dict) and event_meta.get("has_video_detail"):
+            return True
+        for source in event.get("sources") or []:
+            if not isinstance(source, dict):
+                continue
+            if source.get("source_type") in cls._FULL_AV_SOURCE_TYPES:
+                text = str(
+                    source.get("full_text") or source.get("text") or ""
+                ).strip()
+                if text:
+                    return True
+        return False
+
+    async def _get_cached_video_memory(
+        self, oid: str, persona_id: str = ""
+    ) -> Optional[tuple[VideoContext, bool]]:
+        """Reuse a validated V6 *video* event by OID/BVID within this account.
+
+        Returns ``(VideoContext, video_context_complete)`` or None.
+        ``complete`` is True only when the hit includes audiovisual digest/log
+        evidence — bare metadata is reusable for title/bvid but incomplete.
+
+        Identifier lookup is intentionally broad (any event carrying this oid).
+        Only video-related events may populate VideoContext.title; conversation
+        threads sharing the same oid must be ignored.
+        """
         if not self.memory_brain or not oid:
             return None
         try:
             hits = await asyncio.to_thread(
                 self.memory_brain.find_by_identifiers, [str(oid)], 20
             )
+            candidates: list[tuple[int, VideoContext, bool]] = []
             for hit in hits:
                 event_id = str(hit.get("event_id") or hit.get("id") or "")
                 if not event_id:
@@ -235,29 +337,103 @@ class CommentContextService:
                 if not event:
                     continue
                 event_meta = event.get("metadata") or {}
+                if not isinstance(event_meta, dict):
+                    event_meta = {}
                 if str(event_meta.get("oid", "")) != str(oid):
                     continue
-                video_meta = {}
+
+                event_type = str(event.get("event_type") or "")
+                source_type = str(event.get("source_type") or "")
+                if (
+                    event_type not in self._VIDEO_EVENT_TYPES
+                    and source_type not in self._VIDEO_SOURCE_TYPES
+                ):
+                    continue
+
+                video_meta: dict = {}
                 for source in event.get("sources") or []:
+                    if not isinstance(source, dict):
+                        continue
                     if source.get("source_type") == "video_metadata":
-                        video_meta = source.get("structured_data") or {}
-                        break
+                        raw = source.get("structured_data") or {}
+                        if isinstance(raw, dict) and raw:
+                            video_meta = raw
+                            break
                 owner = video_meta.get("owner") or {}
                 if not isinstance(owner, dict):
                     owner = {}
-                return VideoContext(
+
+                # Prefer real B站 metadata title over event_title (the latter is
+                # sometimes a generic label or bot-experience summary title).
+                title = str(
+                    video_meta.get("title")
+                    or event_meta.get("title")
+                    or ""
+                ).strip()
+                event_title = str(event.get("title") or "").strip()
+                if not title and event_title not in self._PLACEHOLDER_TITLES:
+                    # video_observation uses the real title as event_title.
+                    if event_type in {"video_observation", "video_metadata_observation"}:
+                        title = event_title
+                if not title or title in self._PLACEHOLDER_TITLES:
+                    # Incomplete cache hit — better fall through to API than
+                    # poison recall with a fake title.
+                    continue
+
+                tags = event_meta.get("tags") or video_meta.get("tag") or []
+                if isinstance(tags, str):
+                    tags = [t.strip() for t in tags.split(",") if t.strip()]
+                elif not isinstance(tags, list):
+                    tags = []
+
+                ctx = VideoContext(
                     oid=str(oid),
-                    bvid=str(event_meta.get("bvid") or video_meta.get("bvid") or ""),
-                    title=str(event.get("title") or video_meta.get("title") or ""),
-                    owner_name=str(event_meta.get("owner") or owner.get("name") or ""),
+                    bvid=str(
+                        event_meta.get("bvid")
+                        or video_meta.get("bvid")
+                        or ""
+                    ),
+                    title=title,
+                    owner_name=str(
+                        event_meta.get("owner")
+                        or owner.get("name")
+                        or ""
+                    ),
                     owner_mid=str(owner.get("mid") or ""),
                     desc=str(video_meta.get("desc") or ""),
-                    tags=list(event_meta.get("tags") or []),
+                    tags=list(tags),
                 )
+                has_full_av = self._event_has_full_audiovisual(event)
+                # Prefer full audiovisual observation over bare metadata.
+                rank = 0
+                if event_type == "video_observation":
+                    rank += 100
+                if has_full_av:
+                    rank += 80
+                if any(
+                    isinstance(s, dict) and s.get("source_type") == "video_detail"
+                    for s in (event.get("sources") or [])
+                ):
+                    rank += 40
+                if any(
+                    isinstance(s, dict) and s.get("source_type") == "behavior_log"
+                    for s in (event.get("sources") or [])
+                ):
+                    rank += 30
+                if ctx.bvid:
+                    rank += 10
+                if ctx.desc:
+                    rank += 5
+                candidates.append((rank, ctx, has_full_av))
+
+            if not candidates:
+                return None
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            _rank, best_ctx, complete = candidates[0]
+            return best_ctx, complete
         except Exception as exc:
             logger.debug("V6 视频记忆复用失败 oid=%s: %s", oid, type(exc).__name__)
             return None
-        return None
 
     # ── 私有：评论线 ──
 
@@ -345,14 +521,21 @@ class CommentContextService:
         try:
             from bilibot.memory_brain import RecallQuery
 
+            video_title = ""
+            bvid = ""
+            if video:
+                raw_title = str(video.title or "").strip()
+                if raw_title and raw_title not in self._PLACEHOLDER_TITLES:
+                    video_title = raw_title
+                bvid = str(video.bvid or "")
             result = await self.memory_brain.recall(
                 RecallQuery(
                     current_message=message,
                     recent_turns=tuple(recent_turns or ()),
                     account_id=getattr(self.memory_brain, "account_id", ""),
                     speaker_actor_id=str(user_id),
-                    title=video.title if video else "",
-                    bvid=video.bvid if video else "",
+                    title=video_title,
+                    bvid=bvid,
                     oid=str(oid),
                     scene="reply_comment",
                 )

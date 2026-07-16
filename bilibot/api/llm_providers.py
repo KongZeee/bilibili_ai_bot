@@ -22,12 +22,25 @@ logger = logging.getLogger("bilibot.api.llm_providers")
 def _save_llm_to_config(config_loader, llm_manager, config_path: str):
     """将 LLM 配置持久化到 config.yaml"""
     try:
-        raw = config_loader.get_raw_config()
-        llm_dict = llm_manager.save_to_config()
-        raw["llm_providers"] = llm_dict["llm_providers"]
-        raw["default_llm"] = llm_dict["default_llm"]
-        raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-        config_loader.save_config(raw, config_path)
+        def _mutate(raw: dict) -> None:
+            llm_dict = llm_manager.save_to_config()
+            # V3：优先写 chat_providers；兼容仍写 llm_providers 的旧 save_to_config
+            if "chat_providers" in llm_dict:
+                raw["chat_providers"] = llm_dict["chat_providers"]
+            if "llm_providers" in llm_dict:
+                raw["llm_providers"] = llm_dict["llm_providers"]
+            if "default_llm" in llm_dict:
+                raw["default_llm"] = llm_dict["default_llm"]
+            if "model_routing" in llm_dict:
+                raw["model_routing"] = llm_dict["model_routing"]
+            raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
+
+        if hasattr(config_loader, "atomic_update"):
+            config_loader.atomic_update(config_path, _mutate)
+        else:
+            raw = config_loader.get_raw_config()
+            _mutate(raw)
+            config_loader.save_config(raw, config_path)
         return True
     except Exception as e:
         logger.error(f"持久化 LLM 配置失败: {e}")
@@ -37,12 +50,18 @@ def _save_llm_to_config(config_loader, llm_manager, config_path: str):
 def _save_accounts_to_config_local(config_loader, account_manager, config_path: str):
     """将账号配置持久化到 config.yaml（force 删除清除引用后保存）"""
     try:
-        raw = config_loader.get_raw_config()
-        accounts_dict = account_manager.save_to_config()
-        raw["accounts"] = accounts_dict["accounts"]
-        raw["default_account"] = accounts_dict["default_account"]
-        raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-        config_loader.save_config(raw, config_path)
+        def _mutate(raw: dict) -> None:
+            accounts_dict = account_manager.save_to_config()
+            raw["accounts"] = accounts_dict["accounts"]
+            raw["default_account"] = accounts_dict["default_account"]
+            raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
+
+        if hasattr(config_loader, "atomic_update"):
+            config_loader.atomic_update(config_path, _mutate)
+        else:
+            raw = config_loader.get_raw_config()
+            _mutate(raw)
+            config_loader.save_config(raw, config_path)
         return True
     except Exception as e:
         logger.error(f"持久化账号配置失败: {e}")
@@ -85,7 +104,8 @@ def create_llm_providers_routes(
             _save_llm_to_config(config_loader, llm_manager, config_path)
             return ok(llm_manager.get_provider(llm_id).get_info(), "LLM Provider 添加成功")
         except ValueError as e:
-            return fail("VALIDATION_ERROR", str(e))
+            logger.warning("添加 LLM Provider 校验失败: %s", e)
+            return fail("VALIDATION_ERROR", "Provider 参数不合法")
         except Exception as e:
             logger.error(f"添加 LLM Provider 失败: {e}", exc_info=True)
             return fail_internal()
@@ -161,7 +181,8 @@ def create_llm_providers_routes(
             else:
                 return fail("CONNECTION_FAILED", f"连接失败: {err_msg or '请检查 api_key / base_url / model'}")
         except Exception as e:
-            return fail("CONNECTION_FAILED", f"测试失败: {e}")
+            logger.error(f"测试 LLM Provider 失败: {e}", exc_info=True)
+            return fail("CONNECTION_FAILED", "连接测试失败，请检查 api_key / base_url / model")
 
     return [
         Route("/api/llm-providers", list_providers, methods=["GET"]),

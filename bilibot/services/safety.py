@@ -3,9 +3,10 @@
 
 集中管理：
 - 全局暂停 Bot（SQLite 持久化）
-- 账号级风险暂停（内存）
+- 账号级风险暂停（SQLite 持久化 + 内存缓存）
 - 发布前内容安全检查（长度 / 敏感词 / 重复度 / 人格一致性）
-- 发布频率限制（滑动窗口：每分钟 / 每小时 / 每天，account_id+scene 隔离）
+- 发布频率限制（滑动窗口：每分钟 / 每小时 / 每天，account_id+scene 隔离；
+  时间戳持久化到 safety.db，重启后恢复近 24h 配额）
 - 用户级黑名单（SQLite 存储，add/remove/check/list）
 - 敏感词过滤（全文匹配 + 正则匹配，支持运行时加载）
 
@@ -25,9 +26,12 @@ from collections import deque
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("bilibot.safety")
+
+# 限流事件保留窗口（秒）：覆盖日桶；小时/分钟从中裁剪
+_RATE_EVENT_RETENTION_SECS = 86400
 
 
 class SafetyChecker:
@@ -75,10 +79,14 @@ class SafetyChecker:
 
         # BUG B-002: 为每个 bucket 的 deque 操作添加线程锁，确保 check+record 原子性
         # _rate_locks 按 key 存储各自的锁，_global_lock 保护全局桶
+        # _rate_locks_guard 保护锁表本身的创建，避免并发首次访问同一 key 时产生两把锁
+        # _db_lock 保护 rate_limit_events / account_pause 的 SQLite 写读与内存同步
         self._rate_locks: Dict[str, threading.Lock] = {}
+        self._rate_locks_guard = threading.Lock()
         self._global_lock = threading.Lock()
+        self._db_lock = threading.Lock()
 
-        # 账号级风险暂停（内存，运行时触发）
+        # 账号级风险暂停（内存缓存，DB 为权威来源；启动时从 DB 加载）
         # 结构: {account_id: {"reason": str, "paused_at": str}}
         self._account_paused: Dict[str, Dict[str, Any]] = {}
 
@@ -89,8 +97,10 @@ class SafetyChecker:
         # 从配置加载所有参数
         self._load_config_params(self.config)
 
-        # 初始化数据库
+        # 初始化数据库并恢复持久化状态
         self._init_db()
+        self._load_account_pauses_from_db()
+        self._load_rate_buckets_from_db()
 
         # 从配置加载敏感词（reply.block_keywords）
         self._load_sensitive_words_from_config()
@@ -168,7 +178,186 @@ class SafetyChecker:
                     created_at TEXT NOT NULL
                 )
             """)
+
+            # 账号级风险暂停（持久化，重启后仍生效）
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS account_pause (
+                    account_id TEXT PRIMARY KEY,
+                    reason TEXT DEFAULT '',
+                    paused_at TEXT DEFAULT '',
+                    updated_at TEXT NOT NULL
+                )
+            """)
+
+            # 限流事件：滚动窗口时间戳（近 24h），重启后恢复日/时配额
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS rate_limit_events (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_scene_key TEXT NOT NULL,
+                    scene TEXT DEFAULT '',
+                    account_id TEXT DEFAULT '',
+                    ts REAL NOT NULL
+                )
+            """)
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rate_limit_events_ts "
+                "ON rate_limit_events(ts)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_rate_limit_events_key_ts "
+                "ON rate_limit_events(account_scene_key, ts)"
+            )
             conn.commit()
+
+    def _connect_db(self) -> sqlite3.Connection:
+        """打开 safety.db 连接（短连接，调用方负责关闭）"""
+        conn = sqlite3.connect(str(self.db_path), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        return conn
+
+    def _load_account_pauses_from_db(self) -> None:
+        """从 DB 加载账号风险暂停到内存缓存"""
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT account_id, reason, paused_at FROM account_pause"
+                    ).fetchall()
+            loaded: Dict[str, Dict[str, Any]] = {}
+            for r in rows:
+                aid = r["account_id"]
+                if not aid:
+                    continue
+                loaded[aid] = {
+                    "reason": r["reason"] or "",
+                    "paused_at": r["paused_at"] or "",
+                }
+            self._account_paused = loaded
+            if loaded:
+                logger.info(f"已从 DB 恢复账号风险暂停 {len(loaded)} 个")
+        except Exception as e:
+            logger.warning(f"加载账号风险暂停失败: {e}")
+
+    def _load_rate_buckets_from_db(self) -> None:
+        """从 DB 加载近 24h 限流时间戳到内存 deque（日桶 + 小时/分钟裁剪）"""
+        cutoff = time.time() - _RATE_EVENT_RETENTION_SECS
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    # 清理过期事件，避免表无限增长
+                    conn.execute(
+                        "DELETE FROM rate_limit_events WHERE ts < ?", (cutoff,)
+                    )
+                    conn.commit()
+                    rows = conn.execute(
+                        "SELECT account_scene_key, ts FROM rate_limit_events "
+                        "WHERE ts >= ? ORDER BY ts ASC",
+                        (cutoff,),
+                    ).fetchall()
+
+            now = time.time()
+            per_key: Dict[str, List[float]] = {}
+            global_ts: List[float] = []
+
+            for key, ts in rows:
+                try:
+                    ts_f = float(ts)
+                except (TypeError, ValueError):
+                    continue
+                if ts_f < cutoff:
+                    continue
+                per_key.setdefault(key or "_global_:_global_", []).append(ts_f)
+                global_ts.append(ts_f)
+
+            for key, stamps in per_key.items():
+                day_dq: Deque[float] = deque(stamps)
+                hour_cutoff = now - 3600
+                minute_cutoff = now - 60
+                hour_dq: Deque[float] = deque(t for t in stamps if t >= hour_cutoff)
+                minute_dq: Deque[float] = deque(t for t in stamps if t >= minute_cutoff)
+                self._rate_buckets[key] = {
+                    "minute": minute_dq,
+                    "hour": hour_dq,
+                    "day": day_dq,
+                }
+
+            self._global_bucket["day"] = deque(global_ts)
+
+            logger.info(
+                f"已从 DB 恢复限流事件: keys={len(per_key)} events={len(global_ts)}"
+            )
+        except Exception as e:
+            logger.warning(f"加载限流事件失败，使用空桶: {e}")
+
+    def _db_insert_rate_event(
+        self, key: str, scene: str, account_id: str, ts: float
+    ) -> None:
+        """写入一条限流事件（调用方应已持有业务锁或接受与 check 同序写）"""
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    conn.execute(
+                        "INSERT INTO rate_limit_events "
+                        "(account_scene_key, scene, account_id, ts) "
+                        "VALUES (?, ?, ?, ?)",
+                        (key, scene or "", account_id or "", float(ts)),
+                    )
+                    # 偶尔清理过期行（约每 50 次插入时触发一次，避免热路径开销）
+                    if int(ts * 1000) % 50 == 0:
+                        cutoff = time.time() - _RATE_EVENT_RETENTION_SECS
+                        conn.execute(
+                            "DELETE FROM rate_limit_events WHERE ts < ?", (cutoff,)
+                        )
+                    conn.commit()
+        except Exception as e:
+            logger.warning(f"写入 rate_limit_events 失败 key={key}: {e}")
+
+    def _db_delete_rate_event_by_ts(self, key: str, ts: float) -> bool:
+        """按 key+精确时间戳删除一条限流事件（refund / 回滚）
+
+        Returns:
+            True 若删除了至少一行
+        """
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    cur = conn.execute(
+                        "DELETE FROM rate_limit_events WHERE id = ("
+                        "  SELECT id FROM rate_limit_events "
+                        "  WHERE account_scene_key = ? AND ABS(ts - ?) < 1e-6 "
+                        "  ORDER BY id DESC LIMIT 1"
+                        ")",
+                        (key, float(ts)),
+                    )
+                    deleted = cur.rowcount > 0
+                    conn.commit()
+            return deleted
+        except Exception as e:
+            logger.warning(f"删除 rate_limit_events 失败 key={key} ts={ts}: {e}")
+            return False
+
+    def _db_delete_latest_rate_event(self, key: str) -> Optional[float]:
+        """删除指定 key 最近一条限流事件，返回被删时间戳（无则 None）"""
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    row = conn.execute(
+                        "SELECT id, ts FROM rate_limit_events "
+                        "WHERE account_scene_key = ? ORDER BY ts DESC, id DESC LIMIT 1",
+                        (key,),
+                    ).fetchone()
+                    if not row:
+                        return None
+                    event_id, ts = row[0], float(row[1])
+                    conn.execute(
+                        "DELETE FROM rate_limit_events WHERE id = ?", (event_id,)
+                    )
+                    conn.commit()
+                    return ts
+        except Exception as e:
+            logger.warning(f"删除最近 rate_limit_events 失败 key={key}: {e}")
+            return None
 
     # ────────────────────── 全局暂停 ──────────────────────
 
@@ -243,7 +432,7 @@ class SafetyChecker:
     # ────────────────────── 账号级风险暂停 ──────────────────────
 
     def is_account_paused(self, account_id: str) -> bool:
-        """检查指定账号是否处于风险暂停状态
+        """检查指定账号是否处于风险暂停状态（读内存缓存，启动时从 DB 加载）
 
         SAFE-501：account_id 非空时检查账号级暂停；
         account_id 为空时返回 False（仅全局暂停由 is_paused() 处理）。
@@ -253,22 +442,47 @@ class SafetyChecker:
         return account_id in self._account_paused
 
     def pause_account(self, account_id: str, reason: str = "") -> None:
-        """暂停指定账号的自动发布行为（不影响其他账号）
+        """暂停指定账号的自动发布行为（不影响其他账号，SQLite 持久化）
 
         SAFE-501：账号级风险暂停（如 B站风控 code=-352）只暂停触发的账号。
         """
         if not account_id:
             return
-        self._account_paused[account_id] = {
-            "reason": reason,
-            "paused_at": datetime.now().isoformat(),
-        }
-        logger.warning(f"账号 {account_id} 已风险暂停 reason={reason!r}")
+        now = datetime.now().isoformat()
+        info = {"reason": reason or "", "paused_at": now}
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    conn.execute(
+                        "INSERT INTO account_pause (account_id, reason, paused_at, updated_at) "
+                        "VALUES (?, ?, ?, ?) "
+                        "ON CONFLICT(account_id) DO UPDATE SET "
+                        "reason=excluded.reason, paused_at=excluded.paused_at, "
+                        "updated_at=excluded.updated_at",
+                        (account_id, reason or "", now, now),
+                    )
+                    conn.commit()
+            self._account_paused[account_id] = info
+            logger.warning(f"账号 {account_id} 已风险暂停 reason={reason!r}")
+        except Exception as e:
+            # DB 失败时仍写入内存，避免风控后继续发帖
+            self._account_paused[account_id] = info
+            logger.error(f"账号 {account_id} 风险暂停写 DB 失败，已写入内存: {e}")
 
     def resume_account(self, account_id: str) -> None:
-        """恢复指定账号的自动发布行为"""
+        """恢复指定账号的自动发布行为（同步清除 DB）"""
         if not account_id:
             return
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    conn.execute(
+                        "DELETE FROM account_pause WHERE account_id = ?",
+                        (account_id,),
+                    )
+                    conn.commit()
+        except Exception as e:
+            logger.warning(f"账号 {account_id} 恢复时删 DB 失败: {e}")
         self._account_paused.pop(account_id, None)
         logger.info(f"账号 {account_id} 已恢复运行")
 
@@ -420,6 +634,7 @@ class SafetyChecker:
 
         SAFE-501：限流键为 account_id:scene，账号间互不抢占配额。
         同时检查全局日配额（global_quota）。
+        通过时同步写入 safety.db.rate_limit_events（重启后恢复近 24h 配额）。
 
         Args:
             scene: 场景标识；为空时使用默认桶 "_global_"
@@ -434,12 +649,12 @@ class SafetyChecker:
         now = time.time()
         key = self._rate_key(scene, account_id)
 
-        # BUG B-002: 获取或创建该 key 的锁
-        if key not in self._rate_locks:
-            self._rate_locks[key] = threading.Lock()
-        bucket_lock = self._rate_locks[key]
+        # BUG B-002: 获取或创建该 key 的锁（锁表插入需保护）
+        with self._rate_locks_guard:
+            if key not in self._rate_locks:
+                self._rate_locks[key] = threading.Lock()
+            bucket_lock = self._rate_locks[key]
 
-        # BUG B-002: 先获取 per-key 锁，检查并记录 per-account-scene 限流
         bucket = self._get_bucket(scene, account_id)
         windows = [
             ("minute", 60, self.rate_limits["per_minute"]),
@@ -447,6 +662,9 @@ class SafetyChecker:
             ("day", 86400, self.rate_limits["per_day"]),
         ]
 
+        # 先持 per-key 锁完成 per-account-scene 检查并预占；
+        # 再在持 bucket_lock 的同时拿 global_lock 做全局配额，避免全局超额回滚时
+        # 无锁 pop per-key 桶的竞态。
         with bucket_lock:
             for name, window_secs, limit in windows:
                 dq = bucket[name]
@@ -456,25 +674,34 @@ class SafetyChecker:
                 if len(dq) >= limit:
                     return False, f"rate_limit:{key}:{name}({len(dq)}/{limit})"
 
-            # BUG B-002: 通过检查后立即记录（仍在锁内）
+            # 通过 per-key 检查后立即记录（仍在锁内）
             bucket["minute"].append(now)
             bucket["hour"].append(now)
             bucket["day"].append(now)
 
-        # BUG B-002: 再获取全局锁，原子检查并记录全局日配额
-        with self._global_lock:
-            global_dq = self._global_bucket["day"]
-            global_cutoff = now - 86400
-            while global_dq and global_dq[0] < global_cutoff:
-                global_dq.popleft()
-            if len(global_dq) >= self.global_quota:
-                # BUG B-002: 全局配额不足时回滚 per-key 记录
-                bucket["minute"].pop()
-                bucket["hour"].pop()
-                bucket["day"].pop()
-                return False, f"global_quota({len(global_dq)}/{self.global_quota})"
+            # 全局日配额：在仍持有 bucket_lock 时获取 global_lock，
+            # 超额回滚 per-key 时无需释放后再抢锁。
+            with self._global_lock:
+                global_dq = self._global_bucket["day"]
+                global_cutoff = now - 86400
+                while global_dq and global_dq[0] < global_cutoff:
+                    global_dq.popleft()
+                if len(global_dq) >= self.global_quota:
+                    # 回滚 per-key 预占（已持 bucket_lock）
+                    for name in ("minute", "hour", "day"):
+                        dq = bucket[name]
+                        if dq:
+                            try:
+                                dq.pop()
+                            except IndexError:
+                                pass
+                    return False, f"global_quota({len(global_dq)}/{self.global_quota})"
 
-            self._global_bucket["day"].append(now)
+                self._global_bucket["day"].append(now)
+
+        # 内存已占额成功后再同步写 DB（失败仅告警，不回滚内存——下次重启可能少计 1 次，
+        # 比写失败却让后续请求无限放行更安全；可接受）
+        self._db_insert_rate_event(key, scene, account_id, now)
 
         return True, "ok"
 
@@ -504,8 +731,9 @@ class SafetyChecker:
         bucket = self._get_bucket(scene, account_id)
 
         # BUG B-002: 在 per-key 锁内检查
-        if key not in self._rate_locks:
-            self._rate_locks[key] = threading.Lock()
+        with self._rate_locks_guard:
+            if key not in self._rate_locks:
+                self._rate_locks[key] = threading.Lock()
         with self._rate_locks[key]:
             windows = [
                 ("minute", 60, self.rate_limits["per_minute"]),
@@ -545,15 +773,23 @@ class SafetyChecker:
         此方法与 check_rate_limit 分离，存在竞态条件。
         请改用 check_and_record_rate_limit 原子方法。
 
-        SAFE-501：同时记录到 account_id:scene 桶和全局桶。
+        SAFE-501：同时记录到 account_id:scene 桶和全局桶，并写 DB。
         """
+        key = self._rate_key(scene, account_id)
+        with self._rate_locks_guard:
+            if key not in self._rate_locks:
+                self._rate_locks[key] = threading.Lock()
+            bucket_lock = self._rate_locks[key]
+
         bucket = self._get_bucket(scene, account_id)
         now = time.time()
-        bucket["minute"].append(now)
-        bucket["hour"].append(now)
-        bucket["day"].append(now)
-        # 全局桶
-        self._global_bucket["day"].append(now)
+        with bucket_lock:
+            bucket["minute"].append(now)
+            bucket["hour"].append(now)
+            bucket["day"].append(now)
+            with self._global_lock:
+                self._global_bucket["day"].append(now)
+        self._db_insert_rate_event(key, scene, account_id, now)
 
     def refund_publish(self, scene: str = "", account_id: str = "") -> None:
         """Task 21.2：退回一次频率配额记录
@@ -561,35 +797,79 @@ class SafetyChecker:
         用于 check_and_record_rate_limit 预占配额后发布失败的场景。
         check_and_record_rate_limit 是"先扣减后执行"设计，失败时需退回。
 
-        最佳努力退回：从对应桶和全局桶各弹出最近一条记录。
-        并发场景下可能弹出其他 worker 的记录，但失败场景较少，可接受。
+        尽量按时间戳精确删除：在持锁下弹出本 key 各窗口最近一条，
+        并用该时间戳从全局桶精确移除；同步删除 DB 中对应事件。
         """
         if not self.rate_limit_enabled:
             return
         key = self._rate_key(scene, account_id)
-        if key not in self._rate_locks:
-            self._rate_locks[key] = threading.Lock()
+        with self._rate_locks_guard:
+            if key not in self._rate_locks:
+                self._rate_locks[key] = threading.Lock()
+            bucket_lock = self._rate_locks[key]
+
         bucket = self._get_bucket(scene, account_id)
-        with self._rate_locks[key]:
-            for name in ("minute", "hour", "day"):
-                dq = bucket[name]
-                if dq:
+        refunded_ts: Optional[float] = None
+
+        with bucket_lock:
+            # 以 day 桶最近一条时间戳为准做精确退回
+            day_dq = bucket["day"]
+            if day_dq:
+                try:
+                    refunded_ts = day_dq.pop()
+                except IndexError:
+                    refunded_ts = None
+
+            if refunded_ts is not None:
+                for name in ("minute", "hour"):
+                    dq = bucket[name]
+                    # 从右向左找匹配时间戳；找不到则 pop 最近一条（兼容旧内存态）
+                    removed = False
+                    for i in range(len(dq) - 1, -1, -1):
+                        if abs(dq[i] - refunded_ts) < 1e-6:
+                            del dq[i]
+                            removed = True
+                            break
+                    if not removed and dq:
+                        try:
+                            dq.pop()
+                        except IndexError:
+                            pass
+
+            with self._global_lock:
+                global_dq = self._global_bucket["day"]
+                if refunded_ts is not None:
+                    removed = False
+                    for i in range(len(global_dq) - 1, -1, -1):
+                        if abs(global_dq[i] - refunded_ts) < 1e-6:
+                            del global_dq[i]
+                            removed = True
+                            break
+                    if not removed and global_dq:
+                        try:
+                            global_dq.pop()
+                        except IndexError:
+                            pass
+                elif global_dq:
                     try:
-                        dq.pop()
+                        global_dq.pop()
                     except IndexError:
                         pass
-        with self._global_lock:
-            global_dq = self._global_bucket["day"]
-            if global_dq:
-                try:
-                    global_dq.pop()
-                except IndexError:
-                    pass
+
+        # 同步 DB：优先按精确时间戳删，否则删 key 最近一条
+        if refunded_ts is not None:
+            if not self._db_delete_rate_event_by_ts(key, refunded_ts):
+                self._db_delete_latest_rate_event(key)
+        else:
+            self._db_delete_latest_rate_event(key)
 
     # BUG B-002: 原子方法——在同一把全局锁内完成 trim + 判断 + record，
     # 避免 check 与 record 之间因 await 产生的竞态条件。
     def check_and_record_global_quota(self) -> Tuple[bool, str]:
         """原子检查并记录全局日配额（trim + 判断 + record 不可分割）
+
+        注意：此方法仅写全局桶内存，不写入 rate_limit_events（无 account/scene 键）。
+        生产路径请使用 check_and_record_rate_limit。
 
         Returns:
             (passed, reason) - passed=True 表示通过；passed=False 时 reason 给出失败原因

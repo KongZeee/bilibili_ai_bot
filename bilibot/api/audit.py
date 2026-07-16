@@ -1,6 +1,7 @@
 """
 审计 API 路由
 """
+import asyncio
 import json
 import logging
 from starlette.requests import Request
@@ -25,7 +26,8 @@ def create_audit_routes(audit_store):
                 return fail("INVALID_INPUT", "page/page_size 必须是正整数", status_code=400)
             offset = (page - 1) * page_size
 
-            items = audit_store.query(
+            items = await asyncio.to_thread(
+                audit_store.query,
                 scene=scene or None,
                 persona_id=persona_id or None,
                 keyword=keyword or None,
@@ -40,7 +42,7 @@ def create_audit_routes(audit_store):
     async def get_generation(request: Request) -> JSONResponse:
         try:
             aid = request.path_params.get("id")
-            item = audit_store.get(aid)
+            item = await asyncio.to_thread(audit_store.get, aid)
             if not item:
                 return fail("NOT_FOUND", "记录不存在", details={"id": aid}, status_code=404)
             return ok(item)
@@ -50,7 +52,7 @@ def create_audit_routes(audit_store):
 
     async def get_audit_stats(request: Request) -> JSONResponse:
         try:
-            stats = audit_store.stats()
+            stats = await asyncio.to_thread(audit_store.stats)
             return ok(stats)
         except Exception as e:
             logger.error(f"get_audit_stats 操作失败: {e}", exc_info=True)
@@ -58,7 +60,7 @@ def create_audit_routes(audit_store):
 
     async def get_audit_analytics(request: Request) -> JSONResponse:
         try:
-            data = audit_store.analytics()
+            data = await asyncio.to_thread(audit_store.analytics)
             return ok(data)
         except Exception as e:
             logger.error(f"get_audit_analytics 操作失败: {e}", exc_info=True)

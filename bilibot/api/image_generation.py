@@ -52,48 +52,63 @@ def create_image_generation_routes(config_loader, config_path: str):
         """更新文生图配置"""
         try:
             body = await request.json()
-            raw = config_loader.get_raw_config()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
 
-            # 更新 image_generation 段
-            ig = raw.get("image_generation", {})
-            if not isinstance(ig, dict):
-                ig = {}
+            # 预校验（失败不写盘）
             for key in ("enabled", "api_key", "base_url", "model", "default_size", "timeout"):
-                if key in body:
+                if key not in body:
+                    continue
+                val = body[key]
+                if key == "timeout":
+                    try:
+                        max(1, min(int(val), 300))
+                    except (ValueError, TypeError):
+                        return fail("INVALID_INPUT", "timeout 必须是整数", status_code=400)
+                elif key == "base_url":
+                    if not isinstance(val, str) or not val.startswith(("http://", "https://")):
+                        return fail("INVALID_INPUT", "base_url 必须以 http:// 或 https:// 开头", status_code=400)
+                elif key == "default_size":
+                    if not isinstance(val, str) or not _SIZE_RE.match(val):
+                        return fail("INVALID_INPUT", "default_size 格式必须为 WIDTHxHEIGHT（如 1024x768）", status_code=400)
+
+            def _mutate(raw: dict) -> None:
+                ig = raw.get("image_generation", {})
+                if not isinstance(ig, dict):
+                    ig = {}
+                for key in ("enabled", "api_key", "base_url", "model", "default_size", "timeout"):
+                    if key not in body:
+                        continue
                     val = body[key]
                     if key == "enabled":
                         val = bool(val)
                     elif key == "timeout":
-                        try:
-                            val = max(1, min(int(val), 300))
-                        except (ValueError, TypeError):
-                            return fail("INVALID_INPUT", "timeout 必须是整数", status_code=400)
-                    elif key == "base_url":
-                        if not isinstance(val, str) or not val.startswith(("http://", "https://")):
-                            return fail("INVALID_INPUT", "base_url 必须以 http:// 或 https:// 开头", status_code=400)
-                    elif key == "default_size":
-                        if not isinstance(val, str) or not _SIZE_RE.match(val):
-                            return fail("INVALID_INPUT", "default_size 格式必须为 WIDTHxHEIGHT（如 1024x768）", status_code=400)
-                    # api_key 占位符不覆盖
+                        val = max(1, min(int(val), 300))
                     if key == "api_key" and val == "***已配置***":
                         continue
                     ig[key] = val
-            raw["image_generation"] = ig
+                raw["image_generation"] = ig
+                if "with_image" in body:
+                    dp = raw.get("dynamic_publish", {})
+                    if not isinstance(dp, dict):
+                        dp = {}
+                    dp["with_image"] = bool(body["with_image"])
+                    raw["dynamic_publish"] = dp
+                raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
 
-            # 同步更新 dynamic_publish.with_image
-            if "with_image" in body:
-                dp = raw.get("dynamic_publish", {})
-                if not isinstance(dp, dict):
-                    dp = {}
-                dp["with_image"] = bool(body["with_image"])
-                raw["dynamic_publish"] = dp
+            if hasattr(config_loader, "atomic_update"):
+                raw = config_loader.atomic_update(config_path, _mutate)
+            else:
+                raw = config_loader.get_raw_config()
+                _mutate(raw)
+                config_loader.save_config(raw, config_path)
 
-            raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-            config_loader.save_config(raw, config_path)
+            ig = raw.get("image_generation", {}) if isinstance(raw, dict) else {}
             logger.info(f"文生图配置已更新: enabled={ig.get('enabled')}, model={ig.get('model')}")
             return ok({
-                "image_generation": _mask_config(ig),
-                "with_image": raw.get("dynamic_publish", {}).get("with_image", False),
+                "image_generation": _mask_config(ig if isinstance(ig, dict) else {}),
+                "with_image": (raw.get("dynamic_publish") or {}).get("with_image", False)
+                if isinstance(raw, dict) else False,
             })
         except Exception as e:
             logger.error(f"更新文生图配置失败: {e}", exc_info=True)

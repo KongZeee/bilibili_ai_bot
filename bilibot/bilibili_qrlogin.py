@@ -1,6 +1,7 @@
 """
 B站扫码登录 API 适配器
 """
+import asyncio
 import logging
 import time
 import json
@@ -20,22 +21,35 @@ class BilibiliQRLogin:
         self.config = config
         self.config_path = config_path
         self.session: Optional[aiohttp.ClientSession] = None
+        # 懒初始化：asyncio.Lock 须在运行中的事件循环内创建
+        self._session_lock: Optional[asyncio.Lock] = None
+
+    def _get_lock(self) -> asyncio.Lock:
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        return self._session_lock
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        """获取或创建aiohttp会话"""
-        if self.session is None or self.session.closed:
+        """获取或创建aiohttp会话（double-check + lock，避免并发多建 session）"""
+        if self.session is not None and not self.session.closed:
+            return self.session
+        async with self._get_lock():
+            if self.session is not None and not self.session.closed:
+                return self.session
             self.session = aiohttp.ClientSession(
                 headers={
                     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                     "Referer": "https://www.bilibili.com/",
                 }
             )
-        return self.session
+            return self.session
 
     async def close(self):
         """关闭会话"""
-        if self.session and not self.session.closed:
-            await self.session.close()
+        async with self._get_lock():
+            if self.session and not self.session.closed:
+                await self.session.close()
+            self.session = None
 
     async def get_qrcode(self) -> Dict:
         """
@@ -147,6 +161,19 @@ class BilibiliQRLogin:
                 elif inner_code == 0:
                     url = result.get("url", "")
                     cookies = self._parse_cookies_from_url(url)
+                    # 官方扫码成功还会在 JSON 里返回 refresh_token（Cookie 自动刷新必需）
+                    rt = result.get("refresh_token") or ""
+                    if rt:
+                        cookies["refresh_token"] = str(rt)
+                    # Set-Cookie 里可能带 buvid
+                    try:
+                        for k, cookie in resp.cookies.items():
+                            name = getattr(cookie, "key", None) or k
+                            val = getattr(cookie, "value", None) or str(cookie)
+                            if name and val and name not in cookies:
+                                cookies[name] = val
+                    except Exception:
+                        pass
                     return {
                         "status": "confirmed",
                         "message": "登录成功！正在保存配置...",
@@ -183,10 +210,15 @@ class BilibiliQRLogin:
                         否则回退到 V1 bilibili 段（兼容单账号）。
         """
         try:
-            sessdata = cookies.get("SESSDATA", "")
+            sessdata = cookies.get("SESSDATA", "") or cookies.get("sessdata", "")
             bili_jct = cookies.get("bili_jct", "")
-            dede_user_id = cookies.get("DedeUserID", "")
+            dede_user_id = cookies.get("DedeUserID", "") or cookies.get("dede_user_id", "")
             buvid3 = cookies.get("buvid3", "")
+            buvid4 = cookies.get("buvid4", "")
+            refresh_token = (
+                cookies.get("refresh_token", "")
+                or cookies.get("REFRESH_TOKEN", "")
+            )
 
             if not sessdata:
                 return {"success": False, "message": "SESSDATA为空"}
@@ -194,16 +226,25 @@ class BilibiliQRLogin:
             raw = self.config.get_raw_config()
             accounts_list = raw.get("accounts", [])
 
+            def _write_fields(target: dict) -> None:
+                target["sessdata"] = sessdata
+                if bili_jct:
+                    target["bili_jct"] = bili_jct
+                if dede_user_id:
+                    target["dede_user_id"] = dede_user_id
+                if buvid3:
+                    target["buvid3"] = buvid3
+                if buvid4:
+                    target["buvid4"] = buvid4
+                if refresh_token:
+                    target["refresh_token"] = refresh_token
+
             # V2：account_id 非空且 accounts 列表存在对应账号 → 写入账号段
             if account_id and accounts_list:
                 updated = False
                 for acc in accounts_list:
                     if acc.get("id") == account_id:
-                        acc["sessdata"] = sessdata
-                        acc["bili_jct"] = bili_jct
-                        acc["dede_user_id"] = dede_user_id
-                        if buvid3:
-                            acc["buvid3"] = buvid3
+                        _write_fields(acc)
                         updated = True
                         break
                 if not updated:
@@ -211,11 +252,7 @@ class BilibiliQRLogin:
             else:
                 # V1 兼容：写入 bilibili 段
                 bili = raw.setdefault("bilibili", {})
-                bili["sessdata"] = sessdata
-                bili["bili_jct"] = bili_jct
-                bili["dede_user_id"] = dede_user_id
-                if buvid3:
-                    bili["buvid3"] = buvid3
+                _write_fields(bili)
 
             # 用 save_config 保存到文件并热重载（更新属性对象 + _raw_config）
             self.config.save_config(raw, self.config_path)

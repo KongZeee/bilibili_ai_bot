@@ -3,6 +3,9 @@ Web 面板 - 修复版
 
 基于 Starlette 的现代 Web 管理界面。
 修复：鉴权中间件、CORS、会话过期
+
+会话存储为进程内 dict，仅支持单进程（workers=1）。
+多 worker / 多副本部署下会话不会共享，请勿横向扩展 Web 进程。
 """
 import logging
 import time
@@ -17,7 +20,7 @@ from typing import Optional, Dict, Any
 
 from starlette.applications import Starlette
 from starlette.routing import Route
-from starlette.responses import JSONResponse, HTMLResponse
+from starlette.responses import JSONResponse, HTMLResponse, RedirectResponse
 from starlette.requests import Request
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -27,6 +30,29 @@ from ..services import PersonaStore
 from ..prompts import PromptOrchestrator
 
 logger = logging.getLogger("bilibot.web")
+
+# 默认弱口令（明文或 bcrypt 哈希匹配均视为弱）
+_DEFAULT_ADMIN_PASSWORD = "admin123"
+
+
+def is_weak_admin_password(stored: str) -> bool:
+    """检测 admin_password 是否为默认弱口令 admin123。
+
+    支持明文与 bcrypt（$2a$/$2b$/$2y$）哈希：哈希时用 checkpw 比对明文 admin123。
+    """
+    if not isinstance(stored, str) or not stored:
+        return False
+    if stored == _DEFAULT_ADMIN_PASSWORD:
+        return True
+    if stored.startswith(("$2a$", "$2b$", "$2y$")):
+        try:
+            return bcrypt.checkpw(
+                _DEFAULT_ADMIN_PASSWORD.encode("utf-8"),
+                stored.encode("utf-8"),
+            )
+        except (ValueError, TypeError):
+            return False
+    return False
 
 
 class NoCacheStaticFiles(StaticFiles):
@@ -45,10 +71,10 @@ class NoCacheStaticFiles(StaticFiles):
 class AuthMiddleware(BaseHTTPMiddleware):
     """统一鉴权中间件"""
 
-    # 允许匿名访问的路径
+    # 允许匿名访问的路径（/ 需登录；/static 见 _is_anon）
     # PRD V4 ACC-003：QR 登录端点不再匿名，需要管理员鉴权
     ANON_PATHS = {
-        "/", "/login",
+        "/login",
         "/api/login",
         "/api/status/public",
     }
@@ -57,6 +83,21 @@ class AuthMiddleware(BaseHTTPMiddleware):
         if path.startswith("/static/"):
             return True
         return path in self.ANON_PATHS
+
+    def _unauthorized(self, request: Request, code: str, message: str) -> JSONResponse | RedirectResponse:
+        """API 返回 JSON 401；页面导航 302 到登录页。"""
+        path = request.url.path
+        accept = (request.headers.get("accept") or "").lower()
+        wants_html = (
+            not path.startswith("/api/")
+            and ("text/html" in accept or request.method == "GET")
+        )
+        if wants_html:
+            return RedirectResponse(url="/login", status_code=302)
+        return JSONResponse(
+            {"success": False, "error": {"code": code, "message": message, "details": {}}},
+            status_code=401,
+        )
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
@@ -86,10 +127,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
             if auth_header.startswith("Bearer "):
                 token = auth_header[7:]
         if not token or token not in _sessions:
-            return JSONResponse(
-                {"success": False, "error": {"code": "UNAUTHORIZED", "message": "请先登录", "details": {}}},
-                status_code=401,
-            )
+            return self._unauthorized(request, "UNAUTHORIZED", "请先登录")
 
         # 检查过期
         session = _sessions.get(token, {})
@@ -97,19 +135,13 @@ class AuthMiddleware(BaseHTTPMiddleware):
         ttl = _session_ttl
         if time.time() - login_ts > ttl:
             _sessions.pop(token, None)
-            return JSONResponse(
-                {"success": False, "error": {"code": "SESSION_EXPIRED", "message": "会话已过期", "details": {}}},
-                status_code=401,
-            )
+            return self._unauthorized(request, "SESSION_EXPIRED", "会话已过期")
 
         # Task 30：滑动续期——长时间无活动则失效（idle_timeout，默认 15 分钟）
         last_activity = session.get("last_activity", login_ts)
         if time.time() - last_activity > _idle_timeout:
             _sessions.pop(token, None)
-            return JSONResponse(
-                {"success": False, "error": {"code": "SESSION_EXPIRED", "message": "会话因长时间无活动已失效", "details": {}}},
-                status_code=401,
-            )
+            return self._unauthorized(request, "SESSION_EXPIRED", "会话因长时间无活动已失效")
         # 刷新最后活动时间，实现滑动续期
         session["last_activity"] = time.time()
 
@@ -349,24 +381,74 @@ def create_web_app(
         })
 
     async def api_status(request: Request) -> JSONResponse:
-        """获取系统状态（需登录）"""
+        """获取系统状态（需登录）
+
+        多账号架构下聚合 account_manager / llm_manager 状态，
+        不再只读顶层 V1 bilibili/llm 配置（否则控制台会误报异常）。
+        """
+        from ..api.responses import ok
+
         raw = config_loader.get_raw_config()
         pwd = raw.get("web", {}).get("admin_password", "")
-        is_default = (pwd == "admin123")
+        # 明文 admin123 或 bcrypt 哈希匹配 admin123 均视为弱口令
+        is_default = is_weak_admin_password(str(pwd) if pwd is not None else "")
         cors_origins = raw.get("web", {}).get("cors_origins", [])
         cors_open = "*" in cors_origins if cors_origins else False
 
-        return JSONResponse({
+        # B站：任一已配置/已认证账号即视为可用
+        bili_authenticated = False
+        bili_uid = config_loader.bilibili.dede_user_id or ""
+        if account_manager is not None:
+            try:
+                for st in account_manager.list_accounts():
+                    if st.get("authenticated"):
+                        bili_authenticated = True
+                        bili_uid = st.get("uid") or st.get("dede_user_id") or bili_uid
+                        break
+            except Exception:
+                bili_authenticated = config_loader.bilibili.is_authenticated
+        else:
+            bili_authenticated = config_loader.bilibili.is_authenticated
+
+        # LLM：任一 enabled chat provider / 默认路由即可
+        llm_connected = False
+        llm_model = config_loader.llm.model
+        llm_base = config_loader.llm.base_url
+        if llm_manager is not None:
+            try:
+                providers = []
+                if hasattr(llm_manager, "list_providers"):
+                    providers = llm_manager.list_providers("chat") or llm_manager.list_providers() or []
+                for p in providers:
+                    if isinstance(p, dict) and p.get("enabled", True) and (
+                        p.get("api_key") or p.get("api_keys") or p.get("has_api_key")
+                    ):
+                        llm_connected = True
+                        llm_model = p.get("model") or llm_model
+                        llm_base = p.get("base_url") or llm_base
+                        break
+                if not llm_connected and hasattr(llm_manager, "get_default"):
+                    default_p = llm_manager.get_default()
+                    if default_p is not None:
+                        llm_connected = bool(getattr(default_p, "api_key", None) or getattr(default_p, "api_keys", None))
+                        llm_model = getattr(default_p, "model", None) or llm_model
+                        llm_base = getattr(default_p, "base_url", None) or llm_base
+            except Exception:
+                llm_connected = bool(config_loader.llm.api_key)
+        else:
+            llm_connected = bool(config_loader.llm.api_key)
+
+        return ok({
             "running": True,
             "current_persona": persona_store.get_current_dict(),
             "bilibili": {
-                "authenticated": config_loader.bilibili.is_authenticated,
-                "uid": config_loader.bilibili.dede_user_id,
+                "authenticated": bili_authenticated,
+                "uid": bili_uid,
             },
             "llm": {
-                "connected": bool(config_loader.llm.api_key),
-                "model": config_loader.llm.model,
-                "base_url": config_loader.llm.base_url,
+                "connected": llm_connected,
+                "model": llm_model,
+                "base_url": llm_base,
             },
             "web": {
                 "enabled": config_loader.web.enabled,
@@ -452,10 +534,10 @@ def create_web_app(
     # PRD V4 MEM-009：账号化记忆路由（新实现，从 account_manager 解析数据目录）
     account_memory_routes = create_account_memory_routes(account_manager)
 
-    # 日志
+    # 日志（限制在 data_dir 下，防止路径穿越）
     from ..api.logs import create_logs_routes
     log_file = config_loader.get("logging.file", "./data/bililog.log") if hasattr(config_loader, "get") else "./data/bililog.log"
-    logs_routes = create_logs_routes(log_file)
+    logs_routes = create_logs_routes(log_file, data_dir=data_dir)
 
     # 审计：使用应用级单例，不另建（PRD V3 §10.2）
     from ..api.audit import create_audit_routes
@@ -465,7 +547,7 @@ def create_web_app(
     audit_routes = create_audit_routes(audit_store)
 
     # 回复审计（PRD §7）
-    replies_routes = create_replies_routes(audit_store)
+    replies_routes = create_replies_routes(audit_store, account_manager=account_manager)
 
     # 任务触发（PRD §7）
     tasks_routes = create_tasks_routes(scheduler)
@@ -707,6 +789,18 @@ def _get_dashboard_html() -> str:
     base_v = _static_version("css/base.css")
     layout_v = _static_version("css/layout.css")
     comp_v = _static_version("css/components.css")
+    # CSP：允许本站资源 + Google Fonts（display=swap 样式与字体文件）
+    csp = (
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+        "font-src 'self' https://fonts.gstatic.com data:; "
+        "img-src 'self' data: blob:; "
+        "connect-src 'self'; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'"
+    )
     return f"""<!DOCTYPE html>
 <html lang="zh-CN" style="color-scheme: light dark">
 <head>
@@ -714,6 +808,7 @@ def _get_dashboard_html() -> str:
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="theme-color" content="#3b352b">
     <meta name="description" content="BiliBot B站 AI Bot 管理面板">
+    <meta http-equiv="Content-Security-Policy" content="{csp}">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&display=swap" rel="stylesheet">

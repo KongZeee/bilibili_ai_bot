@@ -470,12 +470,28 @@ const AccountInfoTab = defineComponent({
     props: { account: Object },
     emits: ['save', 'delete'],
     setup(props, { emit }) {
-        const form = ref({ ...props.account });
+        // 兼容后端 uid / name 与表单 dede_user_id / nickname 字段
+        const form = ref({
+            ...props.account,
+            dede_user_id: props.account?.dede_user_id || props.account?.uid || '',
+            nickname: props.account?.nickname || props.account?.name || '',
+            note: props.account?.note || '',
+        });
         const saving = ref(false);
 
         async function handleSave() {
             saving.value = true;
-            try { emit('save', form.value); } finally { saving.value = false; }
+            try {
+                emit('save', {
+                    ...form.value,
+                    // 写回后端识别的字段
+                    name: form.value.nickname || form.value.name,
+                    dede_user_id: form.value.dede_user_id,
+                    note: form.value.note,
+                });
+            } finally {
+                saving.value = false;
+            }
         }
 
         return () => h('article', {
@@ -1018,9 +1034,34 @@ export const AccountDetailPage = defineComponent({
 
         onMounted(() => { if (!appState.accountsLoaded) refreshAccounts(); });
 
-        return () => !account.value
-            ? h(Loading)
-            : h('div', { style: 'display:grid; gap:calc(var(--spacing) * 4);' }, [
+        return () => {
+            // 账号列表尚未加载完：显示 Loading
+            if (!appState.accountsLoaded) {
+                return h(Loading);
+            }
+            // 已加载但仍找不到：空状态，避免永久转圈
+            if (!account.value) {
+                return h('div', { style: 'display:grid; gap:calc(var(--spacing) * 4);' }, [
+                    h('div', {
+                        style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 3); flex-wrap:wrap;',
+                    }, [
+                        h('button', {
+                            type: 'button',
+                            class: 'btn ghost',
+                            onClick: () => navigate('/accounts'),
+                        }, [
+                            h(Icon, { name: 'chevron-right', size: '1rem', style: 'transform: scaleX(-1);' }),
+                            h('span', '返回'),
+                        ]),
+                    ]),
+                    h(EmptyState, {
+                        icon: 'user',
+                        title: '账号不存在',
+                        desc: `未找到账号 ${accountId.value || ''}，可能已被删除`,
+                    }),
+                ]);
+            }
+            return h('div', { style: 'display:grid; gap:calc(var(--spacing) * 4);' }, [
                 // 顶部：返回按钮 + 账号标题
                 h('div', {
                     style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 3); flex-wrap:wrap;',
@@ -1076,5 +1117,6 @@ export const AccountDetailPage = defineComponent({
                     onConfirm: handleConfirm,
                 }),
             ]);
+        };
     },
 });

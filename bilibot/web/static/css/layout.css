@@ -18,6 +18,22 @@
   color: hsl(var(--foreground));
   font-family: var(--font-sans);
   letter-spacing: var(--tracking-normal);
+  transition: grid-template-columns .28s ease;
+}
+/* 桌面端侧边栏收起：窄图标栏 */
+.app-shell[data-sidebar-collapsed="true"] {
+  grid-template-columns: 72px minmax(0, 1fr);
+}
+/* 记忆图谱：锁死视口高度，禁止整页纵向滚动，让 3D 区吃满剩余空间 */
+.app-shell[data-page="memory-graph"] {
+  height: 100vh;
+  max-height: 100vh;
+  overflow: hidden;
+}
+html:has(.app-shell[data-page="memory-graph"]),
+body:has(.app-shell[data-page="memory-graph"]) {
+  height: 100%;
+  overflow: hidden;
 }
 
 /* ── Data-icon mask infrastructure ──────────────────── */
@@ -46,7 +62,9 @@
   top: 0;
   align-self: start;
   max-height: 100vh;
+  overflow-x: hidden;
   overflow-y: auto;
+  transition: padding .28s ease;
 }
 
 /* ── Brand lockup ───────────────────────────────────── */
@@ -55,6 +73,32 @@
   gap: calc(var(--spacing) * 1.3);
   padding-bottom: calc(var(--spacing) * 2);
   border-bottom: 1px solid hsl(var(--sidebar-border));
+}
+.brand-row {
+  display: flex;
+  align-items: center;
+  gap: calc(var(--spacing) * 2);
+  min-width: 0;
+}
+.brand-mark {
+  width: 2.2rem;
+  height: 2.2rem;
+  border-radius: calc(var(--radius) * 0.72);
+  background: hsl(var(--sidebar-primary));
+  color: hsl(var(--sidebar-primary-foreground));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 600;
+  font-size: 1.05rem;
+  flex: 0 0 auto;
+  letter-spacing: 0;
+}
+.brand-text {
+  display: grid;
+  gap: 0.15rem;
+  min-width: 0;
+  flex: 1 1 auto;
 }
 .brand-kicker {
   color: hsl(var(--muted-foreground));
@@ -73,6 +117,44 @@
   font-size: 0.95rem;
   max-width: 18rem;
   line-height: 1.5;
+}
+
+/* ── Sidebar collapse button ────────────────────────── */
+.sidebar-collapse-btn {
+  width: 2.2rem;
+  height: 2.2rem;
+  background: hsl(var(--card));
+  color: hsl(var(--foreground));
+  border: 1px solid hsl(var(--border));
+  border-radius: calc(var(--radius) * 0.72);
+  box-shadow: var(--shadow-xs);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  cursor: pointer;
+  padding: 0;
+  transition: transform .18s ease, border-color .18s ease, background-color .18s ease;
+}
+.sidebar-collapse-btn [data-icon] {
+  width: 1.05rem;
+  height: 1.05rem;
+  background-color: currentColor;
+}
+.sidebar-collapse-btn:hover {
+  transform: translateY(-1px);
+  border-color: hsl(var(--accent));
+}
+.sidebar-collapse-btn:active {
+  transform: scale(0.98);
+}
+.sidebar-collapse-btn:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+/* 顶栏折叠按钮：桌面可见，移动端隐藏 */
+.topbar-collapse-btn {
+  display: none;
 }
 
 /* ── Nav groups ─────────────────────────────────────── */
@@ -139,6 +221,7 @@
   gap: calc(var(--spacing) * 2);
   min-width: 0;
 }
+.nav-item-label,
 .nav-copy > span:last-child {
   white-space: nowrap;
   overflow: hidden;
@@ -185,6 +268,7 @@
   display: grid;
   gap: calc(var(--spacing) * 1.1);
   background: hsl(var(--card));
+  transition: padding .28s ease;
 }
 .eyebrow {
   color: hsl(var(--muted-foreground));
@@ -192,13 +276,91 @@
   text-transform: uppercase;
   letter-spacing: 0.14em;
 }
-.sidebar-footer strong {
+.sidebar-footer strong,
+.sidebar-status {
   font-size: 1.05rem;
 }
 .muted {
   color: hsl(var(--muted-foreground));
   font-size: 0.88rem;
   line-height: 1.5;
+}
+
+/* ── Desktop collapsed sidebar (icon rail) ──────────── */
+.sidebar[data-collapsed="true"] {
+  padding: calc(var(--spacing) * 3) calc(var(--spacing) * 2);
+  gap: calc(var(--spacing) * 3);
+  align-items: center;
+}
+.sidebar[data-collapsed="true"] .brand-lockup {
+  width: 100%;
+  justify-items: center;
+  border-bottom-color: transparent;
+  padding-bottom: 0;
+  gap: calc(var(--spacing) * 1.5);
+}
+.sidebar[data-collapsed="true"] .brand-row {
+  flex-direction: column;
+  gap: calc(var(--spacing) * 1.5);
+}
+.sidebar[data-collapsed="true"] .brand-text,
+.sidebar[data-collapsed="true"] .workspace-note,
+.sidebar[data-collapsed="true"] .nav-label,
+.sidebar[data-collapsed="true"] .nav-item-label,
+.sidebar[data-collapsed="true"] .nav-meta,
+.sidebar[data-collapsed="true"] .eyebrow,
+.sidebar[data-collapsed="true"] .muted {
+  display: none;
+}
+.sidebar[data-collapsed="true"] .nav-group {
+  width: 100%;
+  gap: calc(var(--spacing) * 1);
+}
+.sidebar[data-collapsed="true"] .nav-item {
+  justify-content: center;
+  padding: calc(var(--spacing) * 1.8);
+  gap: 0;
+}
+.sidebar[data-collapsed="true"] .nav-copy {
+  gap: 0;
+  justify-content: center;
+}
+.sidebar[data-collapsed="true"] .sidebar-footer {
+  width: 100%;
+  padding: calc(var(--spacing) * 2);
+  justify-items: center;
+  text-align: center;
+  gap: calc(var(--spacing) * 1.2);
+}
+.sidebar[data-collapsed="true"] .sidebar-status {
+  font-size: 0;
+  width: 0.7rem;
+  height: 0.7rem;
+  border-radius: 999px;
+  background: hsl(142 45% 42%);
+  display: block;
+  overflow: hidden;
+}
+.sidebar[data-collapsed="true"] .sidebar-status[data-paused="true"] {
+  background: hsl(var(--destructive));
+}
+.sidebar[data-collapsed="true"] .sidebar-logout {
+  min-height: 2.2rem;
+  padding: calc(var(--spacing) * 1.2) calc(var(--spacing) * 1.5);
+  font-size: 0.75rem;
+  width: 100%;
+}
+
+/* 桌面端：顶栏也提供折叠入口，与侧边栏按钮二选一均可 */
+@media (min-width: 1101px) {
+  .topbar-collapse-btn {
+    display: inline-flex;
+  }
+  /* 侧边栏内按钮已足够时也可保留；两者同步同一状态 */
+  .sidebar[data-collapsed="true"] .sidebar-collapse-btn {
+    width: 2.2rem;
+    height: 2.2rem;
+  }
 }
 
 /* ── Main area ──────────────────────────────────────── */
@@ -209,6 +371,12 @@
   width: 100%;
   min-width: 0;
   max-width: 100%;
+}
+.main-area[data-page="memory-graph"] {
+  height: 100vh;
+  max-height: 100vh;
+  min-height: 0;
+  overflow: hidden;
 }
 
 /* ── Topbar ─────────────────────────────────────────── */
@@ -425,6 +593,22 @@
   min-width: 0;
   max-width: 100%;
 }
+/* 记忆图谱页：去掉多余内边距与纵向滚动，子页面撑满 */
+.view-frame[data-page="memory-graph"] {
+  min-height: 0;
+  height: 100%;
+  overflow: hidden;
+  padding: calc(var(--spacing) * 2) calc(var(--spacing) * 2.5);
+  gap: 0;
+  display: flex;
+  flex-direction: column;
+  animation: none;
+}
+.view-frame[data-page="memory-graph"] > * {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 100%;
+}
 @keyframes viewIn {
   from { opacity: 0; transform: translateY(12px); }
   to { opacity: 1; transform: translateY(0); }
@@ -432,7 +616,8 @@
 
 /* ── Responsive ─────────────────────────────────────── */
 @media (max-width: 1100px) {
-  .app-shell {
+  .app-shell,
+  .app-shell[data-sidebar-collapsed="true"] {
     grid-template-columns: minmax(0, 1fr);
   }
   /* 侧边栏改为抽屉式：固定定位，默认滑出视口左侧 */
@@ -449,10 +634,76 @@
     transition: transform .28s ease;
     z-index: 1001;
     overflow-y: auto;
+    /* 移动端始终完整展示，忽略桌面折叠态 */
+    padding: calc(var(--spacing) * 6);
+    gap: calc(var(--spacing) * 5);
+    align-items: stretch;
   }
   .sidebar[data-open="true"] {
     transform: translateX(0);
     box-shadow: 4px 0 24px hsl(var(--foreground) / 0.12);
+  }
+  /* 移动端强制展开侧栏内容（即使 data-collapsed=true） */
+  .sidebar[data-collapsed="true"] {
+    padding: calc(var(--spacing) * 6);
+    gap: calc(var(--spacing) * 5);
+    align-items: stretch;
+  }
+  .sidebar[data-collapsed="true"] .brand-lockup {
+    width: auto;
+    justify-items: stretch;
+    border-bottom-color: hsl(var(--sidebar-border));
+    padding-bottom: calc(var(--spacing) * 2);
+    gap: calc(var(--spacing) * 1.3);
+  }
+  .sidebar[data-collapsed="true"] .brand-row {
+    flex-direction: row;
+    gap: calc(var(--spacing) * 2);
+  }
+  .sidebar[data-collapsed="true"] .brand-text,
+  .sidebar[data-collapsed="true"] .workspace-note,
+  .sidebar[data-collapsed="true"] .nav-label,
+  .sidebar[data-collapsed="true"] .nav-item-label,
+  .sidebar[data-collapsed="true"] .nav-meta,
+  .sidebar[data-collapsed="true"] .eyebrow,
+  .sidebar[data-collapsed="true"] .muted {
+    display: revert;
+  }
+  .sidebar[data-collapsed="true"] .brand-text {
+    display: grid;
+  }
+  .sidebar[data-collapsed="true"] .nav-item {
+    justify-content: space-between;
+    padding: calc(var(--spacing) * 2.3) calc(var(--spacing) * 2.8);
+    gap: calc(var(--spacing) * 2);
+  }
+  .sidebar[data-collapsed="true"] .nav-copy {
+    gap: calc(var(--spacing) * 2);
+    justify-content: flex-start;
+  }
+  .sidebar[data-collapsed="true"] .sidebar-footer {
+    width: auto;
+    padding: calc(var(--spacing) * 3);
+    justify-items: stretch;
+    text-align: left;
+  }
+  .sidebar[data-collapsed="true"] .sidebar-status {
+    font-size: 1.05rem;
+    width: auto;
+    height: auto;
+    border-radius: 0;
+    background: transparent;
+    overflow: visible;
+  }
+  .sidebar[data-collapsed="true"] .sidebar-logout {
+    min-height: 2.95rem;
+    padding: calc(var(--spacing) * 2.1) calc(var(--spacing) * 4);
+    font-size: inherit;
+    width: auto;
+  }
+  /* 移动端隐藏折叠按钮，改用汉堡抽屉 */
+  .sidebar-collapse-btn {
+    display: none !important;
   }
   /* 遮罩层：抽屉打开时显示 */
   .sidebar-overlay {

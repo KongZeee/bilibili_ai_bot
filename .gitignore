@@ -6,8 +6,13 @@ config.local.yaml
 standalone/config.yaml
 demo_video_config.yaml
 demo_video_config.example.yaml
+config.yaml.backup*
+*.backup*
+cookies.txt
+config.yaml.backup_*
 *.env
 .env
+
 
 # Non-project and runtime data
 data/

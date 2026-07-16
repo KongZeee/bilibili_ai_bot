@@ -143,6 +143,8 @@ tests/                       # 测试套件（177 passed）
 - 默认端口 8080
 - 默认账号 admin/admin123
 - **生产环境务必修改密码**
+- Session 与登录态保存在进程内存中，服务重启后需重新登录
+- 限流与 Session 正确性依赖单进程部署；多 worker / 多副本未做共享状态
 
 ## API 端点
 
@@ -196,6 +198,8 @@ tests/                       # 测试套件（177 passed）
 - `GET /api/status` - 完整系统状态（需登录，含 `security.default_password` / `security.cors_open` 风险标志）
 
 ## 部署
+
+> Session / 限流为进程内内存状态，重启需重新登录；请使用单进程部署以保证正确性（多 worker 不会跨进程共享）。
 
 ### Docker
 

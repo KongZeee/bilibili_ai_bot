@@ -170,13 +170,23 @@ def comment_thread_observation(
                 },
             )
         )
+    # \u4e0d\u8981\u7528\u56fa\u5b9a\u6807\u9898\u300c\u8bc4\u8bba\u5bf9\u8bdd\u4e0a\u4e0b\u6587\u300d\uff1afind_events_by_identifiers \u4f1a\u6309 e.title
+    # \u7cbe\u786e\u5339\u914d\uff0c\u56fa\u5b9a\u6807\u9898\u4f1a\u8ba9 title_entity \u901a\u9053\u628a\u6240\u6709\u8bc4\u8bba\u7ebf\u7a0b\u4e00\u8d77\u635e\u4e0a\u6765\uff0c
+    # \u4e5f\u4f1a\u88ab\u9519\u8bef\u590d\u7528\u6210\u89c6\u9891\u6807\u9898\u3002\u6539\u6210\u5e26 thread_key \u7684\u53ef\u533a\u5206\u6807\u9898\u3002
+    first_line = lines[0] if lines else ""
+    if len(first_line) > 40:
+        first_line = first_line[:40].rstrip() + "\u2026"
+    event_title = (
+        f"\u8bc4\u8bba\u7ebf\u7a0b {thread_key}"
+        + (f"\uff1a{first_line}" if first_line else "")
+    )
     return ObservationEnvelope(
         idempotency_key=(
             f"comment_thread:{account_id}:{comment_type}:{oid}:{thread_key}:{digest}"
         ),
         source_type="comment_thread",
         event_type="conversation_context",
-        event_title="\u8bc4\u8bba\u5bf9\u8bdd\u4e0a\u4e0b\u6587",
+        event_title=event_title,
         persona_id=persona_id,
         scene="reply_comment",
         importance=0.3,
@@ -316,6 +326,7 @@ def video_observation(
     context: Mapping[str, Any],
     tags: Sequence[str] = (),
     persona_id: str = "",
+    video_detail: str = "",
 ) -> ObservationEnvelope:
     safe_context = _safe_structured(context)
     metadata = safe_context.get("metadata") or {}
@@ -323,6 +334,31 @@ def video_observation(
     search_reference = safe_context.get("search_reference") or {}
     audiovisual = safe_context.get("audiovisual") or {}
     sources: list[SourceDocument] = []
+
+    # Prefer a compact ≤2000-char "video_detail" note as the primary recall surface.
+    # Raw audiovisual sources remain for deep retrieval / re-summarization.
+    detail_text = str(video_detail or "").strip()
+    if not detail_text:
+        # Allow callers to stash it on context as well.
+        detail_text = str(safe_context.get("video_detail") or "").strip()
+    if detail_text:
+        if len(detail_text) > 2000:
+            detail_text = detail_text[:2000].rstrip()
+        sources.append(
+            SourceDocument(
+                source_type="video_detail",
+                external_id=bvid or oid,
+                full_text=detail_text,
+                data={"max_chars": 2000, "kind": "audiovisual_digest"},
+                observations=(
+                    Observation(
+                        text=detail_text,
+                        modality="video_detail",
+                        actor_id="self",
+                    ),
+                ),
+            )
+        )
 
     if metadata:
         sources.append(
@@ -482,13 +518,25 @@ def video_observation(
         source_type="video",
         event_type="video_observation",
         event_title=title,
-        event_summary=f"观察了视频《{title}》，UP主 {owner}",
+        # Prefer the detailed digest as event.summary so title/id hits already
+        # carry "what the video is about" without needing chunk re-ranking.
+        event_summary=(
+            detail_text
+            if detail_text
+            else f"观察了视频《{title}》，UP主 {owner}"
+        ),
         speaker_actor_id="self",
         persona_id=persona_id,
         scene="proactive_video",
         importance=0.55,
         occurred_at=time.time(),
-        metadata={"bvid": bvid, "oid": str(oid), "owner": owner, "tags": list(tags)},
+        metadata={
+            "bvid": bvid,
+            "oid": str(oid),
+            "owner": owner,
+            "tags": list(tags),
+            "has_video_detail": bool(detail_text),
+        },
         sources=tuple(sources),
     )
 

@@ -53,7 +53,7 @@ const PAGE_SUBTITLES = {
     '/': 'BiliBot 运营全景一览，实时掌握账号状态、互动表现与系统健康度。',
     '/accounts': '管理 B站账号接入、Cookie 凭证、人格绑定与对话模型配置。',
     '/personas': '为不同账号配置专属 AI 人格，定义性格、语气与交互边界。',
-    '/memory/graph': '以三维可旋转视角探索记忆节点间的关联关系。',
+    '/memory/graph': '左侧视图设置，右侧整页可旋转 3D 图谱；可切换布局与统计信息。',
     '/memory/list': '浏览与管理 Bot 记忆库中的所有记忆条目，支持分类筛选与召回测试。',
     '/memory/recall': '测试 Bot 记忆库的召回能力，验证记忆检索效果。',
     '/config': '配置 B站账号、模型服务、回复策略与主动行为等全局参数。',
@@ -118,15 +118,32 @@ function iconSpan(name) {
     });
 }
 
-// SideBar 组件 — 渲染全部导航分组（移动端为抽屉式）
+const SIDEBAR_COLLAPSED_KEY = 'bilibot-sidebar-collapsed';
+
+function loadSidebarCollapsed() {
+    try {
+        return localStorage.getItem(SIDEBAR_COLLAPSED_KEY) === '1';
+    } catch (_) {
+        return false;
+    }
+}
+
+function saveSidebarCollapsed(collapsed) {
+    try {
+        localStorage.setItem(SIDEBAR_COLLAPSED_KEY, collapsed ? '1' : '0');
+    } catch (_) { /* 隐私模式等可能不可写 */ }
+}
+
+// SideBar 组件 — 渲染全部导航分组（移动端为抽屉式；桌面端可折叠为图标栏）
 export const Sidebar = defineComponent({
     name: 'Sidebar',
     props: {
         currentPath: String,
         open: { type: Boolean, default: false },
+        collapsed: { type: Boolean, default: false },
         onNavigate: { type: Function, default: null },
     },
-    emits: ['navigate', 'close'],
+    emits: ['navigate', 'close', 'toggleCollapse'],
     setup(props, { emit }) {
         const paused = ref(false);
         async function refreshPauseStatus() {
@@ -154,10 +171,29 @@ export const Sidebar = defineComponent({
                 class: 'sidebar',
                 id: 'app-sidebar',
                 'data-open': props.open ? 'true' : 'false',
+                'data-collapsed': props.collapsed ? 'true' : 'false',
+                'aria-label': props.collapsed ? '导航（已收起）' : '导航',
             }, [
                 h('div', { class: 'brand-lockup' }, [
-                    h('span', { class: 'brand-kicker' }, 'BiliBot 控制台'),
-                    h('div', { class: 'brand-name' }, 'BiliBot'),
+                    h('div', { class: 'brand-row' }, [
+                        h('div', { class: 'brand-mark', 'aria-hidden': 'true' }, 'B'),
+                        h('div', { class: 'brand-text' }, [
+                            h('span', { class: 'brand-kicker' }, 'BiliBot 控制台'),
+                            h('div', { class: 'brand-name' }, 'BiliBot'),
+                        ]),
+                        // 桌面端折叠按钮（移动端由汉堡菜单控制抽屉，此按钮隐藏）
+                        h('button', {
+                            class: 'sidebar-collapse-btn',
+                            type: 'button',
+                            title: props.collapsed ? '展开侧边栏' : '收起侧边栏',
+                            'aria-label': props.collapsed ? '展开侧边栏' : '收起侧边栏',
+                            'aria-expanded': props.collapsed ? 'false' : 'true',
+                            'aria-controls': 'app-sidebar',
+                            onClick: () => emit('toggleCollapse'),
+                        }, [
+                            iconSpan(props.collapsed ? 'chevron-right' : 'chevron-left'),
+                        ]),
+                    ]),
                     h('div', { class: 'workspace-note' }, '面向 B站 AI 机器人的多账号运营工作台，统一调度人格、记忆与内容创作。'),
                 ]),
                 ...NAV_GROUPS.map(group =>
@@ -168,6 +204,7 @@ export const Sidebar = defineComponent({
                             return h('a', {
                                 class: 'nav-item',
                                 href: '#' + item.path,
+                                title: props.collapsed ? `${item.label}${item.meta ? ' · ' + item.meta : ''}` : undefined,
                                 'data-active': active ? 'true' : 'false',
                                 'aria-current': active ? 'page' : undefined,
                                 onClick: (e) => {
@@ -177,7 +214,7 @@ export const Sidebar = defineComponent({
                             }, [
                                 h('span', { class: 'nav-copy' }, [
                                     h('span', { class: 'nav-icon' }, [iconSpan(item.icon)]),
-                                    h('span', item.label),
+                                    h('span', { class: 'nav-item-label' }, item.label),
                                 ]),
                                 h('span', { class: 'nav-meta' }, item.meta),
                             ]);
@@ -186,13 +223,18 @@ export const Sidebar = defineComponent({
                 ),
                 h('div', { class: 'sidebar-footer' }, [
                     h('span', { class: 'eyebrow' }, '当前状态'),
-                    h('strong', paused.value ? '已暂停' : 'Bot 运行中'),
+                    h('strong', {
+                        class: 'sidebar-status',
+                        'data-paused': paused.value ? 'true' : 'false',
+                        title: props.collapsed ? (paused.value ? '已暂停' : 'Bot 运行中') : undefined,
+                    }, paused.value ? '已暂停' : 'Bot 运行中'),
                     h('span', { class: 'muted' }, '多账号运营工作台已就绪。'),
                     h('button', {
-                        class: 'btn ghost',
+                        class: 'btn ghost sidebar-logout',
                         type: 'button',
+                        title: props.collapsed ? '退出登录' : undefined,
                         onClick: handleLogout,
-                    }, '退出登录'),
+                    }, props.collapsed ? '退出' : '退出登录'),
                 ]),
             ]),
         ];
@@ -206,8 +248,10 @@ export const Topbar = defineComponent({
         pageTitle: String,
         pageSubtitle: String,
         sidebarOpen: { type: Boolean, default: false },
+        sidebarCollapsed: { type: Boolean, default: false },
         onNavigate: { type: Function, default: null },
         onToggleSidebar: { type: Function, default: null },
+        onToggleCollapse: { type: Function, default: null },
     },
     setup(props) {
         return () => h('header', { class: 'topbar' }, [
@@ -225,6 +269,18 @@ export const Topbar = defineComponent({
                     h('span', { class: 'menu-toggle-bar', 'aria-hidden': 'true' }),
                     h('span', { class: 'menu-toggle-bar', 'aria-hidden': 'true' }),
                 ]),
+                // 桌面端折叠侧边栏按钮 — 移动端隐藏（CSS 控制）
+                h('button', {
+                    class: 'sidebar-collapse-btn topbar-collapse-btn',
+                    type: 'button',
+                    title: props.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏',
+                    'aria-label': props.sidebarCollapsed ? '展开侧边栏' : '收起侧边栏',
+                    'aria-expanded': props.sidebarCollapsed ? 'false' : 'true',
+                    'aria-controls': 'app-sidebar',
+                    onClick: () => props.onToggleCollapse && props.onToggleCollapse(),
+                }, [
+                    iconSpan(props.sidebarCollapsed ? 'chevron-right' : 'chevron-left'),
+                ]),
                 h('div', { class: 'topbar-titles' }, [
                     h('h1', { class: 'page-title' }, props.pageTitle),
                     h('div', { class: 'page-subtitle' }, props.pageSubtitle),
@@ -241,7 +297,7 @@ export const Topbar = defineComponent({
     },
 });
 
-// AppShell 组件（双栏布局外壳 + 移动端抽屉状态管理）
+// AppShell 组件（双栏布局外壳 + 移动端抽屉 + 桌面端可收起侧边栏）
 export const AppShell = defineComponent({
     name: 'AppShell',
     props: {
@@ -252,6 +308,7 @@ export const AppShell = defineComponent({
     emits: ['navigate'],
     setup(props, { emit, slots }) {
         const sidebarOpen = ref(false);
+        const sidebarCollapsed = ref(loadSidebarCollapsed());
 
         const subtitle = computed(() => {
             if (props.pageSubtitle) return props.pageSubtitle;
@@ -277,27 +334,50 @@ export const AppShell = defineComponent({
         onBeforeUnmount(() => document.removeEventListener('keydown', onKeydown));
 
         const toggleSidebar = () => { sidebarOpen.value = !sidebarOpen.value; };
+        const toggleCollapse = () => {
+            sidebarCollapsed.value = !sidebarCollapsed.value;
+            saveSidebarCollapsed(sidebarCollapsed.value);
+        };
 
-        return () => h('div', { class: 'app-shell' }, [
-            h(Sidebar, {
-                currentPath: props.currentPath,
-                open: sidebarOpen.value,
-                onClose: () => { sidebarOpen.value = false; },
-                onNavigate: (path) => {
-                    emit('navigate', path);
-                    sidebarOpen.value = false;
-                },
-            }),
-            h('main', { class: 'main-area' }, [
-                h(Topbar, {
-                    pageTitle: props.pageTitle,
-                    pageSubtitle: subtitle.value,
-                    sidebarOpen: sidebarOpen.value,
-                    onToggleSidebar: toggleSidebar,
-                    onNavigate: (path) => emit('navigate', path),
+        return () => {
+            const isMemoryGraph = props.currentPath === '/memory/graph'
+                || (props.currentPath || '').startsWith('/memory/graph/');
+
+            return h('div', {
+                class: 'app-shell',
+                'data-page': isMemoryGraph ? 'memory-graph' : '',
+                'data-sidebar-collapsed': sidebarCollapsed.value ? 'true' : 'false',
+            }, [
+                h(Sidebar, {
+                    currentPath: props.currentPath,
+                    open: sidebarOpen.value,
+                    collapsed: sidebarCollapsed.value,
+                    onClose: () => { sidebarOpen.value = false; },
+                    onToggleCollapse: toggleCollapse,
+                    onNavigate: (path) => {
+                        emit('navigate', path);
+                        sidebarOpen.value = false;
+                    },
                 }),
-                h('div', { class: 'view-frame' }, slots.default?.()),
-            ]),
-        ]);
+                h('main', {
+                    class: 'main-area',
+                    'data-page': isMemoryGraph ? 'memory-graph' : '',
+                }, [
+                    h(Topbar, {
+                        pageTitle: props.pageTitle,
+                        pageSubtitle: subtitle.value,
+                        sidebarOpen: sidebarOpen.value,
+                        sidebarCollapsed: sidebarCollapsed.value,
+                        onToggleSidebar: toggleSidebar,
+                        onToggleCollapse: toggleCollapse,
+                        onNavigate: (path) => emit('navigate', path),
+                    }),
+                    h('div', {
+                        class: 'view-frame',
+                        'data-page': isMemoryGraph ? 'memory-graph' : '',
+                    }, slots.default?.()),
+                ]),
+            ]);
+        };
     },
 });

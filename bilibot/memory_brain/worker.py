@@ -118,12 +118,19 @@ class PersistentMemoryWorker:
             except asyncio.TimeoutError:
                 pass
 
+    def _renew_or_lose(self, job: ClaimedJob) -> None:
+        """Renew lease around long LLM awaits; raise if ownership was lost."""
+        if not self.store.renew_job_lease(job.id, self.worker_id, self.lease_seconds):
+            raise RuntimeError(f"memory job lease was lost: {job.job_type}:{job.id}")
+
     async def _execute(self, job: ClaimedJob) -> None:
         if not job.event_id:
             raise ValueError("memory enrichment job has no event_id")
         event = self.store.get_event_index_input(job.event_id)
         if job.job_type == "summarize_event":
+            self._renew_or_lose(job)
             summary = await self.gateway.summarize_event(event)
+            self._renew_or_lose(job)
             self.store.update_event_summary(job.event_id, summary)
             # These jobs may have completed before the summary was available.
             self.store.requeue_event_job(job.event_id, "embed_event")
@@ -136,7 +143,9 @@ class PersistentMemoryWorker:
             await self._embed_chunks(job, event)
             return
         if job.job_type == "extract_entities":
+            self._renew_or_lose(job)
             entities = await self.gateway.extract_entities(event)
+            self._renew_or_lose(job)
             self.store.upsert_entities(job.event_id, entities)
             self.store.requeue_event_job(job.event_id, "link_associations")
             return
@@ -148,7 +157,9 @@ class PersistentMemoryWorker:
                 if item["id"] != job.event_id
             ]
             if candidates:
+                self._renew_or_lose(job)
                 links = await self.gateway.suggest_links(event, candidates)
+                self._renew_or_lose(job)
                 self.store.upsert_links(
                     job.event_id,
                     validate_suggested_links(event, candidates, links),
@@ -159,8 +170,12 @@ class PersistentMemoryWorker:
     async def _embed_event(self, job: ClaimedJob, event: dict[str, Any]) -> None:
         text = event["embedding_text"]
         if not text:
-            return
+            # Do not complete-as-success with a missing vector; leave a diagnosable failure
+            # so reindex/retry can pick it up after summary/title becomes available.
+            raise ValueError("EMPTY_EMBEDDING_TEXT: event has no embedding_text")
+        self._renew_or_lose(job)
         batch = await self.gateway.embed_texts([text])
+        self._renew_or_lose(job)
         self.store.upsert_embedding(
             "event",
             event["id"],

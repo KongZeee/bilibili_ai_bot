@@ -18,6 +18,7 @@
 - POST /api/personas/import/github - 从 GitHub URL 导入
 - POST /api/personas/{id}/evaluate - 自动评测人格
 """
+import asyncio
 import json
 import logging
 import uuid
@@ -37,8 +38,14 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
         return JSONResponse({"success": True, "data": personas})
 
     async def create_persona(request: Request) -> JSONResponse:
+        from .responses import fail_internal
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return JSONResponse({
+                    "success": False,
+                    "error": {"code": "INVALID_INPUT", "message": "请求体必须是 JSON 对象", "details": {}},
+                }, status_code=400)
             persona = persona_store.create_persona(body)
             return JSONResponse({
                 "success": True,
@@ -46,11 +53,8 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
                 "data": persona,
             })
         except Exception as e:
-            logger.error(f"创建人格失败: {e}")
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "CREATE_FAILED", "message": str(e), "details": {}},
-            }, status_code=500)
+            logger.error(f"创建人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def get_current_persona(request: Request) -> JSONResponse:
         current = persona_store.get_current_dict()
@@ -67,9 +71,15 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
         return JSONResponse({"success": True, "data": persona})
 
     async def update_persona(request: Request) -> JSONResponse:
+        from .responses import fail_internal
         persona_id = request.path_params.get("id")
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return JSONResponse({
+                    "success": False,
+                    "error": {"code": "INVALID_INPUT", "message": "请求体必须是 JSON 对象", "details": {}},
+                }, status_code=400)
             persona = persona_store.update_persona(persona_id, body)
             if not persona:
                 return JSONResponse({
@@ -82,11 +92,8 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
                 "data": persona,
             })
         except Exception as e:
-            logger.error(f"更新人格失败: {e}")
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "UPDATE_FAILED", "message": str(e), "details": {}},
-            }, status_code=500)
+            logger.error(f"更新人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def delete_persona(request: Request) -> JSONResponse:
         persona_id = request.path_params.get("id")
@@ -141,7 +148,7 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
             test_input = body.get("input", "")
             persona_id = body.get("persona_id")
             use_llm = body.get("use_llm", False)
-            llm_provider_id = body.get("llm_provider_id", "")
+            llm_provider_id = body.get("llm_provider_id") or None
 
             if not test_input:
                 return JSONResponse({
@@ -198,11 +205,9 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
 
             return JSONResponse({"success": True, "data": result})
         except Exception as e:
-            logger.error(f"测试人格失败: {e}")
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "TEST_FAILED", "message": str(e), "details": {}},
-            }, status_code=500)
+            from .responses import fail_internal
+            logger.error(f"测试人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def preview_prompt(request: Request) -> JSONResponse:
         persona_id = request.query_params.get("persona_id")
@@ -236,11 +241,9 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
                 "data": persona,
             })
         except Exception as e:
-            logger.error(f"导入人格失败: {e}")
-            return JSONResponse({
-                "success": False,
-                "error": {"code": "IMPORT_FAILED", "message": str(e), "details": {}},
-            }, status_code=500)
+            from .responses import fail_internal
+            logger.error(f"导入人格失败: {e}", exc_info=True)
+            return fail_internal()
 
     async def export_persona(request: Request) -> JSONResponse:
         persona_id = request.path_params.get("id")
@@ -276,40 +279,52 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
 
             # SSRF 防护：只允许 https + GitHub 域名
             from urllib.parse import urlparse
-            import ipaddress
             parsed = urlparse(url)
             if parsed.scheme != "https":
                 return fail("INVALID_INPUT", "仅支持 https:// 协议", status_code=400)
             allowed_hosts = ("raw.githubusercontent.com", "github.com", "gist.githubusercontent.com")
             if parsed.hostname not in allowed_hosts:
                 return fail("INVALID_INPUT", f"仅支持 GitHub 域名: {allowed_hosts}", status_code=400)
-            # 防止通过域名解析到内网 IP（再校验一次解析结果）
-            # getaddrinfo 返回 5 元组 (family, type, proto, canonname, sockaddr)
-            try:
+
+            def _fetch_github_json() -> dict:
+                import ipaddress
                 import socket
-                resolved_ips = socket.getaddrinfo(parsed.hostname, None)
-                if not resolved_ips:
-                    return fail("INVALID_INPUT", "无法解析目标域名", status_code=400)
-                for family, type_, proto, canonname, sockaddr in resolved_ips:
-                    ip = ipaddress.ip_address(sockaddr[0])
-                    if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
-                        return fail("INVALID_INPUT", "目标地址解析到内网 IP，拒绝请求", status_code=400)
-            except (socket.gaierror, ValueError, OSError):
-                return fail("INVALID_INPUT", "域名解析失败，拒绝请求", status_code=400)
+                import urllib.request
+                import json as _json
 
-            import urllib.request, json as _json
-            req = urllib.request.Request(url, headers={"User-Agent": "BiliBot-Market/1.0"})
-            # 禁止跟随重定向，防止跳到内网/非白名单 host
-            class _NoRedirect(urllib.request.HTTPRedirectHandler):
-                def redirect_request(self, req, fp, code, msg, headers, newurl):
-                    return None
+                # 防止通过域名解析到内网 IP（再校验一次解析结果）
+                # getaddrinfo 返回 5 元组 (family, type, proto, canonname, sockaddr)
+                try:
+                    resolved_ips = socket.getaddrinfo(parsed.hostname, None)
+                    if not resolved_ips:
+                        raise ValueError("无法解析目标域名")
+                    for family, type_, proto, canonname, sockaddr in resolved_ips:
+                        ip = ipaddress.ip_address(sockaddr[0])
+                        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved:
+                            raise ValueError("目标地址解析到内网 IP，拒绝请求")
+                except ValueError:
+                    raise
+                except (socket.gaierror, OSError) as exc:
+                    raise ValueError("域名解析失败，拒绝请求") from exc
 
-            opener = urllib.request.build_opener(_NoRedirect)
-            with opener.open(req, timeout=10) as resp:
-                final_host = urlparse(resp.geturl()).hostname
-                if final_host not in allowed_hosts:
-                    return fail("INVALID_INPUT", "重定向目标不在允许域名内", status_code=400)
-                data = _json.loads(resp.read().decode("utf-8"))
+                req = urllib.request.Request(url, headers={"User-Agent": "BiliBot-Market/1.0"})
+                # 禁止跟随重定向，防止跳到内网/非白名单 host
+                class _NoRedirect(urllib.request.HTTPRedirectHandler):
+                    def redirect_request(self, req, fp, code, msg, headers, newurl):
+                        return None
+
+                opener = urllib.request.build_opener(_NoRedirect)
+                with opener.open(req, timeout=10) as resp:
+                    final_host = urlparse(resp.geturl()).hostname
+                    if final_host not in allowed_hosts:
+                        raise ValueError("重定向目标不在允许域名内")
+                    return _json.loads(resp.read().decode("utf-8"))
+
+            try:
+                data = await asyncio.to_thread(_fetch_github_json)
+            except ValueError as e:
+                return fail("INVALID_INPUT", str(e), status_code=400)
+
             persona = persona_store.import_persona(data)
             return JSONResponse({"success": True, "message": "imported", "data": persona})
         except Exception as e:

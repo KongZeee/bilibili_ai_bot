@@ -15,7 +15,12 @@ export const VideoAnalysisPage = {
             frame_extractor: 'ffmpeg',
             scenedetect_threshold: 27.0,
             image_max_size: 768,
+            max_keyframes: 150,
             vision_window_size: 5,
+            vision_requests_per_minute: 10,
+            vision_frame_max_retries: 2,
+            vision_frame_retry_backoff_seconds: 1.5,
+            vision_min_success_ratio: 0.5,
             analysis_timeout_seconds: 600,
             max_duration_seconds: 600,
             max_concurrent_global: 1,
@@ -79,7 +84,12 @@ export const VideoAnalysisPage = {
                 config.frame_extractor = data.frame_extractor || 'ffmpeg';
                 config.scenedetect_threshold = data.scenedetect_threshold ?? 27.0;
                 config.image_max_size = data.image_max_size ?? 768;
+                config.max_keyframes = data.max_keyframes ?? 150;
                 config.vision_window_size = data.vision_window_size ?? 5;
+                config.vision_requests_per_minute = data.vision_requests_per_minute ?? 10;
+                config.vision_frame_max_retries = data.vision_frame_max_retries ?? 2;
+                config.vision_frame_retry_backoff_seconds = data.vision_frame_retry_backoff_seconds ?? 1.5;
+                config.vision_min_success_ratio = data.vision_min_success_ratio ?? 0.5;
                 config.analysis_timeout_seconds = data.analysis_timeout_seconds ?? 600;
                 config.max_duration_seconds = data.max_duration_seconds ?? 600;
                 config.max_concurrent_global = data.max_concurrent_global ?? 1;
@@ -135,7 +145,6 @@ export const VideoAnalysisPage = {
             try {
                 const res = await api.videoAnalysis.test({
                     video_url: testUrl.value,
-                    config: { ...config },
                 });
                 testResult.value = res;
                 appState.notify('分析完成', 'success');
@@ -265,6 +274,20 @@ export const VideoAnalysisPage = {
                                 }),
                             ]),
                             h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '抽帧上限（帧）'),
+                                h(FormInput, {
+                                    modelValue: String(config.max_keyframes),
+                                    'onUpdate:modelValue': (v) => {
+                                        const n = parseInt(v, 10);
+                                        config.max_keyframes = Number.isFinite(n)
+                                            ? Math.max(1, Math.min(n, 500))
+                                            : 150;
+                                    },
+                                    type: 'number',
+                                }),
+                                h(FormHint, '镜头数 ≤ 本值则按镜头全抽；超过则在镜头中等距抽本值张（默认 150，最大 500）'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '视觉窗口大小（帧数）'),
                                 h(FormInput, {
                                     modelValue: String(config.vision_window_size),
@@ -272,6 +295,62 @@ export const VideoAnalysisPage = {
                                     type: 'number',
                                 }),
                                 h(FormHint, '期望并发；实际受「配置页 → 模型请求限制」的视觉并发硬顶与密钥数约束'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '视觉请求起步速率（次/分钟）'),
+                                h(FormInput, {
+                                    modelValue: String(config.vision_requests_per_minute),
+                                    'onUpdate:modelValue': (v) => {
+                                        const n = parseInt(v, 10);
+                                        config.vision_requests_per_minute = Number.isFinite(n)
+                                            ? Math.max(1, Math.min(n, 600))
+                                            : 10;
+                                    },
+                                    type: 'number',
+                                }),
+                                h(FormHint, '多 key 时运行时会按密钥数线性放大；与模型请求限制共同决定吞吐'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '单帧失败额外重试次数'),
+                                h(FormInput, {
+                                    modelValue: String(config.vision_frame_max_retries),
+                                    'onUpdate:modelValue': (v) => {
+                                        const n = parseInt(v, 10);
+                                        config.vision_frame_max_retries = Number.isFinite(n)
+                                            ? Math.max(0, Math.min(n, 5))
+                                            : 2;
+                                    },
+                                    type: 'number',
+                                }),
+                                h(FormHint, '连接错误/超时等瞬时故障的额外重试（0–5）'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '单帧重试退避基数（秒）'),
+                                h(FormInput, {
+                                    modelValue: String(config.vision_frame_retry_backoff_seconds),
+                                    'onUpdate:modelValue': (v) => {
+                                        const n = parseFloat(v);
+                                        config.vision_frame_retry_backoff_seconds = Number.isFinite(n)
+                                            ? Math.max(0, Math.min(n, 30))
+                                            : 1.5;
+                                    },
+                                    type: 'number',
+                                }),
+                                h(FormHint, '第 n 次重试等待 n × 该值秒'),
+                            ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '最低成功帧比例'),
+                                h(FormInput, {
+                                    modelValue: String(config.vision_min_success_ratio),
+                                    'onUpdate:modelValue': (v) => {
+                                        const n = parseFloat(v);
+                                        config.vision_min_success_ratio = Number.isFinite(n)
+                                            ? Math.max(0, Math.min(n, 1))
+                                            : 0.5;
+                                    },
+                                    type: 'number',
+                                }),
+                                h(FormHint, 'require_complete 时达到此比例即可继续（0–1，默认 0.5）'),
                             ]),
                             h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '视频时长上限（秒）'),

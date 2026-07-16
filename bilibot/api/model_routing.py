@@ -31,19 +31,29 @@ FEATURE_LABELS = {
 
 
 def _save_to_config(config_loader, router, config_path: str):
-    """持久化到 config.yaml"""
+    """持久化到 config.yaml（在写锁内完成 RMW，避免并发丢段）"""
     try:
-        raw = config_loader.get_raw_config()
-        saved = router.save_to_config()
-        # 更新各 provider 列表
-        for ptype in PROVIDER_TYPES:
-            key = CONFIG_KEYS[ptype]
-            if key in saved:
-                raw[key] = saved[key]
-        raw["model_routing"] = saved.get("model_routing", {})
-        raw["allow_llm_fallback"] = saved.get("allow_llm_fallback", raw.get("allow_llm_fallback", False))
-        raw["config_revision"] = int(raw.get("config_revision", 0)) + 1
-        config_loader.save_config(raw, config_path)
+        def _mutate(raw: dict) -> None:
+            saved = router.save_to_config()
+            for ptype in PROVIDER_TYPES:
+                key = CONFIG_KEYS[ptype]
+                if key in saved:
+                    raw[key] = saved[key]
+            raw["model_routing"] = saved.get("model_routing", {})
+            raw["allow_llm_fallback"] = saved.get(
+                "allow_llm_fallback", raw.get("allow_llm_fallback", False)
+            )
+            # model_request_limits 以 router 当前值为准写回
+            if "model_request_limits" in saved:
+                raw["model_request_limits"] = saved["model_request_limits"]
+            raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
+
+        if hasattr(config_loader, "atomic_update"):
+            config_loader.atomic_update(config_path, _mutate)
+        else:
+            raw = config_loader.get_raw_config()
+            _mutate(raw)
+            config_loader.save_config(raw, config_path)
         return True
     except Exception as e:
         logger.error(f"持久化模型配置失败: {e}", exc_info=True)
@@ -122,7 +132,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
             _save_to_config(config_loader, router, config_path)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 添加成功")
         except ValueError as e:
-            return fail("VALIDATION_ERROR", str(e))
+            logger.warning("模型路由校验失败: %s", e)
+            return fail("VALIDATION_ERROR", "路由参数不合法")
         except Exception as e:
             logger.error(f"添加 Provider 失败: {e}", exc_info=True)
             return fail_internal()

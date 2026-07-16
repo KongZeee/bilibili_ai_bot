@@ -23,7 +23,9 @@ from bilibot.app.config_loader import is_sensitive_placeholder as is_redaction_m
 logger = logging.getLogger("bilibot.account")
 
 # 敏感字段：PATCH 时若值为占位符 / None / 空字符串则保留原值
-SENSITIVE_FIELDS = {"sessdata", "bili_jct", "buvid3", "refresh_token", "access_token"}
+SENSITIVE_FIELDS = {
+    "sessdata", "bili_jct", "buvid3", "buvid4", "refresh_token", "access_token",
+}
 
 # 占位符：表示"不修改此敏感字段"
 REDACTED_PLACEHOLDER = "__REDACTED__"
