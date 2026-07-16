@@ -147,8 +147,19 @@ export const CompanionPage = defineComponent({
             if (!selectedAccount.value) return;
             triggering.value = true;
             try {
-                await api.accounts.companion.trigger(selectedAccount.value, action);
-                showToast(action + ' 已触发', 'success');
+                const res = await api.accounts.companion.trigger(selectedAccount.value, action);
+                // returnEnvelope: { success, data, message }
+                const payload = res && typeof res === 'object' ? res : {};
+                const data = payload.data;
+                const msg = payload.message || '';
+                const produced = data && typeof data === 'object' && 'produced' in data
+                    ? !!data.produced
+                    : (data != null);
+                if (!produced && ['explore', 'creative', 'dream', 'diary', 'plan'].includes(action)) {
+                    showToast(msg || `${action} 未产生结果（检查开关/联网搜索/冷却）`, 'warning');
+                } else {
+                    showToast(msg || `${action} 已完成`, 'success');
+                }
                 await loadAll();
             } catch (e) {
                 showToast('触发失败: ' + e.message, 'error');

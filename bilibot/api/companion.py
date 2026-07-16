@@ -141,21 +141,36 @@ def create_companion_routes(account_manager) -> list:
             action = str((body or {}).get("action") or "tick").strip().lower()
             if action == "diary":
                 data = await companion.generate_diary(force=True)
-                return _ok(data.to_dict() if data else None, message="日记已生成")
+                return _ok(
+                    {"produced": bool(data), "item": data.to_dict() if data else None},
+                    message="日记已生成" if data else "日记未生成",
+                )
             if action == "dream":
                 data = await companion.generate_dream(force=True)
-                return _ok(data.to_dict() if data else None, message="梦境已生成")
+                return _ok(
+                    {"produced": bool(data), "item": data.to_dict() if data else None},
+                    message="梦境已生成" if data else "梦境未生成",
+                )
             if action == "explore":
                 data = await companion.maybe_explore(force=True)
-                return _ok(data.to_dict() if data else None, message="探索已执行" if data else "探索未产生结果")
+                return _ok(
+                    {"produced": bool(data), "item": data.to_dict() if data else None},
+                    message="探索已执行" if data else "探索未产生结果（检查 web_search / 场景开关 / 冷却）",
+                )
             if action == "creative":
                 data = await companion.maybe_advance_creative(force=True)
-                return _ok(data.to_dict() if data else None, message="创作已推进" if data else "创作未推进")
+                return _ok(
+                    {"produced": bool(data), "item": data.to_dict() if data else None},
+                    message="创作已推进" if data else "创作未推进（检查 creative 开关 / 空闲条件）",
+                )
             if action == "plan":
                 data = await companion.ensure_daily_plan(force=True)
-                return _ok(data.to_dict() if data else None, message="日程已生成")
+                return _ok(
+                    {"produced": bool(data and data.items), "item": data.to_dict() if data else None},
+                    message="日程已生成" if data else "日程生成失败",
+                )
             result = await companion.tick()
-            return _ok(result, message="tick 完成")
+            return _ok({"produced": True, "item": result}, message="tick 完成")
         except Exception as e:
             logger.error("companion trigger failed: %s", e, exc_info=True)
             return _err("触发失败", "INTERNAL", 500)

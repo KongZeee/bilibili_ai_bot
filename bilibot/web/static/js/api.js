@@ -90,7 +90,11 @@ export const api = {
             dreams: (id) => api.get(`/api/accounts/${id}/companion/dreams`),
             notes: (id) => api.get(`/api/accounts/${id}/companion/notes`),
             bookshelf: (id) => api.get(`/api/accounts/${id}/companion/bookshelf`),
-            trigger: (id, action) => api.post(`/api/accounts/${id}/companion/trigger`, { action: action || 'tick' }),
+            trigger: (id, action) => request(`/api/accounts/${id}/companion/trigger`, {
+                method: 'POST',
+                body: { action: action || 'tick' },
+                returnEnvelope: true,
+            }),
         },
     },
 
