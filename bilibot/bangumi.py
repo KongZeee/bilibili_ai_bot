@@ -317,7 +317,11 @@ class BangumiService:
                     ),
                     query=query_text,
                     scene="bangumi",
-                    title=str(season_title or "").strip(),
+                    title=(
+                        f"{str(season_title or '').strip()} 第{episode_index}话"
+                        if episode_index not in (None, "")
+                        else str(season_title or "").strip()
+                    ),
                     oid=str(season_id or "").strip(),
                     persona_id=self.persona_id,
                     metadata={
@@ -786,6 +790,46 @@ class BangumiService:
                     "season_completed": season_completed,
                 },
             )
+            # Close the begin_activity intent so cross-scene recent/self memory
+            # sees a terminal evaluate_bangumi_episode outcome, not a dangling intent.
+            try:
+                brain = self._require_memory_brain()
+                finish = getattr(brain, "finish_activity", None)
+                if callable(finish):
+                    ep_label = f"第{ep_index}话" if ep_index not in (None, "") else ""
+                    result_text = (
+                        f"看完《{season_title}》{ep_label}"
+                        f"{('「' + ep_title + '」') if ep_title else ''}，"
+                        f"评分{score}，心情{mood}。"
+                        f"{('想继续追。' if evaluation.get('want_continue') else '')}"
+                        f"{(' 短评：' + str(comment)[:120]) if comment else ''}"
+                    ).strip()
+                    await finish(
+                        action_key=(
+                            f"bangumi_watch:{season_info.get('season_id', 0) or season_title}"
+                            f":{ep_index}:evaluate"
+                        ),
+                        action_type="evaluate_bangumi_episode",
+                        result_text=result_text,
+                        state="completed",
+                        scene="bangumi",
+                        title=f"{season_title} {ep_label}".strip(),
+                        persona_id=self.persona_id,
+                        metadata={
+                            "season_id": str(season_info.get("season_id", 0) or ""),
+                            "episode_id": str(ep_id),
+                            "episode_index": str(ep_index),
+                            "score": score,
+                            "memory_event_id": memory_event_id,
+                        },
+                    )
+            except Exception:
+                logger.warning(
+                    "bangumi finish_activity failed sid=%s ep=%s",
+                    season_info.get("season_id", 0),
+                    ep_id,
+                    exc_info=True,
+                )
         except Exception:
             self._cleanup_episode_artifacts(ep_id, video_path, analysis_result)
             logger.error(
