@@ -359,7 +359,27 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
             else:
                 print(f"miss_hit:{a['source_type']}:{a['id']}:{a['needles'][:2]}:n={last_n}")
 
+        # Ensure creative continuity probe has a durable self novel memory.
+        try:
+            from bilibot.memory_brain.ingestion import bot_action_observation
+
+            await brain.archive_observation_async(
+                bot_action_observation(
+                    account_id=account_id,
+                    action_key="creative:seed-chapter-e2e",
+                    action_type="creative_chunk",
+                    text="小说第三章写到主角把青铜钥匙藏进雨夜的大衣口袋。",
+                    published=True,
+                    state="completed",
+                    scene="creative",
+                    title="小说第三章",
+                )
+            )
+        except Exception as exc:
+            print(f"creative_seed_warn:{type(exc).__name__}")
+
         # Targeted continuity probes for ATRI noise + self dynamic paraphrase.
+
         probe_ok = 0
         probe_cases: list[tuple[str, list[str], list[str]]] = [
             (
@@ -405,6 +425,11 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
             (
                 "你最近在追什么番",
                 ["ATRI", "亚托莉", "视觉小说"],
+                [],
+            ),
+            (
+                "写小说的时候用过青铜钥匙吗",
+                ["小说", "青铜钥匙", "大衣"],
                 [],
             ),
         ]
