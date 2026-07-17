@@ -344,3 +344,26 @@ async def test_exact_dream_title_not_polluted(seeded_store):
     assert not result.is_empty
     titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
     assert titles == ["窗边的午后"] or titles[0] == "窗边的午后"
+
+
+
+@pytest.mark.asyncio
+async def test_open_bangumi_query_seeds_atri(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="atri-vn",
+            account_id="acc",
+            source_type="web_reference",
+            source_external_id="atri-vn",
+            source_text="探索 ATRI -My Dear Moments- 视觉小说 亚托莉 夏生 海边。",
+            event_title="探索 ATRI -My Dear Moments- 亚托莉 夏生 海边场景 视觉小说",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你最近在追什么番", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert any("ATRI" in t for t in titles)

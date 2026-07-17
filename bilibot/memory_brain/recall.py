@@ -180,7 +180,7 @@ _SELF_MEMORY_QUERY_RE = re.compile(
     r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发|"
     r"评论说了|发过评论|刚给.*评论|你回复|"
     r"刚看了|刚看过|看了什么视频|看过什么视频|最近看|"
-    r"日程|安排|周总结|追什么番|在追)"
+    r"日程|安排|周总结|追什么番|在追|追番|番剧|看番)"
 )
 
 _UTILITY_QUERY_RE = re.compile(
@@ -794,6 +794,17 @@ class RecallEngine:
         self._watch_query_active = bool(
             re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", message_for_flags)
         )
+        self._bangumi_query_active = bool(
+            re.search(r"(追什么番|在追|追番|番剧|看番)", message_for_flags)
+        )
+        # Open bangumi questions have almost no distinctive FTS terms. Seed the
+        # bot's known anime/visual-novel anchors so hybrid recall can fire.
+        if self._bangumi_query_active:
+            object.__setattr__(
+                query,
+                "current_message",
+                f"{message_for_flags} ATRI 亚托莉 视觉小说 夏生 番剧",
+            )
 
         # Per-call inject cap (0 → engine default max_events)
         inject_cap = self.max_events
@@ -1754,6 +1765,26 @@ class RecallEngine:
                     elif source in {"comment", "comment_thread", "web_reference"}:
                         # "总结一下这个视频" comments are pure noise for weekly self-reflection.
                         candidate.final_score = 0.0
+                elif re.search(r"(追什么番|在追|追番|番剧|看番)", query_text):
+                    title = str(candidate.title or "")
+                    summary = str(candidate.summary or "")
+                    blob = title + summary
+                    is_bangumiish = any(
+                        k in blob
+                        for k in (
+                            "ATRI",
+                            "亚托莉",
+                            "视觉小说",
+                            "番剧",
+                            "追番",
+                            "夏生",
+                            "动漫",
+                        )
+                    ) or source in {"bangumi"}
+                    if is_bangumiish:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.30)
+                    elif source in {"comment", "comment_thread"}:
+                        candidate.final_score = max(0.0, candidate.final_score - 0.15)
                 elif source == "bot_action":
                     candidate.final_score = min(1.0, candidate.final_score + 0.12)
                 elif source in {"diary", "dream", "weekly_summary", "life_plan"}:
