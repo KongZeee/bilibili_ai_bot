@@ -584,7 +584,11 @@ class MemoryBrainService:
                 != "intent"
                 and lifecycle_key(row)
             }
-            filtered = []
+            # Diversify recent lane by action_type so a burst of identical ticks
+            # cannot fully bury distinctive self experiences.
+            filtered: list[Mapping[str, Any]] = []
+            seen_types: set[str] = set()
+            overflow: list[Mapping[str, Any]] = []
             for row in ordered:
                 meta = row.get("metadata") or {}
                 activity_key = lifecycle_key(row)
@@ -595,9 +599,26 @@ class MemoryBrainService:
                 )
                 if state == "intent" and activity_key in terminal_keys:
                     continue
+                action_type = ""
+                if isinstance(meta, Mapping):
+                    action_type = str(meta.get("action_type") or "").strip().casefold()
+                type_key = (
+                    action_type
+                    or str(row.get("source_type") or "").strip().casefold()
+                    or "other"
+                )
+                if type_key in seen_types:
+                    overflow.append(row)
+                    continue
+                seen_types.add(type_key)
                 filtered.append(row)
                 if len(filtered) >= recent_cap:
                     break
+            if len(filtered) < recent_cap:
+                for row in overflow:
+                    filtered.append(row)
+                    if len(filtered) >= recent_cap:
+                        break
             return filtered
 
         recall_query = RecallQuery(
