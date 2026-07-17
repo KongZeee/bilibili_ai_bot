@@ -387,6 +387,21 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 [],  # non-empty is enough; validated by forbid + not comment-only
                 ["空泽同学 评论：@亚托莉小姐 这个视频讲了什么"],
             ),
+            (
+                "你的日程安排",
+                ["日程"],
+                [],
+            ),
+            (
+                "周总结写了啥",
+                ["周总结"],
+                ["总结一下这个视频"],
+            ),
+            (
+                "窗边的午后",
+                ["窗边的午后"],
+                ["崩坏", "陪伴我10年"],
+            ),
         ]
         for q, must_any, forbid_any in probe_cases:
             result = await brain.recall(
