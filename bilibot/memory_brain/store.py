@@ -1911,6 +1911,23 @@ class MemoryBrainStore:
             except ImportError:  # pragma: no cover - optional acceleration
                 np = None
             if np is not None and self.vector_cache_limit > 0:
+                cache_key = (model_id, target_type)
+                # Warm-cache fast path: skip COUNT(*) when entry already loaded.
+                with self._vector_cache_lock:
+                    entry = self._vector_cache.get(cache_key)
+                    if entry is not None and entry.dimension != dimension:
+                        self._vector_cache.pop(cache_key, None)
+                        entry = None
+                    if entry is not None:
+                        return self._rank_cached_vectors(
+                            entry,
+                            query,
+                            target_type=target_type,
+                            model_id=model_id,
+                            result_limit=result_limit,
+                            batch_size=batch_size,
+                            np=np,
+                        )
                 if embedding_count is None:
                     embedding_count = int(
                         conn.execute(
@@ -1919,7 +1936,6 @@ class MemoryBrainStore:
                         ).fetchone()[0]
                     )
                 if embedding_count <= self.vector_cache_limit:
-                    cache_key = (model_id, target_type)
                     with self._vector_cache_lock:
                         entry = self._vector_cache.get(cache_key)
                         if entry is not None and entry.dimension != dimension:
