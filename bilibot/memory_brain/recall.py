@@ -1299,13 +1299,52 @@ class RecallEngine:
                 if candidate.kind == "association"
                 else FALLBACK_DIRECT_THRESHOLD
             )
-            if candidate.final_score >= threshold:
-                eligible.append(candidate)
+            if candidate.final_score < threshold:
+                continue
+            # Recent/graph-only RRF ranks must not inject under provider_unavailable.
+            # Utility queries (weather/math) often rank a random video via event_fts
+            # at exactly FALLBACK_DIRECT_THRESHOLD from one weak OR-term; require
+            # content-bearing evidence and strict coverage for single-channel hits.
+            if not RecallEngine._fallback_has_content_evidence(candidate):
+                continue
+            eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
             max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
             max_associations=self.max_associations,
         )
+
+    @staticmethod
+    def _fallback_has_content_evidence(candidate: RecallCandidate) -> bool:
+        channels = set(candidate.channel_ranks or {})
+        if {"explicit_id", "title_entity"}.intersection(channels):
+            return True
+        content_lex = [
+            cov
+            for ch, cov in (candidate.lexical_coverages or {}).items()
+            if ch in {"event_fts", "chunk_fts", "context"} and cov is not None
+        ]
+        content_vec = [
+            score
+            for ch, score in (candidate.vector_scores or {}).items()
+            if ch in {"event_vector", "chunk_vector", "context"} and score is not None
+        ]
+        if not content_lex and not content_vec:
+            return False
+        strong_vec = [s for s in content_vec if s >= 0.35]
+        if strong_vec:
+            return True
+        if not content_lex:
+            return False
+        max_lex = max(content_lex)
+        dual_ok = sum(1 for cov in content_lex if cov >= 0.35) >= 2
+        # Strict > threshold: weather hit sits at exactly 0.40 on one FTS channel.
+        # Multi-term conversational hits land ~0.43+ and still pass.
+        if max_lex > FALLBACK_DIRECT_THRESHOLD:
+            return True
+        if dual_ok and max_lex >= FALLBACK_DIRECT_THRESHOLD:
+            return True
+        return False
 
     @staticmethod
     def _bounded_selection(
