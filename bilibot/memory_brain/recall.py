@@ -1550,6 +1550,7 @@ class RecallEngine:
                 )
             # Soft source priors: self-authored continuity beats search dumps.
             source = str(candidate.source_type or "").strip().casefold()
+            title_cf = str(candidate.title or "").strip().casefold()
             if source in {
                 "bot_action",
                 "diary",
@@ -1559,7 +1560,13 @@ class RecallEngine:
                 "video_experience",
             }:
                 candidate.final_score = min(1.0, candidate.final_score + 0.03)
-            elif source in {"web_reference", "video_metadata"}:
+            elif source == "web_reference":
+                # Generic search-dump titles are almost never the best answer.
+                if title_cf in {"联网搜索参考", "web reference", "search reference"}:
+                    candidate.final_score = max(0.0, candidate.final_score - 0.20)
+                else:
+                    candidate.final_score = max(0.0, candidate.final_score - 0.05)
+            elif source in {"video_metadata"}:
                 candidate.final_score = max(0.0, candidate.final_score - 0.05)
             # Title-term exact-ish bonus: if a content term appears in the title,
             # rank it above body-only weak hits with the same coverage.
