@@ -559,6 +559,36 @@ class MemoryBrainService:
                 for index, event_id in enumerate(ids)
             ]
 
+            def _recent_priority(row: Mapping[str, Any], position: int) -> tuple:
+                """Prefer distinctive experiences over homogeneous tick noise.
+
+                Lower tuple sorts first. Recency is preserved as a secondary key
+                so the lane still feels current.
+                """
+                meta = row.get("metadata") or {}
+                if not isinstance(meta, Mapping):
+                    meta = {}
+                action_type = str(meta.get("action_type") or "").strip().casefold()
+                source = str(row.get("source_type") or "").strip().casefold()
+                detail = _activity_source_text(row)
+                # Generic companion ticks / empty bodies deprioritized.
+                generic = action_type in {"tick", "companion_tick", ""} and source == "bot_action"
+                content_score = min(len(detail), 240)
+                # position is 0 for newest
+                return (
+                    1 if generic and content_score < 24 else 0,
+                    -content_score,
+                    position,
+                )
+
+            ordered = [
+                row
+                for _, row in sorted(
+                    enumerate(ordered),
+                    key=lambda item: _recent_priority(item[1], item[0]),
+                )
+            ]
+
             def lifecycle_key(row: Mapping[str, Any]) -> str:
                 meta = row.get("metadata") or {}
                 explicit = (
