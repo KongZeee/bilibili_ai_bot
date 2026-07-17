@@ -52,7 +52,9 @@ _QUOTED_RE = re.compile(r"[\"'“‘《]([^\"'”’》]{1,80})[\"'”’》]")
 
 
 _CONVERSATIONAL_FILLER_RE = re.compile(
-    r"(你不是|是不是|有没有|能不能|可不可以|记得吗|还记得|发过|说过|看过|写过|吗|呢|啊|呀|吧|了)"
+    r"(你不是|是不是|有没有|能不能|可不可以|记得吗|还记得|发过|说过|看过|写过|"
+    r"那部|那期|上次|前几天|有意思|怎么样|怎么|怎样|什么|有啥|讲了啥|"
+    r"吗|呢|啊|呀|吧|了)"
 )
 
 # Generic Chinese tokens that OR-FTS often matches across the whole library.
@@ -146,7 +148,31 @@ _LEXICAL_STOP_TERMS = frozenset(
         "说了",
         "看了",
         "情日",
+        # Conversational glue bigrams that pollute ATRI/dynamic paraphrases.
+        "的那",
+        "那部",
+        "那期",
+        "上次",
+        "发的",
+        "了什",
+        "样了",
+        "追的",
+        "的动",
+        "发动",
+        "态说",
+        "说了",
+        "有意",
+        "意思",
+        "思的",
+        "前几",
+        "几天",
+        "的心",
     }
+)
+
+# Queries about the bot's own prior posts / writings (not topical "动态" alone).
+_SELF_MEMORY_QUERY_RE = re.compile(
+    r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发)"
 )
 
 _UTILITY_QUERY_RE = re.compile(
@@ -164,6 +190,9 @@ def _is_content_lexical_term(term: str) -> bool:
         return False
     if re.fullmatch(r"[0-9_.:-]+", t):
         return False
+    # Single CJK characters are almost never distinctive evidence alone.
+    if re.fullmatch(r"[㐀-䶿一-鿿豈-﫿]", t):
+        return False
     # Keep distinctive CJK bigrams (青铜/钥匙/雨夜). Function-word glue bigrams
     # (天怎/步的/的动) are stop-listed above.
     return True
@@ -174,6 +203,8 @@ def _content_heavy_query(message: str) -> str:
 
     Candidate generation still uses the original message; this rewrite is only
     used as an additional FTS channel when the raw query is long/chatty.
+    Prefer contentful terms (incl. ASCII ids like ATRI) so glue bigrams do not
+    re-enter the rewrite channel.
     """
     text_in = " ".join(str(message or "").replace("\x00", "").split())
     if not text_in:
@@ -182,8 +213,25 @@ def _content_heavy_query(message: str) -> str:
     stripped = re.sub(r"[？?！!。，,、：:；;…]+", " ", stripped)
     stripped = " ".join(stripped.split())
     if len(stripped) < 2 or stripped == text_in:
-        return ""
-    return stripped
+        # Still try to harvest distinctive ASCII/CJK tokens from the raw query.
+        stripped = text_in
+    try:
+        from bilibot.memory_brain.store import _fts_query_terms
+    except Exception:
+        return "" if stripped == text_in else stripped
+    terms = [
+        term
+        for term in _fts_query_terms(stripped)
+        if _is_content_lexical_term(term)
+    ]
+    # Always keep standalone Latin tokens (ATRI, BV ids already handled elsewhere).
+    for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,24}", text_in):
+        low = token.casefold()
+        if low not in {t.casefold() for t in terms}:
+            terms.insert(0, token)
+    if not terms:
+        return "" if stripped == text_in else stripped
+    return " ".join(terms[:16])
 
 # Prefer content that helps answer "what is this video about?" over raw API
 # metadata JSON / search blobs when a video event is only hit by title/id.
@@ -902,7 +950,7 @@ class RecallEngine:
         decisions, rerank_status, rerank_calls = await self._rerank(query, rough)
         if decisions is None:
             mode = "fallback"
-            selected = self._select_fallback(rough)
+            selected = self._select_fallback(rough, query=query)
         else:
             mode = "llm"
             selected = self._apply_decisions(rough, decisions)
@@ -1091,12 +1139,6 @@ class RecallEngine:
                     for ch, cov in candidate.lexical_coverages.items()
                     if ch in {"event_fts", "chunk_fts", "context"} and cov >= 0.35
                 ]
-                if len(fts_hits) >= 2:
-                    evidence_cap = max(evidence_cap, min(1.0, max(fts_hits) + 0.15))
-                # Title content-term hits are high precision under OR-FTS dilution
-                # (e.g. query 海龟汤第二集 / 心情日记). Raise the evidence floor so
-                # they can clear FALLBACK_DIRECT_THRESHOLD without opening pure
-                # body-only weak matches.
                 title = str(candidate.title or "")
                 content_terms = [
                     term
@@ -1104,6 +1146,15 @@ class RecallEngine:
                     if _is_content_lexical_term(term)
                 ]
                 title_hits = [term for term in content_terms if term in title]
+                # Dual-channel FTS alone is not enough for a single common noun
+                # (心情) shared by many video_experience rows; require multi-term
+                # content or a title hit before the dual boost.
+                if len(fts_hits) >= 2 and (len(content_terms) >= 2 or title_hits):
+                    evidence_cap = max(evidence_cap, min(1.0, max(fts_hits) + 0.15))
+                # Title content-term hits are high precision under OR-FTS dilution
+                # (e.g. query 海龟汤第二集 / 心情日记). Raise the evidence floor so
+                # they can clear FALLBACK_DIRECT_THRESHOLD without opening pure
+                # body-only weak matches.
                 if title_hits:
                     evidence_cap = max(
                         evidence_cap,
@@ -1515,7 +1566,14 @@ class RecallEngine:
             max_associations=self.max_associations,
         )
 
-    def _select_fallback(self, candidates: Sequence[RecallCandidate]) -> list[RecallCandidate]:
+    def _select_fallback(
+        self,
+        candidates: Sequence[RecallCandidate],
+        *,
+        query: RecallQuery | None = None,
+    ) -> list[RecallCandidate]:
+        query_text = str(getattr(query, "current_message", "") or "")
+        self_query = bool(_SELF_MEMORY_QUERY_RE.search(query_text))
         eligible: list[RecallCandidate] = []
         for candidate in candidates:
             candidate.llm_score = None
@@ -1561,22 +1619,48 @@ class RecallEngine:
             }:
                 candidate.final_score = min(1.0, candidate.final_score + 0.03)
             elif source == "web_reference":
-                # Generic search-dump titles are almost never the best answer.
                 if title_cf in {"联网搜索参考", "web reference", "search reference"}:
                     candidate.final_score = max(0.0, candidate.final_score - 0.20)
                 else:
                     candidate.final_score = max(0.0, candidate.final_score - 0.05)
             elif source in {"video_metadata"}:
                 candidate.final_score = max(0.0, candidate.final_score - 0.05)
+            # When the user asks what *I* posted/wrote, strongly prefer bot_action
+            # / diary over random videos that happen to contain 动态 tokens.
+            if self_query:
+                if source == "bot_action" or title_cf == "动态":
+                    candidate.final_score = min(1.0, candidate.final_score + 0.18)
+                elif source in {"diary", "dream", "weekly_summary", "life_plan"}:
+                    candidate.final_score = min(1.0, candidate.final_score + 0.10)
+                elif source in {"video", "video_experience", "subtitle", "comment"}:
+                    candidate.final_score = max(0.0, candidate.final_score - 0.08)
             # Title-term exact-ish bonus: if a content term appears in the title,
             # rank it above body-only weak hits with the same coverage.
             title = str(candidate.title or "").casefold()
-            if title and any(
-                term.casefold() in title
+            title_content_hits = [
+                term
                 for term in (candidate.lexical_matched_terms or set())
-                if _is_content_lexical_term(term) and len(term) >= 3
+                if _is_content_lexical_term(term)
+                and len(term) >= 2
+                and term.casefold() in title
+            ]
+            if title_content_hits:
+                candidate.final_score = min(
+                    1.0, candidate.final_score + 0.08 + 0.03 * min(len(title_content_hits), 2)
+                )
+            # Body-only single-noun video hits are weak versus titled self events.
+            if (
+                source in {"video", "video_experience", "subtitle"}
+                and content_term_count <= 1
+                and not title_content_hits
             ):
-                candidate.final_score = min(1.0, candidate.final_score + 0.04)
+                candidate.final_score = max(0.0, candidate.final_score - 0.10)
+            # ASCII entity in query + title (ATRI) is high-precision.
+            if query_text:
+                for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,24}", query_text):
+                    if token.casefold() in title:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.12)
+                        break
             eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
@@ -1615,18 +1699,24 @@ class RecallEngine:
         if not content_terms:
             return False
         max_lex = max(content_lex)
+        title = str(candidate.title or "")
+        title_hit = any(term in title for term in content_terms if len(term) >= 2)
+        # A single body-only common noun (心情) shared by dozens of videos is not
+        # enough even when OR-FTS coverage looks high after dual-channel hits.
+        if len(content_terms) == 1 and not title_hit and max_lex <= 0.55:
+            return False
         dual_ok = sum(1 for cov in content_lex if cov >= 0.35) >= 2
         # Strict > threshold: weather hit sits at exactly 0.40 on one FTS channel.
         # Multi-term conversational hits land ~0.43+ and still pass.
         if max_lex > FALLBACK_DIRECT_THRESHOLD:
             return True
-        if dual_ok and max_lex >= FALLBACK_DIRECT_THRESHOLD:
+        if dual_ok and max_lex >= FALLBACK_DIRECT_THRESHOLD and (
+            len(content_terms) >= 2 or title_hit
+        ):
             return True
         # Title content-term hits: OR-FTS coverage can look weak when the query
         # includes ordinals/fillers, but a title that literally contains a
         # content term is high-precision evidence.
-        title = str(candidate.title or "")
-        title_hit = any(term in title for term in content_terms if len(term) >= 2)
         if title_hit and max_lex >= 0.25:
             return True
         # Durable self writings with a title hit get a slightly softer floor.
