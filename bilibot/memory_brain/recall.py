@@ -21,8 +21,12 @@ RERANK_MAX_TOKENS = 600
 RERANK_RELEVANCE_BASELINE = 0.65
 DIRECT_THRESHOLD = 0.72
 ASSOCIATION_THRESHOLD = 0.80
-FALLBACK_DIRECT_THRESHOLD = 0.80
-FALLBACK_ASSOCIATION_THRESHOLD = 0.88
+# Conversational Chinese queries often land ~0.43 lexical_coverage after OR-FTS
+# even when multiple distinctive multi-char terms match (雨夜/散步/动态). The old
+# 0.80 gate rejected those under provider_unavailable fallback. Unrelated
+# weather queries stay near 0.0 coverage and still fail closed.
+FALLBACK_DIRECT_THRESHOLD = 0.40
+FALLBACK_ASSOCIATION_THRESHOLD = 0.55
 MAX_FALLBACK_EVENTS = 3
 MIN_VECTOR_COSINE = 0.25
 
