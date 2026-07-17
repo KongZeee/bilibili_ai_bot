@@ -153,3 +153,73 @@ async def test_episode_ordinal_does_not_outrank_title(seeded_store):
     assert any("海龟汤" in (t or "") for t in titles)
     # Ordinal-only noise title should not be the sole winner.
     assert not (len(titles) == 1 and "陪伴" in (titles[0] or ""))
+
+
+
+@pytest.mark.asyncio
+async def test_atri_paraphrase_prefers_entity_title(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="atri-explore",
+            account_id="acc",
+            source_type="web_reference",
+            source_external_id="atri-1",
+            source_text="探索 ATRI -My Dear Moments- 亚托莉 夏生 海边场景 视觉小说资料。",
+            event_title="探索 ATRI -My Dear Moments- 亚托莉 夏生 海边场景 视觉小说",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="noise-90",
+            account_id="acc",
+            source_type="video",
+            source_external_id="v90",
+            source_text="90后这辈子第一次接受到的鼓励式教育，和这部番无关。",
+            event_title="90后这辈子第一次接受到的鼓励式教育",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="追的那部 ATRI 怎么样了", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert any("ATRI" in t for t in titles)
+    assert not any("90后" in t for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_self_dynamic_query_prefers_bot_action(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="dyn-haland",
+            account_id="acc",
+            source_type="bot_action",
+            source_external_id="dyn-1",
+            source_text="亚托莉发布了动态，提到哈兰德表情包和无限暖暖 PV。",
+            event_title="动态",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="vid-kitchen",
+            account_id="acc",
+            source_type="video",
+            source_external_id="vk",
+            source_text="【迪奥の厨房】复刻临榆炸鸡腿成功，皮脆肉嫩。",
+            event_title="【迪奥の厨房】复刻临榆炸鸡腿成功，皮脆肉嫩，香到停止思考！",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你上次发的动态说了什么", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    types = [e.get("source_type") for e in result.events if isinstance(e, dict)]
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert "bot_action" in types or any(t == "动态" for t in titles)
+    assert not any("迪奥" in t for t in titles)

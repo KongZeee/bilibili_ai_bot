@@ -1655,12 +1655,23 @@ class RecallEngine:
                 and not title_content_hits
             ):
                 candidate.final_score = max(0.0, candidate.final_score - 0.10)
-            # ASCII entity in query + title (ATRI) is high-precision.
+            # ASCII entity in query: title hits are high-precision; body-only mentions
+            # (e.g. "和 ATRI 无关") must not outrank a titled ATRI exploration row.
             if query_text:
                 for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,24}", query_text):
-                    if token.casefold() in title:
+                    tok = token.casefold()
+                    if tok in title:
                         candidate.final_score = min(1.0, candidate.final_score + 0.12)
-                        break
+                    else:
+                        body_blob = " ".join(
+                            str(t) for t in (candidate.lexical_matched_terms or set())
+                        ).casefold()
+                        summary_blob = str(candidate.summary or "").casefold()
+                        if tok in body_blob or tok in summary_blob:
+                            candidate.final_score = max(
+                                0.0, candidate.final_score - 0.15
+                            )
+                    break
             eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
