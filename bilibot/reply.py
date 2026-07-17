@@ -440,7 +440,7 @@ class ReplyGenerator:
                 reply_text = await self.llm.generate(
                     prompt=final_user_prompt,
                     system_prompt=system_prompt,
-                    max_tokens=800,
+                    max_tokens=1500,
                 )
 
             # 模型明确不回复 / 空回复 → skip

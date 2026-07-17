@@ -19,8 +19,8 @@ MAX_RERANK_CANDIDATES = 20
 # Reasoning chat models often need 15–40s for a 20-candidate JSON decision.
 RERANK_TIMEOUT_SECONDS = 45.0
 # Reasoning chat models (e.g. agnes-2.0-flash) spend many tokens on hidden
-# chain-of-thought before emitting JSON; 600 often yields empty content.
-RERANK_MAX_TOKENS = 1600
+# chain-of-thought before emitting JSON; 600–800 often yields empty content.
+RERANK_MAX_TOKENS = 2000
 RERANK_RELEVANCE_BASELINE = 0.65
 DIRECT_THRESHOLD = 0.72
 ASSOCIATION_THRESHOLD = 0.80
