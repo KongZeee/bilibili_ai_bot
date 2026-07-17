@@ -145,6 +145,7 @@ _LEXICAL_STOP_TERMS = frozenset(
         "讲了",
         "说了",
         "看了",
+        "情日",
     }
 )
 
@@ -1101,7 +1102,24 @@ class RecallEngine:
 
     @staticmethod
     def _rough_order(candidates: Mapping[str, RecallCandidate]) -> list[RecallCandidate]:
-        return sorted(candidates.values(), key=lambda item: (-item.rrf_score, item.event_id))
+        def key(item: RecallCandidate) -> tuple:
+            content_terms = {
+                term
+                for term in (item.lexical_matched_terms or set())
+                if _is_content_lexical_term(term)
+            }
+            title = str(item.title or "").casefold()
+            title_hits = sum(1 for term in content_terms if term.casefold() in title)
+            # Prefer multi-term + title hits so distinctive self events survive
+            # the top-k cut before fallback ranking.
+            return (
+                -len(content_terms),
+                -title_hits,
+                -item.rrf_score,
+                item.event_id,
+            )
+
+        return sorted(candidates.values(), key=key)
 
     async def _validate_and_enrich(
         self, candidates: Sequence[RecallCandidate], errors: dict[str, str]
@@ -1493,12 +1511,14 @@ class RecallEngine:
                 if candidate.kind == "association"
                 else FALLBACK_DIRECT_THRESHOLD
             )
-            if candidate.final_score < threshold:
+            # Title/self near-threshold candidates may sit slightly under the
+            # numeric gate after OR-FTS dilution; content evidence check is the
+            # real safety net.
+            if candidate.final_score < threshold and not (
+                candidate.final_score >= 0.30
+                and RecallEngine._fallback_has_content_evidence(candidate)
+            ):
                 continue
-            # Recent/graph-only RRF ranks must not inject under provider_unavailable.
-            # Utility queries (weather/math) often rank a random video via event_fts
-            # at exactly FALLBACK_DIRECT_THRESHOLD from one weak OR-term; require
-            # content-bearing evidence and strict coverage for single-channel hits.
             if not RecallEngine._fallback_has_content_evidence(candidate):
                 continue
             # Prefer multi-term content matches over single common noun hits
@@ -1578,6 +1598,21 @@ class RecallEngine:
         if max_lex > FALLBACK_DIRECT_THRESHOLD:
             return True
         if dual_ok and max_lex >= FALLBACK_DIRECT_THRESHOLD:
+            return True
+        # Near-threshold rescue for durable self writings with a title hit when
+        # OR-FTS coverage is diluted by multi-term queries (e.g. 心情日记).
+        # Keep this narrow: title_hit alone on ordinary videos re-opens pollution.
+        title = str(candidate.title or "")
+        title_hit = any(term in title for term in content_terms if len(term) >= 2)
+        source = str(candidate.source_type or "").strip().casefold()
+        durable_self = source in {
+            "bot_action",
+            "diary",
+            "dream",
+            "life_plan",
+            "weekly_summary",
+        }
+        if max_lex >= 0.30 and durable_self and title_hit:
             return True
         return False
 
