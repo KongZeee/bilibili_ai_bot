@@ -59,11 +59,24 @@ export const MemoryRecallPage = defineComponent({
         const channelErrors = computed(() => Object.entries(trace.value.channel_errors || {}));
 
         async function loadTraces() {
-            accountId.value = appState.currentAccountId || appState.accounts[0]?.id;
-            if (!accountId.value) return;
+            const nextId = appState.currentAccountId
+                || appState.accounts[0]?.account_id
+                || appState.accounts[0]?.id
+                || '';
+            if (!nextId) {
+                accountId.value = '';
+                traces.value = [];
+                return;
+            }
+            if (accountId.value && accountId.value !== nextId) {
+                result.value = null;
+                traces.value = [];
+            }
+            accountId.value = nextId;
             historyLoading.value = true;
             try {
                 const data = await api.memory.recallTraces(accountId.value, { limit: 30 });
+                if (accountId.value !== nextId) return;
                 traces.value = data?.items || [];
             } catch (e) {
                 showToast('读取召回记录失败: ' + e.message, 'error');
@@ -76,12 +89,14 @@ export const MemoryRecallPage = defineComponent({
             if (!accountId.value || !query.value.trim()) return;
             loading.value = true;
             activeTraceId.value = '';
+            const boundAccount = accountId.value;
             try {
                 const turns = recentTurns.value
                     .split('\n')
                     .map(line => line.trim())
                     .filter(Boolean)
                     .slice(-6);
+                // 仅账号级 API；body 带 account_id 便于后端日志/审计对齐
                 result.value = await api.memory.recall(accountId.value, {
                     query: query.value.trim(),
                     recent_turns: turns,
@@ -89,7 +104,9 @@ export const MemoryRecallPage = defineComponent({
                     bvid: bvid.value.trim(),
                     oid: oid.value.trim(),
                     scene: scene.value || 'memory_debug',
+                    account_id: boundAccount,
                 });
+                if (accountId.value !== boundAccount) return;
                 activeTraceId.value = result.value?.trace_id || '';
                 await loadTraces();
             } catch (e) {
@@ -129,10 +146,11 @@ export const MemoryRecallPage = defineComponent({
         }
 
         onMounted(loadTraces);
-        watch(() => appState.currentAccountId, (newId) => {
-            if (!newId) return;
+        watch(() => appState.currentAccountId, (newId, prevId) => {
+            if (!newId || newId === prevId) return;
             result.value = null;
             traces.value = [];
+            activeTraceId.value = '';
             loadTraces();
         });
 

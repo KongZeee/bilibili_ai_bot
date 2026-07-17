@@ -487,14 +487,15 @@ class ConfigLoader:
         Args:
             account_id: 目标账号 id；空或找不到时写 V1 bilibili 段
             patch: 要合并的字段（sessdata/bili_jct/buvid*/refresh_token 等）
-            filepath: 配置路径；默认 self.filepath 或 config.yaml
+            filepath: 配置路径；默认 self.filepath。两者都为空时仅更新内存，
+                禁止猜测当前工作目录下的 config.yaml。
 
         Returns:
             True 如果至少写入了一个字段
         """
         if not isinstance(patch, dict) or not patch:
             return False
-        path = filepath or self.filepath or "config.yaml"
+        path = filepath or self.filepath
         with self._write_lock:
             written = False
             accounts = self._raw_config.get("accounts")
@@ -519,6 +520,15 @@ class ConfigLoader:
                     written = True
             if not written:
                 return False
+            # ConfigLoader 也可作为纯内存配置用于测试、嵌入式调用和预览。
+            # 此时猜测 cwd/config.yaml 会覆盖调用者的真实生产配置；只同步内存。
+            if not path:
+                self._original_config = copy.deepcopy(self._raw_config)
+                self._apply_config()
+                logger.warning(
+                    "配置加载器未绑定文件路径，账号凭据仅更新内存，未写入磁盘"
+                )
+                return True
             # 在锁内保存：传入当前内存配置的快照，避免 save 再被并发改
             self.save_config(copy.deepcopy(self._raw_config), path)
             return True

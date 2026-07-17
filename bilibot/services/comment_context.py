@@ -125,6 +125,7 @@ class CommentContextService:
             persona_id=persona_id,
             video=video,
             recent_turns=recent_turns or [],
+            scene="reply_comment",
         )
 
         # 7. 当前心情
@@ -192,12 +193,15 @@ class CommentContextService:
                         )
                     )
                 except ContextArchiveError as archive_exc:
-                    # 元数据归档失败不应阻断评论回复：仍返回标题/UP，complete=False。
-                    logger.warning(
-                        "视频元数据归档失败，降级为不完整上下文 oid=%s: %s",
+                    # The fetched metadata is already being used as model
+                    # context. If it cannot enter the account brain, generating
+                    # a reply would create an unremembered experience.
+                    logger.error(
+                        "视频元数据归档失败，阻断本次评论上下文 oid=%s: %s",
                         oid,
                         type(archive_exc).__name__,
                     )
+                    raise
 
             # 仅元数据：可回填标题/UP，但禁止模型编造视听细节。
             return VideoContext(
@@ -212,7 +216,6 @@ class CommentContextService:
                 publish_time=str(info.get("pubdate", "") or ""),
             ), False
         except ContextArchiveError:
-            # 不应再到达：上面已吞掉 metadata 归档错误。
             raise
         except Exception as e:
             logger.warning(f"获取视频信息失败 oid={oid}: {e}")
@@ -514,8 +517,14 @@ class CommentContextService:
         persona_id: str = "",
         video: Optional[VideoContext] = None,
         recent_turns: Optional[List[Any]] = None,
+        scene: str = "reply_comment",
     ) -> str:
-        """Run the single account-wide V6 recall contract for this input."""
+        """Account-wide V6 hybrid recall (Direct + Association).
+
+        Never speaker-only: speaker_actor_id is a boost channel; global_recent +
+        FTS/vector always surface Bot self experiences (video / bangumi /
+        dynamic / companion) when relevant.
+        """
         if not self.memory_brain or not callable(getattr(self.memory_brain, "recall", None)):
             return ""
         try:
@@ -523,24 +532,41 @@ class CommentContextService:
 
             video_title = ""
             bvid = ""
+            entity_hints: list[str] = []
             if video:
                 raw_title = str(video.title or "").strip()
                 if raw_title and raw_title not in self._PLACEHOLDER_TITLES:
                     video_title = raw_title
+                    entity_hints.append(raw_title)
                 bvid = str(video.bvid or "")
+                owner = str(getattr(video, "owner_name", "") or "").strip()
+                if owner:
+                    entity_hints.append(owner)
+            # Nudge query so bot self experiences are lexical-eligible
+            msg = str(message or "").strip()
+            if video_title and video_title not in msg:
+                msg = f"视频《{video_title}》\n{msg}".strip()
+            account_id = str(
+                getattr(self.memory_brain, "account_id", "")
+                or getattr(self, "account_id", "")
+                or ""
+            )
             result = await self.memory_brain.recall(
                 RecallQuery(
-                    current_message=message,
+                    current_message=msg,
                     recent_turns=tuple(recent_turns or ()),
-                    account_id=getattr(self.memory_brain, "account_id", ""),
-                    speaker_actor_id=str(user_id),
+                    account_id=account_id,
+                    # speaker boost only — hybrid channels still pull Bot self
+                    speaker_actor_id=str(user_id or ""),
                     title=video_title,
                     bvid=bvid,
-                    oid=str(oid),
-                    scene="reply_comment",
+                    oid=str(oid or ""),
+                    scene=RecallQuery.normalize_scene(scene),
+                    entity_hints=tuple(entity_hints),
                 )
             )
-            return result.prompt_evidence
+            evidence = result.prompt_evidence if result is not None else ""
+            return str(evidence or "")
         except Exception as exc:
             logger.warning("V6 记忆召回失败，降级为空: %s", type(exc).__name__)
             return ""

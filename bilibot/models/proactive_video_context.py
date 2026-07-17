@@ -17,12 +17,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 # 各段独立截断上限（防止 prompt 膨胀）。
-# 视听 log 基于真实 memory_brain 样本：p50≈2.9k / p75≈10k，
-# 10000 可完整覆盖约 3/4 的 behavior_log；搜索只作弱参考，预算单独压小。
+# Prompt 侧只注入摘要窗口；完整 behavior_log 已独立归档到 memory brain，
+# 不应为了“完整”再次塞入模型上下文并造成成本/延迟失控。
 _MAX_METADATA_CHARS = 2000
 _MAX_HOT_COMMENTS_CHARS = 2000
 _MAX_SEARCH_REFERENCE_CHARS = 800
-_MAX_AUDIOVISUAL_CHARS = 10000
+_MAX_AUDIOVISUAL_CHARS = 2000
 # 兼容旧测试/外部引用
 _MAX_SECTION_CHARS = _MAX_AUDIOVISUAL_CHARS
 
@@ -51,6 +51,11 @@ class ProactiveVideoContext:
     search_reference: Optional[Dict[str, Any]] = None
     audiovisual: Optional[Dict[str, Any]] = None
     degradation_reasons: List[str] = field(default_factory=list)
+    # 账号级 V6 混合召回（近期视频/番剧/日记/评论等）；不进入归档 envelope 的
+    # 原始媒体字段，仅供评价/主动评论 prompt 与 audit 使用。
+    memory_evidence: str = ""
+    memory_event_ids: List[str] = field(default_factory=list)
+    companion_context: str = ""
 
     # ─── Prompt 构建 ───
 
@@ -77,14 +82,23 @@ class ProactiveVideoContext:
             if hc:
                 sections.append(hc)
 
-        # 视听优先于搜索：评价/评论主要依赖 behavior_log，避免搜索抢额度。
+        sr = self._format_search_reference()
+        if sr:
+            sections.append(sr)
+
         av = self._format_audiovisual()
         if av:
             sections.append(av)
 
-        sr = self._format_search_reference()
-        if sr:
-            sections.append(sr)
+        mem = str(self.memory_evidence or "").strip()
+        if mem:
+            sections.append(
+                "【相关记忆/近期经历】\n" + mem[:1800]
+            )
+
+        life = str(self.companion_context or "").strip()
+        if life:
+            sections.append("【你今天的状态与念头】\n" + life[:500])
 
         if self.degradation_reasons:
             sections.append(self._format_degradation())
@@ -218,6 +232,8 @@ class ProactiveVideoContext:
         ])
 
     def to_dict(self) -> dict:
+        # memory/companion 不写入 video_observation envelope，避免把 prompt 证据
+        # 当成「本片视听」二次归档；仅返回媒体侧字段。
         return {
             "bvid": self.bvid,
             "metadata": self.metadata,
@@ -225,4 +241,12 @@ class ProactiveVideoContext:
             "search_reference": self.search_reference,
             "audiovisual": self.audiovisual,
             "degradation_reasons": list(self.degradation_reasons),
+        }
+
+    def prompt_memory_bundle(self) -> dict:
+        """Fields for evaluate / proactive-comment generation (not for archive)."""
+        return {
+            "memory_evidence": str(self.memory_evidence or ""),
+            "memory_event_ids": list(self.memory_event_ids or []),
+            "companion_context": str(self.companion_context or ""),
         }

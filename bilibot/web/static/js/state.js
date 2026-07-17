@@ -37,7 +37,7 @@ export async function refreshAccounts() {
         appState.accounts = list;
         appState.accountsLoaded = true;
         if (!appState.currentAccountId && appState.accounts.length > 0) {
-            appState.currentAccountId = appState.accounts[0].id;
+            const _a0 = appState.accounts[0]; appState.currentAccountId = _a0.account_id || _a0.id;
         }
     } catch (e) {
         showToast('加载账号列表失败: ' + e.message, 'error');

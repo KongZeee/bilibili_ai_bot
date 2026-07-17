@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 
 from bilibot.memory_brain.ingestion import (
     bangumi_episode_observation,
+    bot_action_observation,
     text_observation,
 )
 from bilibot.memory_brain.models import Observation, SourceDocument
@@ -67,6 +68,8 @@ class BangumiService:
         account_id: str = "",
         persona_id: str = "",
         persona: str = "",
+        companion=None,
+        safety_checker=None,
     ):
         """
         Args:
@@ -75,9 +78,11 @@ class BangumiService:
             video_service: VideoUnderstandingService 实例
             config_loader: ConfigLoader 实例
             data_dir: 数据目录
-            memory_brain: 当前账号的 MemoryBrainService；省略时为旧调用方自动创建
+            memory_brain: 当前账号的 MemoryBrainService；必须由账号运行时注入
             account_id: 账号 ID，用于严格隔离脑库
             persona_id/persona: 本次观察所用人格 ID，仅作为来源信息
+            companion: 可选 CompanionLifeService，评价时注入生活面
+            safety_checker: 应用级 SafetyChecker；缺失时所有站外互动 fail-closed
         """
         self.bili = bili_api
         self.llm = llm_manager
@@ -94,7 +99,17 @@ class BangumiService:
         if brain_account_id and brain_account_id != self.account_id:
             raise ValueError("bangumi memory brain belongs to a different account")
         self.persona_id = str(persona_id or persona or "")
-        self.memory_brain = memory_brain or self._create_memory_brain()
+        self.companion = companion
+        self.safety_checker = safety_checker
+        self._action_locks: dict[str, asyncio.Lock] = {}
+        # Production AccountInstance always injects the account brain. Creating a
+        # second brain under data_dir would break isolation / reload semantics.
+        if memory_brain is None:
+            raise RuntimeError(
+                "BangumiService requires an account-scoped memory_brain "
+                "(fail-closed: no silent orphan brain)"
+            )
+        self.memory_brain = memory_brain
 
     def _ensure_dirs(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -108,8 +123,65 @@ class BangumiService:
                 return None
         return self.llm if provider_type == "chat" else None
 
+    def _require_memory_brain(self):
+        brain = getattr(self, "memory_brain", None)
+        if brain is None:
+            raise RuntimeError("bangumi memory brain is not initialized")
+        brain_account = str(getattr(brain, "account_id", "") or "")
+        if brain_account and brain_account != str(self.account_id):
+            raise ValueError("bangumi memory brain belongs to a different account")
+        return brain
+
+    def rebind_memory_brain(self, memory_brain) -> None:
+        """Hot-reload: re-attach the account brain after config reload."""
+        if memory_brain is None:
+            raise RuntimeError("cannot rebind bangumi to empty memory_brain")
+        brain_account = str(getattr(memory_brain, "account_id", "") or "")
+        if brain_account and brain_account != str(self.account_id):
+            raise ValueError("bangumi memory brain belongs to a different account")
+        self.memory_brain = memory_brain
+
+    def rebind_safety_checker(self, safety_checker) -> None:
+        """Hot-reload: keep bangumi interactions on the application safety gate."""
+        self.safety_checker = safety_checker
+
+    def _bangumi_options(self) -> Dict[str, Any]:
+        """Return one normalized options mapping for old and new configs.
+
+        ``proactive.bangumi`` is historically a boolean feature hint, while
+        early implementations also accepted an object at the same path.  A
+        production config with ``true`` must therefore never be treated like a
+        mapping.  The optional top-level ``bangumi`` mapping is preferred for
+        new deployments; legacy proactive fields remain compatible.
+        """
+        raw = self.config.get_raw_config() if hasattr(self.config, "get_raw_config") else {}
+        raw = raw if isinstance(raw, Mapping) else {}
+        proactive = raw.get("proactive") or {}
+        proactive = proactive if isinstance(proactive, Mapping) else {}
+
+        options: Dict[str, Any] = {}
+        nested = proactive.get("bangumi")
+        if isinstance(nested, Mapping):
+            options.update(nested)
+        top_level = raw.get("bangumi")
+        if isinstance(top_level, Mapping):
+            options.update(top_level)
+
+        # Preserve the legacy flat controls used by existing config.yaml files.
+        if "comment" not in options and "comment" in proactive:
+            options["comment"] = bool(proactive.get("comment"))
+        if "auto_follow" not in options:
+            if "follow" in proactive:
+                options["auto_follow"] = bool(proactive.get("follow"))
+            else:
+                options["auto_follow"] = True
+        options.setdefault("continue_score", 7)
+        options.setdefault("max_episodes", 3)
+        options.setdefault("pools", ["trending"])
+        return options
+
     def _create_memory_brain(self):
-        """Keep the legacy constructor usable while writing only the V6 brain."""
+        """Test/legacy helper only; production must inject brain via ctor."""
         from bilibot.memory_brain.service import MemoryBrainService
 
         return MemoryBrainService(
@@ -125,7 +197,7 @@ class BangumiService:
     # ══════════════════════════════════════
 
     def _get_watched_ep_ids(self, season_id) -> set:
-        states = self.memory_brain.list_bangumi_watch_state(
+        states = self._require_memory_brain().list_bangumi_watch_state(
             season_id=str(season_id), limit=5000
         )
         return {
@@ -144,7 +216,8 @@ class BangumiService:
         )
 
     def _mark_season_completed(self, season_id: Any) -> None:
-        states = self.memory_brain.list_bangumi_watch_state(
+        brain = self._require_memory_brain()
+        states = brain.list_bangumi_watch_state(
             season_id=str(season_id), limit=5000
         )
         if not states:
@@ -152,7 +225,7 @@ class BangumiService:
         latest = states[0]
         metadata = dict(latest.get("metadata") or {})
         metadata["season_completed"] = True
-        self.memory_brain.upsert_bangumi_watch_state(
+        brain.upsert_bangumi_watch_state(
             str(season_id),
             str(latest["episode_id"]),
             episode_title=str(latest.get("episode_title") or ""),
@@ -174,7 +247,8 @@ class BangumiService:
 
     async def _get_context_summary(self, season_id, season_title) -> str:
         """Build evaluation context from archived brain events, not legacy JSON."""
-        states = self.memory_brain.list_bangumi_watch_state(
+        brain = self._require_memory_brain()
+        states = brain.list_bangumi_watch_state(
             season_id=str(season_id), limit=5000
         )
         if not states:
@@ -185,8 +259,8 @@ class BangumiService:
             metadata = dict(state.get("metadata") or {})
             evaluation = dict(metadata.get("evaluation") or {})
             event_id = str(metadata.get("memory_event_id") or "")
-            if event_id and hasattr(self.memory_brain, "get_event"):
-                event = self.memory_brain.get_event(event_id, chunks_per_event=0)
+            if event_id and hasattr(brain, "get_event"):
+                event = brain.get_event(event_id, chunks_per_event=0)
                 if inspect.isawaitable(event):
                     event = await event
                 for source in (event or {}).get("sources", []):
@@ -205,14 +279,117 @@ class BangumiService:
             )
         return f"【《{season_title}》已看 {len(states)} 集，最近记录】\n" + "\n".join(lines)
 
+    async def _recall_for_bangumi(
+        self,
+        *,
+        season_title: str = "",
+        episode_title: str = "",
+        episode_index: str = "",
+        season_id: str = "",
+        styles: str = "",
+    ) -> Dict[str, Any]:
+        """Hybrid recall so evaluation/comment can link other scenes' memories.
+
+        Failures degrade to empty evidence; archive path remains fail-closed.
+        """
+        empty = {"memory_evidence": "", "memory_event_ids": []}
+        brain = getattr(self, "memory_brain", None)
+        if brain is None or not callable(getattr(brain, "recall", None)):
+            return empty
+        query_parts = [
+            "番剧 看番 评价 日记 视频",
+            str(season_title or "").strip(),
+            f"第{episode_index}话" if episode_index else "",
+            str(episode_title or "").strip(),
+            str(styles or "").strip(),
+        ]
+        query_text = " ".join(p for p in query_parts if p).strip() or "最近追番经历"
+        try:
+            begin = getattr(brain, "begin_activity", None)
+            if callable(begin) and callable(getattr(type(brain), "begin_activity", None)):
+                result = await begin(
+                    action_key=(
+                        f"bangumi_watch:{season_id or season_title}:{episode_index}:evaluate"
+                    ),
+                    action_type="evaluate_bangumi_episode",
+                    current_activity=(
+                        "正在观看并评价一集番剧，会结合此前追番进度、最近经历和当前感受决定评价、评论及是否继续追。"
+                    ),
+                    query=query_text,
+                    scene="bangumi",
+                    title=str(season_title or "").strip(),
+                    oid=str(season_id or "").strip(),
+                    persona_id=self.persona_id,
+                    metadata={
+                        "season_id": str(season_id or ""),
+                        "episode_index": str(episode_index or ""),
+                    },
+                )
+            else:
+                from bilibot.memory_brain import RecallQuery
+
+                result = await brain.recall(
+                    RecallQuery(
+                        current_message=query_text,
+                        account_id=self.account_id or "",
+                        title=str(season_title or "").strip(),
+                        oid=str(season_id or "").strip(),
+                        scene="bangumi",
+                        entity_hints=tuple(
+                            h
+                            for h in (
+                                str(season_title or "").strip(),
+                                str(episode_title or "").strip(),
+                            )
+                            if h
+                        ),
+                    )
+                )
+        except Exception as exc:
+            if callable(getattr(type(brain), "begin_activity", None)):
+                raise RuntimeError("bangumi activity memory failed") from exc
+            logger.debug("bangumi hybrid recall failed: %s", type(exc).__name__)
+            return empty
+        evidence = str(
+            getattr(result, "prompt_text", "")
+            or getattr(result, "prompt_evidence", "")
+            or ""
+        ) if result else ""
+        event_ids: List[str] = []
+        activity_ids = list(getattr(result, "event_ids", ()) or ()) if result else []
+        for eid in activity_ids:
+            eid = str(eid or "").strip()
+            if eid and eid not in event_ids:
+                event_ids.append(eid)
+        for ev in (getattr(result, "events", ()) or ()) if result else ():
+            if not isinstance(ev, dict):
+                continue
+            eid = str(ev.get("id") or ev.get("event_id") or "").strip()
+            if eid and eid not in event_ids:
+                event_ids.append(eid)
+        if evidence:
+            logger.info(
+                "番剧混合召回: events=%s evidence_chars=%s title=%s",
+                len(event_ids),
+                len(evidence),
+                (season_title or "")[:40],
+            )
+        return {
+            "memory_evidence": evidence,
+            "memory_event_ids": event_ids[:20],
+        }
+
     # ══════════════════════════════════════
     #  选番
     # ══════════════════════════════════════
 
     async def pick_bangumi(self) -> Optional[int]:
         """选一部番：排行/时间表 → 去重 → 排除已看完 → 追更优先 → 随机选"""
-        raw = self.config.get_raw_config() if hasattr(self.config, "get_raw_config") else {}
-        pools = (raw.get("proactive", {}).get("bangumi", {}).get("pools", ["trending"])) or ["trending"]
+        pools = self._bangumi_options().get("pools") or ["trending"]
+        if isinstance(pools, str):
+            pools = [pools]
+        elif not isinstance(pools, Sequence):
+            pools = ["trending"]
 
         candidates = []
         for pool in pools:
@@ -260,7 +437,7 @@ class BangumiService:
 
         states_by_season = {
             str(candidate["season_id"]): list(
-                self.memory_brain.list_bangumi_watch_state(
+                self._require_memory_brain().list_bangumi_watch_state(
                     season_id=str(candidate["season_id"]), limit=5000
                 )
             )
@@ -343,6 +520,8 @@ class BangumiService:
         Returns:
             {"watched": n, "season_title": "...", "last_score": n}
         """
+        # Fail-closed: no brain → never mark progress / never interact.
+        self._require_memory_brain()
         if not season_id:
             season_id = await self.pick_bangumi()
         if not season_id:
@@ -380,8 +559,12 @@ class BangumiService:
             return {"watched": 0, "season_title": season_title, "completed": True}
 
         raw = self.config.get_raw_config() if hasattr(self.config, "get_raw_config") else {}
-        bangumi_cfg = raw.get("proactive", {}).get("bangumi", {})
-        continue_score = bangumi_cfg.get("continue_score", 7)
+        raw = raw if isinstance(raw, Mapping) else {}
+        bangumi_cfg = self._bangumi_options()
+        try:
+            continue_score = max(1, min(10, int(bangumi_cfg.get("continue_score", 7))))
+        except (TypeError, ValueError):
+            continue_score = 7
         comment_enabled = bangumi_cfg.get("comment", True)
         auto_follow = bangumi_cfg.get("auto_follow", True)
         like_enabled = raw.get("interactions", {}).get("like", {}).get("enabled", False)
@@ -500,9 +683,25 @@ class BangumiService:
             )
             raise
 
-        # 3. LLM 评价
+        # 3. LLM 评价（本剧进度 + 跨场景混合召回）
         analysis = str(analysis_result.get("behavior_log") or "")
-        evaluation = await self._evaluate_episode(season_info, ep_info, analysis, context)
+        memory_bundle = await self._recall_for_bangumi(
+            season_title=season_title,
+            episode_title=ep_title,
+            episode_index=str(ep_index),
+            season_id=str(season_info.get("season_id", "") or ""),
+            styles=str(season_info.get("styles") or ""),
+        )
+        memory_evidence = str(memory_bundle.get("memory_evidence") or "")
+        memory_event_ids = list(memory_bundle.get("memory_event_ids") or [])
+        evaluation = await self._evaluate_episode(
+            season_info,
+            ep_info,
+            analysis,
+            context,
+            memory_evidence=memory_evidence,
+            companion_context="",  # resolved inside from self.companion if present
+        )
         if not evaluation:
             evaluation = {"score": 5, "comment": "", "mood": "平静", "review": "没什么特别的感觉", "want_continue": False}
 
@@ -517,8 +716,9 @@ class BangumiService:
         review = evaluation.get("review", "")
         logger.info(f"评分：{score}/10 | 心情：{mood} | 短评：{(comment or '')[:30]}")
 
-        # 4. 原始提取内容与评价必须先持久提交；失败时不允许主动互动。
+        # 4. 原始提取内容与评价必须先持久提交；失败时不允许主动互动 / 不推进 completed。
         try:
+            self._require_memory_brain()
             envelope = self._build_episode_envelope(
                 season_info,
                 ep_info,
@@ -528,7 +728,9 @@ class BangumiService:
             )
             existing_event = await self._find_existing_episode_event(envelope.idempotency_key)
             if existing_event:
-                memory_event_id = str(existing_event.get("id") or "")
+                memory_event_id = str(
+                    existing_event.get("id") or existing_event.get("event_id") or ""
+                )
             else:
                 archived = await self._archive_envelope(envelope)
                 memory_event_id = str(
@@ -538,6 +740,14 @@ class BangumiService:
                         if isinstance(archived, Mapping)
                         else ""
                     )
+                )
+            if not memory_event_id:
+                # Existing hit without id is still a committed observation; keep going
+                # but surface empty id for metadata.
+                logger.debug(
+                    "bangumi archive missing event_id sid=%s ep=%s",
+                    season_info.get("season_id", 0),
+                    ep_id,
                 )
 
             # 5. 只有完整档案成功后才执行互动；每个实际结果单独归档。
@@ -549,6 +759,7 @@ class BangumiService:
                 comment_enabled=comment_enabled,
                 auto_follow=auto_follow,
                 like_enabled=like_enabled,
+                memory_evidence=memory_evidence,
             )
 
             completed_ids = self._get_watched_ep_ids(season_info.get("season_id", 0))
@@ -559,7 +770,7 @@ class BangumiService:
                 if item.get("ep_id")
             }
             season_completed = bool(catalog_ids) and catalog_ids.issubset(completed_ids)
-            self.memory_brain.upsert_bangumi_watch_state(
+            self._require_memory_brain().upsert_bangumi_watch_state(
                 str(season_info.get("season_id", 0)),
                 str(ep_id),
                 episode_title=ep_title,
@@ -570,6 +781,7 @@ class BangumiService:
                     "episode_index": str(ep_index),
                     "evaluation": dict(evaluation),
                     "memory_event_id": memory_event_id,
+                    "recall_memory_event_ids": memory_event_ids[:12],
                     "action_results": action_results,
                     "season_completed": season_completed,
                 },
@@ -595,11 +807,12 @@ class BangumiService:
         return score, evaluation
 
     async def _archive_envelope(self, envelope):
-        method = getattr(self.memory_brain, "archive_observation_async", None)
+        brain = self._require_memory_brain()
+        method = getattr(brain, "archive_observation_async", None)
         if callable(method):
             result = method(envelope)
         else:
-            result = self.memory_brain.archive_observation(envelope)
+            result = brain.archive_observation(envelope)
         archived = await result if inspect.isawaitable(result) else result
         committed = (
             archived.get("source_committed", True)
@@ -611,13 +824,16 @@ class BangumiService:
         return archived
 
     async def _find_existing_episode_event(self, idempotency_key: str):
-        method = getattr(self.memory_brain, "find_by_identifiers", None)
+        brain = self._require_memory_brain()
+        method = getattr(brain, "find_by_identifiers", None)
         if not callable(method):
             return None
         events = method([idempotency_key], limit=1)
         if inspect.isawaitable(events):
             events = await events
-        return events[0] if events else None
+        if not events:
+            return None
+        return events[0] if isinstance(events, (list, tuple)) else events
 
     @classmethod
     def _safe_extracted_data(cls, value: Any) -> Any:
@@ -669,6 +885,7 @@ class BangumiService:
             analysis_result=analysis_result,
             subtitle_segments=subtitle_segments,
             persona_id=self.persona_id,
+            evaluation=evaluation,
         )
         sources = list(envelope.normalized_sources())
 
@@ -806,6 +1023,7 @@ class BangumiService:
         comment_enabled: bool,
         auto_follow: bool,
         like_enabled: bool,
+        memory_evidence: str = "",
     ) -> list[dict[str, Any]]:
         aid = ep_info.get("aid", 0)
         if not aid:
@@ -825,7 +1043,12 @@ class BangumiService:
         if score >= 6 and comment_enabled:
             if not comment:
                 comment = await self._generate_comment(
-                    str(season_info.get("title") or ""), ep_info.get("ep_index", "?")
+                    str(season_info.get("title") or ""),
+                    ep_info.get("ep_index", "?"),
+                    memory_evidence=memory_evidence,
+                    episode_title=str(
+                        ep_info.get("long_title") or ep_info.get("title") or ""
+                    ),
                 ) or "这集还行"
             result = await self._execute_and_archive_action(
                 season_info,
@@ -864,54 +1087,148 @@ class BangumiService:
         operation,
         content: str = "",
     ) -> dict[str, Any]:
-        error = ""
-        try:
-            raw = await operation()
-            # Optional[bool]: None means transport uncertainty — not a clean success
-            if raw is None:
-                success = False
-                error = "RESULT_UNKNOWN"
-            else:
-                success = bool(raw)
-        except Exception as exc:
-            success = False
-            error = type(exc).__name__
-            logger.warning("番剧%s失败: %s", label, error)
-        result = {
-            "action_type": action_type,
-            "label": label,
-            "success": success,
-            "error": error,
-            "content": content,
-        }
         season_id = season_info.get("season_id", 0)
         ep_id = ep_info.get("ep_id", 0)
-        outcome = "成功" if success else "失败"
-        envelope = text_observation(
-            account_id=self.account_id,
-            idempotency_key=(
-                f"bangumi:{season_id}:{ep_id}:action:{action_type}:"
-                f"{'success' if success else 'failed'}"
-            ),
-            source_type="bot_action",
-            event_type="bot_action_result",
-            text=(
-                f"番剧《{season_info.get('title', '')}》第"
-                f"{ep_info.get('ep_index', '?')}话：{label}{outcome}。"
-                + (f"实际内容：{content}" if content else "")
-            ),
-            title=f"番剧{label}结果",
-            persona_id=self.persona_id,
-            scene="bangumi",
-            metadata={
-                **result,
+        action_key = f"bangumi:{season_id}:{ep_id}:action:{action_type}"
+        lock = self._action_locks.setdefault(action_key, asyncio.Lock())
+
+        async with lock:
+            base_metadata = {
+                "label": label,
+                "content": content,
                 "season_id": str(season_id),
                 "episode_id": str(ep_id),
-            },
-            importance=0.55,
-        )
-        await self._archive_envelope(envelope)
-        return result
+                "episode_index": str(ep_info.get("ep_index", "?")),
+            }
+
+            async def archive_state(
+                state: str, *, success: bool, error: str = ""
+            ) -> dict[str, Any]:
+                result = {
+                    "action_type": action_type,
+                    "label": label,
+                    "success": success,
+                    "error": error,
+                    "content": content,
+                }
+                outcome = "成功" if success else (error or "失败")
+                envelope = bot_action_observation(
+                    account_id=self.account_id,
+                    action_key=action_key,
+                    action_type=action_type,
+                    text=(
+                        f"番剧《{season_info.get('title', '')}》第"
+                        f"{ep_info.get('ep_index', '?')}话：{label}{outcome}。"
+                        + (f"实际内容：{content}" if content else "")
+                    ),
+                    published=success,
+                    persona_id=self.persona_id,
+                    title=f"番剧{label}{state}",
+                    scene="bangumi",
+                    metadata={**base_metadata, **result},
+                    importance=0.55,
+                    state=state,
+                )
+                await self._archive_envelope(envelope)
+                return result
+
+            intent = bot_action_observation(
+                account_id=self.account_id,
+                action_key=action_key,
+                action_type=action_type,
+                text=(
+                    f"准备对番剧《{season_info.get('title', '')}》第"
+                    f"{ep_info.get('ep_index', '?')}话执行{label}。"
+                    + (f"拟发布内容：{content}" if content else "")
+                ),
+                published=False,
+                persona_id=self.persona_id,
+                title=f"番剧{label}意图",
+                scene="bangumi",
+                metadata=base_metadata,
+                importance=0.5,
+                state="intent",
+            )
+
+            # A previous intent without a committed outcome may mean the remote
+            # action succeeded just before a crash.  Prefer a deferred/manual
+            # decision over repeating a like/comment/follow.
+            if await self._find_existing_episode_event(intent.idempotency_key):
+                return await archive_state(
+                    "deferred", success=False, error="ACTION_ALREADY_ATTEMPTED"
+                )
+            await self._archive_envelope(intent)
+
+            safety = self.safety_checker
+            if safety is None:
+                return await archive_state(
+                    "rejected", success=False, error="SAFETY_CHECKER_UNAVAILABLE"
+                )
+
+            try:
+                if content:
+                    passed, reason = await safety.check_content(
+                        content,
+                        scene="bangumi_comment",
+                        persona_id=self.persona_id,
+                        account_id=self.account_id,
+                    )
+                elif safety.is_paused():
+                    passed, reason = False, "global_paused"
+                elif safety.is_account_paused(self.account_id):
+                    passed, reason = False, f"account_paused:{self.account_id}"
+                else:
+                    passed, reason = True, "ok"
+            except Exception as exc:
+                passed, reason = False, f"SAFETY_CHECK_FAILED:{type(exc).__name__}"
+            if not passed:
+                return await archive_state("rejected", success=False, error=str(reason))
+
+            rate_scene = f"bangumi_{action_type}"
+            try:
+                rate_ok, rate_reason = safety.check_and_record_rate_limit(
+                    rate_scene, account_id=self.account_id
+                )
+            except Exception as exc:
+                rate_ok, rate_reason = False, f"RATE_CHECK_FAILED:{type(exc).__name__}"
+            if not rate_ok:
+                return await archive_state(
+                    "rejected", success=False, error=str(rate_reason)
+                )
+
+            error = ""
+            state = "failed"
+            try:
+                raw = await operation()
+                if raw is None:
+                    success = False
+                    error = "RESULT_UNKNOWN"
+                    state = "result_unknown"
+                else:
+                    success = bool(raw)
+                    if success:
+                        state = "completed"
+                    else:
+                        error = "REMOTE_REJECTED"
+            except Exception as exc:
+                success = False
+                error = f"RESULT_UNKNOWN:{type(exc).__name__}"
+                state = "result_unknown"
+                logger.warning("番剧%s失败: %s", label, error)
+
+            if not success:
+                try:
+                    safety.refund_publish(rate_scene, account_id=self.account_id)
+                except Exception:
+                    logger.warning("番剧%s限流配额回滚失败", label, exc_info=True)
+
+            result = await archive_state(state, success=success, error=error)
+            if success and content:
+                try:
+                    safety.record_content(content, account_id=self.account_id)
+                except Exception:
+                    logger.warning("番剧评论最近内容记录失败", exc_info=True)
+            return result
 
     @staticmethod
     def _artifact_paths(video_path: Any, analysis_result: Mapping[str, Any]) -> list[Path]:
@@ -980,14 +1297,50 @@ class BangumiService:
             parts.append(f"B站评分：{score}")
         return "\n".join(parts)
 
-    async def _evaluate_episode(self, season_info, ep_info, analysis, context) -> Optional[dict]:
-        """LLM 评价番剧单集"""
+    async def _evaluate_episode(
+        self,
+        season_info,
+        ep_info,
+        analysis,
+        context,
+        memory_evidence: str = "",
+        companion_context: str = "",
+    ) -> Optional[dict]:
+        """LLM 评价番剧单集（本剧进度 + 可选跨场景记忆证据 + 生活面）。"""
         if not self.llm:
             return None
         try:
             provider = self._provider_by_type("chat")
             if not provider:
                 return None
+
+            extra_blocks = []
+            if context:
+                extra_blocks.append(f"【你之前看过的进度】\n{context}")
+            life = str(companion_context or "").strip()
+            if not life:
+                companion = getattr(self, "companion", None)
+                if companion is not None and getattr(companion, "enabled", False):
+                    try:
+                        getter = getattr(companion, "build_proactive_context_block", None)
+                        if callable(getter):
+                            life = str(getter() or "").strip()
+                        if not life:
+                            surface = getattr(companion, "get_prompt_surface", None)
+                            if callable(surface):
+                                life = str(surface() or "").strip()
+                    except Exception:
+                        life = ""
+            if life:
+                block = life if life.startswith("【") else f"【你今天的状态与念头】\n{life}"
+                extra_blocks.append(block[:800])
+            mem = str(memory_evidence or "").strip()
+            if mem:
+                extra_blocks.append(
+                    "【相关记忆/近期经历】（可自然联想，勿编造未出现的细节）\n"
+                    + mem[:1600]
+                )
+            context_block = ("\n" + "\n\n".join(extra_blocks)) if extra_blocks else ""
 
             prompt = _EVAL_PROMPT.format(
                 title=season_info.get("title", ""),
@@ -997,7 +1350,7 @@ class BangumiService:
                 ep_index=ep_info.get("ep_index", "?"),
                 ep_title=ep_info.get("long_title", "") or ep_info.get("title", ""),
                 analysis=analysis if analysis else "（无分析数据）",
-                context=f"\n【你之前看过的进度】\n{context}" if context else "",
+                context=context_block,
             )
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="bangumi_eval", account_id=getattr(self, "account_id", "") or ""):
@@ -1022,15 +1375,35 @@ class BangumiService:
             logger.error(f"番剧评价失败: {e}")
             return None
 
-    async def _generate_comment(self, title, ep_index) -> str:
-        """LLM 生成番剧评论"""
+    async def _generate_comment(
+        self,
+        title,
+        ep_index,
+        memory_evidence: str = "",
+        episode_title: str = "",
+    ) -> str:
+        """LLM 生成番剧评论（可带混合记忆，避免空洞夸赞）。"""
         if not self.llm:
             return ""
         try:
             provider = self._provider_by_type("chat")
             if not provider:
                 return ""
-            prompt = _COMMENT_PROMPT.format(title=title, ep_index=ep_index)
+            mem = str(memory_evidence or "").strip()
+            mem_section = (
+                f"\n【相关记忆/近期经历】\n{mem[:800]}\n" if mem else ""
+            )
+            ep_bit = f"「{episode_title}」" if episode_title else ""
+            prompt = (
+                _COMMENT_PROMPT.format(title=title, ep_index=ep_index)
+                + mem_section
+                + (
+                    f"\n本集标题：{ep_bit}\n"
+                    "评论尽量点到本集具体感受，若记忆相关可自然带一句，不要复述记忆。"
+                    if (mem or episode_title)
+                    else ""
+                )
+            )
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="bangumi_comment", account_id=getattr(self, "account_id", "") or ""):
                 return await provider.generate(prompt, max_tokens=80) or ""
@@ -1082,5 +1455,12 @@ class BangumiService:
         # 看一部更新的番
         target = random.choice(to_watch)
         logger.info(f"触发追番更新：《{target.get('title', '')}》")
-        result = await self.watch_bangumi(season_id=target["season_id"], max_episodes=3)
+        options = self._bangumi_options()
+        try:
+            max_episodes = max(1, min(10, int(options.get("max_episodes", 3))))
+        except (TypeError, ValueError):
+            max_episodes = 3
+        result = await self.watch_bangumi(
+            season_id=target["season_id"], max_episodes=max_episodes
+        )
         return {"updated": len(to_watch), "watched": result.get("watched", 0)}

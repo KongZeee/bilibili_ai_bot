@@ -14,6 +14,9 @@ from .models import ProviderNotConfigured, VectorDimensionError
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
+# rebind_providers 区分「未传」与「显式 None」
+_UNSET = object()
+
 
 # Background association is intentionally conservative. A language model can
 # propose topical links, but only an explicit workflow can establish semantic
@@ -124,9 +127,33 @@ def validate_suggested_links(
 class MemoryModelGateway:
     """Keep chat and embedding providers independent and explicit."""
 
-    def __init__(self, chat_provider: Any = None, embedding_provider: Any = None) -> None:
+    def __init__(
+        self,
+        chat_provider: Any = None,
+        embedding_provider: Any = None,
+        *,
+        account_id: str = "",
+    ) -> None:
         self.chat_provider = chat_provider
         self.embedding_provider = embedding_provider
+        # 用于 token usage_context 归因（未传则为空，兼容旧调用）
+        self.account_id = str(account_id or "")
+
+    def rebind_providers(
+        self,
+        *,
+        chat_provider: Any = _UNSET,
+        embedding_provider: Any = _UNSET,
+    ) -> None:
+        """热重载：替换 chat/embedding provider（不重建 worker/store）。
+
+        未传的侧保持不变；显式传 None 清空该侧。
+        例：rebind_providers(embedding_provider=ep)
+        """
+        if chat_provider is not _UNSET:
+            self.chat_provider = chat_provider
+        if embedding_provider is not _UNSET:
+            self.embedding_provider = embedding_provider
 
     @staticmethod
     def _enabled(provider: Any) -> bool:
@@ -171,33 +198,38 @@ class MemoryModelGateway:
             or getattr(provider, "chat", None)
             or getattr(provider, "complete", None)
         )
-        try:
-            from bilibot.services.token_usage import usage_context
-            with usage_context(scene="memory_brain", account_id=getattr(self, "account_id", "") or ""):
-                try:
-                    value = method(
-                        prompt,
-                        system_prompt=system_prompt,
-                        max_tokens=max_tokens,
-                        temperature=temperature,
-                    )
-                except TypeError:
-                    value = method(prompt)
-                result = await asyncio.wait_for(_resolve(value), timeout=max(0.1, float(timeout)))
-        except ProviderNotConfigured:
-            raise
-        except Exception:
-            # preserve original behavior for provider errors outside usage_context import
+
+        def _invoke():
             try:
-                value = method(
+                return method(
                     prompt,
                     system_prompt=system_prompt,
                     max_tokens=max_tokens,
                     temperature=temperature,
                 )
             except TypeError:
-                value = method(prompt)
-            result = await asyncio.wait_for(_resolve(value), timeout=max(0.1, float(timeout)))
+                return method(prompt)
+
+        # usage_context 仅包一层；失败不得二次 invoke（超时/429 会双倍烧配额）
+        try:
+            from bilibot.services.token_usage import usage_context
+
+            _usage_cm = usage_context(
+                scene="memory_brain",
+                account_id=getattr(self, "account_id", "") or "",
+            )
+        except Exception:
+            _usage_cm = None
+
+        if _usage_cm is not None:
+            with _usage_cm:
+                result = await asyncio.wait_for(
+                    _resolve(_invoke()), timeout=max(0.1, float(timeout))
+                )
+        else:
+            result = await asyncio.wait_for(
+                _resolve(_invoke()), timeout=max(0.1, float(timeout))
+            )
         if result is None or not str(result).strip():
             raise ProviderNotConfigured("chat provider returned no result")
         return str(result).strip()
@@ -265,35 +297,51 @@ class MemoryModelGateway:
         values = [str(text) for text in texts]
         if not values:
             return EmbeddingBatch(self.embedding_provider_name, self.embedding_model_name, ())
-        vectors: Any
-        if callable(getattr(provider, "embed_many", None)):
-            vectors = await asyncio.wait_for(
-                _resolve(provider.embed_many(values)), timeout=max(0.1, float(timeout))
+        # usage_context 覆盖 embedding 调用（provider 内部 record 会读 scene）
+        try:
+            from bilibot.services.token_usage import usage_context
+            _usage_cm = usage_context(
+                scene="memory_embedding",
+                account_id=self.account_id or "",
             )
-        elif callable(getattr(provider, "get_embeddings", None)):
-            vectors = await asyncio.wait_for(
-                _resolve(provider.get_embeddings(values)), timeout=max(0.1, float(timeout))
-            )
-        elif callable(getattr(provider, "embed", None)):
-            try:
-                vectors = await asyncio.wait_for(
-                    _resolve(provider.embed(values)), timeout=max(0.1, float(timeout))
+        except Exception:
+            _usage_cm = None
+
+        async def _run_embed() -> Any:
+            if callable(getattr(provider, "embed_many", None)):
+                return await asyncio.wait_for(
+                    _resolve(provider.embed_many(values)), timeout=max(0.1, float(timeout))
                 )
-            except (TypeError, ValueError):
-                vectors = [
-                    await asyncio.wait_for(
-                        _resolve(provider.embed(text)), timeout=max(0.1, float(timeout))
+            if callable(getattr(provider, "get_embeddings", None)):
+                return await asyncio.wait_for(
+                    _resolve(provider.get_embeddings(values)), timeout=max(0.1, float(timeout))
+                )
+            if callable(getattr(provider, "embed", None)):
+                try:
+                    return await asyncio.wait_for(
+                        _resolve(provider.embed(values)), timeout=max(0.1, float(timeout))
                     )
-                    for text in values
-                ]
-        else:
-            vectors = [
+                except (TypeError, ValueError):
+                    return [
+                        await asyncio.wait_for(
+                            _resolve(provider.embed(text)), timeout=max(0.1, float(timeout))
+                        )
+                        for text in values
+                    ]
+            return [
                 await asyncio.wait_for(
                     _resolve(provider.get_embedding(text)), timeout=max(0.1, float(timeout))
                 )
                 for text in values
             ]
+
+        if _usage_cm is not None:
+            with _usage_cm:
+                vectors = await _run_embed()
+        else:
+            vectors = await _run_embed()
         if vectors is None:
+            # 未配置侧返回 None → 阻塞 job；已配置路径应上抛而非 None
             raise ProviderNotConfigured("embedding provider returned no result")
         if len(values) == 1 and vectors and isinstance(vectors[0], (int, float)):
             vectors = [vectors]
@@ -304,8 +352,10 @@ class MemoryModelGateway:
         normalized: list[tuple[float, ...]] = []
         dimension: int | None = None
         for vector in vectors:
+            # 空/None 向量是 API 异常或瞬时故障，必须 ValueError 走 fail/retry，
+            # 不得 ProviderNotConfigured（否则 block 成「只进不出」）。
             if vector is None:
-                raise ProviderNotConfigured("embedding provider returned an empty vector")
+                raise ValueError("embedding provider returned an empty vector")
             item = tuple(float(value) for value in vector)
             if not item:
                 raise ValueError("embedding vector is empty")
@@ -540,6 +590,10 @@ class MemoryModelGateway:
             "\u4f60\u662f\u89c6\u9891\u5185\u5bb9\u6574\u7406\u5668\u3002\u6839\u636e\u89c6\u542c\u5206\u6790\u65e5\u5fd7\u5199\u4e00\u4efd\u4e2d\u6587\u300c\u89c6\u9891\u8be6\u7ec6\u5185\u5bb9\u300d\u7b14\u8bb0\uff0c"
             "\u4f9b\u65e5\u540e\u56de\u5fc6\u4f7f\u7528\u3002\u53ea\u8f93\u51fa\u6b63\u6587\uff0c\u4e0d\u8981\u6807\u9898\u524d\u7f00\uff0c\u4e0d\u8981 markdown \u4ee3\u7801\u5757\u3002"
         )
+        # Python 3.11 不允许 f-string 表达式里出现反斜杠转义；Docker
+        # 生产镜像正是 3.11，因此先计算回退文本再插值。
+        display_title = title or "\u672a\u77e5"
+        display_owner = owner or "\u672a\u77e5"
         prompt = (
             f"\u8bf7\u628a\u4e0b\u9762\u7684\u89c6\u9891\u89c6\u542c\u65e5\u5fd7\u6574\u7406\u6210\u4e0d\u8d85\u8fc7 {budget} \u5b57\u7684\u4e2d\u6587\u8be6\u7ec6\u5185\u5bb9\u3002"
             "\u8981\u6c42\uff1a\n"
@@ -548,8 +602,8 @@ class MemoryModelGateway:
             "3) \u4e0d\u8981\u5199\u6210\u5f39\u5e55\u53e3\u543b\uff0c\u4e0d\u8981\u7f16\u9020\u65e5\u5fd7\u91cc\u6ca1\u6709\u7684\u4fe1\u606f\uff1b\n"
             "4) \u8fd9\u662f Bot \u89c2\u770b/\u5206\u6790\u522b\u4eba\u7684\u89c6\u9891\uff0c\u7981\u6b62\u5199\u300c\u53d1\u5e03\u4e86/\u4e0a\u4f20\u4e86/\u6295\u7a3f\u4e86\u89c6\u9891\u300d\uff1b\n"
             f"5) \u603b\u5b57\u6570\u5fc5\u987b \u2264 {budget}\u3002\n\n"
-            f"\u6807\u9898\uff1a{title or '\u672a\u77e5'}\n"
-            f"UP\u4e3b\uff1a{owner or '\u672a\u77e5'}\n"
+            f"\u6807\u9898\uff1a{display_title}\n"
+            f"UP\u4e3b\uff1a{display_owner}\n"
         )
         if extra_context:
             prompt += f"\n\u8865\u5145\u4e0a\u4e0b\u6587\uff1a\n{str(extra_context)[:1500]}\n"

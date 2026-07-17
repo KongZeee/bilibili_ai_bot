@@ -14,6 +14,7 @@ import os
 import shutil
 import sqlite3
 import tempfile
+import time
 import zipfile
 from dataclasses import dataclass
 from datetime import datetime
@@ -451,6 +452,45 @@ def _sanitize_name(name: str) -> str:
     return safe_name
 
 
+def _is_staging_backup_name(name: str) -> bool:
+    """半成品 / 隐藏备份名：list/download/restore/delete 均应拒绝。"""
+    n = str(name or "")
+    return (not n) or n.startswith(".") or n.endswith(".creating")
+
+
+def _cleanup_stale_staging(backups_root: Path, max_age_seconds: float = 3600.0) -> int:
+    """删除过期的 ``.xxx.creating`` staging 目录（进程崩溃遗留）。
+
+    仅清理名称符合 staging 约定且 mtime 超过 max_age 的目录；返回删除个数。
+    """
+    removed = 0
+    try:
+        if not backups_root.is_dir():
+            return 0
+        now = time.time()
+        for item in backups_root.iterdir():
+            if not item.is_dir():
+                continue
+            name = item.name
+            if not (name.startswith(".") and name.endswith(".creating")):
+                continue
+            try:
+                age = now - item.stat().st_mtime
+            except OSError:
+                continue
+            if age < max_age_seconds:
+                continue
+            try:
+                shutil.rmtree(item, ignore_errors=True)
+                removed += 1
+                logger.info("已清理过期备份 staging: %s age=%.0fs", name, age)
+            except Exception as e:
+                logger.warning("清理备份 staging 失败 %s: %s", name, e)
+    except Exception as e:
+        logger.debug("cleanup stale staging skipped: %s", e)
+    return removed
+
+
 def create_backup_routes(
     data_dir: str = "./data",
     *,
@@ -497,10 +537,33 @@ def create_backup_routes(
                 )
 
             def _do_create() -> int:
+                # 先写到临时目录再原子 rename，避免半成品备份目录被 list/download
                 backups_root.mkdir(parents=True, exist_ok=True)
-                return _write_backup(data_path, backup_dir)
+                # 创建前顺带清理崩溃遗留的过期 staging，避免盘占满
+                _cleanup_stale_staging(backups_root)
+                stage = backups_root / f".{backup_name}.creating"
+                if stage.exists():
+                    shutil.rmtree(stage, ignore_errors=True)
+                try:
+                    count = _write_backup(data_path, stage)
+                    if backup_dir.exists():
+                        raise FileExistsError(backup_name)
+                    os.replace(stage, backup_dir)
+                    return count
+                except Exception:
+                    if stage.exists():
+                        shutil.rmtree(stage, ignore_errors=True)
+                    raise
 
-            count = await asyncio.to_thread(_do_create)
+            try:
+                count = await asyncio.to_thread(_do_create)
+            except FileExistsError:
+                return fail(
+                    "BACKUP_EXISTS",
+                    f"备份已存在: {backup_name}",
+                    details={"name": backup_name},
+                    status_code=409,
+                )
 
             logger.info(f"创建备份 {backup_name}，共 {count} 个文件")
             return ok(
@@ -522,11 +585,18 @@ def create_backup_routes(
                 return ok({"backups": []})
 
             def _do_list() -> list:
+                # 顺带清理过期 staging（崩溃遗留的 .xxx.creating）
+                _cleanup_stale_staging(backups_root)
                 result = []
                 # 按名称倒序排列（新的 backup_YYYYMMDD 在前）
+                # 跳过半成品 staging（.name.creating）与隐藏目录，避免 list/download 半文件
                 for item in sorted(backups_root.iterdir(), key=lambda p: p.name, reverse=True):
-                    if item.is_dir():
-                        result.append(_backup_info(item))
+                    if not item.is_dir():
+                        continue
+                    name = item.name
+                    if _is_staging_backup_name(name):
+                        continue
+                    result.append(_backup_info(item))
                 return result
 
             backups = await asyncio.to_thread(_do_list)
@@ -552,6 +622,8 @@ def create_backup_routes(
                 # 防止路径穿越：清理后必须与原值一致
                 safe_name = _sanitize_name(name)
                 if not safe_name or safe_name != name:
+                    return fail("INVALID_INPUT", "备份名称无效", status_code=400)
+                if _is_staging_backup_name(safe_name):
                     return fail("INVALID_INPUT", "备份名称无效", status_code=400)
 
                 backup_dir = backups_root / safe_name
@@ -670,6 +742,8 @@ def create_backup_routes(
             safe_name = _sanitize_name(name)
             if not safe_name or safe_name != name:
                 return fail("INVALID_INPUT", "备份名称无效", status_code=400)
+            if _is_staging_backup_name(safe_name):
+                return fail("INVALID_INPUT", "备份名称无效", status_code=400)
 
             backup_dir = backups_root / safe_name
             if not await asyncio.to_thread(backup_dir.is_dir):
@@ -693,13 +767,22 @@ def create_backup_routes(
             backup_dir = backups_root / safe_name
             if not await asyncio.to_thread(backup_dir.is_dir):
                 return fail_not_found(f"备份不存在: {safe_name}")
+            # 禁止下载 staging / 隐藏名（与 list 过滤一致）
+            if _is_staging_backup_name(safe_name):
+                return fail("INVALID_INPUT", "备份名称无效", status_code=400)
 
             files = await asyncio.to_thread(lambda: sorted(backup_dir.iterdir()))
             if not files:
                 return fail_not_found("备份为空")
 
             # 先将 zip 写入临时文件，再分块流式返回，避免在内存中持有整个 zip
-            tmp_zip = data_path / f".{safe_name}.download.zip.tmp"
+            # 临时 zip 使用 .creating 后缀，list 逻辑会当 staging 跳过
+            tmp_zip = data_path / f".{safe_name}.download.zip.creating"
+            try:
+                if tmp_zip.exists():
+                    tmp_zip.unlink()
+            except OSError:
+                pass
             try:
                 def _do_zip() -> None:
                     with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED) as zf:

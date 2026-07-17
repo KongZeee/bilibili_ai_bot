@@ -496,46 +496,65 @@ class HumanizedCommentGenerator:
         persona_id: str = None,
     ) -> Optional[str]:
         """
-        生成人格化评论
+        生成人格化评论（LEGACY 非主调度路径）。
 
-        流程：
-        1. 从知识库检索与该用户相关的记忆
-        2. 构建包含记忆上下文的Prompt
-        3. 调用LLM生成回复
-        4. 根据人格调整语气
+        主路径请用 ReplyGenerator + ContextBuilder（账号级 hybrid recall）。
+        本方法优先 V6 ``recall``，失败再降级 ``search_memories``；失败 warning 可观测。
 
         MEM-603：persona_id 用于记忆检索的硬过滤，防止跨人格记忆泄漏。
         未显式传入时回退到 self.account_id。
         """
-        # 1. 检索知识库
+        # 1. 检索知识库（优先 V6 hybrid，避免仅 user 近窗）
         knowledge_context = ""
         if self.knowledge_memory:
             try:
-                memories = await self.knowledge_memory.search_memories(
-                    query=f"{username} 的对话",
-                    limit=5,
-                    user_id=user_id,
-                    persona_id=persona_id or self.account_id,
-                    categories=["episodic", "factual", "preference"]
-                )
-                if memories:
-                    knowledge_context = "\n".join([
-                        f"- {m.get('content', '')}" for m in memories[:3]
-                    ])
-                    logger.info(f"检索到 {len(memories)} 条相关知识")
+                evidence = ""
+                if callable(getattr(self.knowledge_memory, "recall", None)):
+                    from bilibot.memory_brain import RecallQuery
+
+                    result = await self.knowledge_memory.recall(
+                        RecallQuery(
+                            current_message=f"{username}: {comment}",
+                            account_id=self.account_id or "",
+                            speaker_actor_id=str(user_id or ""),
+                            scene="reply_comment",
+                        )
+                    )
+                    if result is not None:
+                        evidence = str(getattr(result, "prompt_evidence", "") or "")
+                if not evidence and hasattr(self.knowledge_memory, "search_memories"):
+                    memories = await self.knowledge_memory.search_memories(
+                        query=f"{username} 的对话 {comment[:80]}",
+                        limit=5,
+                        user_id=user_id,
+                        persona_id=persona_id or self.account_id,
+                        categories=["episodic", "factual", "preference"],
+                    )
+                    if memories:
+                        evidence = "\n".join(
+                            f"- {m.get('content', '')}" for m in memories[:3]
+                        )
+                if evidence:
+                    knowledge_context = evidence[:1500]
+                    logger.info(
+                        "legacy generate_comment: memory evidence chars=%s",
+                        len(knowledge_context),
+                    )
             except Exception as e:
-                logger.debug(f"知识库检索失败: {e}")
-        
+                logger.warning(
+                    "legacy generate_comment 记忆检索失败: %s", type(e).__name__
+                )
+
         # 2. 获取人格信息（含 reply_comment 场景规则）
         personality_info = self._get_persona_prompt(scene="reply_comment")
-        
+
         # 3. 获取当前情绪
         mood_expr = self.behavior.get_mood_expression()
         mood_context = f"当前情绪: {mood_expr['tone']}"
-        
+
         # 4. 构建Prompt
         memory_section = f"你们之前的对话记忆:\n{knowledge_context}" if knowledge_context else ""
-        
+
         prompt = f"""用户 {username} 在评论区说了: "{comment}"
 
 {memory_section}
@@ -543,38 +562,38 @@ class HumanizedCommentGenerator:
 {mood_context}
 
 请像一个真实的B站用户一样回复。回复要简短自然。"""
-        
+
         system_prompt = self.SYSTEM_PROMPT
         if personality_info:
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
-        
+
         # 5. 调用LLM（检查是否初始化）
         if not self.llm:
             logger.warning("LLM未初始化，跳过评论生成")
             return None
-        
+
         try:
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="reply_comment", account_id=getattr(self, "account_id", "") or ""):
                 response = await self.llm.generate(prompt, system_prompt=system_prompt, max_tokens=150)
             if not response:
                 return None
-            
+
             # 检查是否是忽略信号
             if "__IGNORE__" in response:
                 return None
-            
+
             # 6. 人格化后处理
             cleaned = self._post_process_comment(response.strip())
-            
+
             if not cleaned or len(cleaned) < 2:
                 return None
-            
+
             # 7. 更新情绪
             self.behavior.update_mood("commented")
-            
+
             return cleaned
-            
+
         except Exception as e:
             logger.error(f"评论生成失败: {e}")
             return None
@@ -637,6 +656,8 @@ class HumanizedCommentGenerator:
         hot_comments: List = None,
         video_content: str = "",
         companion_context: str = "",
+        memory_evidence: str = "",
+        memory_context: str = "",
     ) -> Optional[Dict]:
         """
         评价视频，返回评分、心情、评论等
@@ -645,6 +666,8 @@ class HumanizedCommentGenerator:
             video_content: 视频理解服务生成的视听行为日志（Markdown），为空则只用元数据
             hot_comments: list[str] 或 list[dict]（含 content/name/mid/rpid）
             companion_context: 可选，陪伴生活层短上下文（今日状态/念头）
+            memory_evidence: 账号级 V6 混合召回证据（近期视频/番/日记/评论等）
+            memory_context: 与 memory_evidence 同义别名（兼容调用方）
 
         Returns:
             {
@@ -705,9 +728,18 @@ class HumanizedCommentGenerator:
         if companion_context and str(companion_context).strip():
             life_section = f"\n【你今天的状态与念头】\n{str(companion_context).strip()[:500]}\n"
 
+        mem_block = str(memory_evidence or memory_context or "").strip()
+        memory_section = ""
+        if mem_block:
+            memory_section = (
+                "\n【相关记忆/近期经历】（可自然联想，勿编造未出现的细节）\n"
+                f"{mem_block[:1800]}\n"
+            )
+
         prompt = f"""请评价以下B站视频，以你的角色视角观看后给出真实反馈。
 评论和评价要基于【视频详细内容/视频内容】里的具体信息，不要只复读标题。
-{life_section}
+若【相关记忆】与本片主题有关，可自然联系到你最近看过/经历过的事，但不要硬套。
+{life_section}{memory_section}
 【视频信息】
 标题: {title}
 UP主: {owner}
@@ -736,6 +768,8 @@ UP主: {owner}
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
         if companion_context and str(companion_context).strip():
             system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
+        if mem_block:
+            system_prompt += f"\n\n【记忆提示】\n{mem_block[:600]}"
 
         # 长 digest + 搜索参考时 300 tokens 容易截断 JSON；放宽并允许一次重试。
         max_tokens = 500
@@ -807,6 +841,8 @@ UP主: {owner}
         mood: str = "",
         video_content: str = "",
         companion_context: str = "",
+        memory_evidence: str = "",
+        memory_context: str = "",
     ) -> Optional[str]:
         """
         为视频生成主动评论（与 evaluate_video 的 comment 不同，这是更深入的评论）
@@ -814,6 +850,8 @@ UP主: {owner}
         Args:
             video_content: 视频理解服务生成的视听行为日志（Markdown），为空则只用元数据
             companion_context: 可选，陪伴生活层短上下文
+            memory_evidence: 账号级 V6 混合召回证据
+            memory_context: 与 memory_evidence 同义别名
 
         Returns:
             评论文本（≤40字），或 None 表示不评论
@@ -847,8 +885,15 @@ UP主: {owner}
         if companion_context and str(companion_context).strip():
             life_section = f"\n【你今天的状态与念头】\n{str(companion_context).strip()[:400]}\n"
 
+        mem_block = str(memory_evidence or memory_context or "").strip()
+        memory_section = ""
+        if mem_block:
+            memory_section = (
+                f"\n【相关记忆/近期经历】\n{mem_block[:1200]}\n"
+            )
+
         prompt = f"""你刚看完一个B站视频，想发一条评论。
-{life_section}
+{life_section}{memory_section}
 【视频】{title} (UP主: {owner})
 【简介】{desc_text}
 【标签】{tags_text}{video_content_section}
@@ -859,6 +904,7 @@ UP主: {owner}
 - 像真人随手打的，不要客套话
 - ≤40字
 - 尽量点到视频里的具体内容（情节/知识点/画面/槽点），不要只会夸“好看/不错”
+- 若记忆与本片相关，可自然带一句联想，不要生硬复述记忆
 - 可以用网络用语、emoji
 - 不要@UP主
 - 只输出评论内容，不要其他文字"""
@@ -868,6 +914,8 @@ UP主: {owner}
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
         if companion_context and str(companion_context).strip():
             system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
+        if mem_block:
+            system_prompt += f"\n\n【记忆提示】\n{mem_block[:500]}"
 
         try:
             from bilibot.services.token_usage import usage_context
@@ -907,54 +955,103 @@ class DynamicPoster:
     - 偶尔会发一些随想
     """
     
-    def __init__(self, behavior_sim: HumanBehaviorSimulator, llm_adapter, config: Any = None):
+    def __init__(
+        self,
+        behavior_sim: HumanBehaviorSimulator,
+        llm_adapter,
+        config: Any = None,
+        account_id: str = "",
+    ):
         self.behavior = behavior_sim
         self.llm = llm_adapter
         self.config = config or {}
-    
-    async def generate_dynamic(self, context: str = "") -> str:
+        self.account_id = account_id or ""
+
+    async def generate_dynamic(
+        self,
+        context: str = "",
+        *,
+        topic: str = "",
+        memory_evidence: str = "",
+        companion_context: str = "",
+        related_videos: Optional[List[str]] = None,
+    ) -> str:
+        """生成动态内容。
+
+        Prefer grounded context (memory / companion / related videos) over
+        random default copy. Callers that own the V6 brain should pass
+        ``memory_evidence`` and ``companion_context`` from recall + life surface.
         """
-        生成动态内容
-        
-        像真人一样发动态，而不是机械地重复
-        """
-        mood = self.behavior._mood
         mood_expressions = self.behavior.get_mood_expression()
-        
+
+        sections: List[str] = [
+            f"当前情绪: {mood_expressions.get('tone', '平静')}",
+        ]
+        if topic and str(topic).strip():
+            sections.append(f"主题方向: {str(topic).strip()}")
+        if companion_context and str(companion_context).strip():
+            sections.append(
+                "【你今天的状态与念头】\n" + str(companion_context).strip()[:800]
+            )
+        if memory_evidence and str(memory_evidence).strip():
+            sections.append(
+                "【相关记忆/近期经历】（请据此自然表达，勿编造未出现的细节）\n"
+                + str(memory_evidence).strip()[:2000]
+            )
+        if related_videos:
+            lines = [str(v).strip() for v in related_videos if str(v).strip()]
+            if lines:
+                sections.append("最近看过: " + "；".join(lines[:5]))
+        if context and str(context).strip():
+            sections.append(str(context).strip()[:800])
+
+        context_block = "\n\n".join(sections)
+        grounded = bool(
+            (memory_evidence and str(memory_evidence).strip())
+            or (companion_context and str(companion_context).strip())
+            or (topic and str(topic).strip())
+            or (related_videos and any(str(v).strip() for v in related_videos))
+        )
+
         prompt = f"""你现在是一个真实的B站UP主，请发一条动态。
 
-当前情绪: {mood_expressions['tone']}
-
-{context}
+{context_block}
 
 要求：
 1. 内容简短（20-80字）
 2. 像一个真实的人在说话
-3. 可以包含日常分享、感想、提问
+3. 可以包含日常分享、感想、提问；优先呼应上面的记忆/状态/主题
 4. 适当使用emoji
 5. 不要过于正式或机械化
+6. 不要编造记忆里没有的具体视频/番名细节
 
 只输出动态内容，不要其他文字。"""
-        
-        # 检查LLM是否初始化
+
         if not self.llm:
-            logger.warning("LLM未初始化，使用默认动态")
-            return random.choice([
-                "今天又是充实的一天呢~",
-                "刚看完一个超棒的视频，推荐给大家！",
-                "突然想到一件事...大家最近有什么好看的番推荐吗？",
-                "天气真好，适合出去走走☀️",
-                "又刷到了好多有趣的内容，B站真好玩~",
-            ])
-        
+            logger.warning("LLM未初始化，无法基于记忆生成动态")
+            # Grounded path: refuse silent random spam; empty lets caller fail-closed.
+            if grounded:
+                return ""
+            return random.choice(
+                [
+                    "今天又是充实的一天呢~",
+                    "刚看完一个超棒的视频，推荐给大家！",
+                    "突然想到一件事...大家最近有什么好看的番推荐吗？",
+                    "天气真好，适合出去走走☀️",
+                    "又刷到了好多有趣的内容，B站真好玩~",
+                ]
+            )
+
         try:
             from bilibot.services.token_usage import usage_context
-            with usage_context(scene="dynamic_post", account_id=getattr(self, "account_id", "") or ""):
+
+            with usage_context(
+                scene="dynamic_post",
+                account_id=getattr(self, "account_id", "") or "",
+            ):
                 response = await self.llm.generate(prompt, max_tokens=200)
             if response:
-                # PRD 5.3：安全截断，避免在 emoji 多字节序列中间截断产生乱码
                 text = response.strip()[:200]
-                # 移除末尾可能的不完整 emoji（Unicode 替换字符）
                 try:
                     text.encode("utf-8").decode("utf-8")
                 except UnicodeDecodeError:
@@ -962,8 +1059,9 @@ class DynamicPoster:
                 return text
         except Exception as e:
             logger.error(f"动态生成失败: {e}")
-        
-        # 降级：返回一个随机日常
+
+        if grounded:
+            return ""
         defaults = [
             "今天又是充实的一天呢~",
             "刚看完一个超棒的视频，推荐给大家！",

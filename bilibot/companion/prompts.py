@@ -90,18 +90,22 @@ def build_dream_prompt(
     fragments: List[str],
     plan_summary: str,
     diary_hint: str,
+    memory_evidence: str = "",
 ) -> tuple[str, str]:
     system = (
         "你是角色梦境生成器。生成「醒来后仍残留」的梦，有情感线与具体碎片。"
+        "可轻度呼应近期经历，但不要编造记忆里没有的具体视频/番名细节。"
         "只输出 JSON，不要解释。"
     )
     frag = "；".join(fragments[:12]) if fragments else "无"
+    mem = _clip(memory_evidence, 900)
+    mem_line = f"\n近期记忆/经历（可选呼应，勿编造）：\n{mem}\n" if mem else ""
     user = f"""角色：{persona_name or "Bot"}
 人设：{_clip(persona_prompt, 400)}
 近期碎片：{frag}
 今日日程摘要：{_clip(plan_summary, 300)}
 近日记提示：{_clip(diary_hint, 200) or "无"}
-
+{mem_line}
 输出：
 {{
   "dream_type": "温柔日常|奇幻|荒诞|怀旧|悬疑 之一",
@@ -137,8 +141,8 @@ def build_diary_prompt(
 人设：{_clip(persona_prompt, 400)}
 今日精力：{energy} 心情倾向：{mood_bias}
 今日日程：{_clip(plan_summary, 400)}
-今日证据（看过/做过/互动，勿编造证据外事件）：
-{_clip(evidence, 1200) or "（今天比较平淡）"}
+今日证据（看过/做过/互动/记忆召回，勿编造证据外事件；记忆块可含近期视频/番剧/评论/动态）：
+{_clip(evidence, 1800) or "（今天比较平淡）"}
 梦境余韵：{_clip(dream_summary, 300) or "无"}
 
 输出：

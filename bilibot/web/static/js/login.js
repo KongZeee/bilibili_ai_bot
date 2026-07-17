@@ -19,7 +19,16 @@ document.getElementById('loginForm').onsubmit = async (e) => {
         });
         const data = await res.json();
         if (data.success) {
-            window.location.href = '/';
+            // 401 时 api.js 会把当前 hash 存入 bilibot_login_return，登录后回跳
+            let dest = '/';
+            try {
+                const ret = sessionStorage.getItem('bilibot_login_return');
+                if (ret && ret.startsWith('#/')) {
+                    dest = '/' + ret;
+                    sessionStorage.removeItem('bilibot_login_return');
+                }
+            } catch (_) { /* ignore */ }
+            window.location.href = dest;
         } else {
             error.textContent = (data.error && data.error.message) || '登录失败';
             error.style.display = 'block';

@@ -41,6 +41,14 @@ async function request(url, options = {}) {
     clearTimeout(timeoutId);
 
     if (resp.status === 401) {
+        // 保留当前 hash，登录后可回跳控制台页面
+        try {
+            const hash = window.location.hash || '';
+            const next = hash && hash !== '#/login' ? hash : '';
+            if (next) {
+                sessionStorage.setItem('bilibot_login_return', next);
+            }
+        } catch (_) { /* sessionStorage 不可用时忽略 */ }
         window.location.href = '/login';
         throw new Error('未登录');
     }
@@ -78,10 +86,17 @@ export const api = {
         switchPersona: (id, personaId) => api.post(`/api/accounts/${id}/switch-persona`, { persona_id: personaId }),
         bindLlm: (id, llmId) => api.post(`/api/accounts/${id}/llm`, { llm_id: llmId }),
         qrLogin: (id) => api.post(`/api/accounts/${id}/qr-login`),
+        // 后端返回 qr_session_id / status(created|scanned|confirmed|expired|cancelled)
         qrPoll: (id, sid) => api.get(`/api/accounts/${id}/qr-login/${sid}`),
         qrCancel: (id, sid) => api.post(`/api/accounts/${id}/qr-login/${sid}/cancel`),
         profiles: () => api.get('/api/accounts/profiles'),
         tasks: (id, params) => api.get(`/api/accounts/${id}/tasks?${buildQuery(params)}`),
+        getTask: (id, taskId) => api.get(`/api/accounts/${id}/tasks/${taskId}`),
+        cancelTask: (id, taskId) => api.post(`/api/accounts/${id}/tasks/${taskId}/cancel`),
+        retryTask: (id, taskId) => api.post(`/api/accounts/${id}/tasks/${taskId}/retry`),
+        triggerProactiveVideo: (id) => api.post(`/api/accounts/${id}/tasks/proactive-video`),
+        triggerDynamic: (id) => api.post(`/api/accounts/${id}/tasks/dynamic`),
+        triggerBangumi: (id) => api.post(`/api/accounts/${id}/tasks/bangumi`),
         companion: {
             state: (id) => api.get(`/api/accounts/${id}/companion/state`),
             plan: (id) => api.get(`/api/accounts/${id}/companion/plan`),
@@ -178,9 +193,64 @@ export const api = {
         `/api/replies/${replyId}/retry`,
         force ? { force: true } : {},
     ),
+    replyContext: (replyId) => api.get(`/api/replies/${replyId}/context`),
+    // 审计：list + 详情 + overview 统计（勿与 token-usage 混淆；路径均后端已注册）
     audits: (params) => api.get(`/api/audit/generations?${buildQuery(params)}`),
+    audit: {
+        list: (params) => api.get(`/api/audit/generations?${buildQuery(params)}`),
+        get: (id) => api.get(`/api/audit/generations/${id}`),
+        stats: () => api.get('/api/audit/stats'),
+        analytics: () => api.get('/api/audit/analytics'),
+    },
     logs: (params) => api.get(`/api/logs?${buildQuery(params)}`),
+    // 日志下载为文本/流，与 backup.download 同理用 fetch blob
+    logsDownload: async () => {
+        const controller = new AbortController();
+        const timeoutId = setTimeout(() => controller.abort(), 60000);
+        let resp;
+        try {
+            resp = await fetch('/api/logs/download', {
+                credentials: 'same-origin',
+                headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                signal: controller.signal,
+            });
+        } catch (fetchErr) {
+            clearTimeout(timeoutId);
+            if (fetchErr.name === 'AbortError') {
+                throw new Error('下载超时，请稍后重试');
+            }
+            throw new Error('网络连接失败，请检查网络');
+        }
+        clearTimeout(timeoutId);
+        if (resp.status === 401) {
+            try {
+                const hash = window.location.hash || '';
+                if (hash && hash !== '#/login') {
+                    sessionStorage.setItem('bilibot_login_return', hash);
+                }
+            } catch (_) { /* ignore */ }
+            window.location.href = '/login';
+            throw new Error('未登录');
+        }
+        if (!resp.ok) {
+            let msg = `下载失败: HTTP ${resp.status}`;
+            const ct = (resp.headers.get('content-type') || '').toLowerCase();
+            if (ct.includes('application/json')) {
+                try {
+                    const data = await resp.json();
+                    msg = data?.error?.message || data?.message || msg;
+                } catch (_) { /* ignore */ }
+            }
+            throw new Error(msg);
+        }
+        return await resp.blob();
+    },
     status: () => api.get('/api/status'),
+    // Token 用量（token-usage.js 等可经此封装调用，避免页面硬编码）
+    tokenUsage: {
+        summary: (params) => api.get(`/api/token-usage/summary?${buildQuery(params)}`),
+        today: (params) => api.get(`/api/token-usage/today?${buildQuery(params)}`),
+    },
     safety: {
         pauseStatus: () => api.get('/api/safety/pause-status'),
         pause: () => api.post('/api/safety/pause'),
@@ -226,6 +296,7 @@ export const api = {
             try {
                 resp = await fetch(`/api/backup/${name}/download`, {
                     credentials: 'same-origin',
+                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
                     signal: controller.signal,
                 });
             } catch (fetchErr) {
@@ -237,10 +308,26 @@ export const api = {
             }
             clearTimeout(timeoutId);
             if (resp.status === 401) {
+                try {
+                    const hash = window.location.hash || '';
+                    if (hash && hash !== '#/login') {
+                        sessionStorage.setItem('bilibot_login_return', hash);
+                    }
+                } catch (_) { /* ignore */ }
                 window.location.href = '/login';
                 throw new Error('未登录');
             }
-            if (!resp.ok) throw new Error(`下载失败: HTTP ${resp.status}`);
+            if (!resp.ok) {
+                let msg = `下载失败: HTTP ${resp.status}`;
+                const ct = (resp.headers.get('content-type') || '').toLowerCase();
+                if (ct.includes('application/json')) {
+                    try {
+                        const data = await resp.json();
+                        msg = data?.error?.message || data?.message || msg;
+                    } catch (_) { /* ignore */ }
+                }
+                throw new Error(msg);
+            }
             return await resp.blob();
         },
     },

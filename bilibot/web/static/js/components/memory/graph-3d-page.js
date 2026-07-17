@@ -217,18 +217,31 @@ export const MemoryGraph3DPage = defineComponent({
         });
 
         // ── 数据加载 ──
+        let loadSeq = 0;
         async function loadData() {
-            accountId.value = appState.currentAccountId || appState.accounts[0]?.id;
-            if (!accountId.value) {
+            const nextId = appState.currentAccountId
+                || appState.accounts[0]?.account_id
+                || appState.accounts[0]?.id
+                || '';
+            if (!nextId) {
+                accountId.value = '';
                 loading.value = false;
+                graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
                 return;
             }
+            if (accountId.value && accountId.value !== nextId) {
+                graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
+                selectedNode.value = null;
+            }
+            accountId.value = nextId;
+            const seq = ++loadSeq;
             loading.value = true;
             loadError.value = '';
             selectedNode.value = null;
             hoveredNode.value = null;
             try {
                 const data = await api.memory.graph(accountId.value);
+                if (seq !== loadSeq || accountId.value !== nextId) return;
                 const snap = data.snapshot || { nodes: [], edges: [], memories: [] };
                 graphData.value = {
                     nodes: snap.nodes || [],
@@ -242,12 +255,13 @@ export const MemoryGraph3DPage = defineComponent({
                     memories: data.total_memories || (snap.memories || []).length,
                 };
             } catch (e) {
+                if (seq !== loadSeq) return;
                 showToast('加载图谱失败: ' + e.message, 'error');
                 loadError.value = e.message || '无法读取图谱数据';
                 graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
                 totalCounts.value = { nodes: 0, edges: 0, memories: 0 };
             } finally {
-                loading.value = false;
+                if (seq === loadSeq) loading.value = false;
             }
         }
 
@@ -813,8 +827,8 @@ export const MemoryGraph3DPage = defineComponent({
         // 注意：不要在 statsOpen 时调用 resize。
         // 统计改为画布浮层后布局尺寸不变；误触发 setSize 会让节点看起来突然放大。
 
-        watch(() => appState.currentAccountId, (newId) => {
-            if (newId) loadData();
+        watch(() => appState.currentAccountId, (newId, prevId) => {
+            if (newId && newId !== prevId) loadData();
         });
 
         function renderNodeDetail(node) {

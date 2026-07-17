@@ -82,8 +82,10 @@ export const TokenUsagePage = defineComponent({
             try {
                 const params = { days: days.value };
                 if (accountId.value) params.account_id = accountId.value;
-                const q = new URLSearchParams(params).toString();
-                data.value = await api.get(`/api/token-usage/summary?${q}`);
+                // 统一走 api.tokenUsage，避免硬编码路径与契约漂移
+                data.value = await (api.tokenUsage?.summary
+                    ? api.tokenUsage.summary(params)
+                    : api.get(`/api/token-usage/summary?${new URLSearchParams(params)}`));
             } catch (e) {
                 showToast('加载用量失败: ' + e.message, 'error');
                 data.value = null;
@@ -190,7 +192,11 @@ export const TokenUsagePage = defineComponent({
                                     Table(
                                         ['场景', 'Token', '调用'],
                                         (data.value.by_scene || []).map(r => [
-                                            auditSceneLabel(r.scene) || r.scene || '-',
+                                            r.scene_label
+                                                || (data.value.scene_labels && data.value.scene_labels[r.scene])
+                                                || auditSceneLabel(r.scene)
+                                                || r.scene
+                                                || '-',
                                             fmt(r.total_tokens),
                                             fmt(r.calls),
                                         ]),
@@ -234,7 +240,11 @@ export const TokenUsagePage = defineComponent({
                                         r.model || '-',
                                         `${fmt(r.prompt_tokens)}/${fmt(r.completion_tokens)}/${fmt(r.total_tokens)}`,
                                         fmt(r.cached_tokens),
-                                        auditSceneLabel(r.scene) || r.scene || '-',
+                                        r.scene_label
+                                            || (data.value.scene_labels && data.value.scene_labels[r.scene])
+                                            || auditSceneLabel(r.scene)
+                                            || r.scene
+                                            || '-',
                                     ]),
                                 ),
                             ], 'Recent'),

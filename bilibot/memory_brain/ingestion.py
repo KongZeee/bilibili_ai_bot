@@ -275,12 +275,22 @@ def bot_action_observation(
     if action_state not in allowed_states:
         raise ValueError(f"unsupported bot action state: {action_state}")
     safe_metadata = _safe_structured(dict(metadata or {}))
+    # Correlation helpers for dynamic posts (draft_id / task_id / dynamic_id) stay
+    # in metadata so companion life feedback and list/find_by_identifiers can join.
+    for corr_key in ("draft_id", "task_id", "dynamic_id", "topic"):
+        if corr_key in safe_metadata and safe_metadata[corr_key] is not None:
+            safe_metadata[corr_key] = str(safe_metadata[corr_key])
     safe_metadata.update(
         {
             "action_type": action_type,
             "action_state": action_state,
             "published": bool(published),
         }
+    )
+    external_id = str(
+        safe_metadata.get("dynamic_id")
+        or safe_metadata.get("draft_id")
+        or action_key
     )
     return ObservationEnvelope(
         idempotency_key=f"bot_action:{account_id}:{action_key}:{action_state}",
@@ -304,7 +314,7 @@ def bot_action_observation(
         sources=(
             SourceDocument(
                 source_type="bot_action",
-                external_id=action_key,
+                external_id=external_id,
                 full_text=str(text),
                 data=safe_metadata,
                 observations=(
@@ -553,7 +563,15 @@ def bangumi_episode_observation(
     analysis_result: Mapping[str, Any],
     subtitle_segments: Sequence[Mapping[str, Any]] = (),
     persona_id: str = "",
+    evaluation: Mapping[str, Any] | None = None,
 ) -> ObservationEnvelope:
+    """Archive one bangumi episode into the unified account brain.
+
+    Stored as ``source_type=bangumi`` / ``event_type=bangumi_episode`` so
+    cross-scene recall (comment/dynamic/diary) can find 番名/集数/评价 via the
+    same FTS/vector space as proactive video — not only ``bangumi_watch_state``.
+    """
+    safe_eval = _safe_structured(dict(evaluation or {}))
     context = {
         "metadata": {
             "season_id": str(season_id),
@@ -561,6 +579,7 @@ def bangumi_episode_observation(
             "title": season_title,
             "episode_title": episode_title,
             "episode_index": episode_index,
+            "kind": "bangumi",
         },
         "audiovisual": _safe_structured(analysis_result),
     }
@@ -575,16 +594,43 @@ def bangumi_episode_observation(
             for item in subtitle_segments
             if item.get("content")
         ]
+    title = f"{season_title} 第{episode_index}话 {episode_title}".strip()
+    review_bit = str(
+        safe_eval.get("review") or safe_eval.get("comment") or ""
+    ).strip()
+    score_bit = safe_eval.get("score")
+    summary_parts = [f"看了番剧《{season_title}》第{episode_index}话"]
+    if episode_title:
+        summary_parts[0] += f"「{episode_title}」"
+    if score_bit is not None and str(score_bit) != "":
+        summary_parts.append(f"评分{score_bit}/10")
+    if review_bit:
+        summary_parts.append(review_bit[:200])
+    event_summary = "，".join(summary_parts)
+
     envelope = video_observation(
         account_id=account_id,
         observation_key=observation_key,
         bvid="",
         oid=str(episode_id),
-        title=f"{season_title} 第{episode_index}话 {episode_title}".strip(),
+        title=title,
         owner="番剧",
         context=context,
         persona_id=persona_id,
     )
+    # Prefer a short narrative summary over raw AV digest so list/recall surfaces
+    # show 番名/集数/评价 without needing chunk re-ranking.
+    meta = {
+        **dict(envelope.metadata),
+        "season_id": str(season_id),
+        "episode_id": str(episode_id),
+        "episode_index": str(episode_index),
+        "season_title": str(season_title),
+        "episode_title": str(episode_title),
+        "kind": "bangumi",
+    }
+    if safe_eval:
+        meta["evaluation"] = safe_eval
     return ObservationEnvelope(
         **{
             **envelope.__dict__,
@@ -592,12 +638,11 @@ def bangumi_episode_observation(
             "account_id": str(account_id),
             "source_type": "bangumi",
             "event_type": "bangumi_episode",
+            "event_title": title,
+            "event_summary": event_summary,
             "scene": "bangumi",
-            "metadata": {
-                **dict(envelope.metadata),
-                "season_id": str(season_id),
-                "episode_id": str(episode_id),
-            },
+            "importance": 0.6,
+            "metadata": meta,
         }
     )
 

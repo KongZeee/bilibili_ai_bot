@@ -68,6 +68,60 @@ def _save_accounts_to_config_local(config_loader, account_manager, config_path: 
         return False
 
 
+def _rebind_chat_providers_on_accounts(llm_manager, account_manager) -> int:
+    """P004：chat/default LLM 变更后，热重绑存活记忆大脑的 chat + embedding。"""
+    emb = None
+    chat = None
+    try:
+        resolve_e = getattr(llm_manager, "resolve_embedding", None)
+        emb = resolve_e() if callable(resolve_e) else None
+    except Exception:
+        emb = None
+    try:
+        resolve_c = getattr(llm_manager, "resolve_chat", None)
+        chat = resolve_c() if callable(resolve_c) else None
+    except Exception:
+        chat = None
+
+    rebound = 0
+    try:
+        from bilibot.memory_brain.service import rebind_all_live_brains
+
+        rebound = rebind_all_live_brains(
+            chat_provider=chat,
+            embedding_provider=emb,
+            rebind_chat=True,
+            rebind_embedding=True,
+        )
+    except Exception as e:
+        logger.warning("rebind_all_live_brains 失败: %s", e)
+
+    if account_manager is not None:
+        try:
+            accounts = getattr(account_manager, "_accounts", None) or {}
+            for acc in list(accounts.values()):
+                brain = getattr(acc, "memory_brain", None)
+                if brain is None or not hasattr(brain, "rebind_providers"):
+                    continue
+                try:
+                    brain.rebind_providers(
+                        chat_provider=getattr(acc, "llm", None) or chat,
+                        embedding_provider=emb,
+                        rebind_chat=True,
+                        rebind_embedding=True,
+                    )
+                    rebound += 1
+                except Exception as e:
+                    logger.warning(
+                        "记忆大脑 chat 重绑失败 account=%s: %s",
+                        getattr(acc, "account_id", "?"),
+                        e,
+                    )
+        except Exception as e:
+            logger.warning("遍历账号重绑记忆大脑失败: %s", e)
+    return rebound
+
+
 def create_llm_providers_routes(
     llm_manager,
     config_loader,
@@ -102,6 +156,7 @@ def create_llm_providers_routes(
                 return fail("VALIDATION_ERROR", "model 不能为空")
             llm_id = llm_manager.add_provider(body)
             _save_llm_to_config(config_loader, llm_manager, config_path)
+            _rebind_chat_providers_on_accounts(llm_manager, account_manager)
             return ok(llm_manager.get_provider(llm_id).get_info(), "LLM Provider 添加成功")
         except ValueError as e:
             logger.warning("添加 LLM Provider 校验失败: %s", e)
@@ -157,6 +212,7 @@ def create_llm_providers_routes(
             if not llm_manager.update_provider(llm_id, body):
                 return fail("NOT_FOUND", f"Provider 不存在: {llm_id}")
             _save_llm_to_config(config_loader, llm_manager, config_path)
+            _rebind_chat_providers_on_accounts(llm_manager, account_manager)
             return ok(llm_manager.get_provider(llm_id).get_info(), "Provider 已更新")
         except Exception as e:
             logger.error(f"更新 LLM Provider 失败: {e}", exc_info=True)
@@ -167,6 +223,7 @@ def create_llm_providers_routes(
         if not llm_manager.set_default(llm_id):
             return fail("NOT_FOUND", f"Provider 不存在: {llm_id}")
         _save_llm_to_config(config_loader, llm_manager, config_path)
+        _rebind_chat_providers_on_accounts(llm_manager, account_manager)
         return ok(message=f"默认 LLM 已设置为: {llm_id}")
 
     async def test_provider(request: Request) -> JSONResponse:

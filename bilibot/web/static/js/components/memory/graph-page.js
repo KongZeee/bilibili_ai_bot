@@ -222,17 +222,30 @@ export const MemoryGraphPage = defineComponent({
         });
 
         // ── 数据加载 ──
+        let loadSeq = 0;
         async function loadData() {
-            accountId.value = appState.currentAccountId || appState.accounts[0]?.id;
-            if (!accountId.value) {
+            const nextId = appState.currentAccountId
+                || appState.accounts[0]?.account_id
+                || appState.accounts[0]?.id
+                || '';
+            if (!nextId) {
+                accountId.value = '';
                 loading.value = false;
+                graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
                 return;
             }
+            if (accountId.value && accountId.value !== nextId) {
+                graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
+                selectedNode.value = null;
+            }
+            accountId.value = nextId;
+            const seq = ++loadSeq;
             loading.value = true;
             selectedNode.value = null;
             hoveredNode.value = null;
             try {
                 const data = await api.memory.graph(accountId.value);
+                if (seq !== loadSeq || accountId.value !== nextId) return;
                 const snap = data.snapshot || { nodes: [], edges: [], memories: [] };
                 graphData.value = {
                     nodes: snap.nodes || [],
@@ -246,11 +259,12 @@ export const MemoryGraphPage = defineComponent({
                     memories: data.total_memories || (snap.memories || []).length,
                 };
             } catch (e) {
+                if (seq !== loadSeq) return;
                 showToast('加载图谱失败: ' + e.message, 'error');
                 graphData.value = { nodes: [], edges: [], memories: [], summary: {} };
                 totalCounts.value = { nodes: 0, edges: 0, memories: 0 };
             } finally {
-                loading.value = false;
+                if (seq === loadSeq) loading.value = false;
             }
         }
 
@@ -308,8 +322,8 @@ export const MemoryGraphPage = defineComponent({
         ];
 
         onMounted(loadData);
-        watch(() => appState.currentAccountId, (newId) => {
-            if (newId) loadData();
+        watch(() => appState.currentAccountId, (newId, prevId) => {
+            if (newId && newId !== prevId) loadData();
         });
 
         // ── 边是否高亮（连接到悬停/选中节点） ──

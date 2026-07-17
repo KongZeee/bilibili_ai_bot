@@ -161,6 +161,7 @@ web_search:
   # PRD V4 SEA-002：场景级开关矩阵
   scenes:
     reply_comment: { enabled: true }
+    # 私信默认关闭联网搜索；若 enabled=true 则 redact_query 必须为 true（配置保存会校验）
     private_message: { enabled: false, redact_query: true }
     proactive_video: { enabled: true }
     dynamic_post: { enabled: false }
@@ -183,28 +184,43 @@ personality:
   # 人格库通过 Web 面板管理（PRD §5.3），不再在此处配置 prompt
 
 # ── 功能开关（PRD §5.2 集中管理）──
+# 热重载后 scheduler / companion / bangumi 会按此段同步；memory 始终按账号装配。
+# 联网搜索总开关以 web_search.enabled 为准；features.web_search 仅为兼容位。
+# 私信不得按评论场景触发联网搜索：web_search.scenes.private_message.enabled 默认 false，
+# 若打开则 redact_query 必须为 true（PATCH /api/config 会校验）。
 features:
-  reply_comment: true        # 评论回复
-  private_message: false     # 私信
-  proactive_video: true      # 主动看视频
-  proactive_comment: true    # 主动评论
-  dynamic_post: true         # 动态发布
-  bangumi: false             # 番剧追更
-  weekly_summary: true       # 周总结
-  web_search: false          # 联网搜索
+  reply_comment: true        # 评论回复（入脑 + 混合召回）
+  private_message: false     # 私信（脱敏后入脑）
+  proactive_video: true      # 主动看视频（视听归档失败会 pause_account）
+  proactive_comment: true    # 主动评论（依赖 proactive_video 流程）
+  dynamic_post: true         # 动态发布（scene=dynamic_post，读写 brain）
+  bangumi: false             # 番剧追更（需账号 memory_brain；无 brain fail-closed）
+  weekly_summary: true       # 周总结（写入 weekly_summary 事件）
+  web_search: false          # 兼容位；真实生效见 web_search.enabled
   affection: true            # 好感度系统
   mood: true                 # 心情系统
   # B站 Cookie 自动检查间隔（小时）；账号级 ConfigLoader 会覆盖 bilibili 段，故放 features
   cookie_check_interval_hours: 6
-  # companion: false         # 可选；优先使用下方 companion.enabled
+  # companion: false         # 可选别名；优先使用下方 companion.enabled
+
+# ── 番剧追更策略 ──
+# features.bangumi 控制启停；看番原始内容、评价和每次动作意图/结果均写入账号统一记忆。
+# 评论/点赞/追番还会经过全局暂停、账号暂停、内容检查和频率限制。
+bangumi:
+  pools: ["trending"]       # 可选 trending / timeline / random
+  max_episodes: 3           # 每次检查最多观看 1-10 集
+  continue_score: 7         # 低于此分且模型不想继续时停止
+  comment: true
+  auto_follow: true
 
 # ── 陪伴生活层（人格化日程/梦境/日记/探索/创作；默认关闭）──
+# enabled=false 时不写脏、不注入 prompt；热重载会 rebind memory_brain。
 # 灵感来自 astrbot_plugin_private_companion 概念，按 B 站多账号架构重写
 companion:
   enabled: false             # 总开关
   life_state:
     enabled: true
-    inject_into_replies: true
+    inject_into_replies: true  # get_prompt_surface → 评论/私信 system 尾部
     energy_default: 70
   schedule:
     enabled: true
@@ -220,7 +236,7 @@ companion:
     max_entries: 14
     offer_dynamic_draft: false   # 日记 share_seed 是否进动态草稿箱
   exploration:
-    enabled: false               # 依赖 web_search.enabled
+    enabled: false               # 依赖 web_search.enabled；写入 web_reference/exploration
     min_interval_hours: 8
     max_results: 6
     interests: []                # 空则从人格 interests/tags + proactive.interest_keywords 推断
@@ -239,12 +255,13 @@ companion:
     require_review: true
 
 # ── 动态发布（PRD §5.2 / §5.6）──
+# 生成侧注入 V6 recall + companion；发布结果 bot_action scene=dynamic_post
 dynamic_publish:
-  # 主题池（留空则由 Bot 自由发挥）
+  # 主题池（留空则由 Bot 自由发挥 / 陪伴 pick_dynamic_topic）
   topics: []
   # 是否配图（需要 image_generation.enabled 同时开启）
   with_image: false
-  # 发布前是否需要 Web 审核
+  # 发布前是否需要 Web 审核（审核通过后独立 TaskRun 发布并写脑）
   review_before_publish: false
   # 草稿过期时间（秒），过期后自动标记 expired，永不发布
   draft_expiry_seconds: 86400
@@ -318,8 +335,7 @@ proactive:
   # 正则变体（IGNORECASE 编译，覆盖"完整.*看完"、"看完了?"等中间插字/可选字变体）
   # forbidden_phrase_patterns: ["完整.{0,4}看完", "看完了?"]
 
-  # PRD 4.17：bangumi/special_follow 在 config_loader 中为 bool 类型，
-  # V2 未实现番剧追更/特别关注，保持 false（旧版对象式配置已清理）
+  # 兼容旧配置；启停以 features.bangumi 为准，具体策略用顶层 bangumi 对象。
   bangumi: false
   special_follow: false
 
@@ -339,6 +355,9 @@ proactive:
       max_attempts: 1
     proactive_comment:
       grace_window_seconds: 900
+      max_attempts: 3
+    bangumi:
+      grace_window_seconds: 21600  # 看番可能耗时较长，允许 6 小时迟到窗口
       max_attempts: 3
 
 # ── 评论回复 ──
@@ -388,6 +407,9 @@ video_analysis:
   temp_dir: ""
 
 # ── 记忆系统 ──
+# 每账号库：data/accounts/<account_id>/memory_brain.db（V6 统一认知脑）
+# 归档失败（不可恢复观察）会 pause_account(reason=memory_archive_failed)，
+# 修复可写后 resume_account 恢复主动行为。
 memory:
   # V6 账号级统一联想记忆大脑
   recall_candidate_limit: 20
@@ -409,6 +431,10 @@ memory:
 # - host 默认仅本机；需要远程访问时再改为 0.0.0.0，并务必改掉默认密码 + 前置反向代理/HTTPS
 # - admin_password 为默认 admin123（明文或 bcrypt 哈希匹配）且 host 非 localhost 时，进程将拒绝启动 Web
 # - 会话为进程内存储，仅支持单进程（workers=1），勿多副本横向扩展 Web
+# - 配置 PATCH 使用 config_revision 乐观锁；OBJECT_ARRAY（profiles/accounts/*_providers）禁止用字符串提交
+# - 备份 create 原子写 .name.creating + replace；list/download/restore/delete 均跳过半成品；过期 staging 约 1h 清理
+# - 关闭进程时账号实例会 drain 记忆队列 + run_jobs_until_idle，勿强制 taskkill 丢向量任务
+# - logging.file / 日志下载限制在 data_dir 内；token-usage today 支持 account_id 过滤并附 scene_labels
 web:
   enabled: true
   host: "127.0.0.1"  # 推荐本机；仅在确知风险时改为 0.0.0.0

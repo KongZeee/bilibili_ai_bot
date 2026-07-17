@@ -432,19 +432,48 @@ class SafetyChecker:
     # ────────────────────── 账号级风险暂停 ──────────────────────
 
     def is_account_paused(self, account_id: str) -> bool:
-        """检查指定账号是否处于风险暂停状态（读内存缓存，启动时从 DB 加载）
+        """检查指定账号是否处于风险暂停状态（内存缓存 + DB 权威）
 
         SAFE-501：account_id 非空时检查账号级暂停；
         account_id 为空时返回 False（仅全局暂停由 is_paused() 处理）。
+
+        fail-closed：
+        - 内存命中 → True
+        - 内存未命中时回查 DB（覆盖启动加载失败 / 他进程写入）
+        - DB 异常 → True（视为已暂停，禁止发布）
         """
         if not account_id:
             return False
-        return account_id in self._account_paused
+        if account_id in self._account_paused:
+            return True
+        try:
+            with self._db_lock:
+                with self._connect_db() as conn:
+                    conn.row_factory = sqlite3.Row
+                    row = conn.execute(
+                        "SELECT account_id, reason, paused_at FROM account_pause "
+                        "WHERE account_id = ?",
+                        (account_id,),
+                    ).fetchone()
+            if row is None:
+                return False
+            self._account_paused[account_id] = {
+                "reason": (row["reason"] or "") if row["reason"] is not None else "",
+                "paused_at": (row["paused_at"] or "") if row["paused_at"] is not None else "",
+            }
+            return True
+        except Exception as e:
+            logger.warning(
+                "is_account_paused DB error for %s, fail-closed to True: %s",
+                account_id, e,
+            )
+            return True
 
     def pause_account(self, account_id: str, reason: str = "") -> None:
         """暂停指定账号的自动发布行为（不影响其他账号，SQLite 持久化）
 
         SAFE-501：账号级风险暂停（如 B站风控 code=-352）只暂停触发的账号。
+        记忆归档失败 reason 约定为 ``memory_archive_failed``（见 can_resume_memory_pause）。
         """
         if not account_id:
             return
@@ -469,8 +498,26 @@ class SafetyChecker:
             self._account_paused[account_id] = info
             logger.error(f"账号 {account_id} 风险暂停写 DB 失败，已写入内存: {e}")
 
+    # 记忆完整性暂停：可在归档恢复后手动 resume（Web/API）
+    MEMORY_ARCHIVE_PAUSE_REASON = "memory_archive_failed"
+
+    def is_memory_archive_pause(self, account_id: str) -> bool:
+        """True when account is paused specifically for memory archive failure."""
+        if not account_id or not self.is_account_paused(account_id):
+            return False
+        status = self.get_account_pause_status(account_id)
+        reason = str(status.get("reason") or "")
+        return reason == self.MEMORY_ARCHIVE_PAUSE_REASON or reason.startswith(
+            self.MEMORY_ARCHIVE_PAUSE_REASON
+        )
+
     def resume_account(self, account_id: str) -> None:
-        """恢复指定账号的自动发布行为（同步清除 DB）"""
+        """恢复指定账号的自动发布行为（同步清除 DB）
+
+        恢复条件（运维约定）：
+        - 风控类：人工确认 B 站侧恢复后 resume
+        - memory_archive_failed：确认 memory_brain 可写（磁盘/权限/DB 健康）后 resume
+        """
         if not account_id:
             return
         try:
@@ -487,14 +534,41 @@ class SafetyChecker:
         logger.info(f"账号 {account_id} 已恢复运行")
 
     def get_account_pause_status(self, account_id: str) -> dict:
-        """获取账号暂停状态详情"""
-        if not account_id or account_id not in self._account_paused:
-            return {"paused": False, "reason": "", "paused_at": ""}
-        info = self._account_paused[account_id]
+        """获取账号暂停状态详情（内存优先，未命中回查 DB）"""
+        if not account_id:
+            return {
+                "paused": False,
+                "reason": "",
+                "paused_at": "",
+                "memory_archive": False,
+                "resume_hint": "",
+            }
+        # 先走 is_account_paused 以触发 DB 回填
+        paused = self.is_account_paused(account_id)
+        if not paused:
+            return {
+                "paused": False,
+                "reason": "",
+                "paused_at": "",
+                "memory_archive": False,
+                "resume_hint": "",
+            }
+        info = self._account_paused.get(account_id) or {}
+        reason = str(info.get("reason") or "")
+        memory_archive = reason == self.MEMORY_ARCHIVE_PAUSE_REASON or reason.startswith(
+            self.MEMORY_ARCHIVE_PAUSE_REASON
+        )
+        resume_hint = (
+            "确认 memory_brain 可写后调用 resume_account"
+            if memory_archive
+            else "确认风控解除后调用 resume_account"
+        )
         return {
             "paused": True,
-            "reason": info.get("reason", ""),
+            "reason": reason,
             "paused_at": info.get("paused_at", ""),
+            "memory_archive": memory_archive,
+            "resume_hint": resume_hint,
         }
 
     # ────────────────────── 发布前内容检查 ──────────────────────

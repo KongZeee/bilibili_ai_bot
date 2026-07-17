@@ -35,8 +35,19 @@ export const ProactivePage = defineComponent({
             if (!selectedAccount.value) return;
             triggering.value = true;
             try {
-                await api.post(`/api/accounts/${selectedAccount.value}/tasks/proactive-video`);
-                showToast('主动视频任务已触发', 'success');
+                const data = await api.accounts.triggerProactiveVideo(selectedAccount.value);
+                // 202 信封：无 task_id 不得报成功（防空响应误 toast）
+                const taskId = data?.task_id || data?.id || '';
+                if (!taskId) {
+                    showToast('触发未返回任务 ID，请刷新任务列表确认', 'warning');
+                    await loadTasks();
+                    return;
+                }
+                const scene = data?.scene || 'proactive_video';
+                showToast(
+                    `主动视频已排队（${auditSceneLabel(scene)} · ${String(taskId).slice(0, 8)}…）`,
+                    'success',
+                );
                 await loadTasks();
             } catch (e) { showToast('触发失败: ' + e.message, 'error'); }
             finally { triggering.value = false; }
@@ -46,11 +57,49 @@ export const ProactivePage = defineComponent({
             if (!selectedAccount.value) return;
             triggering.value = true;
             try {
-                await api.post(`/api/accounts/${selectedAccount.value}/tasks/dynamic`);
-                showToast('动态发布任务已触发', 'success');
+                const data = await api.accounts.triggerDynamic(selectedAccount.value);
+                const taskId = data?.task_id || data?.id || '';
+                if (!taskId) {
+                    showToast('触发未返回任务 ID，请刷新任务列表确认', 'warning');
+                    await loadTasks();
+                    return;
+                }
+                const scene = data?.scene || 'dynamic_post';
+                showToast(
+                    `动态发布已排队（${auditSceneLabel(scene)} · ${String(taskId).slice(0, 8)}…）`,
+                    'success',
+                );
                 await loadTasks();
             } catch (e) { showToast('触发失败: ' + e.message, 'error'); }
             finally { triggering.value = false; }
+        }
+
+        async function triggerBangumi() {
+            if (!selectedAccount.value) return;
+            triggering.value = true;
+            try {
+                const data = await api.accounts.triggerBangumi(selectedAccount.value);
+                const taskId = data?.task_id || data?.id || '';
+                if (!taskId) {
+                    showToast('触发未返回任务 ID，请刷新任务列表确认', 'warning');
+                    await loadTasks();
+                    return;
+                }
+                showToast(
+                    `追番检查已排队（${String(taskId).slice(0, 8)}…）`,
+                    'success',
+                );
+                await loadTasks();
+            } catch (e) { showToast('触发追番失败: ' + e.message, 'error'); }
+            finally { triggering.value = false; }
+        }
+
+        function triggerForScene(scene) {
+            if (scene === 'dynamic' || scene === 'dynamic_post') return triggerDynamic();
+            if (scene === 'proactive_video') return triggerVideo();
+            if (scene === 'bangumi' || scene === 'bangumi_comment') return triggerBangumi();
+            showToast(`“${auditSceneLabel(scene)}”暂不支持手动触发`, 'warning');
+            return undefined;
         }
 
         async function ensureAccountAndLoad() {
@@ -60,6 +109,8 @@ export const ProactivePage = defineComponent({
             if (!selectedAccount.value && appState.accounts.length > 0) {
                 const first = appState.accounts[0];
                 selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
+                // selectedAccount watch 统一 loadTasks，避免赋值后再手动 load 双请求
+                return;
             }
             if (selectedAccount.value) await loadTasks();
         }
@@ -70,13 +121,22 @@ export const ProactivePage = defineComponent({
             if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
                 const first = appState.accounts[0];
                 selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                loadTasks();
+                // selectedAccount watch 会触发 loadTasks
             }
         });
 
         watch(() => appState.currentAccountId, (id) => {
             if (id && id !== selectedAccount.value) {
                 selectedAccount.value = id;
+                // selectedAccount watch 统一 loadTasks
+            }
+        });
+
+        watch(selectedAccount, (id, prev) => {
+            if (id && id !== prev) {
+                tasks.value = [];
+                loadTasks();
+            } else if (id && !tasks.value.length) {
                 loadTasks();
             }
         });
@@ -106,7 +166,7 @@ export const ProactivePage = defineComponent({
                             }, String(tasks.value.length || 0)),
                             h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '条任务记录'),
                         ]),
-                        h('p', { class: 'muted m-0' }, '管理主动视频生成与动态发布任务'),
+                        h('p', { class: 'muted m-0' }, '管理主动视频、动态发布与追番检查任务'),
                     ]),
                     // 右侧：账号选择 Card
                     h('article', {
@@ -122,7 +182,7 @@ export const ProactivePage = defineComponent({
                         h('div', { class: 'card-body grid gap-2' }, [
                             h(FormSelect, {
                                 modelValue: selectedAccount.value,
-                                'onUpdate:modelValue': (v) => { selectedAccount.value = v; loadTasks(); },
+                                'onUpdate:modelValue': (v) => { selectedAccount.value = v; },
                                 options: appState.accounts.map(a => ({ value: a.account_id || a.id, label: a.name || a.account_id || a.id })),
                             }),
                             h('div', { class: 'flex items-center gap-2 flex-wrap' }, [
@@ -134,7 +194,13 @@ export const ProactivePage = defineComponent({
                                 h(Button, {
                                     type: 'ghost',
                                     onClick: triggerDynamic,
+                                    loading: triggering.value,
                                 }, () => '触发动态'),
+                                h(Button, {
+                                    type: 'ghost',
+                                    onClick: triggerBangumi,
+                                    loading: triggering.value,
+                                }, () => '检查追番'),
                             ]),
                         ]),
                     ]),
@@ -200,10 +266,11 @@ export const ProactivePage = defineComponent({
                                 h('div', { class: 'flex items-center gap-1' }, [
                                     h('button', {
                                         class: 'btn btn-sm primary',
-                                        onClick: () => {
-                                            if (t.scene === 'dynamic') triggerDynamic();
-                                            else triggerVideo();
-                                        },
+                                        onClick: () => triggerForScene(t.scene),
+                                        disabled: ![
+                                            'dynamic', 'dynamic_post', 'proactive_video',
+                                            'bangumi', 'bangumi_comment',
+                                        ].includes(t.scene),
                                     }, '触发'),
                                 ]),
                             ])),

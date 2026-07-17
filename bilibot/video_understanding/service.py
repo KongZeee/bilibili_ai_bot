@@ -491,9 +491,10 @@ class VideoUnderstandingService:
                 }
 
             try:
-                # 2. 双轨并行
+                # 2. 双轨并行（整体 analysis_timeout 包裹，防 Whisper/Vision 泄漏占满信号量）
                 frames_dir = os.path.join(prep.work_dir, "keyframes")
                 use_vision = self.has_vision()
+                analysis_timeout = max(30, int(cfg.analysis_timeout_seconds or 600))
 
                 async def _visual_task():
                     if not use_vision or not self.adapter:
@@ -595,37 +596,78 @@ class VideoUnderstandingService:
                         if (seg.get("content") or "").strip()
                     ]
 
-                # VID-605：确保 audio_task 抛异常时 visual_future 被取消，避免 Vision LLM 调用泄漏
-                visual_future = asyncio.create_task(_visual_task())
-                try:
-                    if subtitle_events or read_subtitles:
-                        # 字幕轨：不调用 ASR（番剧字幕识别模式严格"不用声音"）
-                        audio_events = subtitle_events or []
-                        audio_result = ASRTranscriptionResult(
-                            audio_events,
-                            "subtitle" if subtitle_events else "visual_subtitle",
-                        )
-                        if read_subtitles and not subtitle_events:
-                            logger.info(
-                                "番剧字幕识别模式：跳过音频 ASR，由 Vision LLM 从画面帧转写硬字幕"
-                            )
-                        elif subtitle_events:
-                            logger.info(
-                                f"番剧字幕识别模式：跳过音频 ASR，使用 {len(audio_events)} 段字幕作为文本轨"
-                            )
-                        visual_events, is_static = await visual_future
-                    else:
-                        # 用专用线程池跑 ASR，避免占满默认 to_thread 池导致 Web 无响应。
-                        audio_result = await loop.run_in_executor(executor, _audio_task)
-                        audio_events = audio_result.events
-                        visual_events, is_static = await visual_future
-                except Exception:
-                    visual_future.cancel()
+                async def _dual_track():
+                    # VID-605：audio 异常 / 外层超时 cancel 时必须取消 visual，
+                    # 避免 Vision LLM 孤儿任务继续占满全局 semaphore。
+                    visual_future = asyncio.create_task(_visual_task())
                     try:
-                        await visual_future
-                    except asyncio.CancelledError:
+                        if subtitle_events or read_subtitles:
+                            audio_events_local = subtitle_events or []
+                            audio_result_local = ASRTranscriptionResult(
+                                audio_events_local,
+                                "subtitle" if subtitle_events else "visual_subtitle",
+                            )
+                            if read_subtitles and not subtitle_events:
+                                logger.info(
+                                    "番剧字幕识别模式：跳过音频 ASR，由 Vision LLM 从画面帧转写硬字幕"
+                                )
+                            elif subtitle_events:
+                                logger.info(
+                                    f"番剧字幕识别模式：跳过音频 ASR，使用 {len(audio_events_local)} 段字幕作为文本轨"
+                                )
+                            visual_events_local, is_static_local = await visual_future
+                        else:
+                            audio_result_local = await loop.run_in_executor(
+                                executor, _audio_task
+                            )
+                            audio_events_local = audio_result_local.events
+                            visual_events_local, is_static_local = await visual_future
+                        return (
+                            audio_events_local,
+                            audio_result_local,
+                            visual_events_local,
+                            is_static_local,
+                        )
+                    finally:
+                        if not visual_future.done():
+                            visual_future.cancel()
+                            try:
+                                await visual_future
+                            except (asyncio.CancelledError, Exception):
+                                pass
+
+                dual_task = asyncio.create_task(_dual_track())
+                try:
+                    (
+                        audio_events,
+                        audio_result,
+                        visual_events,
+                        is_static,
+                    ) = await asyncio.wait_for(
+                        dual_task, timeout=analysis_timeout
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "视频双轨分析超时（%ss），释放全局并发", analysis_timeout
+                    )
+                    if not dual_task.done():
+                        dual_task.cancel()
+                        try:
+                            await dual_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
+                    try:
+                        import shutil
+
+                        shutil.rmtree(prep.work_dir, ignore_errors=True)
+                    except Exception:
                         pass
-                    raise
+                    return {
+                        "behavior_log": "",
+                        "answer": None,
+                        "work_dir": "",
+                        "degradation_reason": "analysis_timeout",
+                    }
 
                 # 3. 时序缝合
                 blocks = align_events(audio_events, visual_events, prep.duration, is_static=is_static)
@@ -728,19 +770,16 @@ class VideoUnderstandingService:
                     ],
                 }
             except Exception as error:
-                # 失败不再保留 work_dir：重试会重新下载/抽帧，残留只会占满磁盘。
-                # 仍把 work_dir 挂到异常上，方便调用方 finally 做幂等清理。
+                # Strict extraction failures are evidence: the caller may need
+                # the downloaded audio/keyframes for retry, diagnostics or a
+                # later memory archive.  Attach the path and let the caller's
+                # bounded delayed-cleanup policy own its lifecycle.
                 try:
                     error.work_dir = prep.work_dir
                 except Exception:
                     pass
-                try:
-                    import shutil
-                    shutil.rmtree(prep.work_dir, ignore_errors=True)
-                except Exception:
-                    pass
                 logger.warning(
-                    "视频提取未完成，已清理处理目录: work_dir=%s error=%s",
+                    "视频提取未完成，保留处理目录等待调用方清理: work_dir=%s error=%s",
                     prep.work_dir,
                     type(error).__name__,
                 )

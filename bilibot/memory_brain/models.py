@@ -22,6 +22,12 @@ class MemoryBrainError(RuntimeError):
     code = "MEMORY_BRAIN_ERROR"
 
 
+class ActivityMemoryError(MemoryBrainError):
+    """The Bot could not establish a durable, recall-backed activity context."""
+
+    code = "ACTIVITY_MEMORY_UNAVAILABLE"
+
+
 class IdempotencyConflictError(MemoryBrainError):
     code = "IDEMPOTENCY_CONFLICT"
 

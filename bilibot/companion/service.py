@@ -147,6 +147,7 @@ class CompanionLifeService:
         llm=None,
         persona_store=None,
         memory_brain=None,
+        safety_checker=None,
         web_search=None,
         draft_store=None,
     ):
@@ -156,6 +157,7 @@ class CompanionLifeService:
         self.llm = llm
         self.persona_store = persona_store
         self.memory_brain = memory_brain
+        self.safety_checker = safety_checker
         self.web_search = web_search
         self.draft_store = draft_store
         self.store = CompanionStore(account_data_dir)
@@ -163,6 +165,11 @@ class CompanionLifeService:
         # 异步可重入保护：bool 在 await 间隙会误判；用 asyncio.Lock
         self._tick_lock: Optional[asyncio.Lock] = None
         self._tick_busy = False  # sync fallback if lock not yet bound to loop
+        # 最近一次入脑失败（可观测，不阻断主链路）
+        self._last_archive_error: str = ""
+        self._last_archive_ok_at: str = ""
+        self._last_archive_fail_at: str = ""
+        self._archive_fail_count: int = 0
 
     # ── config ──
 
@@ -175,6 +182,31 @@ class CompanionLifeService:
                 raw = {}
         self._cfg = load_companion_config(raw)
         return self._cfg
+
+    def rebind_memory_brain(self, memory_brain) -> None:
+        """Hot-reload: keep companion writing the current account brain."""
+        self.memory_brain = memory_brain
+
+    def rebind_safety_checker(self, safety_checker) -> None:
+        """Hot-reload: keep memory failures connected to account fail-closed state."""
+        self.safety_checker = safety_checker
+
+    def _pause_for_memory_failure(self, detail: str = "") -> None:
+        safety = getattr(self, "safety_checker", None)
+        pause = getattr(safety, "pause_account", None)
+        if not callable(pause):
+            return
+        reason = "memory_archive_failed:companion"
+        if detail:
+            reason = f"{reason}:{detail[:80]}"
+        try:
+            pause(self.account_id, reason=reason)
+        except Exception:
+            logger.error(
+                "[%s] companion memory failure could not pause account",
+                self.account_id,
+                exc_info=True,
+            )
 
     @property
     def config(self) -> CompanionConfig:
@@ -274,9 +306,36 @@ class CompanionLifeService:
         idempotency_key: str = "",
         importance: float = 0.55,
         metadata: Optional[Dict[str, Any]] = None,
-    ) -> None:
-        if not self.memory_brain or not text:
-            return
+    ) -> bool:
+        """Archive companion output into the account memory brain.
+
+        Returns True on commit / soft idempotent hit; False on skip or failure.
+        Callers publish local companion state only after True.  A real memory
+        failure also pauses this account's automatic external actions.
+        """
+        if not self.enabled:
+            return False
+        if not text:
+            return False
+        if not self.memory_brain:
+            self._last_archive_error = "memory_brain_missing"
+            self._last_archive_fail_at = _now_iso()
+            self._archive_fail_count = int(self._archive_fail_count or 0) + 1
+            logger.warning(
+                "[%s] companion archive skipped: no memory_brain source=%s",
+                self.account_id,
+                source_type,
+            )
+            self._pause_for_memory_failure("memory_brain_missing")
+            try:
+                self.store.patch_runtime(
+                    last_archive_error=self._last_archive_error,
+                    last_archive_fail_at=self._last_archive_fail_at,
+                    archive_fail_count=self._archive_fail_count,
+                )
+            except Exception:
+                pass
+            return False
         try:
             from bilibot.memory_brain.ingestion import text_observation
 
@@ -285,6 +344,13 @@ class CompanionLifeService:
             if source_type in {"diary", "dream", "life_plan", "creative", "web_reference"}:
                 digest = hashlib.sha1(str(text).encode("utf-8", errors="ignore")).hexdigest()[:10]
                 base_key = f"{base_key}:{digest}"
+
+            meta = dict(metadata or {})
+            meta.setdefault("companion", True)
+            meta.setdefault("source_module", "companion")
+            # 可观测：连续归档失败次数挂到 runtime，供面板/运维感知「本地有脑无」
+            if int(self._archive_fail_count or 0) > 0:
+                meta.setdefault("prior_archive_fail_count", int(self._archive_fail_count or 0))
 
             env = text_observation(
                 account_id=self.account_id,
@@ -295,20 +361,279 @@ class CompanionLifeService:
                 title=title,
                 persona_id=self._persona_bits().get("id") or "",
                 scene="companion",
-                metadata=metadata or {},
+                metadata=meta,
                 importance=importance,
             )
+            result = None
             if hasattr(self.memory_brain, "archive_observation_async"):
-                await self.memory_brain.archive_observation_async(env)
+                result = await self.memory_brain.archive_observation_async(env)
             elif hasattr(self.memory_brain, "archive_observation"):
-                self.memory_brain.archive_observation(env)
+                result = self.memory_brain.archive_observation(env)
+            else:
+                raise RuntimeError("memory_brain has no archive_observation")
+
+            committed = True
+            if result is not None:
+                if isinstance(result, dict):
+                    committed = result.get("source_committed", True) is not False
+                else:
+                    committed = getattr(result, "source_committed", True) is not False
+            if not committed:
+                raise RuntimeError("companion archive source_committed=false")
+
+            self._last_archive_error = ""
+            self._last_archive_ok_at = _now_iso()
+            try:
+                self.store.patch_runtime(
+                    last_archive_ok_at=self._last_archive_ok_at,
+                    last_archive_error="",
+                    last_archive_source=source_type,
+                )
+            except Exception:
+                pass
+            return True
         except Exception as e:
             msg = str(e)
+            err_name = type(e).__name__
             # 同内容重入可静默；不同内容冲突仅 debug
-            if "already exists" in msg or "Idempotency" in type(e).__name__:
+            if "already exists" in msg or "Idempotency" in err_name:
                 logger.debug("[%s] companion archive skip: %s", self.account_id, msg[:160])
-            else:
-                logger.warning("[%s] companion archive failed: %s", self.account_id, e)
+                return True
+            self._last_archive_error = f"{err_name}:{msg[:120]}"
+            self._last_archive_fail_at = _now_iso()
+            self._archive_fail_count = int(self._archive_fail_count or 0) + 1
+            # soft：不 pause 平台动作；连续失败升级 warning 便于运维感知「本地有脑无」
+            log_fn = (
+                logger.error
+                if self._archive_fail_count >= 3
+                else logger.warning
+            )
+            log_fn(
+                "[%s] companion archive failed source=%s fail_count=%s: %s",
+                self.account_id,
+                source_type,
+                self._archive_fail_count,
+                self._last_archive_error,
+            )
+            self._pause_for_memory_failure(self._last_archive_error)
+            try:
+                self.store.patch_runtime(
+                    last_archive_error=self._last_archive_error,
+                    last_archive_fail_at=self._last_archive_fail_at,
+                    archive_fail_count=self._archive_fail_count,
+                    last_archive_source=source_type,
+                )
+            except Exception:
+                pass
+            return False
+
+    async def _recall_life_evidence(
+        self,
+        *,
+        query: str = "",
+        scene: str = "companion",
+        limit: int = 6,
+        action_key: str = "",
+        action_type: str = "",
+        current_activity: str = "",
+        title: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """V6 hybrid recall for diary/explore generation (not fragile string search).
+
+        Returns ``{memory_evidence, memory_event_ids, snippets}``. Failures
+        degrade to empty with a warning — never raise into generators.
+        """
+        empty: Dict[str, Any] = {
+            "memory_evidence": "",
+            "memory_event_ids": [],
+            "snippets": [],
+        }
+        if not self.memory_brain:
+            return empty
+        today = _today()
+        q = (query or "").strip() or (
+            f"{today} 最近看的视频、番剧、评论、动态、日记、心情、想法"
+        )
+        evidence = ""
+        event_ids: List[str] = []
+        snippets: List[str] = []
+
+        if action_key:
+            begin = getattr(self.memory_brain, "begin_activity", None)
+            if not callable(begin) or not callable(
+                getattr(type(self.memory_brain), "begin_activity", None)
+            ):
+                # Legacy/test brains predate the activity API. Production uses
+                # MemoryBrainService and therefore always takes the durable
+                # branch below; compatibility callers retain their old recall-
+                # empty then archive-output behavior.
+                return empty
+            try:
+                activity = await begin(
+                    action_key=action_key,
+                    action_type=action_type or scene,
+                    current_activity=current_activity or f"正在进行{scene}任务。",
+                    query=q,
+                    scene=scene,
+                    title=title or action_type or scene,
+                    persona_id=self._persona_bits().get("id") or "",
+                    metadata={
+                        **dict(metadata or {}),
+                        "companion": True,
+                        "source_module": "companion",
+                    },
+                    recent_limit=max(6, limit),
+                    recall_limit=limit,
+                )
+            except Exception as exc:
+                self._pause_for_memory_failure(
+                    f"activity_memory_failed:{type(exc).__name__}"
+                )
+                logger.error(
+                    "[%s] companion activity memory failed scene=%s action=%s",
+                    self.account_id,
+                    scene,
+                    action_key,
+                    exc_info=True,
+                )
+                raise
+            evidence = str(getattr(activity, "prompt_text", "") or "").strip()
+            event_ids = list(getattr(activity, "event_ids", ()) or ())
+            snippets = list(getattr(activity, "recent_self_actions", ()) or ())
+            if not evidence:
+                self._pause_for_memory_failure("activity_memory_empty")
+                raise RuntimeError("companion activity memory returned empty context")
+            return {
+                "memory_evidence": evidence[:4000],
+                "memory_event_ids": event_ids[:20],
+                "snippets": snippets[:limit],
+            }
+
+        try:
+            if callable(getattr(self.memory_brain, "recall", None)):
+                from bilibot.memory_brain import RecallQuery
+
+                result = await self.memory_brain.recall(
+                    RecallQuery(
+                        current_message=q,
+                        account_id=self.account_id or "",
+                        scene=scene,
+                    )
+                )
+                if result is not None:
+                    evidence = str(getattr(result, "prompt_evidence", "") or "")
+                    for ev in getattr(result, "events", ()) or ():
+                        if not isinstance(ev, dict):
+                            continue
+                        eid = str(ev.get("id") or ev.get("event_id") or "").strip()
+                        if eid and eid not in event_ids:
+                            event_ids.append(eid)
+                        title = str(
+                            ev.get("title") or ev.get("event_title") or ""
+                        ).strip()
+                        summary = str(
+                            ev.get("summary")
+                            or ev.get("event_summary")
+                            or ev.get("text")
+                            or ""
+                        ).strip()
+                        line = " — ".join(x for x in (title, summary[:160]) if x)
+                        if line and line not in snippets:
+                            snippets.append(line)
+                        if len(snippets) >= limit:
+                            break
+            elif hasattr(self.memory_brain, "search_memories"):
+                hits = await self.memory_brain.search_memories(query=q, limit=limit)
+                if isinstance(hits, list):
+                    for h in hits[:limit]:
+                        if isinstance(h, dict):
+                            line = str(
+                                h.get("summary")
+                                or h.get("event_summary")
+                                or h.get("title")
+                                or h.get("text")
+                                or ""
+                            ).strip()
+                            eid = str(h.get("id") or h.get("event_id") or "").strip()
+                        else:
+                            line = str(h).strip()
+                            eid = ""
+                        if line:
+                            snippets.append(line[:200])
+                        if eid and eid not in event_ids:
+                            event_ids.append(eid)
+        except Exception as exc:
+            logger.warning(
+                "[%s] companion V6 recall failed scene=%s: %s",
+                self.account_id,
+                scene,
+                type(exc).__name__,
+            )
+            return empty
+
+        if not evidence and snippets:
+            evidence = "\n".join(f"- {s}" for s in snippets[:limit])
+        if evidence:
+            logger.info(
+                "[%s] companion recall scene=%s events=%s chars=%s",
+                self.account_id,
+                scene,
+                len(event_ids),
+                len(evidence),
+            )
+        return {
+            "memory_evidence": evidence[:2500],
+            "memory_event_ids": event_ids[:20],
+            "snippets": snippets[:limit],
+        }
+
+    async def _finish_activity_memory(
+        self,
+        *,
+        action_key: str,
+        action_type: str,
+        result_text: str,
+        scene: str,
+        title: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Close an activity lifecycle after its domain output is archived."""
+        finish = getattr(self.memory_brain, "finish_activity", None)
+        if not callable(finish) or not callable(
+            getattr(type(self.memory_brain), "finish_activity", None)
+        ):
+            return False
+        try:
+            await finish(
+                action_key=action_key,
+                action_type=action_type,
+                result_text=result_text,
+                state="completed",
+                scene=scene,
+                title=title,
+                persona_id=self._persona_bits().get("id") or "",
+                metadata={
+                    **dict(metadata or {}),
+                    "companion": True,
+                    "source_module": "companion",
+                },
+            )
+            return True
+        except Exception as exc:
+            # The domain event was already committed, so do not regenerate a
+            # different diary/dream/chunk. Pause future automation and keep the
+            # successfully archived output as the source of truth.
+            self._pause_for_memory_failure(
+                f"activity_outcome_failed:{type(exc).__name__}"
+            )
+            logger.error(
+                "[%s] companion activity outcome failed action=%s",
+                self.account_id,
+                action_key,
+                exc_info=True,
+            )
+            return False
 
     def _offer_draft(self, content: str, created_by: str) -> Optional[str]:
         if not content or not content.strip():
@@ -563,6 +888,8 @@ class CompanionLifeService:
         review: str = "",
         comment: str = "",
         bvid: str = "",
+        memory_event_ids: Optional[List[str]] = None,
+        oid: str = "",
     ) -> None:
         """Feedback from operational proactive-video into living state (soft)."""
         if not self.enabled:
@@ -606,11 +933,21 @@ class CompanionLifeService:
                     )
                 )
                 self.store.save_dream_fragments(self._normalize_fragments(pool))
-            self.store.patch_runtime(
-                last_proactive_video_at=_now_iso(),
-                last_proactive_video_bvid=bvid or "",
-                last_proactive_video_score=sc,
-            )
+            runtime_patch: Dict[str, Any] = {
+                "last_proactive_video_at": _now_iso(),
+                "last_proactive_video_bvid": bvid or "",
+                "last_proactive_video_score": sc,
+                "last_proactive_video_title": short_title,
+            }
+            if oid:
+                runtime_patch["last_proactive_video_oid"] = str(oid)[:32]
+            if memory_event_ids:
+                runtime_patch["last_proactive_video_memory_event_ids"] = [
+                    str(x) for x in list(memory_event_ids)[:12] if str(x)
+                ]
+            if review:
+                runtime_patch["last_proactive_video_review"] = str(review)[:120]
+            self.store.patch_runtime(**runtime_patch)
             logger.info(
                 "[%s] companion feedback from video 《%s》 score=%s energy→%s",
                 self.account_id,
@@ -621,7 +958,21 @@ class CompanionLifeService:
         except Exception as e:
             logger.warning("[%s] on_proactive_video_finished failed: %s", self.account_id, e)
 
-    def on_dynamic_posted(self, content: str = "", topic: str = "") -> None:
+    def on_dynamic_posted(
+        self,
+        content: str = "",
+        topic: str = "",
+        *,
+        draft_id: str = "",
+        dynamic_id: str = "",
+        task_id: str = "",
+    ) -> None:
+        """Soft life-state feedback after a dynamic is published.
+
+        Brain archival of the post itself is owned by scheduler
+        (``bot_action`` / ``dynamic_post``); this only updates local life surface
+        and records correlation ids so diary/explore can reference the same post.
+        """
         if not self.enabled:
             return
         try:
@@ -634,7 +985,18 @@ class CompanionLifeService:
             state.activity = "刚发了条动态"
             state.updated_at = _now_iso()
             self.store.save_life_state(state)
-            self.store.patch_runtime(last_dynamic_at=_now_iso())
+            runtime_patch: Dict[str, Any] = {"last_dynamic_at": _now_iso()}
+            if draft_id:
+                runtime_patch["last_dynamic_draft_id"] = str(draft_id)[:64]
+            if dynamic_id:
+                runtime_patch["last_dynamic_id"] = str(dynamic_id)[:64]
+            if task_id:
+                runtime_patch["last_dynamic_task_id"] = str(task_id)[:64]
+            if content:
+                runtime_patch["last_dynamic_preview"] = str(content)[:120]
+            if topic:
+                runtime_patch["last_dynamic_topic"] = str(topic)[:80]
+            self.store.patch_runtime(**runtime_patch)
         except Exception as e:
             logger.warning("[%s] on_dynamic_posted failed: %s", self.account_id, e)
 
@@ -664,6 +1026,9 @@ class CompanionLifeService:
             "interest_keywords": self.get_interest_keywords(),
             "wants_browse_now": self.wants_browse_bilibili_now(),
             "runtime": self.store.get_runtime(),
+            "memory_brain_bound": bool(self.memory_brain),
+            "last_archive_error": self._last_archive_error,
+            "archive_fail_count": int(self._archive_fail_count or 0),
         }
 
     # ── life state ──
@@ -772,6 +1137,24 @@ class CompanionLifeService:
             dream_afterglow=state.dream_afterglow,
             item_count=self._cfg.schedule.item_count,
         )
+        plan_recall = await self._recall_life_evidence(
+            query=(
+                f"{today} 安排今天的生活 最近做过的事 日记 梦境 视频 番剧 "
+                f"{state.activity or ''} {state.mood_bias or ''}"
+            ),
+            scene="life_plan",
+            limit=5,
+            action_key=f"companion_plan:{today}",
+            action_type="create_daily_plan",
+            current_activity=(
+                "正在安排今天的生活计划，会参考最近做过的事、当前精力、心情和还想继续做的事。"
+            ),
+            title=f"日程 {today}",
+            metadata={"date": today},
+        )
+        plan_memory = str(plan_recall.get("memory_evidence") or "").strip()
+        if plan_memory:
+            user = f"{user}\n\n【近期活动记忆】\n{plan_memory[:1600]}"
         raw = await self._llm_text(system, user, max_tokens=1200, scene="life_plan")
         items: List[PlanItem] = []
         source = "fallback"
@@ -809,18 +1192,35 @@ class CompanionLifeService:
             quality_score=score,
             raw=(raw or "")[:4000],
         )
-        self.store.save_daily_plan(plan)
-        self._sync_state_from_plan(plan)
-        self.store.patch_runtime(last_plan_at=_now_iso(), plan_source=source)
-        await self._archive_text(
+        archived = await self._archive_text(
             source_type="life_plan",
             event_type="daily_plan",
             text=P.format_plan_summary([i.to_dict() for i in items]),
             title=f"日程 {today}",
             idempotency_key=f"daily_plan:{today}",
             importance=0.45,
-            metadata={"source": source, "quality": score},
+            metadata={
+                "source": source,
+                "quality": score,
+                "memory_grounded": bool(plan_memory),
+                "memory_event_ids": list(
+                    plan_recall.get("memory_event_ids") or []
+                )[:10],
+            },
         )
+        if not archived:
+            raise RuntimeError("companion daily plan memory archive failed")
+        await self._finish_activity_memory(
+            action_key=f"companion_plan:{today}",
+            action_type="create_daily_plan",
+            result_text="今天的生活计划已经生成并归档。",
+            scene="life_plan",
+            title=f"日程 {today}",
+            metadata={"date": today},
+        )
+        self.store.save_daily_plan(plan)
+        self._sync_state_from_plan(plan)
+        self.store.patch_runtime(last_plan_at=_now_iso(), plan_source=source)
         return plan
 
     async def ensure_detail_enhancement(self) -> Optional[StoryDetail]:
@@ -866,6 +1266,23 @@ class CompanionLifeService:
             persona_name=bits["name"],
             energy=state.energy,
         )
+        detail_recall = await self._recall_life_evidence(
+            query=(
+                f"{plan.date} {window} {target.activity} 当前生活时段 最近做过的事"
+            ),
+            scene="life_plan",
+            limit=4,
+            action_key=f"companion_life_detail:{seg_key}",
+            action_type="expand_life_detail",
+            current_activity=(
+                "正在细化当前生活时段，先回顾今天已经做过什么、现在处于哪个安排、接下来准备做什么。"
+            ),
+            title=f"生活时段 {window}",
+            metadata={"segment_key": seg_key, "date": plan.date},
+        )
+        detail_memory = str(detail_recall.get("memory_evidence") or "").strip()
+        if detail_memory:
+            user = f"{user}\n\n【近期活动记忆】\n{detail_memory[:1200]}"
         raw = await self._llm_text(system, user, max_tokens=500, scene="life_plan")
         summary = target.activity
         events: List[str] = []
@@ -886,6 +1303,37 @@ class CompanionLifeService:
             events=events,
             proactive_hooks=hooks,
             generated_at=_now_iso(),
+        )
+        detail_text = summary
+        if events:
+            detail_text += "\n事件：" + "；".join(events)
+        if hooks:
+            detail_text += "\n念头：" + "；".join(hooks)
+        archived = await self._archive_text(
+            source_type="life_plan",
+            event_type="life_detail",
+            text=detail_text,
+            title=f"生活时段 {window}",
+            idempotency_key=f"life_detail:{seg_key}",
+            importance=0.35,
+            metadata={
+                "segment_key": seg_key,
+                "window": window,
+                "memory_grounded": bool(detail_memory),
+                "memory_event_ids": list(
+                    detail_recall.get("memory_event_ids") or []
+                )[:10],
+            },
+        )
+        if not archived:
+            raise RuntimeError("companion life detail memory archive failed")
+        await self._finish_activity_memory(
+            action_key=f"companion_life_detail:{seg_key}",
+            action_type="expand_life_detail",
+            result_text="当前生活时段已经细化并归档。",
+            scene="life_plan",
+            title=f"生活时段 {window}",
+            metadata={"segment_key": seg_key, "date": plan.date},
         )
         self.store.save_story_detail(detail)
         state.activity = target.activity
@@ -931,13 +1379,46 @@ class CompanionLifeService:
         plan_sum = P.format_plan_summary([i.to_dict() for i in plan.items])
         diaries = self.store.get_diaries()
         diary_hint = diaries[0].summary if diaries else ""
-        system, user = P.build_dream_prompt(
-            persona_name=bits["name"],
-            persona_prompt=bits["base_prompt"],
-            fragments=frag_texts,
-            plan_summary=plan_sum,
-            diary_hint=diary_hint,
+        # V6 混合召回：梦境生成侧读近期经历，避免「只写不读」
+        dream_recall = await self._recall_life_evidence(
+            query=(
+                f"{today} 最近 看了 视频 番剧 评论 动态 日记 心情 念头 日程 "
+                f"{(self.ensure_life_state().activity if self.enabled else '') or ''}"
+            ),
+            scene="dream",
+            limit=5,
+            action_key=f"companion_dream:{today}",
+            action_type="write_dream",
+            current_activity=(
+                "正在整理今天的梦境，会结合最近看过、做过、写过和感受过的事情形成连续的梦。"
+            ),
+            title=f"梦境 {today}",
+            metadata={"date": today},
         )
+        memory_hint = str(dream_recall.get("memory_evidence") or "").strip()
+        if not memory_hint and dream_recall.get("snippets"):
+            memory_hint = "\n".join(
+                f"- {s}" for s in (dream_recall.get("snippets") or [])[:5]
+            )
+        try:
+            system, user = P.build_dream_prompt(
+                persona_name=bits["name"],
+                persona_prompt=bits["base_prompt"],
+                fragments=frag_texts,
+                plan_summary=plan_sum,
+                diary_hint=diary_hint,
+                memory_evidence=memory_hint,
+            )
+        except TypeError:
+            system, user = P.build_dream_prompt(
+                persona_name=bits["name"],
+                persona_prompt=bits["base_prompt"],
+                fragments=frag_texts,
+                plan_summary=plan_sum,
+                diary_hint=diary_hint,
+            )
+            if memory_hint:
+                user = f"{user}\n\n近期记忆/经历（可选呼应）：\n{memory_hint[:900]}"
         raw = await self._llm_text(system, user, max_tokens=1000, scene="dream")
         dream = None
         if raw:
@@ -956,6 +1437,30 @@ class CompanionLifeService:
                 energy_delta=-2,
                 factors=["光斑", "手机", "安静"],
             )
+        archived = await self._archive_text(
+            source_type="dream",
+            event_type="dream",
+            text=dream.content,
+            title=dream.label or f"梦境 {today}",
+            idempotency_key=f"dream:{today}",
+            importance=0.5,
+            metadata={
+                "mood": dream.mood,
+                "afterglow": dream.afterglow,
+                "memory_grounded": bool(memory_hint),
+                "memory_event_ids": list(dream_recall.get("memory_event_ids") or [])[:12],
+            },
+        )
+        if not archived:
+            raise RuntimeError("companion dream memory archive failed")
+        await self._finish_activity_memory(
+            action_key=f"companion_dream:{today}",
+            action_type="write_dream",
+            result_text="今天的梦境已经整理并归档。",
+            scene="dream",
+            title=f"梦境 {today}",
+            metadata={"date": today},
+        )
         self.store.save_latest_dream(dream)
         # merge factors into fragment pool
         pool = self.store.get_dream_fragments()
@@ -973,15 +1478,6 @@ class CompanionLifeService:
         state.energy = max(0, min(100, state.energy + int(dream.energy_delta or 0)))
         state.updated_at = _now_iso()
         self.store.save_life_state(state)
-        await self._archive_text(
-            source_type="dream",
-            event_type="dream",
-            text=dream.content,
-            title=dream.label or f"梦境 {today}",
-            idempotency_key=f"dream:{today}",
-            importance=0.5,
-            metadata={"mood": dream.mood, "afterglow": dream.afterglow},
-        )
         self.store.patch_runtime(last_dream_at=_now_iso())
         return dream
 
@@ -1008,21 +1504,29 @@ class CompanionLifeService:
             evidence_parts.append("时段：" + detail.summary)
         if detail.events:
             evidence_parts.append("事件：" + "；".join(detail.events[:4]))
-        # soft recall from memory if available
-        if self.memory_brain and hasattr(self.memory_brain, "search_memories"):
-            try:
-                hits = await self.memory_brain.search_memories(
-                    query=f"{today} 今天 看了 评论 动态",
-                    limit=5,
-                )
-                if isinstance(hits, list):
-                    for h in hits[:5]:
-                        if isinstance(h, dict):
-                            evidence_parts.append(str(h.get("summary") or h.get("text") or "")[:200])
-                        else:
-                            evidence_parts.append(str(h)[:200])
-            except Exception:
-                pass
+        # V6 混合召回：近期视频/动态/番剧/评论 + 生活面，替代脆弱 search_memories 字符串
+        recall_bundle = await self._recall_life_evidence(
+            query=(
+                f"{today} 今天 最近 看了 视频 番剧 评论 动态 日记 心情 想法 "
+                f"{state.activity or ''} {state.message_seed or ''}"
+            ),
+            scene="diary",
+            limit=6,
+            action_key=f"companion_diary:{today}",
+            action_type="write_diary",
+            current_activity=(
+                "正在写今天的日记，会回顾今天和最近做过的事、当前生活状态、梦境与真实感受。"
+            ),
+            title=f"日记 {today}",
+            metadata={"date": today},
+        )
+        memory_evidence = str(recall_bundle.get("memory_evidence") or "").strip()
+        memory_event_ids = list(recall_bundle.get("memory_event_ids") or [])
+        for snip in recall_bundle.get("snippets") or []:
+            if snip and snip not in evidence_parts:
+                evidence_parts.append(str(snip)[:220])
+        if memory_evidence and memory_evidence not in evidence_parts:
+            evidence_parts.append(memory_evidence[:1800])
         dream_sum = ""
         if dream and dream.content:
             dream_sum = f"{dream.label}: {dream.afterglow or dream.content[:120]}"
@@ -1052,7 +1556,31 @@ class CompanionLifeService:
                 tags=["日常"],
                 dream_fragments=[],
             )
-        # prepend diary list
+        archived = await self._archive_text(
+            source_type="diary",
+            event_type="diary",
+            text=entry.body or entry.summary,
+            title=f"日记 {today}",
+            idempotency_key=f"diary:{today}",
+            importance=0.6,
+            metadata={
+                "share_seed": entry.share_seed,
+                "tags": entry.tags,
+                "memory_event_ids": memory_event_ids[:12],
+                "memory_grounded": bool(memory_evidence),
+            },
+        )
+        if not archived:
+            raise RuntimeError("companion diary memory archive failed")
+        await self._finish_activity_memory(
+            action_key=f"companion_diary:{today}",
+            action_type="write_diary",
+            result_text="今天的日记已经写完并归档。",
+            scene="diary",
+            title=f"日记 {today}",
+            metadata={"date": today},
+        )
+        # prepend diary list only after the account brain confirms the source.
         diaries = [entry] + [d for d in diaries if d.date != today]
         diaries = diaries[: self._cfg.diary.max_entries]
         self.store.save_diaries(diaries)
@@ -1062,15 +1590,6 @@ class CompanionLifeService:
         for t in entry.dream_fragments:
             pool.append(DreamFragment(text=t, weight=1.0, created_ts=now, source="diary", date=today))
         self.store.save_dream_fragments(self._normalize_fragments(pool))
-        await self._archive_text(
-            source_type="diary",
-            event_type="diary",
-            text=entry.body or entry.summary,
-            title=f"日记 {today}",
-            idempotency_key=f"diary:{today}",
-            importance=0.6,
-            metadata={"share_seed": entry.share_seed, "tags": entry.tags},
-        )
         if self._cfg.diary.offer_dynamic_draft and entry.share_seed:
             self._offer_draft(entry.share_seed, created_by="companion_diary")
         self.store.patch_runtime(last_diary_at=_now_iso(), diary_date=today)
@@ -1176,12 +1695,31 @@ class CompanionLifeService:
         state = self.store.get_life_state()
         plan = self.store.get_daily_plan()
         plan_sum = P.format_plan_summary([i.to_dict() for i in plan.items]) if plan.items else ""
+        # 探索动机可吸收近期记忆/主动行为，避免只会空转兴趣词
+        explore_recall = await self._recall_life_evidence(
+            query=(
+                f"最近想了解 感兴趣 视频 番剧 动态 {state.activity or ''} "
+                + " ".join((bits.get("interests") or [])[:6])
+            ),
+            scene="exploration",
+            limit=4,
+            action_key=f"companion_explore:{_today()}",
+            action_type="explore_topic",
+            current_activity=(
+                "正在主动探索一个感兴趣的话题，会结合最近经历和当前生活状态决定要查什么。"
+            ),
+            title=f"主动探索 {_today()}",
+            metadata={"date": _today()},
+        )
+        memory_seed = "；".join(explore_recall.get("snippets") or [])[:300]
         system, user = P.build_explore_query_prompt(
             persona_name=bits["name"],
             interests=bits.get("interests") or [],
             activity=state.activity,
             mood_bias=state.mood_bias,
-            recent_topics=", ".join(self.get_topic_seeds()),
+            recent_topics=", ".join(
+                x for x in (self.get_topic_seeds() + ([memory_seed] if memory_seed else [])) if x
+            ),
             plan_summary=plan_sum,
         )
         raw = await self._llm_text(system, user, max_tokens=220, scene="exploration")
@@ -1279,14 +1817,11 @@ class CompanionLifeService:
             items=[x for x in (items or [])[: self._cfg.exploration.max_results] if isinstance(x, dict)],
             source="web_search",
         )
-        # stash highlights into first item-like meta via impression already; also runtime
-        notes = [note] + self.store.get_explore_notes()
-        self.store.save_explore_notes(notes[:40])
         body = (
             f"探索：{query}\n动机：{motive}\n{impression}\n关联：{self_link}"
             + (f"\n要点：{'；'.join(highlights)}" if highlights else "")
         )
-        await self._archive_text(
+        archived = await self._archive_text(
             source_type="web_reference",
             event_type="exploration",
             text=body,
@@ -1298,8 +1833,23 @@ class CompanionLifeService:
                 "should_share": should_share,
                 "search_ok": search_ok,
                 "highlights": highlights,
+                "memory_event_ids": list(explore_recall.get("memory_event_ids") or [])[:12],
+                "memory_grounded": bool(explore_recall.get("memory_evidence")),
             },
         )
+        if not archived:
+            raise RuntimeError("companion exploration memory archive failed")
+        await self._finish_activity_memory(
+            action_key=f"companion_explore:{_today()}",
+            action_type="explore_topic",
+            result_text="本次主动探索已经完成并归档。",
+            scene="exploration",
+            title=f"主动探索 {_today()}",
+            metadata={"date": _today()},
+        )
+        # Local companion surface becomes visible only after the brain commit.
+        notes = [note] + self.store.get_explore_notes()
+        self.store.save_explore_notes(notes[:40])
         # 无结果不进草稿；有结果且模型认为可分享才进
         if self._cfg.exploration.offer_dynamic_draft and should_share and impression and search_ok:
             seed = f"【随便搜到】{query}\n{impression[:400]}"
@@ -1357,6 +1907,28 @@ class CompanionLifeService:
                     or state.activity
                     or "日常碎片"
                 )
+                project_recall = await self._recall_life_evidence(
+                    query=(
+                        f"创作新项目 灵感 最近经历 视频 番剧 日记 梦境 {insp} "
+                        f"{state.activity or ''}"
+                    ),
+                    scene="creative",
+                    limit=5,
+                    action_key=(
+                        f"companion_creative_project:{_today()}:{len(projects)}"
+                    ),
+                    action_type="create_creative_project",
+                    current_activity=(
+                        "正在构思一个新的创作项目，会结合最近做过的事、日记、梦境和已有兴趣决定写什么。"
+                    ),
+                    title=f"新创作项目 {_today()}",
+                    metadata={"date": _today(), "project_slot": len(projects)},
+                )
+                project_memory = str(
+                    project_recall.get("memory_evidence") or ""
+                ).strip()
+                if project_memory:
+                    insp = f"{insp}\n\n【近期活动记忆】\n{project_memory[:1400]}"
                 system, user = P.build_creative_project_prompt(
                     persona_name=bits["name"],
                     persona_prompt=bits["base_prompt"] + (("\n" + bits.get("creative_rules", "")) if bits.get("creative_rules") else ""),
@@ -1378,6 +1950,39 @@ class CompanionLifeService:
                             "next_advance_at": now + random.randint(45, 140) * 60,
                         }
                     )
+                    archived = await self._archive_text(
+                        source_type="creative",
+                        event_type="creative_project",
+                        text=(
+                            f"创建《{proj.title}》："
+                            f"{proj.premise or proj.inspiration_source or '新的创作计划'}"
+                        ),
+                        title=proj.title,
+                        idempotency_key=f"creative_project:{proj.id}",
+                        importance=0.4,
+                        metadata={
+                            "project_id": proj.id,
+                            "status": proj.status,
+                            "memory_grounded": bool(diaries or dream or project_memory),
+                            "memory_event_ids": list(
+                                project_recall.get("memory_event_ids") or []
+                            )[:10],
+                        },
+                    )
+                    if not archived:
+                        raise RuntimeError(
+                            "companion creative project memory archive failed"
+                        )
+                    await self._finish_activity_memory(
+                        action_key=(
+                            f"companion_creative_project:{_today()}:{len(projects)}"
+                        ),
+                        action_type="create_creative_project",
+                        result_text="新的创作项目已经建立并归档。",
+                        scene="creative",
+                        title=f"新创作项目 {_today()}",
+                        metadata={"date": _today(), "project_slot": len(projects)},
+                    )
                     projects = [proj] + projects
                     self.store.save_projects(projects[:20])
                     drafting = [p for p in projects if p.status == "drafting"]
@@ -1390,6 +1995,33 @@ class CompanionLifeService:
         proj = due[0]
         prev = proj.draft_chunks[-1].text if proj.draft_chunks else ""
         budget = self._cfg.creative.chars_per_session
+        creative_chunk_index = len(proj.draft_chunks)
+        # 续写前 V6 混合召回：可联想近期经历/兴趣，避免创作路径「只写不读」
+        creative_recall = await self._recall_life_evidence(
+            query=(
+                f"{proj.title} {proj.premise or ''} 创作 灵感 最近 视频 番剧 日记 "
+                f"{(self.ensure_life_state().activity if self.enabled else '') or ''}"
+            ),
+            scene="creative",
+            limit=4,
+            action_key=f"companion_creative_chunk:{proj.id}:{creative_chunk_index}",
+            action_type="write_creative_chunk",
+            current_activity=(
+                "正在续写当前创作项目，会记住此前写到哪里、最近经历了什么以及这一段接下来要写什么。"
+            ),
+            title=proj.title,
+            metadata={
+                "project_id": proj.id,
+                "chunk_index": creative_chunk_index,
+            },
+        )
+        creative_mem = str(creative_recall.get("memory_evidence") or "").strip()
+        persona_for_chunk = bits["base_prompt"]
+        if creative_mem:
+            persona_for_chunk = (
+                f"{persona_for_chunk}\n\n【可轻量呼应的近期经历/兴趣】\n"
+                f"{creative_mem[:700]}"
+            )
         system, user = P.build_creative_chunk_prompt(
             title=proj.title,
             work_type=proj.work_type,
@@ -1398,7 +2030,7 @@ class CompanionLifeService:
             previous=prev,
             next_hint=proj.next_hint,
             budget=budget,
-            persona_prompt=bits["base_prompt"],
+            persona_prompt=persona_for_chunk,
         )
         text = await self._llm_text(system, user, max_tokens=max(300, budget + 100), scene="creative")
         if not text or len(text.strip()) < 40:
@@ -1423,18 +2055,36 @@ class CompanionLifeService:
             if self._cfg.creative.offer_dynamic_draft:
                 seed = f"写完了《{proj.title}》的一小节，自己还挺满意。"
                 self._offer_draft(seed, created_by="companion_creative")
-        # replace in list
-        projects = [proj if p.id == proj.id else p for p in projects]
-        self.store.save_projects(projects[:20])
-        await self._archive_text(
+        archived = await self._archive_text(
             source_type="creative",
             event_type="creative_chunk",
             text=f"《{proj.title}》续写 {chunk.chars} 字",
             title=proj.title,
             idempotency_key=f"creative:{proj.id}:{chunk.at}",
             importance=0.4,
-            metadata={"project_id": proj.id, "status": proj.status},
+            metadata={
+                "project_id": proj.id,
+                "status": proj.status,
+                "memory_grounded": bool(creative_mem),
+                "memory_event_ids": list(creative_recall.get("memory_event_ids") or [])[:8],
+            },
         )
+        if not archived:
+            raise RuntimeError("companion creative chunk memory archive failed")
+        await self._finish_activity_memory(
+            action_key=f"companion_creative_chunk:{proj.id}:{creative_chunk_index}",
+            action_type="write_creative_chunk",
+            result_text="当前创作项目的新一段已经续写并归档。",
+            scene="creative",
+            title=proj.title,
+            metadata={
+                "project_id": proj.id,
+                "chunk_index": creative_chunk_index,
+            },
+        )
+        # replace in list only after the account brain confirms the chunk.
+        projects = [proj if p.id == proj.id else p for p in projects]
+        self.store.save_projects(projects[:20])
         self.apply_activity_energy_delta(-2, "creative")
         return proj
 

@@ -148,15 +148,42 @@ export const CompanionPage = defineComponent({
             triggering.value = true;
             try {
                 const res = await api.accounts.companion.trigger(selectedAccount.value, action);
-                // returnEnvelope: { success, data, message }
+                // returnEnvelope: { success, data, message }；api.js 已对 success:false 抛错
                 const payload = res && typeof res === 'object' ? res : {};
+                if (payload.success === false) {
+                    const errMsg = payload.error?.message || payload.message || '触发失败';
+                    showToast(errMsg, 'error');
+                    return;
+                }
                 const data = payload.data;
                 const msg = payload.message || '';
-                const produced = data && typeof data === 'object' && 'produced' in data
-                    ? !!data.produced
-                    : (data != null);
-                if (!produced && ['explore', 'creative', 'dream', 'diary', 'plan'].includes(action)) {
+                // 严格按 data.produced；缺 produced 字段时不得默认成功（防误报）
+                // tick 返回可能是扁平 data（含 produced/actions）或嵌套 item.actions
+                let produced = false;
+                if (data && typeof data === 'object') {
+                    if (Object.prototype.hasOwnProperty.call(data, 'produced')) {
+                        produced = !!data.produced;
+                    } else if (action === 'tick') {
+                        const actions = Array.isArray(data.actions)
+                            ? data.actions
+                            : (data.item && Array.isArray(data.item.actions) ? data.item.actions : null);
+                        if (actions !== null) {
+                            produced = actions.length > 0;
+                        } else if (data.item && typeof data.item === 'object' && Object.prototype.hasOwnProperty.call(data.item, 'ok')) {
+                            produced = !!data.item.ok;
+                        } else {
+                            // 无 produced / actions / ok 信号 → 失败安全，不报成功
+                            produced = false;
+                        }
+                    }
+                }
+                const softActions = ['explore', 'creative', 'dream', 'diary', 'plan'];
+                if (!produced && softActions.includes(action)) {
                     showToast(msg || `${action} 未产生结果（检查开关/联网搜索/冷却）`, 'warning');
+                } else if (!produced && action === 'tick') {
+                    showToast(msg || 'tick 完成（本轮无额外产出）', 'info');
+                } else if (!produced) {
+                    showToast(msg || `${action} 未确认产出`, 'warning');
                 } else {
                     showToast(msg || `${action} 已完成`, 'success');
                 }
@@ -194,8 +221,19 @@ export const CompanionPage = defineComponent({
             }
         });
         watch(selectedAccount, (id, prev) => {
-            if (id && id !== prev) loadAll();
-            else if (id && !state.value) loadAll();
+            if (id && id !== prev) {
+                // 切换账号：清空旧数据，避免短暂串屏
+                state.value = null;
+                diaries.value = [];
+                dreams.value = { latest: null, fragments: [] };
+                notes.value = [];
+                projects.value = [];
+                openBookId.value = '';
+                openNoteId.value = '';
+                loadAll();
+            } else if (id && !state.value) {
+                loadAll();
+            }
         });
 
         const enabled = computed(() => !!(state.value && state.value.enabled));
@@ -312,6 +350,43 @@ export const CompanionPage = defineComponent({
                         ]),
                     ]),
                 ]),
+                // 记忆归档 soft 策略可观测：本地生活有产出但脑未记时，运维可见
+                (() => {
+                    const archErr = state.value?.last_archive_error
+                        || rt.last_archive_error
+                        || '';
+                    const archFailN = Number(
+                        state.value?.archive_fail_count
+                        ?? rt.archive_fail_count
+                        ?? 0,
+                    ) || 0;
+                    const archOkAt = rt.last_archive_ok_at || '—';
+                    const archFailAt = rt.last_archive_fail_at || '—';
+                    const archSrc = rt.last_archive_source || '—';
+                    const brainBound = state.value?.memory_brain_bound;
+                    return panel('记忆归档', '陪伴写脑 soft 可观测（失败不暂停平台）', [
+                        h('div', { class: 'flex gap-2 flex-wrap', style: 'margin-bottom:.5rem;' }, [
+                            chip(
+                                brainBound ? '记忆脑已绑定' : '记忆脑未绑定',
+                                brainBound ? 'success' : 'danger',
+                            ),
+                            chip(
+                                archFailN > 0 ? `连续失败 ${archFailN}` : '归档正常',
+                                archFailN >= 3 ? 'danger' : (archFailN > 0 ? 'warning' : 'success'),
+                            ),
+                        ]),
+                        metaRow('最近成功', archOkAt),
+                        metaRow('最近失败', archFailAt),
+                        metaRow('失败来源', archSrc),
+                        archErr
+                            ? h('p', {
+                                class: 'muted',
+                                style: 'margin:.4rem 0 0;font-size:.85rem;color:hsl(var(--destructive));word-break:break-all;',
+                            }, String(archErr).slice(0, 240))
+                            : h('p', { class: 'muted', style: 'margin:.4rem 0 0;font-size:.85rem;' },
+                                '写失败仅记日志/runtime，不 pause 评论与发布。'),
+                    ]);
+                })(),
                 panel('模块开关', '当前配置摘要', [
                     h('div', { class: 'flex gap-2 flex-wrap' }, [
                         chip(cfg.value.enabled ? '总开关 ON' : '总开关 OFF', cfg.value.enabled ? 'success' : 'warning'),

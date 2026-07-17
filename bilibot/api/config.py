@@ -59,7 +59,16 @@ class ConfigValidationError(ValueError):
 
 # PRD V5 CFG-501：对象数组字段（数组项必须是 dict）
 # 这些字段禁止用逗号分隔的字符串数组提交，必须由专用页面/API 管理
-OBJECT_ARRAY_FIELDS = {"profiles", "accounts", "llm_providers"}
+OBJECT_ARRAY_FIELDS = {
+    "profiles",
+    "accounts",
+    "llm_providers",
+    "chat_providers",
+    "vision_providers",
+    "embedding_providers",
+    "asr_providers",
+    "image_providers",
+}
 
 
 # PRD V5 CFG-502 §11.3：热重载契约
@@ -737,6 +746,39 @@ def _build_config_schema() -> dict:
                     "description": "B站 Cookie 自动检查间隔；账号级 ConfigLoader 会覆盖 bilibili 段，故放 features",
                 },
             }
+        },
+        "bangumi": {
+            "type": "object",
+            "label": "番剧追更策略",
+            "description": "features.bangumi 控制启停；此处控制选番、单次观看与互动。观看/动作均写入账号统一记忆。",
+            "fields": {
+                "pools": {
+                    "type": "array",
+                    "itemType": "string",
+                    "label": "选番来源",
+                    "description": "可选 trending / timeline / random",
+                },
+                "max_episodes": {
+                    "type": "number",
+                    "label": "单次最多观看集数",
+                    "default": 3,
+                },
+                "continue_score": {
+                    "type": "number",
+                    "label": "继续观看评分阈值",
+                    "default": 7,
+                },
+                "comment": {
+                    "type": "boolean",
+                    "label": "允许发布番剧评论",
+                    "default": True,
+                },
+                "auto_follow": {
+                    "type": "boolean",
+                    "label": "允许自动追番",
+                    "default": True,
+                },
+            },
         },
         "companion": {
             "type": "object",
@@ -1453,6 +1495,11 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                     validate_memory_config_values(m.get("memory", {}))
                 except ValueError as exc:
                     raise ConfigValidationError(str(exc)) from exc
+                try:
+                    from bilibot.services.web_search import validate_web_search_config
+                    validate_web_search_config(m)
+                except ValueError as exc:
+                    raise ConfigValidationError(str(exc)) from exc
                 m["config_revision"] = cur + 1
                 raw.clear()
                 raw.update(m)
@@ -1483,6 +1530,11 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 merged = _sync_safety_content_fields(merged)
                 try:
                     validate_memory_config_values(merged.get("memory", {}))
+                except ValueError as exc:
+                    raise ConfigValidationError(str(exc)) from exc
+                try:
+                    from bilibot.services.web_search import validate_web_search_config
+                    validate_web_search_config(merged)
                 except ValueError as exc:
                     raise ConfigValidationError(str(exc)) from exc
                 merged["config_revision"] = current_revision + 1
@@ -1562,6 +1614,11 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 normalized = _normalize_by_schema(body, _build_config_schema())
                 validation_config = _merge_with_preserved_sensitive(raw, normalized)
                 validate_memory_config_values(validation_config.get("memory", {}))
+                try:
+                    from bilibot.services.web_search import validate_web_search_config
+                    validate_web_search_config(validation_config)
+                except ValueError as ws_exc:
+                    errors.append({"field": "web_search", "message": str(ws_exc)})
             except (ConfigValidationError, ValueError) as exc:
                 errors.append({"field": "memory", "message": str(exc)})
             if "llm" in body:
@@ -1582,8 +1639,46 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 if not bili_jct:
                     warnings.append({"field": "bilibili.bili_jct", "message": "未配置 B站 bili_jct"})
             if "web" in body:
-                if body["web"].get("admin_password") == "admin123":
-                    warnings.append({"field": "web.admin_password", "message": "使用了默认密码，请修改"})
+                web_body = body.get("web") if isinstance(body.get("web"), dict) else {}
+                pwd = web_body.get("admin_password")
+                if pwd is None:
+                    pwd = (raw.get("web") or {}).get("admin_password")
+                try:
+                    from bilibot.web.panel import is_weak_admin_password
+                    if is_weak_admin_password(str(pwd) if pwd is not None else ""):
+                        warnings.append({
+                            "field": "web.admin_password",
+                            "message": "使用了默认弱口令 admin123（明文或 bcrypt），请修改",
+                        })
+                except Exception:
+                    if pwd == "admin123":
+                        warnings.append({
+                            "field": "web.admin_password",
+                            "message": "使用了默认密码，请修改",
+                        })
+            # 即使 body 未带 web 段，也校验当前生效配置的安全面（弱口令 / Secure Cookie）
+            web_eff = raw.get("web") if isinstance(raw.get("web"), dict) else {}
+            if "web" in body and isinstance(body.get("web"), dict):
+                web_eff = {**web_eff, **(body.get("web") or {})}
+            host_eff = str(web_eff.get("host") or "127.0.0.1")
+            non_local = host_eff not in ("127.0.0.1", "localhost", "::1")
+            if non_local and web_eff.get("enabled", True):
+                sc = web_eff.get("secure_cookies")
+                if sc is False or str(sc).lower() in ("0", "false", "no"):
+                    warnings.append({
+                        "field": "web.secure_cookies",
+                        "message": "host 非本机且 secure_cookies=false，Cookie 将明文传输，生产请开启或前置 HTTPS",
+                    })
+                if "web" not in body:
+                    try:
+                        from bilibot.web.panel import is_weak_admin_password
+                        if is_weak_admin_password(str(web_eff.get("admin_password") or "")):
+                            warnings.append({
+                                "field": "web.admin_password",
+                                "message": "使用了默认弱口令 admin123（明文或 bcrypt），请修改",
+                            })
+                    except Exception:
+                        pass
             valid = len(errors) == 0
             return JSONResponse({
                 "success": valid,

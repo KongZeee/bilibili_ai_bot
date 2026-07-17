@@ -74,6 +74,8 @@ class Persona:
     boundaries: str = ""
     relationship_rules: str = ""
     reply_rules: str = ""
+    # 私信专用规则（可选）；空则 get_rules_for_scene(PRIVATE_REPLY) 回退 reply_rules
+    private_message_rules: str = ""
     proactive_comment_rules: str = ""
     dynamic_rules: str = ""
     weekly_rules: str = ""
@@ -116,6 +118,7 @@ class Persona:
             boundaries=d.get("boundaries", ""),
             relationship_rules=d.get("relationship_rules", ""),
             reply_rules=d.get("reply_rules", ""),
+            private_message_rules=d.get("private_message_rules", "") or d.get("pm_rules", "") or "",
             proactive_comment_rules=d.get("proactive_comment_rules", ""),
             dynamic_rules=d.get("dynamic_rules", ""),
             weekly_rules=d.get("weekly_rules", ""),
@@ -135,10 +138,18 @@ class Persona:
         )
 
     def get_rules_for_scene(self, scene: SceneType) -> str:
-        """根据场景获取对应规则"""
+        """根据场景获取对应规则。
+
+        私信优先使用 ``private_message_rules``（若人格提供），否则回退 reply_rules。
+        """
+        private_rules = (
+            getattr(self, "private_message_rules", None)
+            or getattr(self, "pm_rules", None)
+            or ""
+        )
         mapping = {
             SceneType.REPLY_COMMENT: self.reply_rules,
-            SceneType.PRIVATE_REPLY: self.reply_rules,
+            SceneType.PRIVATE_REPLY: private_rules or self.reply_rules,
             SceneType.PROACTIVE_COMMENT: self.proactive_comment_rules,
             SceneType.DYNAMIC_POST: self.dynamic_rules,
             SceneType.WEEKLY_SUMMARY: self.weekly_rules,
@@ -146,7 +157,7 @@ class Persona:
             SceneType.DIARY: self.diary_rules,
             SceneType.CREATIVE: self.creative_rules,
         }
-        return mapping.get(scene, "")
+        return mapping.get(scene, "") or ""
 
 
 # ═══════════════════════════════════════════════

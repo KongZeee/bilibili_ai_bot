@@ -50,17 +50,22 @@ export function getStatusType(status) {
     return map[String(status || '').toLowerCase()] || 'info';
 }
 
-/** 审计场景英文 → 中文 */
+/** 审计场景英文 → 中文（覆盖 companion / proactive / bangumi / memory 用量 scene） */
 export const AUDIT_SCENE_LABELS = {
     reply_comment: '评论回复',
     proactive_comment: '主动评论',
     proactive_video: '主动视频',
     private_message: '私信',
+    private_reply: '私信',
     dynamic_post: '动态发布',
+    dynamic: '动态发布',
     weekly_summary: '周总结',
     memory_admin: '记忆管理',
     memory_brain: '记忆大脑',
     memory_extract: '记忆抽取',
+    memory_embedding: '记忆向量',
+    memory_debug: '记忆调试',
+    memory_list_quick_test: '列表快速召回',
     image_generation: '文生图',
     image_prompt: '配图提示词',
     video_analysis: '视频分析',
@@ -73,12 +78,30 @@ export const AUDIT_SCENE_LABELS = {
     exploration: '探索',
     creative: '创作',
     companion: '陪伴生活',
+    companion_exploration: '陪伴探索',
+    companion_diary: '陪伴日记',
+    companion_dream: '陪伴梦境',
+    companion_creative: '陪伴创作',
+    companion_plan: '陪伴日程',
     web_search_judge: '搜索判断',
     web_search_video_judge: '视频搜索判断',
+    bangumi: '追番',
     bangumi_eval: '番剧评价',
     bangumi_comment: '番剧评论',
     persona_test: '人格测试',
     persona_evaluate: '人格评测',
+    // 系统/安全
+    memory_archive_failed: '记忆归档失败暂停',
+    safety_check: '安全检查',
+    tick: '陪伴 tick',
+    // 任务/用量扩展
+    publish_draft: '草稿真发',
+    dynamic_publish: '动态发布',
+    proactive_video_eval: '主动视频评价',
+    asr: '语音识别',
+    vision: '视觉理解',
+    embedding: '向量嵌入',
+    chat: '对话生成',
 };
 
 /** 审计/生成状态英文 → 中文 */

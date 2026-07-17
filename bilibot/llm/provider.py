@@ -883,7 +883,10 @@ class LLMProvider:
                             pass
                         if response.data:
                             return response.data[0].embedding
-                        return None
+                        # 已配置但空 data：上抛，避免记忆 job 当 unconfigured 永久跳过
+                        raise RuntimeError(
+                            f"[{self.llm_id}] embedding API returned empty data"
+                        )
                     except Exception as exc:
                         last_exc = exc
                         if _is_rate_limit_error(exc) and attempts > 1:
@@ -926,19 +929,28 @@ class LLMProvider:
                     pass
                 data = list(response.data or ())
                 if len(data) != len(values):
-                    return None
+                    raise RuntimeError(
+                        f"[{self.llm_id}] embedding batch size mismatch: "
+                        f"got {len(data)} for {len(values)} inputs"
+                    )
                 ordered: List[Optional[List[float]]] = [None] * len(values)
                 for position, item in enumerate(data):
                     index = getattr(item, "index", position)
                     if index is None:
                         index = position
                     if not isinstance(index, int) or not 0 <= index < len(values):
-                        return None
+                        raise RuntimeError(
+                            f"[{self.llm_id}] embedding batch invalid index: {index}"
+                        )
                     if ordered[index] is not None:
-                        return None
+                        raise RuntimeError(
+                            f"[{self.llm_id}] embedding batch duplicate index: {index}"
+                        )
                     ordered[index] = list(item.embedding)
                 if any(vector is None for vector in ordered):
-                    return None
+                    raise RuntimeError(
+                        f"[{self.llm_id}] embedding batch missing vectors"
+                    )
                 return [vector for vector in ordered if vector is not None]
 
             if not pool.slots:

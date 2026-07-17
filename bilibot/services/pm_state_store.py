@@ -19,7 +19,7 @@
           与评论回复的退避参数互不影响。
 
 隐私边界（PRD-V5 §6.3 / PM-501）：
-    - 私信原文仅存储在本状态库（pm_state_store），不进入 KnowledgeBaseMemory。
+    - 私信原文仅存储在本状态库（pm_state_store），不进入统一认知记忆。
     - 本状态库按账号隔离（每账号独立 DB 文件），不写入他账号数据目录。
 """
 import hashlib
@@ -174,7 +174,7 @@ class PrivateMessageStateStore:
     PRD-V5 §6.3 / PM-501：
     - 幂等键为 account_id + platform_message_id（B站平台消息 ID）
     - 独立的 max_attempts 和 backoff_base_seconds，与评论回复互不影响
-    - 私信原文仅存于此库，不进入 KnowledgeBaseMemory
+    - 私信原文仅存于此库，不进入统一认知记忆
     - 按账号隔离（DB 文件位于账号数据目录）
     """
 

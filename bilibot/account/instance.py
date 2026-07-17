@@ -5,7 +5,7 @@
 - BilibiliAPI（账号凭据）
 - DataStore（data/accounts/{account_id}/）
 - UserStateSystem（画像/好感度/心情，纯 JSON）
-- KnowledgeBaseMemory（SQLite 记忆存储）
+- MemoryBrainService（账号级 SQLite 统一记忆）
 - PersonalitySystem
 - Scheduler
 - ContextBuilder（PRD-V5 §5.1 ACC-502：账号级，注入本账号 DataStore/UserState/Bili/KnowledgeMemory）
@@ -95,8 +95,6 @@ class AccountInstance:
         self.user_state = None
         self.knowledge_memory = None
         self.memory_brain = None
-        # MEM-501：每账号记忆写入队列（与 knowledge_memory 同生命周期）
-        self.memory_write_queue = None
         self.personality = None
         self.comment_context_service = None
         self.companion = None
@@ -227,7 +225,6 @@ class AccountInstance:
             await self.memory_brain.start()
             # Narrow compatibility alias. It points to V6 and never opens legacy files.
             self.knowledge_memory = self.memory_brain
-            self.memory_write_queue = None
             logger.info(f"[{self.account_id}] V6 记忆大脑已启动")
         except Exception as e:
             logger.error(f"[{self.account_id}] V6 记忆大脑初始化失败: {e}", exc_info=True)
@@ -245,6 +242,7 @@ class AccountInstance:
             config=self.account_config_loader.get_raw_config(),
             knowledge_memory=self.knowledge_memory,
             account_id=self.account_id,
+            companion=None,  # filled after CompanionLifeService init
         )
 
         # 10. 评论上下文服务（账号级）
@@ -301,6 +299,7 @@ class AccountInstance:
                 llm=self.llm,
                 persona_store=self.persona_store,
                 memory_brain=self.memory_brain,
+                safety_checker=self.safety_checker,
                 web_search=None,  # filled after Scheduler creates WebSearchService
                 draft_store=None,  # filled after Scheduler draft store is available
             )
@@ -340,7 +339,6 @@ class AccountInstance:
             image_provider=self.image_provider,
             knowledge_memory=self.knowledge_memory,
             memory_brain=self.memory_brain,
-            memory_write_queue=self.memory_write_queue,
             proactive_comment_store=self.proactive_comment_store,
             companion=self.companion,
         )
@@ -431,7 +429,9 @@ class AccountInstance:
                 logger.warning(f"[{self.account_id}] 同步账号 BiliConfig 失败: {e}")
         # 3) 原子写盘（应用级锁，防多账号互盖）
         try:
-            path = getattr(self.app_config_loader, "filepath", None) or "config.yaml"
+            # 只使用调用方显式绑定的配置路径。纯内存 ConfigLoader 不得猜测
+            # cwd/config.yaml，否则测试或嵌入式实例会覆盖真实生产配置。
+            path = getattr(self.app_config_loader, "filepath", None)
             ok = self.app_config_loader.patch_account_credentials(
                 self.account_id, patch, filepath=path,
             )
@@ -477,14 +477,28 @@ class AccountInstance:
             except Exception as e:
                 logger.warning(f"[{self.account_id}] 等待调度任务结束异常: {e}")
             self._scheduler_task = None
-        # V6 jobs are durable. Stop the worker; uncompleted leases recover on restart.
+        # V6 jobs are durable. 关闭前尽量 run_jobs_until_idle 冲刷向量/衍生 job，
+        # 再 stop worker；未完成 lease 仍可在重启后恢复。
         if self.memory_brain is not None:
+            try:
+                idle = getattr(self.memory_brain, "run_jobs_until_idle", None)
+                if callable(idle):
+                    await asyncio.wait_for(idle(max_jobs=64), timeout=12.0)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[{self.account_id}] 关闭前记忆 job 冲刷超时（将继续 close worker）"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[{self.account_id}] 关闭前记忆 job 冲刷失败: {e}"
+                )
             try:
                 await asyncio.wait_for(self.memory_brain.close(), timeout=8.0)
             except asyncio.TimeoutError:
                 logger.warning(f"[{self.account_id}] 关闭 V6 记忆大脑超时")
             except Exception as e:
                 logger.warning(f"[{self.account_id}] 关闭 V6 记忆大脑失败: {e}")
+            self.memory_brain = None
         # B3：关闭视频理解（线程池 / Whisper / 临时目录 / 定时清理）
         vu = getattr(self, "video_understanding", None)
         if vu is not None:
@@ -594,9 +608,9 @@ class AccountInstance:
         当 bili 从 None 变为非 None 时，initialize() 期间绑定了 None 的
         ContextBuilder / CommentContextService / Scheduler 需要重建/刷新以注入
         新的 bili 引用。保留 data_store / user_state / personality /
-        knowledge_memory / memory_write_queue 等已有状态。
+        knowledge_memory 等已有状态。
         """
-        # 重建 ContextBuilder（注入新 bili）
+        # 重建 ContextBuilder（注入新 bili；保留 companion 引用）
         from bilibot.context_builder import ContextBuilder
         self.context_builder = ContextBuilder(
             data_store=self.data_store,
@@ -606,6 +620,7 @@ class AccountInstance:
             config=self.account_config_loader.get_raw_config(),
             knowledge_memory=self.knowledge_memory,
             account_id=self.account_id,
+            companion=getattr(self, "companion", None),
         )
 
         # 重建 CommentContextService（注入新 bili）
@@ -768,12 +783,25 @@ class AccountInstance:
         except Exception as e:
             logger.warning(f"[{self.account_id}] 互动策略热重载失败: {e}")
 
-        # 4) 陪伴生活层：热读 companion.*；同步 web_search / draft 引用
+        # 4) 陪伴生活层：热读 companion.*；同步 web_search / draft / memory_brain 引用
         try:
             if self.companion is not None:
                 self.companion.config_loader = self.account_config_loader
                 self.companion.llm = self.llm
+                self.companion.persona_store = self.persona_store
                 self.companion.reload_config()
+                # 热重载后 brain 仍指向当前账号（enabled=false 时也不写脏）
+                if hasattr(self.companion, "rebind_memory_brain"):
+                    try:
+                        self.companion.rebind_memory_brain(self.memory_brain)
+                    except Exception:
+                        self.companion.memory_brain = self.memory_brain
+                else:
+                    self.companion.memory_brain = self.memory_brain
+                if hasattr(self.companion, "rebind_safety_checker"):
+                    self.companion.rebind_safety_checker(self.safety_checker)
+                else:
+                    self.companion.safety_checker = self.safety_checker
                 if self.scheduler is not None:
                     self.companion.web_search = getattr(self.scheduler, "web_search", None)
                     try:
@@ -800,6 +828,7 @@ class AccountInstance:
                         llm=self.llm,
                         persona_store=self.persona_store,
                         memory_brain=self.memory_brain,
+                        safety_checker=self.safety_checker,
                         web_search=getattr(self.scheduler, "web_search", None) if self.scheduler else None,
                         draft_store=(
                             self.scheduler.get_draft_store()
@@ -812,6 +841,12 @@ class AccountInstance:
                     if self.scheduler is not None:
                         self.scheduler.companion = self.companion
                     logger.info(f"[{self.account_id}] 陪伴生活层已按配置新建")
+            # companion.enabled 从 true→false 时：不销毁对象，但确保引用同步且不写脏
+            # （service 内部 _archive_text / get_prompt_surface 已检查 enabled）
+            if self.companion is not None and self.context_builder is not None:
+                self.context_builder.companion = self.companion
+            if self.companion is not None and self.scheduler is not None:
+                self.scheduler.companion = self.companion
         except Exception as e:
             logger.warning(f"[{self.account_id}] 陪伴生活层热重载失败: {e}")
 
@@ -829,24 +864,40 @@ class AccountInstance:
         except Exception as e:
             logger.warning(f"[{self.account_id}] Personality/UserState 配置热重载失败: {e}")
 
-        # 5) features.bangumi 开关：新建或清空 BangumiService
+
+        # 5) features.bangumi 开关：新建或清空 BangumiService；热重载同步 brain
         try:
             sched = self.scheduler
             if sched is not None:
                 want_bangumi = bool((raw.get("features") or {}).get("bangumi", False))
                 existing_bg = getattr(sched, "bangumi_service", None)
-                if want_bangumi and existing_bg is None:
+                brain = getattr(self, "memory_brain", None) or getattr(
+                    sched, "memory_brain", None
+                )
+                if want_bangumi and brain is None:
+                    logger.error(
+                        f"[{self.account_id}] features.bangumi=true 但 memory_brain 缺失，"
+                        "不创建追番服务（fail-closed）"
+                    )
+                    if existing_bg is not None:
+                        sched.bangumi_service = None
+                elif want_bangumi and existing_bg is None:
                     from bilibot.bangumi import BangumiService
-                    data_dir = raw.get("data_dir", self.account_data_dir) or self.account_data_dir
+                    data_dir = (
+                        str(getattr(brain, "data_dir", "") or "")
+                        or raw.get("data_dir", self.account_data_dir)
+                        or self.account_data_dir
+                    )
                     sched.bangumi_service = BangumiService(
                         bili_api=self.bili,
                         llm_manager=self.llm_manager or getattr(sched, "llm", None),
                         video_service=self.video_understanding,
                         config_loader=self.account_config_loader,
                         data_dir=data_dir,
-                        memory_brain=getattr(self, "memory_brain", None)
-                        or getattr(sched, "memory_brain", None),
+                        memory_brain=brain,
                         account_id=self.account_id,
+                        companion=getattr(self, "companion", None),
+                        safety_checker=self.safety_checker,
                     )
                     logger.info(f"[{self.account_id}] 番剧追番服务已按配置新建")
                 elif not want_bangumi and existing_bg is not None:
@@ -859,6 +910,25 @@ class AccountInstance:
                         existing_bg.config_loader = self.account_config_loader
                     if hasattr(existing_bg, "video_service"):
                         existing_bg.video_service = self.video_understanding
+                    # 热重载后确保仍指向当前账号 brain + companion 生活面
+                    existing_bg.companion = getattr(self, "companion", None)
+                    if hasattr(existing_bg, "rebind_safety_checker"):
+                        existing_bg.rebind_safety_checker(self.safety_checker)
+                    else:
+                        existing_bg.safety_checker = self.safety_checker
+                    if brain is not None and hasattr(existing_bg, "rebind_memory_brain"):
+                        try:
+                            existing_bg.rebind_memory_brain(brain)
+                        except Exception as rebind_exc:
+                            logger.warning(
+                                f"[{self.account_id}] bangumi rebind brain 失败: {rebind_exc}"
+                            )
+                            # fail-closed: drop service rather than write to wrong/no brain
+                            sched.bangumi_service = None
+                    elif brain is not None:
+                        existing_bg.memory_brain = brain
+                    if hasattr(existing_bg, "account_id"):
+                        existing_bg.account_id = self.account_id
         except Exception as e:
             logger.warning(f"[{self.account_id}] 番剧服务热重载失败: {e}")
 

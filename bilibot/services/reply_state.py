@@ -583,20 +583,51 @@ class ReplyStateStore:
             created_at = float(existing["created_at"]) if existing else now
             meta = (existing.get("metadata") if existing else None) or "{}"
             gen = (existing.get("generation_result") if existing else None) or ""
+            gen_hash = (existing.get("generation_hash") if existing else None) or ""
+            try:
+                gen_rev = int(existing.get("generation_revision") or 0) if existing else 0
+            except (TypeError, ValueError):
+                gen_rev = 0
+            gen_audit = (existing.get("generation_audit_id") if existing else None) or ""
+            gen_persona = (existing.get("generation_persona_id") if existing else None) or ""
             persona = (existing.get("persona_id") if existing else None) or ""
             notif = (existing.get("notification_json") if existing else None) or ""
+            # 保留 generation_*，确保 retry_wait 可复用原文发布（REP-502）
             conn.execute(
                 """
                 INSERT INTO reply_states
                     (account_id, comment_type, source_rpid, state, attempts, max_attempts,
                      last_error, last_error_code, notification_json, generation_result,
-                     persona_id, created_at, updated_at, next_retry_at, metadata)
-                VALUES (?, ?, ?, 'retry_wait', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     generation_hash, generation_revision, generation_audit_id,
+                     generation_persona_id, persona_id, created_at, updated_at,
+                     next_retry_at, metadata)
+                VALUES (?, ?, ?, 'retry_wait', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(account_id, comment_type, source_rpid) DO UPDATE SET
                     state='retry_wait',
                     max_attempts=excluded.max_attempts,
                     last_error=excluded.last_error,
                     last_error_code=excluded.last_error_code,
+                    generation_result=COALESCE(
+                        NULLIF(excluded.generation_result, ''),
+                        reply_states.generation_result
+                    ),
+                    generation_hash=COALESCE(
+                        NULLIF(excluded.generation_hash, ''),
+                        reply_states.generation_hash
+                    ),
+                    generation_revision=CASE
+                        WHEN excluded.generation_revision > 0
+                        THEN excluded.generation_revision
+                        ELSE reply_states.generation_revision
+                    END,
+                    generation_audit_id=COALESCE(
+                        NULLIF(excluded.generation_audit_id, ''),
+                        reply_states.generation_audit_id
+                    ),
+                    generation_persona_id=COALESCE(
+                        NULLIF(excluded.generation_persona_id, ''),
+                        reply_states.generation_persona_id
+                    ),
                     updated_at=excluded.updated_at,
                     next_retry_at=excluded.next_retry_at
                 """,
@@ -604,7 +635,7 @@ class ReplyStateStore:
                     self.account_id, ct, rpid,
                     attempts, max_att,
                     reason, error_code,
-                    notif, gen, persona,
+                    notif, gen, gen_hash, gen_rev, gen_audit, gen_persona, persona,
                     created_at, now, now,  # next_retry_at = now → 立即可调度
                     meta,
                 ),

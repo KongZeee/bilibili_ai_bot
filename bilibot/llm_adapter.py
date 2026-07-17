@@ -32,19 +32,24 @@ class LLMAdapter:
             logger.warning("openai 库未安装，LLMAdapter 跳过客户端初始化")
             return
 
+        # BUG B-006：timeout 必须传入，避免 chat/vision/embedding 无限挂起
+        timeout = self._resolve_timeout(config)
+
         # 初始化主客户端
         if config.llm.api_key:
             self.client = AsyncOpenAI(
                 api_key=config.llm.api_key,
                 base_url=config.llm.base_url,
+                timeout=timeout,
             )
-            logger.info(f"LLM客户端已初始化: {config.llm.model}")
+            logger.info(f"LLM客户端已初始化: {config.llm.model} (timeout={timeout}s)")
 
         # 初始化Vision客户端
         if config.llm.vision_enabled and config.llm.vision_api_key:
             self.vision_client = AsyncOpenAI(
                 api_key=config.llm.vision_api_key,
                 base_url=config.llm.vision_base_url,
+                timeout=timeout,
             )
             logger.info("Vision客户端已初始化")
 
@@ -53,8 +58,39 @@ class LLMAdapter:
             self.embedding_client = AsyncOpenAI(
                 api_key=config.llm.embedding_api_key,
                 base_url=config.llm.embedding_base_url,
+                timeout=timeout,
             )
             logger.info("Embedding客户端已初始化")
+
+    @staticmethod
+    def _resolve_timeout(config) -> int:
+        """从 config 解析 HTTP 超时（秒），缺省 120，夹紧到 [5, 600]。"""
+        candidates = []
+        try:
+            candidates.append(getattr(config.llm, "timeout", None))
+        except Exception:
+            pass
+        try:
+            if hasattr(config, "get"):
+                candidates.append(config.get("llm.timeout", None))
+        except Exception:
+            pass
+        try:
+            raw = getattr(config, "get_raw_config", None)
+            if callable(raw):
+                llm_raw = (raw() or {}).get("llm") or {}
+                if isinstance(llm_raw, dict):
+                    candidates.append(llm_raw.get("timeout"))
+        except Exception:
+            pass
+        for value in candidates:
+            if value is None or value == "":
+                continue
+            try:
+                return max(5, min(int(value), 600))
+            except (TypeError, ValueError):
+                continue
+        return 120
     
     async def generate(
         self,
@@ -188,32 +224,29 @@ class LLMAdapter:
     
     async def get_embedding(self, text: str) -> Optional[List[float]]:
         """
-        获取文本的embedding向量
-        
-        Args:
-            text: 输入文本
-            
-        Returns:
-            向量列表，失败返回None
+        获取文本的 embedding 向量。
+
+        客户端未配置时返回 None（调用方可降级）。
+        已配置但请求失败（超时/429/5xx）时上抛，避免记忆路径把瞬时故障
+        当成「无向量」永久跳过（与 LLMProvider.get_embedding 一致）。
         """
         client = self.embedding_client
         if not client or not self.config.llm.embedding_model:
             logger.warning("Embedding客户端未初始化")
             return None
-        
+
         try:
             response = await client.embeddings.create(
                 model=self.config.llm.embedding_model,
                 input=text,
             )
-            
             if response.data:
                 return response.data[0].embedding
-            return None
-            
+            # 已配置但返回空向量：上抛，禁止记忆路径当「无 embedding」永久跳过
+            raise RuntimeError("embedding API returned empty data")
         except Exception as e:
             logger.error(f"Embedding获取失败: {e}")
-            return None
+            raise
     
     @staticmethod
     def repair_json(text: str) -> str:

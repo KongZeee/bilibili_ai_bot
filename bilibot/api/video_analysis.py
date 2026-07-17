@@ -413,6 +413,7 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             logger.info(f"[test] 视频已下载: {video_file}, 开始分析...")
 
             result = None
+            cleanup_ready = False
             try:
                 # 3. 执行视频理解
                 result = await asyncio.wait_for(
@@ -435,6 +436,7 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
                         "[test] 视频提取降级，返回元数据并清理临时文件: %s",
                         degradation,
                     )
+                    cleanup_ready = True
                     return ok({
                         "title": title,
                         "owner": owner,
@@ -445,13 +447,23 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
                         "frames": [],
                     })
 
-                # 4. 完整提取内容提交到账号脑库后，再清理媒体与处理目录。
-                await _archive_test_analysis(
-                    acc,
-                    bvid=bvid,
-                    vinfo=vinfo,
-                    result=result,
-                )
+                # 无 behavior_log 且无有效视听观测 → 不写无意义评价/观测记忆
+                visual_obs = result.get("visual_observations") or []
+                audio_obs = result.get("audio_observations") or []
+                has_extract = bool(behavior_log) or bool(visual_obs) or bool(audio_obs)
+                if has_extract:
+                    # 4. 完整提取内容提交到账号脑库后，再清理媒体与处理目录。
+                    await _archive_test_analysis(
+                        acc,
+                        bvid=bvid,
+                        vinfo=vinfo,
+                        result=result,
+                    )
+                else:
+                    logger.warning(
+                        "[test] 视频理解无有效提取内容，跳过记忆归档 bvid=%s", bvid,
+                    )
+                cleanup_ready = True
 
                 # 截取行为日志前 2000 字作为描述
                 desc = behavior_log[:2000] if behavior_log else "（未生成行为日志）"
@@ -467,8 +479,23 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
                     "frames": [],
                 })
             finally:
-                # 成功 / 失败 / 超时：一律清理，避免 test_ 前缀视频堆积
-                _cleanup_test_analysis_artifacts(video_file, result or {})
+                if cleanup_ready:
+                    # 只有无需归档或账号脑库已经确认提交，才可立即删除证据。
+                    _cleanup_test_analysis_artifacts(video_file, result or {})
+                else:
+                    # 提取/归档失败时保留一小段诊断窗口，避免“记忆没写入，
+                    # 原始证据也没了”。定时清理仍给磁盘占用设置上界。
+                    from bilibot.video_understanding.cleanup import schedule_cleanup
+
+                    paths = [video_file]
+                    work_dir = (result or {}).get("work_dir")
+                    if work_dir:
+                        paths.append(work_dir)
+                    schedule_cleanup(paths, delay_seconds=1800)
+                    logger.warning(
+                        "[test] 视频证据因提取/归档失败保留 1800 秒: bvid=%s",
+                        bvid,
+                    )
 
         except asyncio.TimeoutError:
             return fail("ANALYSIS_TIMEOUT", "视频分析超时（超过 10 分钟）")

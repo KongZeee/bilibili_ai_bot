@@ -53,7 +53,7 @@ class ContextBuilder:
 
     def __init__(self, data_store=None, user_state=None,
                  persona_store=None, bili=None, config: dict | None = None,
-                 knowledge_memory=None, account_id: str = ""):
+                 knowledge_memory=None, account_id: str = "", companion=None):
         self.ds = data_store
         self.user_state = user_state
         self.persona_store = persona_store
@@ -62,6 +62,8 @@ class ContextBuilder:
         # ACC-502：账号隔离字段，build() 会校验传入 account_id 与此一致
         self.knowledge_memory = knowledge_memory
         self.account_id = account_id
+        # 账号级陪伴生活层（可选）；enabled=false 时 get_prompt_surface 返回空
+        self.companion = companion
 
     # ── 主入口 ──
 
@@ -97,6 +99,7 @@ class ContextBuilder:
         memory_context = _value(context, "memory_context", []) or []
         memory_evidence = _value(context, "memory_evidence", "") or ""
         bot_thread_replies = _value(context, "bot_thread_replies", []) or []
+        context_recent_actions = _value(context, "recent_bot_actions", []) or []
         mood = _value(context, "mood", "")
         video_context_complete = _value(context, "video_context_complete", True)
 
@@ -169,19 +172,40 @@ class ContextBuilder:
             parts.append(user_block)
             meta["sources"].append("user_profile")
 
-        # 4. 相关长期记忆
-        if memory_context:
-            mem_block = "【相关记忆】\n"
-            for m in memory_context[:5]:
-                mem_block += f"  - {m}\n"
-            parts.append(mem_block)
-            meta["sources"].append("memory")
+        # 4. 相关长期记忆（V6 evidence 优先；legacy memory_context 仅作补充且去重）
         if memory_evidence:
             parts.append(str(memory_evidence))
             meta["sources"].append("memory_brain")
+        if memory_context:
+            # Skip lines already covered by the evidence block to avoid inflation
+            evidence_blob = str(memory_evidence or "")
+            extra_lines = []
+            for m in memory_context[:5]:
+                line = str(m or "").strip()
+                if not line:
+                    continue
+                if evidence_blob and line[:40] in evidence_blob:
+                    continue
+                extra_lines.append(f"  - {line}")
+            if extra_lines:
+                parts.append("【相关记忆补充】\n" + "\n".join(extra_lines))
+                meta["sources"].append("memory")
+        if memory_evidence or memory_context:
+            meta["memory_present"] = True
+        else:
+            meta["memory_present"] = False
 
         # 5. Bot 最近主动行为
-        recent = self._get_recent_actions(limit=5)
+        # The V6 activity context supplies account-brain actions. Keep the
+        # legacy DataStore lane as a compatibility supplement, not as the sole
+        # source of what the Bot just did.
+        recent: list[str] = []
+        for item in [*context_recent_actions, *self._get_recent_actions(limit=5)]:
+            line = str(item or "").strip()
+            if line and line not in recent:
+                recent.append(line)
+            if len(recent) >= 8:
+                break
         if recent:
             parts.append("【Bot 近期行为】\n  " + "\n  ".join(recent))
             meta["sources"].append("recent_actions")
@@ -199,14 +223,21 @@ class ContextBuilder:
         if mood:
             parts.append(f"【当前心情】{mood}")
 
-        # 7. 陪伴生活层（账号级，可选）
+        # 7. 陪伴生活层（账号级，可选；enabled=false 不注入、不挡主链路）
         companion_surface = ""
         try:
             companion = getattr(self, "companion", None)
             if companion is not None and getattr(companion, "enabled", False):
-                companion_surface = companion.get_prompt_surface() or ""
+                # Prefer prompt_surface; fall back to proactive block for richer seed
+                getter = getattr(companion, "get_prompt_surface", None)
+                if callable(getter):
+                    companion_surface = getter() or ""
+                if not companion_surface:
+                    pro = getattr(companion, "build_proactive_context_block", None)
+                    if callable(pro):
+                        companion_surface = pro() or ""
                 if companion_surface:
-                    parts.append(companion_surface)
+                    parts.append(str(companion_surface).strip())
                     meta["sources"].append("companion_life")
         except Exception:
             companion_surface = ""

@@ -1109,8 +1109,8 @@ def create_memory_routes(
 ) -> list[Route]:
     """Create deprecated root reads mapped to the default account's V6 brain.
 
-    Every root-level mutation remains permanently gone.  The retained arguments
-    are part of the web-panel factory contract.
+    Writes remain permanently gone (410). Frontend must use account-scoped
+    routes under ``/api/accounts/{account_id}/memory`` only.
     """
 
     del persona_store, scheduler

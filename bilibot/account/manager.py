@@ -265,7 +265,7 @@ class AccountManager:
                     "has_llm": False,
                     "has_bili": False,
                 }
-            status["is_default"] = (acc_id == self._default_id)
+            status["is_default"] = (acc_id == getattr(self, "_default_id", ""))
             result.append(status)
         return result
 

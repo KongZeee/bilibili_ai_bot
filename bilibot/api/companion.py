@@ -126,10 +126,19 @@ def create_companion_routes(account_manager) -> list:
         return _ok({"items": items, "total": len(items)})
 
     async def trigger_tick(request: Request) -> JSONResponse:
+        """POST /api/accounts/{account_id}/companion/trigger
+
+        信封契约（前端 toast 依赖）：
+          success: true  → data.produced 表示是否真正产出；message 给人读
+          success: false → error.message 给人读；HTTP 4xx/5xx
+        探索失败不得 success:true + 无 produced 误导；未产出时 produced=false。
+        """
         account_id = request.path_params.get("account_id") or ""
-        _, companion = _get_companion(account_id)
+        acc, companion = _get_companion(account_id)
+        if acc is None:
+            return _err(f"账号不存在: {account_id}", "NOT_FOUND", 404)
         if companion is None:
-            return _err("账号不存在或陪伴层未初始化", "NOT_FOUND", 404)
+            return _err("陪伴层未初始化", "NOT_FOUND", 404)
         if not companion.enabled:
             return _err("陪伴层未启用（companion.enabled=false）", "DISABLED", 400)
         try:
@@ -139,38 +148,85 @@ def create_companion_routes(account_manager) -> list:
             except Exception:
                 body = {}
             action = str((body or {}).get("action") or "tick").strip().lower()
+            allowed = {"tick", "diary", "dream", "explore", "creative", "plan"}
+            if action not in allowed:
+                return _err(
+                    f"不支持的 action: {action!r}，允许: {sorted(allowed)}",
+                    "BAD_REQUEST",
+                    400,
+                )
+
+            def _payload(produced: bool, item: Any, **extra: Any) -> dict:
+                out = {
+                    "produced": bool(produced),
+                    "action": action,
+                    "account_id": account_id,
+                    "item": item,
+                }
+                out.update(extra)
+                return out
+
             if action == "diary":
                 data = await companion.generate_diary(force=True)
+                produced = bool(data)
                 return _ok(
-                    {"produced": bool(data), "item": data.to_dict() if data else None},
-                    message="日记已生成" if data else "日记未生成",
+                    _payload(produced, data.to_dict() if data else None),
+                    message="日记已生成" if produced else "日记未生成",
                 )
             if action == "dream":
                 data = await companion.generate_dream(force=True)
+                produced = bool(data)
                 return _ok(
-                    {"produced": bool(data), "item": data.to_dict() if data else None},
-                    message="梦境已生成" if data else "梦境未生成",
+                    _payload(produced, data.to_dict() if data else None),
+                    message="梦境已生成" if produced else "梦境未生成",
                 )
             if action == "explore":
                 data = await companion.maybe_explore(force=True)
+                produced = bool(data)
                 return _ok(
-                    {"produced": bool(data), "item": data.to_dict() if data else None},
-                    message="探索已执行" if data else "探索未产生结果（检查 web_search / 场景开关 / 冷却）",
+                    _payload(produced, data.to_dict() if data else None),
+                    message=(
+                        "探索已执行"
+                        if produced
+                        else "探索未产生结果（检查 web_search / 场景开关 / 冷却）"
+                    ),
                 )
             if action == "creative":
                 data = await companion.maybe_advance_creative(force=True)
+                produced = bool(data)
                 return _ok(
-                    {"produced": bool(data), "item": data.to_dict() if data else None},
-                    message="创作已推进" if data else "创作未推进（检查 creative 开关 / 空闲条件）",
+                    _payload(produced, data.to_dict() if data else None),
+                    message=(
+                        "创作已推进"
+                        if produced
+                        else "创作未推进（检查 creative 开关 / 空闲条件）"
+                    ),
                 )
             if action == "plan":
                 data = await companion.ensure_daily_plan(force=True)
+                produced = bool(data and getattr(data, "items", None))
                 return _ok(
-                    {"produced": bool(data and data.items), "item": data.to_dict() if data else None},
-                    message="日程已生成" if data else "日程生成失败",
+                    _payload(produced, data.to_dict() if data else None),
+                    message="日程已生成" if produced else "日程生成失败",
                 )
             result = await companion.tick()
-            return _ok({"produced": True, "item": result}, message="tick 完成")
+            # tick：有 actions 列表时以是否非空为准；否则看 ok；默认 produced=False 防误报
+            produced = False
+            item = result if isinstance(result, dict) else {"result": result}
+            if isinstance(result, dict):
+                actions = result.get("actions")
+                if isinstance(actions, list):
+                    produced = len(actions) > 0
+                elif "ok" in result:
+                    produced = bool(result.get("ok"))
+                else:
+                    # 未知结构：标记为已运行但未确认产出，由前端 info/warning 展示
+                    produced = False
+                    item = {**item, "ran": True}
+            return _ok(
+                _payload(produced, item if isinstance(item, dict) else {"result": item}),
+                message="tick 完成" if produced else "tick 完成（本轮无额外产出）",
+            )
         except Exception as e:
             logger.error("companion trigger failed: %s", e, exc_info=True)
             return _err("触发失败", "INTERNAL", 500)

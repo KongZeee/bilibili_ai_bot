@@ -4,18 +4,20 @@
 职责：
 - 任务结束后立即或延迟清理临时目录
 - 默认延迟 30 分钟（仅非 defer_cleanup 成功路径）
-- 生产路径失败/成功后均应立即清理，避免 video_temp 堆积
-- 启动时清理残留的孤儿临时文件（进程被杀后未清理的）
+- 成功归档后立即清理；失败证据短暂保留并延迟清理
+- 启动时清理超过保留窗口的孤儿临时文件（进程被杀后未清理的）
 """
 import logging
 import os
 import shutil
 import threading
+import time
 from typing import Iterable, List, Optional
 
 logger = logging.getLogger("bilibot.video_u.cleanup")
 
 _SCHEDULED: List[threading.Timer] = []
+_SCHEDULED_LOCK = threading.Lock()
 
 
 def cleanup_now(paths: List[str]) -> None:
@@ -56,11 +58,14 @@ def cleanup_media_artifacts(
         cleanup_now(ordered)
 
 
-def cleanup_orphaned_video_temp(video_temp_dir: str) -> int:
+def cleanup_orphaned_video_temp(
+    video_temp_dir: str, min_age_seconds: int = 1800
+) -> int:
     """启动时清理 video_temp 目录中的孤儿临时文件。
 
     进程被杀后，已下载的 .mp4、关键帧目录、.m4s 中间文件等不会被清理。
-    本函数在 scheduler 启动时调用，删除所有残留文件。
+    本函数在 scheduler 启动时调用，只删除超过保留窗口的残留文件。
+    新鲜失败证据可能尚未完成人工补归档，不能在快速重启时立即抹掉。
 
     Args:
         video_temp_dir: video_temp 目录路径
@@ -81,6 +86,15 @@ def cleanup_orphaned_video_temp(video_temp_dir: str) -> int:
     for name in entries:
         path = os.path.join(video_temp_dir, name)
         try:
+            try:
+                age = max(0.0, time.time() - os.path.getmtime(path))
+            except OSError:
+                age = float("inf")
+            if age < max(0, int(min_age_seconds)):
+                logger.info(
+                    "保留新鲜 video_temp 证据: %s (age=%.0fs)", name, age
+                )
+                continue
             if os.path.isfile(path):
                 # 删除 .mp4、.m4s、.mp3、.wav 等临时媒体文件
                 ext = os.path.splitext(name)[1].lower()
@@ -104,19 +118,34 @@ def cleanup_orphaned_video_temp(video_temp_dir: str) -> int:
 def schedule_cleanup(paths: List[str], delay_seconds: int = 1800) -> threading.Timer:
     """延迟清理临时文件"""
 
+    holder: dict[str, threading.Timer] = {}
+
     def _run():
-        cleanup_now(paths)
+        try:
+            cleanup_now(paths)
+        finally:
+            timer_ref = holder.get("timer")
+            if timer_ref is not None:
+                with _SCHEDULED_LOCK:
+                    try:
+                        _SCHEDULED.remove(timer_ref)
+                    except ValueError:
+                        pass
 
     timer = threading.Timer(delay_seconds, _run)
+    holder["timer"] = timer
     timer.daemon = True
+    with _SCHEDULED_LOCK:
+        _SCHEDULED.append(timer)
     timer.start()
-    _SCHEDULED.append(timer)
     logger.info(f"已调度 {len(paths)} 个临时路径，{delay_seconds} 秒后清理")
     return timer
 
 
 def cancel_all_scheduled() -> None:
     """取消所有已调度的清理任务（测试用）"""
-    for timer in _SCHEDULED:
+    with _SCHEDULED_LOCK:
+        timers = list(_SCHEDULED)
+        _SCHEDULED.clear()
+    for timer in timers:
         timer.cancel()
-    _SCHEDULED.clear()

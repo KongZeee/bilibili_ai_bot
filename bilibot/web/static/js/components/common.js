@@ -263,21 +263,23 @@ export const Modal = defineComponent({
                 keydownHandler = null;
             }
             if (prevFocus) {
-                prevFocus.focus();
+                try { prevFocus.focus(); } catch (_) { /* ignore */ }
                 prevFocus = null;
             }
         });
 
-        // 用 watch 监听 modelValue
+        // 用 watch 监听 modelValue；打开前先卸旧 handler，防止重复挂载
         watch(() => props.modelValue, (val) => {
             if (val) {
                 prevFocus = document.activeElement;
-                // 等 DOM 更新后聚焦 modal
                 setTimeout(() => {
                     if (modalRef.value) {
                         modalRef.value.focus();
                     }
                 }, 0);
+                if (keydownHandler) {
+                    document.removeEventListener('keydown', keydownHandler);
+                }
                 keydownHandler = trapFocus;
                 document.addEventListener('keydown', keydownHandler);
             } else {
@@ -286,7 +288,7 @@ export const Modal = defineComponent({
                     keydownHandler = null;
                 }
                 if (prevFocus) {
-                    prevFocus.focus();
+                    try { prevFocus.focus(); } catch (_) { /* ignore */ }
                     prevFocus = null;
                 }
             }

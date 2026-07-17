@@ -11,7 +11,7 @@ from typing import Any, Mapping, Sequence
 DEFAULT_MEMORY_PROMPT_BUDGET = 5000
 MAX_EVENTS = 5
 MAX_ASSOCIATIONS = 2
-MAX_CHUNKS_PER_EVENT = 3
+MAX_CHUNKS_PER_EVENT = 2
 MAX_EVENT_CHARS = 2200
 
 _HEADER = (
@@ -104,13 +104,32 @@ def _source_label(event: Mapping[str, Any]) -> tuple[str, str]:
         or first.get("type")
         or (event.get("source") if isinstance(event.get("source"), str) else "")
     )
+    # Friendly labels so Bot self experiences are obvious in the prompt surface
+    kind_map = {
+        "video": "视频观看",
+        "video_experience": "视频体验",
+        "video_detail": "视频细节",
+        "bangumi": "追番",
+        "bangumi_episode": "追番",
+        "bot_action": "Bot动作",
+        "diary": "日记",
+        "dream": "梦境",
+        "life_plan": "日程",
+        "creative": "创作",
+        "web_reference": "探索/搜索",
+        "comment": "评论",
+        "comment_thread": "评论串",
+        "weekly_summary": "周总结",
+        "private_message": "私信",
+    }
+    display_type = kind_map.get(source_type.casefold(), source_type) if source_type else ""
     title = _clean(
         event.get("title")
         or event.get("event_title")
         or first.get("title")
         or first.get("source_title")
     )
-    return source_type, title
+    return display_type or source_type, title
 
 
 def _summary(event: Mapping[str, Any]) -> str:
@@ -224,6 +243,13 @@ def _fit_block(block: str, limit: int) -> str:
 
 def _render_event(event: Mapping[str, Any], ordinal: int, limit: int) -> tuple[str, tuple[str, ...]]:
     source_type, title = _source_label(event)
+    source_rows = _sources(event)
+    first_source = source_rows[0] if source_rows else {}
+    raw_source_type = _clean(
+        event.get("source_type")
+        or first_source.get("source_type")
+        or first_source.get("type")
+    ).casefold()
     summary = _summary(event)
     chunks = _chunks(event, MAX_CHUNKS_PER_EVENT)
     # If the event already carries a long video_detail digest as summary, avoid
@@ -255,7 +281,7 @@ def _render_event(event: Mapping[str, Any], ordinal: int, limit: int) -> tuple[s
         lines.append(f"来源: {_escaped(source_type, 80)}")
     if title:
         lines.append(f"标题: {_escaped(title, 160)}")
-    if source_type.casefold() in _USER_SOURCES and not bool(event.get("verified", False)):
+    if raw_source_type in _USER_SOURCES and not bool(event.get("verified", False)):
         lines.append("事实边界: 这是某人当时说过的话，不是已验证事实。")
     if summary:
         # Video detail digests can be up to ~2000 chars and are the main recall

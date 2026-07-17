@@ -181,11 +181,27 @@ export const MemoryListPage = defineComponent({
         let loadSeq = 0;
 
         async function loadData() {
-            accountId.value = appState.currentAccountId || appState.accounts[0]?.id;
-            if (!accountId.value) {
+            // 账号切换：只读 currentAccountId，禁止无账号时乱点默认账号造成串数据
+            const nextId = appState.currentAccountId
+                || appState.accounts[0]?.account_id
+                || appState.accounts[0]?.id
+                || '';
+            if (!nextId) {
+                accountId.value = '';
+                memories.value = [];
+                total.value = 0;
+                jobs.value = [];
                 loading.value = false;
                 return;
             }
+            if (accountId.value && accountId.value !== nextId) {
+                // 切换账号时清空旧数据，避免短暂串屏
+                memories.value = [];
+                total.value = 0;
+                jobs.value = [];
+                selectedMemory.value = null;
+            }
+            accountId.value = nextId;
             const seq = ++loadSeq;
             loading.value = true;
             try {
@@ -203,6 +219,8 @@ export const MemoryListPage = defineComponent({
                     }).catch(() => ({ items: [] })),
                 ]);
                 if (seq !== loadSeq) return;
+                // 再次校验：异步返回时账号可能已切走
+                if (accountId.value !== nextId) return;
                 stats.value = statsData || { total: 0, categories: {} };
                 memories.value = listData?.items || [];
                 total.value = listData?.total || 0;
@@ -393,9 +411,11 @@ export const MemoryListPage = defineComponent({
 
         onMounted(loadData);
 
-        watch(() => appState.currentAccountId, (newId) => {
-            if (newId) {
+        watch(() => appState.currentAccountId, (newId, prevId) => {
+            if (newId && newId !== prevId) {
                 page.value = 1;
+                loadData();
+            } else if (newId && !memories.value.length && !loading.value) {
                 loadData();
             }
         });

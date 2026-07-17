@@ -66,26 +66,38 @@ export const LogsPage = defineComponent({
 
         async function download() {
             try {
-                const resp = await fetch('/api/logs/download', {
-                    credentials: 'same-origin',
-                    headers: { 'X-Requested-With': 'XMLHttpRequest' },
-                });
-                if (resp.status === 401) {
-                    window.location.href = '/login';
-                    return;
-                }
-                if (!resp.ok) {
-                    let msg = `下载失败: HTTP ${resp.status}`;
-                    const ct = (resp.headers.get('content-type') || '').toLowerCase();
-                    if (ct.includes('application/json')) {
+                // 优先 api.logsDownload（统一 401 hash 回跳 + 超时）；否则降级直 fetch
+                let blob;
+                if (typeof api.logsDownload === 'function') {
+                    blob = await api.logsDownload();
+                } else {
+                    const resp = await fetch('/api/logs/download', {
+                        credentials: 'same-origin',
+                        headers: { 'X-Requested-With': 'XMLHttpRequest' },
+                    });
+                    if (resp.status === 401) {
                         try {
-                            const data = await resp.json();
-                            msg = data?.error?.message || data?.message || msg;
+                            const hash = window.location.hash || '';
+                            if (hash && hash !== '#/login') {
+                                sessionStorage.setItem('bilibot_login_return', hash);
+                            }
                         } catch (_) { /* ignore */ }
+                        window.location.href = '/login';
+                        return;
                     }
-                    throw new Error(msg);
+                    if (!resp.ok) {
+                        let msg = `下载失败: HTTP ${resp.status}`;
+                        const ct = (resp.headers.get('content-type') || '').toLowerCase();
+                        if (ct.includes('application/json')) {
+                            try {
+                                const data = await resp.json();
+                                msg = data?.error?.message || data?.message || msg;
+                            } catch (_) { /* ignore */ }
+                        }
+                        throw new Error(msg);
+                    }
+                    blob = await resp.blob();
                 }
-                const blob = await resp.blob();
                 // 防止把 JSON 错误体当日志文件保存
                 if ((blob.type || '').includes('json') || blob.size < 8) {
                     const text = await blob.text();
@@ -96,7 +108,6 @@ export const LogsPage = defineComponent({
                         }
                     } catch (parseErr) {
                         if (parseErr.message && parseErr.message !== 'Unexpected end of JSON input') {
-                            // rethrow real error messages; ignore pure parse failures on binary logs
                             if (!(parseErr instanceof SyntaxError)) throw parseErr;
                         }
                     }

@@ -6,7 +6,7 @@
 2. 好感度（affection.json）
 3. 心情（mood.json）
 
-不依赖 LLMAdapter，不涉及记忆存储/检索（那部分由 KnowledgeBaseMemory 负责）。
+不依赖 LLMAdapter，不涉及记忆存储/检索（由账号级 MemoryBrainService 负责）。
 """
 import logging
 import random

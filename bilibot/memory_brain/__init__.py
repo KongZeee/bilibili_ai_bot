@@ -15,6 +15,7 @@ from .ingestion import (
     video_observation,
 )
 from .models import (
+    ActivityMemoryError,
     ArchiveResult,
     BootstrapResult,
     ClaimedJob,
@@ -40,10 +41,12 @@ from .store import (
 )
 from .recall import RecallQuery, RecallResult
 from .redaction import PrivateMessageRedactor, RedactionResult
-from .service import MemoryBrainService
+from .service import ActivityMemoryContext, MemoryBrainService
 from .worker import PersistentMemoryWorker, WorkerRunReport
 
 __all__ = [
+    "ActivityMemoryContext",
+    "ActivityMemoryError",
     "ArchiveResult",
     "BootstrapResult",
     "ClaimedJob",

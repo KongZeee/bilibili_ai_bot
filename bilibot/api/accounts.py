@@ -767,6 +767,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
 
         PRD-V5 §7.4：手动创建 TaskRun（trigger_type=manual），异步触发 _do_proactive_video。
         创建协程 ≠ 成功；任务状态通过 GET /tasks/{task_id} 查询。
+        信封：{ success, data: { task_id, status, scene, account_id }, message }
         """
         try:
             acc_id = request.path_params.get("id")
@@ -787,14 +788,25 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 scheduler._do_proactive_video(task_id=task_id),
                 tag=f"manual_proactive_video:{task_id}",
             )
-            return ok({"task_id": task_id, "status": "scheduled"},
-                       "任务已创建（异步执行）", status_code=202)
+            return ok(
+                {
+                    "task_id": task_id,
+                    "status": "scheduled",
+                    "scene": scene,
+                    "account_id": acc_id,
+                },
+                "主动视频任务已创建（异步执行）",
+                status_code=202,
+            )
         except Exception as e:
             logger.error(f"触发主动视频任务失败: {e}", exc_info=True)
             return fail_internal()
 
     async def trigger_dynamic_task(request: Request) -> JSONResponse:
-        """POST /api/accounts/{id}/tasks/dynamic → 202 + task_id"""
+        """POST /api/accounts/{id}/tasks/dynamic → 202 + task_id
+
+        与调度内部/列表展示对齐：scene 使用 ``dynamic_post``（非短名 dynamic）。
+        """
         try:
             acc_id = request.path_params.get("id")
             scheduler, err = _get_account_scheduler(acc_id)
@@ -804,7 +816,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 body = await request.json()
             except Exception:
                 body = {}
-            scene = "dynamic"
+            # Canonical scene for FE labels + task recovery (scheduler treats
+            # dynamic_post / dynamic equivalently on recovery).
+            scene = "dynamic_post"
             task_id = scheduler.create_manual_task(scene, input_data=body or None)
             if not task_id:
                 return fail_internal("创建 TaskRun 失败")
@@ -812,10 +826,62 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 scheduler._do_post_dynamic(task_id=task_id),
                 tag=f"manual_dynamic:{task_id}",
             )
-            return ok({"task_id": task_id, "status": "scheduled"},
-                       "任务已创建（异步执行）", status_code=202)
+            return ok(
+                {
+                    "task_id": task_id,
+                    "status": "scheduled",
+                    "scene": scene,
+                    "account_id": acc_id,
+                },
+                "动态发布任务已创建（异步执行）",
+                status_code=202,
+            )
         except Exception as e:
             logger.error(f"触发动态任务失败: {e}", exc_info=True)
+            return fail_internal()
+
+    async def trigger_bangumi_task(request: Request) -> JSONResponse:
+        """POST /api/accounts/{id}/tasks/bangumi → observable async check."""
+        try:
+            acc_id = request.path_params.get("id")
+            scheduler, err = _get_account_scheduler(acc_id)
+            if err is not None:
+                return err
+            if getattr(scheduler, "bangumi_service", None) is None:
+                return fail(
+                    "BANGUMI_DISABLED",
+                    "番剧追更未启用，或账号记忆大脑未就绪",
+                    status_code=409,
+                )
+            scene = "bangumi"
+            task_id = scheduler.create_manual_task(
+                scene, input_data={"trigger_source": "manual"}
+            )
+            if not task_id:
+                return fail_internal("创建 TaskRun 失败")
+            if not scheduler._dispatch_task_run(
+                task_id, tag_prefix="manual", claim_if_scheduled=True
+            ):
+                scheduler._fail_task(
+                    task_id,
+                    "DISPATCH_FAILED",
+                    "番剧任务派发失败",
+                    retryable=True,
+                )
+                return fail_internal("番剧任务派发失败")
+            fresh = scheduler.task_store.get(task_id) if scheduler.task_store else None
+            return ok(
+                {
+                    "task_id": task_id,
+                    "status": getattr(fresh, "status", "claimed"),
+                    "scene": scene,
+                    "account_id": acc_id,
+                },
+                "追番检查任务已创建（异步执行）",
+                status_code=202,
+            )
+        except Exception as e:
+            logger.error("触发追番任务失败: %s", e, exc_info=True)
             return fail_internal()
 
     async def list_account_tasks(request: Request) -> JSONResponse:
@@ -860,12 +926,16 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         try:
             acc_id = request.path_params.get("id")
             task_id = request.path_params.get("task_id")
-            scheduler, err = _get_account_scheduler(acc_id)
+            task_store, err = _get_account_task_store(acc_id)
             if err is not None:
                 return err
-            task = scheduler.task_store.get(task_id)
+            task = task_store.get(task_id)
             if task is None:
                 return fail("NOT_FOUND", f"任务不存在: {task_id}", status_code=404)
+            # 多账号隔离：禁止跨账号读取任务（即使 task_id 猜中）
+            task_acc = str(getattr(task, "account_id", "") or "")
+            if task_acc != str(acc_id):
+                return fail("TASK_ACCOUNT_MISMATCH", "任务不属于该账号", status_code=403)
             from bilibot.services.task_store import desensitize_task_run
             return ok(desensitize_task_run(task))
         except Exception as e:
@@ -887,6 +957,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             task = scheduler.task_store.get(task_id)
             if task is None:
                 return fail("NOT_FOUND", f"任务不存在: {task_id}", status_code=404)
+            task_acc = str(getattr(task, "account_id", "") or "")
+            if task_acc != str(acc_id):
+                return fail("TASK_ACCOUNT_MISMATCH", "任务不属于该账号", status_code=403)
             if scheduler.task_store.cancel(task_id):
                 return ok({"task_id": task_id, "status": "cancelled"},
                            "任务已取消")
@@ -901,7 +974,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         """POST /api/accounts/{id}/tasks/{task_id}/retry
 
         PRD-V5 §7.4：重试 retry_wait/failed/interrupted 状态的任务。
-        重置为 scheduled，需要调度循环重新拾取。
+        重置为 scheduled 后立即 claim + 按 scene 分发（不依赖下一次主循环）。
         """
         try:
             acc_id = request.path_params.get("id")
@@ -912,12 +985,39 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             task = scheduler.task_store.get(task_id)
             if task is None:
                 return fail("NOT_FOUND", f"任务不存在: {task_id}", status_code=404)
-            if scheduler.task_store.retry(task_id):
-                return ok({"task_id": task_id, "status": "scheduled"},
-                           "任务已重新入队")
-            return fail("INVALID_STATE",
-                        f"任务状态 {task.status} 不允许重试（仅 retry_wait/failed/interrupted 可重试）",
-                        status_code=409)
+            task_acc = str(getattr(task, "account_id", "") or "")
+            if task_acc != str(acc_id):
+                return fail("TASK_ACCOUNT_MISMATCH", "任务不属于该账号", status_code=403)
+            if not scheduler.task_store.retry(task_id):
+                return fail(
+                    "INVALID_STATE",
+                    f"任务状态 {task.status} 不允许重试（仅 retry_wait/failed/interrupted 可重试）",
+                    status_code=409,
+                )
+            # 立即派发：避免仅入队后等待主循环；dynamic_post 也需被支持
+            dispatched = False
+            dispatch = getattr(scheduler, "_dispatch_task_run", None)
+            if callable(dispatch):
+                dispatched = bool(
+                    dispatch(task_id, tag_prefix="api_retry", claim_if_scheduled=True)
+                )
+            else:
+                # 兼容旧 scheduler：至少 claim，留给已有 start 路径
+                try:
+                    scheduler.task_store.claim(task_id)
+                except Exception:
+                    pass
+            fresh = scheduler.task_store.get(task_id)
+            status = getattr(fresh, "status", None) if fresh else "scheduled"
+            return ok(
+                {
+                    "task_id": task_id,
+                    "status": status or "scheduled",
+                    "dispatched": dispatched,
+                    "scene": getattr(fresh or task, "scene", None),
+                },
+                "任务已重新入队并派发" if dispatched else "任务已重新入队",
+            )
         except Exception as e:
             logger.error(f"重试账号任务失败: {e}", exc_info=True)
             return fail_internal()
@@ -945,6 +1045,7 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         Route("/api/accounts/{id}/tasks", list_account_tasks, methods=["GET"]),
         Route("/api/accounts/{id}/tasks/proactive-video", trigger_proactive_video_task, methods=["POST"]),
         Route("/api/accounts/{id}/tasks/dynamic", trigger_dynamic_task, methods=["POST"]),
+        Route("/api/accounts/{id}/tasks/bangumi", trigger_bangumi_task, methods=["POST"]),
         Route("/api/accounts/{id}/tasks/{task_id}", get_account_task, methods=["GET"]),
         Route("/api/accounts/{id}/tasks/{task_id}/cancel", cancel_account_task, methods=["POST"]),
         Route("/api/accounts/{id}/tasks/{task_id}/retry", retry_account_task, methods=["POST"]),

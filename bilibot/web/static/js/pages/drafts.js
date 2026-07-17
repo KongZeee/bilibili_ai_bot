@@ -93,10 +93,21 @@ export const DraftsPage = {
                 confirmText: '通过',
                 action: async () => {
                     try {
-                        await api.dynamicDrafts.approve(selectedAccount.value, id, {
+                        const res = await api.dynamicDrafts.approve(selectedAccount.value, id, {
                             expected_revision: draft.revision,
                         });
-                        appState.notify('草稿已通过', 'success');
+                        const taskId = res?.publish_task_id || res?.task_id || '';
+                        if (!taskId) {
+                            appState.notify(
+                                '审核已通过但未返回发布任务 ID，请刷新草稿/任务列表确认',
+                                'warning',
+                            );
+                        } else {
+                            appState.notify(
+                                `草稿已通过，发布任务已创建（${String(taskId).slice(0, 10)}…）`,
+                                'success',
+                            );
+                        }
                         refresh();
                     } catch (e) {
                         appState.notify('操作失败：' + (e.message || e), 'danger');
@@ -134,8 +145,19 @@ export const DraftsPage = {
                 confirmText: '重新发布',
                 action: async () => {
                     try {
-                        await api.dynamicDrafts.retry(selectedAccount.value, id);
-                        appState.notify('已触发重新发布', 'info');
+                        const res = await api.dynamicDrafts.retry(selectedAccount.value, id);
+                        const taskId = res?.publish_task_id || res?.task_id || '';
+                        if (!taskId) {
+                            appState.notify(
+                                '已请求重发但未返回任务 ID，请刷新确认',
+                                'warning',
+                            );
+                        } else {
+                            appState.notify(
+                                `已触发重新发布（${String(taskId).slice(0, 10)}…）`,
+                                'info',
+                            );
+                        }
                         if (refreshTimer) clearTimeout(refreshTimer);
                         refreshTimer = setTimeout(refresh, 1500);
                     } catch (e) {
@@ -199,7 +221,10 @@ export const DraftsPage = {
                 await refreshAccounts();
             }
             if (!selectedAccount.value && appState.accounts.length > 0) {
-                selectedAccount.value = appState.currentAccountId || appState.accounts[0].id;
+                const first = appState.accounts[0];
+                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
+                // selectedAccount watch 统一 refresh，避免双请求
+                return;
             }
             if (selectedAccount.value) refresh();
         }
@@ -210,13 +235,25 @@ export const DraftsPage = {
             if (id && id !== selectedAccount.value) {
                 selectedAccount.value = id;
                 page.value = 1;
-                refresh();
+                // selectedAccount watch 统一 refresh
             }
         });
 
         watch(() => appState.accountsLoaded, (loaded) => {
             if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
-                selectedAccount.value = appState.currentAccountId || appState.accounts[0].id;
+                const first = appState.accounts[0];
+                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
+                // selectedAccount watch 统一 refresh
+            }
+        });
+
+        watch(selectedAccount, (id, prev) => {
+            if (id && id !== prev) {
+                page.value = 1;
+                drafts.value = [];
+                total.value = 0;
+                refresh();
+            } else if (id && !drafts.value.length) {
                 refresh();
             }
         });
@@ -231,7 +268,7 @@ export const DraftsPage = {
         const tableGrid = 'minmax(8rem, 0.8fr) 7rem minmax(0, 1.8fr) 7rem 11rem';
 
         const accName = (id) => {
-            const acc = appState.accounts.find(a => a.id === id);
+            const acc = appState.accounts.find(a => (a.account_id || a.id) === id);
             return acc?.name || id || '-';
         };
 
@@ -274,10 +311,12 @@ export const DraftsPage = {
                                 'onUpdate:modelValue': (v) => {
                                     selectedAccount.value = v;
                                     appState.currentAccountId = v;
-                                    page.value = 1;
-                                    refresh();
+                                    // selectedAccount watch 会 refresh
                                 },
-                                options: appState.accounts.map(a => ({ value: a.id, label: a.name || a.id })),
+                                options: appState.accounts.map(a => ({
+                                    value: a.account_id || a.id,
+                                    label: a.name || a.account_id || a.id,
+                                })),
                             }),
                             h(Button, {
                                 type: 'primary',

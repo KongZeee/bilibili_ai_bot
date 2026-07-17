@@ -3,7 +3,7 @@
 
 PRD V4 §4.3.2 方案 A：
 - generate_reply() 新增 reply_context 参数
-- 内部统一走 PromptOrchestrator.build(scene=REPLY_COMMENT, context=reply_context)
+- 内部统一走 PromptOrchestrator.build(scene=REPLY_COMMENT|PRIVATE_REPLY, context=reply_context)
 - ContextBuilder.build() 生成 context_summary 和 meta
 - 返回值含 audit_id 和 context_meta（PRD V4 §6.1）
 
@@ -15,6 +15,7 @@ PRD-V5 §6.1 / REP-501：
 """
 import asyncio
 import hashlib
+import inspect
 import logging
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -133,6 +134,93 @@ class ReplyGenerator:
 
     # ── 主入口实现（返回 GenerationOutcome，REP-501 / PRD-V5 §6.1） ──
 
+    async def _attach_activity_memory(
+        self,
+        *,
+        user_id: str,
+        username: str,
+        comment: str,
+        thread_id: str,
+        oid: str,
+        comment_type: int,
+        reply_context: Optional[ReplyContext],
+        comment_context: str,
+        scene: str,
+    ) -> Optional[ReplyContext]:
+        """Persist current reply intent and attach cross-scene self memory."""
+        begin_activity = getattr(self.knowledge_memory, "begin_activity", None)
+        supports_activity = callable(begin_activity) and (
+            inspect.iscoroutinefunction(begin_activity)
+            or callable(getattr(type(self.knowledge_memory), "begin_activity", None))
+        )
+        if not supports_activity or scene not in {"reply_comment", "private_message"}:
+            return reply_context
+
+        activity_query = str(comment or "")[:800]
+        activity_speaker = str(user_id or "")
+        if scene == "private_message":
+            redact = getattr(self.knowledge_memory, "redact_private_message", None)
+            if not callable(redact):
+                # Never place an unredacted private message in generic activity
+                # traces merely to improve recall.
+                return reply_context
+            safe = redact(activity_query, actor_id=user_id, username=username)
+            activity_query = str(getattr(safe, "text", "") or "")
+            activity_speaker = str(getattr(safe, "actor_pseudonym", "") or "")
+            if not activity_query:
+                return reply_context
+
+        video = getattr(reply_context, "video", None) if reply_context else None
+        activity = await begin_activity(
+            action_key=(
+                f"comment_reply:{comment_type}:{thread_id}"
+                if scene == "reply_comment"
+                else f"private_reply:{thread_id}"
+            ),
+            action_type="reply_comment" if scene == "reply_comment" else "private_reply",
+            current_activity=(
+                "正在回复一条公开评论，并结合评论线程、视频上下文和最近经历组织自然回复。"
+                if scene == "reply_comment"
+                else "正在回复一条已脱敏的私信，并结合对话上下文和最近经历组织自然回复。"
+            ),
+            query=" ".join(
+                item
+                for item in (activity_query, str(comment_context or "")[:600])
+                if item
+            ),
+            scene=scene,
+            speaker_actor_id=activity_speaker,
+            title=str(getattr(video, "title", "") or ""),
+            bvid=str(getattr(video, "bvid", "") or ""),
+            oid=str(oid or getattr(video, "oid", "") or ""),
+            metadata={
+                "thread_id": str(thread_id),
+                "comment_type": str(comment_type),
+            },
+        )
+        activity_prompt = str(getattr(activity, "prompt_text", "") or "").strip()
+        activity_actions = list(getattr(activity, "recent_self_actions", ()) or ())
+        if reply_context is None:
+            reply_context = ReplyContext()
+        if activity_prompt and activity_prompt not in str(
+            reply_context.memory_evidence or ""
+        ):
+            reply_context.memory_evidence = "\n\n".join(
+                item
+                for item in (
+                    str(reply_context.memory_evidence or "").strip(),
+                    activity_prompt,
+                )
+                if item
+            )
+        merged_actions: list[str] = []
+        for item in [*(reply_context.recent_bot_actions or []), *activity_actions]:
+            line = str(item or "").strip()
+            if line and line not in merged_actions:
+                merged_actions.append(line)
+        reply_context.recent_bot_actions = merged_actions[:8]
+        return reply_context
+
     async def _generate_reply_impl(
         self,
         user_id: str,
@@ -173,46 +261,87 @@ class ReplyGenerator:
 
         try:
             # 1. 通过 orchestrator + reply_context 构建 prompt
+            reply_context = await self._attach_activity_memory(
+                user_id=user_id,
+                username=username,
+                comment=comment,
+                thread_id=thread_id,
+                oid=oid,
+                comment_type=comment_type,
+                reply_context=reply_context,
+                comment_context=comment_context,
+                scene=scene,
+            )
             system_prompt, user_prompt, persona_id, context_meta = self._build_prompts(
                 comment=comment,
                 username=username,
                 reply_context=reply_context,
                 comment_context=comment_context,
+                scene=scene,
             )
 
             # PRD 3.15 / V4 SEA-004：联网搜索（结果注入 user_prompt 作为 Reference Block）
             # PRD V4 SEA-004：搜索结果不得进入 system_prompt，防止 prompt injection
             # PRD-V5 §6.1：搜索失败可降级，不终止生成
+            # P006：私信场景不按评论逻辑误触发搜索；仅当 web_search 显式支持
+            # private_message scene 且 should_search 返回 query 时才搜，结果必脱敏。
             search_ref_block = ""
-            if self.web_search and self.web_search.is_available():
+            scene_key = str(getattr(scene, "value", scene) or "reply_comment").strip().lower()
+            search_allowed = True
+            if scene_key in {
+                "private_message", "private_reply", "pm",
+                "private_chat", "private_msg", "dm",
+            }:
+                # 私信：默认允许但强制 scene=private_message；服务端 is_scene_enabled 可关
+                if self.web_search and hasattr(self.web_search, "is_scene_enabled"):
+                    try:
+                        search_allowed = bool(
+                            self.web_search.is_scene_enabled("private_message")
+                        )
+                    except Exception:
+                        search_allowed = False
+            if search_allowed and self.web_search and self.web_search.is_available():
                 try:
                     # PRD V4 SEA-002：场景开关检查在 should_search_for_reply 内完成
                     # PRD-V5 §4.3 SEA-501：使用传入的 scene，不再硬编码 reply_comment
+                    search_scene = (
+                        "private_message"
+                        if scene_key in {
+                            "private_message", "private_reply", "pm",
+                            "private_chat", "private_msg", "dm",
+                        }
+                        else scene_key or "reply_comment"
+                    )
                     search_query = await self.web_search.should_search_for_reply(
                         user_comment=comment,
                         context=comment_context or "",
-                        scene=scene,
+                        scene=search_scene,
                     )
                     if search_query:
                         # PRD V4 SEA-005：search_text 返回结构化 Reference Block
                         search_ref_block = await self.web_search.search_text(
-                            search_query, scene=scene,
+                            search_query, scene=search_scene,
                         )
                         if search_ref_block:
-                            if scene == "private_message" and self.knowledge_memory:
-                                search_ref_block = self.knowledge_memory.redact_private_message(
-                                    search_ref_block,
-                                    actor_id=user_id,
-                                    username=username,
-                                ).text
+                            if search_scene == "private_message" and self.knowledge_memory:
+                                redact = getattr(
+                                    self.knowledge_memory, "redact_private_message", None
+                                )
+                                if callable(redact):
+                                    search_ref_block = redact(
+                                        search_ref_block,
+                                        actor_id=user_id,
+                                        username=username,
+                                    ).text
                             # Anything entering the model context must be durably
                             # archived first. Failure degrades to no web reference.
+                            # 私信 scene 归档标签保持 private_message，禁止写成 reply_comment。
                             if self.knowledge_memory:
                                 try:
                                     from bilibot.memory_brain.ingestion import text_observation
 
                                     digest = hashlib.sha256(
-                                        (scene + "\0" + search_query + "\0" + search_ref_block).encode("utf-8")
+                                        (search_scene + "\0" + search_query + "\0" + search_ref_block).encode("utf-8")
                                     ).hexdigest()
                                     await self.knowledge_memory.archive_observation_async(
                                         text_observation(
@@ -222,8 +351,13 @@ class ReplyGenerator:
                                             event_type="web_observation",
                                             text=search_ref_block,
                                             title="联网搜索参考",
-                                            scene=scene,
-                                            metadata={"query_hash": hashlib.sha256(search_query.encode("utf-8")).hexdigest()},
+                                            scene=search_scene,
+                                            metadata={
+                                                "query_hash": hashlib.sha256(
+                                                    search_query.encode("utf-8")
+                                                ).hexdigest(),
+                                                "search_scene": search_scene,
+                                            },
                                             importance=0.35,
                                         )
                                     )
@@ -237,6 +371,7 @@ class ReplyGenerator:
                             logger.info(f"联网搜索 Reference Block 已注入: {len(search_ref_block)} 字")
                 except Exception as e:
                     logger.debug(f"联网搜索失败（降级为无搜索）: {e}")
+                    search_ref_block = ""
 
             # PRD V4 SEA-004：搜索结果作为 Reference Block 追加到 user_prompt 末尾
             # system_prompt 保持纯净，只包含 Persona 和场景规则
@@ -363,6 +498,7 @@ class ReplyGenerator:
         username: str,
         reply_context: Optional[ReplyContext] = None,
         comment_context: str = "",
+        scene: str = "reply_comment",
     ):
         """通过 orchestrator + reply_context 构建 system/user prompt
 
@@ -387,7 +523,9 @@ class ReplyGenerator:
             "sources": [],
             "video_ctx_complete": True,
             "context_summary": "",
+            "companion_life": "",
         }
+        built_companion = ""
         if reply_context is not None and self.context_builder is not None:
             try:
                 built = self.context_builder.build(reply_context, account_id=self.account_id)
@@ -396,6 +534,8 @@ class ReplyGenerator:
                     "video_ctx_complete", True
                 )
                 context_meta["context_summary"] = built.get("text", "")[:2000]
+                built_companion = str(built.get("companion_life") or "")
+                context_meta["companion_life"] = built_companion
             except Exception as e:
                 logger.warning(f"ContextBuilder.build 失败: {e}")
         elif reply_context is not None:
@@ -417,23 +557,52 @@ class ReplyGenerator:
                 f"（以上是这条评论之前的对话记录，请参考上下文回复）\n\n"
             )
 
+        # 陪伴生活面：ContextBuilder 已注入时优先；否则直接取 companion surface
+        life_surface = built_companion
+        if not life_surface:
+            try:
+                companion = None
+                if self.context_builder is not None:
+                    companion = getattr(self.context_builder, "companion", None)
+                if companion is None:
+                    companion = getattr(self, "companion", None)
+                if companion is not None and getattr(companion, "enabled", False):
+                    life_surface = companion.get_prompt_surface() or ""
+            except Exception:
+                life_surface = ""
+
+        # 场景：私信走 PRIVATE_REPLY（含 chat/msg/dm 别名），评论走 REPLY_COMMENT
+        scene_key = str(getattr(scene, "value", scene) or "reply_comment").strip().lower()
+        if scene_key in {
+            "private_message", "private_reply", "pm",
+            "private_chat", "private_msg", "dm",
+        }:
+            orch_scene = SceneType.PRIVATE_REPLY
+            content_body = (
+                f"{ctx_prefix}用户 {username} 私信说：{comment}\n\n"
+                "请用简短、自然、像真人私聊的语气回复，不超过100字。"
+                '不要重复"好的"、"谢谢"等空洞词汇。'
+            )
+        else:
+            orch_scene = SceneType.REPLY_COMMENT
+            content_body = (
+                f"{ctx_prefix}用户 {username} 评论说：{comment}\n\n"
+                "请用简短、自然、像真人回复的语气回复这条评论，不超过100字。"
+                '不要重复"好的"、"谢谢"等空洞词汇。'
+            )
+
         # 优先走 orchestrator（PRD V3 §8.3 / V4 §4.3.2）
         if self.orchestrator is not None:
             try:
                 extra_context = None
-                try:
-                    companion = getattr(self.context_builder, "companion", None) if self.context_builder else None
-                    if companion is not None and getattr(companion, "enabled", False):
-                        life = companion.get_prompt_surface() or ""
-                        if life:
-                            extra_context = {"companion_life": life}
-                except Exception:
-                    extra_context = None
+                if life_surface:
+                    extra_context = {"companion_life": life_surface}
+                    if "companion_life" not in context_meta.get("sources", []):
+                        context_meta.setdefault("sources", []).append("companion_life")
+                    context_meta["companion_life"] = life_surface
                 prompt_dict = self.orchestrator.build(
-                    scene=SceneType.REPLY_COMMENT,
-                    content=f"{ctx_prefix}用户 {username} 评论说：{comment}\n\n"
-                            "请用简短、自然、像真人回复的语气回复这条评论，不超过100字。"
-                            '不要重复"好的"、"谢谢"等空洞词汇。',
+                    scene=orch_scene,
+                    content=content_body,
                     context=reply_context,
                     persona=persona,
                     extra_context=extra_context,
@@ -457,12 +626,12 @@ class ReplyGenerator:
                 system_prompt = ""
         if not system_prompt:
             system_prompt = "你是一个友好的B站AI助手。"
+        if life_surface:
+            system_prompt = f"{system_prompt}\n\n{life_surface}"
+            context_meta.setdefault("sources", []).append("companion_life")
+            context_meta["companion_life"] = life_surface
 
-        user_prompt = (
-            f"{ctx_prefix}用户 {username} 评论说：{comment}\n\n"
-            "请用简短、自然、像真人回复的语气回复这条评论，不超过100字。"
-            '不要重复"好的"、"谢谢"等空洞词汇。'
-        )
+        user_prompt = content_body
         return system_prompt, user_prompt, persona_id, context_meta
 
     # ── 私有：审计写入 ──

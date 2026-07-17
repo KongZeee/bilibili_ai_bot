@@ -129,7 +129,17 @@ class RecallStore(Protocol):
 
 @dataclass(frozen=True)
 class RecallQuery:
-    """Account-bound recall input.  Recent context is bounded on consumption."""
+    """Account-bound recall input.  Recent context is bounded on consumption.
+
+    Contract (P006):
+    - ``account_id`` must match the bound store (enforced in RecallEngine).
+    - ``scene`` is a soft label for traces / prompt assembly; normalized aliases
+      keep reply_comment / private_message / proactive_video / dynamic_post /
+      companion / bangumi consistent across API and runtime callers.
+    - Hybrid channels always include account-wide recent events (Bot self
+      experiences: video / bangumi / dynamic / companion) plus optional
+      speaker-recent; never speaker-only.
+    """
 
     current_message: str
     recent_turns: Sequence[Any] = field(default_factory=tuple)
@@ -141,6 +151,7 @@ class RecallQuery:
     scene: str = "reply_comment"
     explicit_ids: Sequence[str] = field(default_factory=tuple)
     entity_hints: Sequence[str] = field(default_factory=tuple)
+    limit: int = 0  # 0 → engine defaults (max_events); >0 caps injected events
 
     def recent_context(self, max_turns: int = 6, max_chars: int = 1200) -> str:
         parts = [_turn_text(item) for item in tuple(self.recent_turns)[-max_turns:]]
@@ -150,11 +161,57 @@ class RecallQuery:
         return text
 
     @classmethod
+    def normalize_scene(cls, scene: str) -> str:
+        """Map caller scene strings onto the canonical recall/prompt vocabulary."""
+        v = str(scene or "").strip().lower()
+        if not v:
+            return "reply_comment"
+        aliases = {
+            "private_reply": "private_message",
+            "pm": "private_message",
+            "private_msg": "private_message",
+            "private_chat": "private_message",
+            "dm": "private_message",
+            "private": "private_message",
+            "proactive_comment": "proactive_video",
+            "proactive": "proactive_video",
+            "companion_diary": "companion",
+            "companion_dream": "companion",
+            "companion_explore": "companion",
+            "companion_exploration": "companion",
+            "companion_creative": "companion",
+            "companion_plan": "companion",
+            "diary": "companion",
+            "dream": "companion",
+            "life_plan": "companion",
+            "exploration": "companion",
+            "creative": "companion",
+            "bangumi_comment": "bangumi",
+            "bangumi_eval": "bangumi",
+            "bangumi_episode": "bangumi",
+            "bangumi_watch": "bangumi",
+            "dynamic": "dynamic_post",
+            "post_dynamic": "dynamic_post",
+            "publish_dynamic": "dynamic_post",
+        }
+        return aliases.get(v, v)
+
+    @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "RecallQuery":
         payload = dict(value)
         if "message" in payload and "current_message" not in payload:
             payload["current_message"] = payload.pop("message")
-        return cls(**payload)
+        # Drop unknown keys so older/newer callers stay compatible
+        known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
+        cleaned = {k: v for k, v in payload.items() if k in known}
+        if "scene" in cleaned:
+            cleaned["scene"] = cls.normalize_scene(str(cleaned.get("scene") or ""))
+        if "limit" in cleaned:
+            try:
+                cleaned["limit"] = max(0, int(cleaned["limit"] or 0))
+            except (TypeError, ValueError):
+                cleaned["limit"] = 0
+        return cls(**cleaned)
 
 
 @dataclass
@@ -403,6 +460,7 @@ def _select_evidence_chunks(
     preferred_ids: Sequence[str] | set[str] | None = None,
     limit: int = 2,
     video_like: bool = False,
+    strict_preferred: bool = False,
 ) -> list[Mapping[str, Any]]:
     """Pick up to ``limit`` evidence chunks, preferring audiovisual content.
 
@@ -444,6 +502,10 @@ def _select_evidence_chunks(
         key = (preferred_rank, source_rank, min(len(text), 2000), -index)
         ranked.append((key, chunk))
     ranked.sort(key=lambda item: item[0], reverse=True)
+    if strict_preferred and preferred:
+        ranked = [
+            item for item in ranked if _chunk_id_of(item[1]) in preferred
+        ]
 
     selected: list[Mapping[str, Any]] = []
     seen: set[str] = set()
@@ -518,10 +580,26 @@ class RecallEngine:
     async def recall(self, query: RecallQuery | Mapping[str, Any]) -> RecallResult:
         if not isinstance(query, RecallQuery):
             query = RecallQuery.from_mapping(query)
+        else:
+            # Normalize scene even when constructed directly
+            object.__setattr__(
+                query,
+                "scene",
+                RecallQuery.normalize_scene(query.scene),
+            )
         self._validate_account(query)
         started = time.perf_counter()
         errors: dict[str, str] = {}
         candidates: dict[str, RecallCandidate] = {}
+
+        # Per-call inject cap (0 → engine default max_events)
+        inject_cap = self.max_events
+        try:
+            req_limit = int(getattr(query, "limit", 0) or 0)
+            if req_limit > 0:
+                inject_cap = min(self.max_events, max(1, req_limit))
+        except (TypeError, ValueError):
+            inject_cap = self.max_events
 
         explicit = self._explicit_identifiers(query)
         if explicit:
@@ -607,6 +685,9 @@ class RecallEngine:
                     **self._embedding_model_kwargs(context_embedding),
                 )
 
+        # Speaker recent is additive only — never the sole channel. Account-wide
+        # global_recent always runs so Bot self experiences (video/bangumi/
+        # dynamic/companion) remain recallable across scenes.
         if query.speaker_actor_id:
             await self._collect_store_channel(
                 candidates,
@@ -636,6 +717,7 @@ class RecallEngine:
         rough = self._rough_order(candidates)[: self.max_candidates]
         rough = await self._validate_and_enrich(rough, errors)
         if not rough:
+            # Empty candidate set: never call LLM rerank (cost + noise).
             return self._empty_result(started, errors)
 
         decisions, rerank_status, rerank_calls = await self._rerank(query, rough)
@@ -650,7 +732,7 @@ class RecallEngine:
         evidence = render_memory_evidence(
             validated_events,
             max_total_chars=self.prompt_budget,
-            max_events=self.max_events,
+            max_events=inject_cap,
             max_associations=self.max_associations,
         )
         included = set(evidence.event_ids)
@@ -878,13 +960,19 @@ class RecallEngine:
                     for chunk_id in _seed_video_evidence_ids(event):
                         candidate.evidence_ids.add(chunk_id)
 
+                strict_evidence = bool(
+                    {"chunk_fts", "chunk_vector", "context"}.intersection(
+                        candidate.channel_ranks
+                    )
+                )
                 selected_chunks = _select_evidence_chunks(
                     chunks,
                     preferred_ids=candidate.evidence_ids,
                     limit=3 if video_like else 2,
                     video_like=video_like,
+                    strict_preferred=strict_evidence,
                 )
-                if not selected_chunks:
+                if not selected_chunks and not strict_evidence:
                     # Last resort: first non-empty chunk, still ranked.
                     selected_chunks = _select_evidence_chunks(
                         chunks,
@@ -1017,6 +1105,9 @@ class RecallEngine:
     async def _rerank(
         self, query: RecallQuery, candidates: Sequence[RecallCandidate]
     ) -> tuple[list[_RerankDecision] | None, str, int]:
+        # Contract: empty / single-trivial candidate sets never pay for LLM rerank.
+        if not candidates:
+            return None, "skipped_empty", 0
         method = self._resolve_chat_callable()
         if method is None:
             return None, "provider_unavailable", 0
@@ -1057,6 +1148,11 @@ class RecallEngine:
         rows = payload["results"]
         if not isinstance(rows, list) or len(rows) > len(candidates):
             return None
+        if not rows:
+            # A syntactically valid empty result is an explicit "nothing is
+            # relevant" decision, not a reranker failure that should trigger
+            # deterministic fallback injection.
+            return []
         by_id = {candidate.event_id: candidate for candidate in candidates}
         seen: set[str] = set()
         decisions: list[_RerankDecision] = []
@@ -1216,6 +1312,7 @@ class RecallEngine:
                         preferred_ids=preferred,
                         limit=3 if video_like else 2,
                         video_like=video_like,
+                        strict_preferred=bool(allowed),
                     )
                 ]
             value["chunks"] = selected_chunks

@@ -110,7 +110,15 @@ export const CommentsPage = defineComponent({
             retryingId.value = replyId;
             try {
                 const result = await api.retryReply(replyId, force);
-                showToast(result?.message || '重试成功', 'success');
+                // 调度入队 ≠ 平台已发出：无明确 published/message 时用 info，避免误报「重试成功」
+                const published = !!(
+                    result?.published
+                    || result?.status === 'published'
+                    || result?.comment
+                );
+                const msg = result?.message
+                    || (published ? '重试成功' : '已标记为立即重试，将在下一轮调度中处理');
+                showToast(msg, published ? 'success' : 'info');
                 await load({ silent: true });
             } catch (e) {
                 showToast('重试失败: ' + e.message, 'error');

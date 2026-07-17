@@ -20,6 +20,9 @@ from ..llm.router import PROVIDER_TYPES, CONFIG_KEYS
 
 logger = logging.getLogger("bilibot.api.model_routing")
 
+# panel 注入 account_manager 的弱引用（或非 weakref 兜底 callable），供 rebind 扫账号
+_ACCOUNT_MANAGER_REF = None
+
 # 功能名称映射
 FEATURE_LABELS = {
     "chat": "对话（主动回复/动态/记忆提取）",
@@ -60,8 +63,98 @@ def _save_to_config(config_loader, router, config_path: str):
         return False
 
 
-def create_model_routing_routes(router, config_loader, config_path: str = "config.yaml"):
-    """创建模型路由管理路由"""
+def _resolve_account_manager(explicit=None):
+    """解析 account_manager：显式参数 → 路由工厂弱引用 → 无。"""
+    if explicit is not None:
+        return explicit
+    try:
+        ref = globals().get("_ACCOUNT_MANAGER_REF")
+        if ref is not None:
+            return ref() if callable(getattr(ref, "__call__", None)) else ref
+    except Exception:
+        pass
+    return None
+
+
+def _rebind_memory_brains_for_embedding(router, account_manager=None) -> int:
+    """P004：embedding 路由/Provider 变更后，热重绑存活 MemoryBrain。
+
+    优先走 MemoryBrainService 弱引用注册表；若注入/缓存 account_manager 则再扫一遍账号，
+    防止 live registry 未注册时 rebind 漏账号。
+    """
+    emb = None
+    try:
+        resolve = getattr(router, "resolve_embedding", None)
+        emb = resolve() if callable(resolve) else None
+    except Exception as e:
+        logger.warning("resolve_embedding 失败，跳过记忆重绑: %s", e)
+        return 0
+
+    rebound = 0
+    try:
+        from bilibot.memory_brain.service import rebind_all_live_brains
+
+        rebound = rebind_all_live_brains(
+            embedding_provider=emb,
+            rebind_embedding=True,
+        )
+    except Exception as e:
+        logger.warning("rebind_all_live_brains 失败: %s", e)
+
+    am = _resolve_account_manager(account_manager)
+    if am is not None:
+        try:
+            accounts = getattr(am, "_accounts", None) or {}
+            seen_ids: set[str] = set()
+            for acc in list(accounts.values()):
+                brain = getattr(acc, "memory_brain", None)
+                if brain is None or not hasattr(brain, "rebind_providers"):
+                    continue
+                aid = str(getattr(acc, "account_id", "") or id(brain))
+                if aid in seen_ids:
+                    continue
+                seen_ids.add(aid)
+                try:
+                    brain.rebind_providers(
+                        chat_provider=getattr(acc, "llm", None),
+                        embedding_provider=emb,
+                        rebind_chat=True,
+                        rebind_embedding=True,
+                    )
+                    rebound += 1
+                except Exception as e:
+                    logger.warning(
+                        "记忆大脑 embedding 重绑失败 account=%s: %s",
+                        getattr(acc, "account_id", "?"),
+                        e,
+                    )
+        except Exception as e:
+            logger.warning("遍历账号重绑记忆大脑失败: %s", e)
+
+    if rebound:
+        logger.info("已热重绑记忆 embedding provider（约 %s 次）", rebound)
+    return rebound
+
+
+def create_model_routing_routes(
+    router,
+    config_loader,
+    config_path: str = "config.yaml",
+    account_manager=None,
+):
+    """创建模型路由管理路由
+
+    account_manager: 可选；传入后 embedding 相关变更会热重绑各账号 MemoryBrain。
+    未传时仍优先 live brain 弱引用表；若后续通过同一进程二次注入可写 _ACCOUNT_MANAGER_REF。
+    """
+    global _ACCOUNT_MANAGER_REF
+    if account_manager is not None:
+        try:
+            import weakref
+
+            _ACCOUNT_MANAGER_REF = weakref.ref(account_manager)
+        except TypeError:
+            _ACCOUNT_MANAGER_REF = lambda: account_manager  # noqa: E731 — 非 weakref 兜底
 
     async def get_overview(request: Request) -> JSONResponse:
         """获取路由总览：功能 → Provider 映射 + 各类型 Provider 列表"""
@@ -102,6 +195,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
             if not updated:
                 return fail_invalid_input("未提供任何路由更新")
             _save_to_config(config_loader, router, config_path)
+            if "embedding" in updated:
+                _rebind_memory_brains_for_embedding(router, account_manager)
             return ok(router.get_routing(), "路由已更新")
         except Exception as e:
             logger.error(f"更新模型路由失败: {e}", exc_info=True)
@@ -130,6 +225,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
                     return fail("VALIDATION_ERROR", "api_key / api_keys 不能为空")
             pid = router.add_provider(ptype, body)
             _save_to_config(config_loader, router, config_path)
+            if ptype == "embedding":
+                _rebind_memory_brains_for_embedding(router, account_manager)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 添加成功")
         except ValueError as e:
             logger.warning("模型路由校验失败: %s", e)
@@ -150,6 +247,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
         if not router.remove_provider(ptype, pid):
             return fail("NOT_FOUND", f"Provider 不存在: {pid}")
         _save_to_config(config_loader, router, config_path)
+        if ptype == "embedding":
+            _rebind_memory_brains_for_embedding(router, account_manager)
         return ok(message="Provider 已删除")
 
     async def update_by_type(request: Request) -> JSONResponse:
@@ -163,6 +262,8 @@ def create_model_routing_routes(router, config_loader, config_path: str = "confi
             if not router.update_provider(ptype, pid, body):
                 return fail("NOT_FOUND", f"Provider 不存在: {pid}")
             _save_to_config(config_loader, router, config_path)
+            if ptype == "embedding":
+                _rebind_memory_brains_for_embedding(router, account_manager)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 已更新")
         except Exception as e:
             logger.error(f"更新 Provider 失败: {e}", exc_info=True)

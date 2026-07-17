@@ -145,23 +145,35 @@ class BiliBotApp:
         self.config_path = config_path
         self.start_time = time.time()
 
-        # PRD V4 MIG-001：启动时执行配置迁移（备份 + 迁移旧开关 + 写 config_version）
+        # Bind disk writes only when the supplied config actually came from the
+        # declared file.  Tests/embedders often pass an in-memory config together
+        # with the default relative path; treating that as authority can overwrite
+        # an unrelated production config in the current working directory.
+        bound_config_path: Optional[str] = None
         try:
-            from bilibot.services.config_migrator import run_migration
-            success, report = run_migration(config_path)
-            if success:
-                # 重新读取迁移后的配置
+            if config_path and os.path.isfile(config_path):
                 import yaml
-                with open(config_path, "r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f) or {}
-                self.config = config
-        except Exception as e:
-            import logging
-            logging.getLogger("bilibot").warning(f"配置迁移失败（继续使用原配置）: {e}")
+
+                with open(config_path, "r", encoding="utf-8") as fh:
+                    disk_config = yaml.safe_load(fh) or {}
+                if disk_config == config:
+                    bound_config_path = config_path
+                else:
+                    logger.warning(
+                        "传入配置与 config_path 内容不一致；禁用该路径的自动写入: %s",
+                        config_path,
+                    )
+            elif config_path:
+                # A non-existent explicit destination cannot alias an existing
+                # production file. Treat it as an authorized future config path.
+                bound_config_path = config_path
+        except Exception as exc:
+            logger.warning("无法验证 config_path，已禁用自动写入: %s", type(exc).__name__)
+        self._config_path_verified = bound_config_path is not None
 
         # 配置加载器（应用级）
         from bilibot.app.config_loader import ConfigLoader
-        self.config_loader = ConfigLoader(config, filepath=config_path)
+        self.config_loader = ConfigLoader(config, filepath=bound_config_path)
 
         # 数据根目录
         self.data_root = config.get("data_dir", "./data")
@@ -295,6 +307,12 @@ class BiliBotApp:
         """
         from bilibot.web.panel import create_web_app
 
+        if self.config.get("web", {}).get("enabled", True) and not self._config_path_verified:
+            raise RuntimeError(
+                "Web mode requires config_path to match the supplied configuration; "
+                "refusing unsafe config writes"
+            )
+
         # 初始化
         await self.initialize()
 
@@ -302,12 +320,15 @@ class BiliBotApp:
         # secret_key 仍为默认值时，随机生成并写回配置文件
         if self.config_loader.web.secret_key == "change-this-to-a-random-string":
             new_secret = secrets.token_hex(32)
-            logger.warning(
-                "检测到 web.secret_key 仍为默认值，已自动随机生成并写回配置文件"
-            )
+            logger.warning("检测到 web.secret_key 仍为默认值，已自动随机生成")
             raw = self.config_loader.get_raw_config()
             raw.setdefault("web", {})["secret_key"] = new_secret
-            self.config_loader.save_config(raw, self.config_path)
+            if self._config_path_verified:
+                self.config_loader.save_config(raw, self.config_path)
+            else:
+                logger.warning(
+                    "config_path 未通过来源校验，secret_key 仅在本进程生效且配置接口为只读"
+                )
             # 同步 self.config 供后续 start() 读取
             self.config = self.config_loader.get_raw_config()
 
@@ -367,7 +388,7 @@ class BiliBotApp:
             persona_store=self.persona_store,
             orchestrator=self.orchestrator,
             scheduler=self.scheduler,
-            config_path=self.config_path,
+            config_path=(self.config_path if self._config_path_verified else ""),
             audit_store=self.audit_store,
             context_builder=self.context_builder,
             account_manager=self.account_manager,
@@ -475,22 +496,66 @@ class BiliBotApp:
         1. 将所有账号标记为 stopping（停止接受新任务）
         2. 等待正在进行的发布任务，超时后取消
         3. 保存任务和回复状态
-        4. flush 向量索引与搜索缓存
+        4. flush 向量索引与搜索缓存（账号 close 内 run_jobs_until_idle + queue drain）
         5. 关闭记忆、HTTP Session 和数据库
         """
         logger.info("正在关闭 BiliBot...")
         # 1-5: stop_all 调用每个 acc.close()，按顺序：
-        #   stop scheduler → wait task → flush memory → close bili session
+        #   stop scheduler → wait task → flush memory jobs → close bili session
         try:
             await self.account_manager.stop_all()
         except Exception as e:
             logger.warning(f"停止账号时出错: {e}")
         # 取消 start_all 协程（通常已立即返回，cancel 是 no-op）
-        scheduler_task.cancel()
+        if scheduler_task is not None:
+            scheduler_task.cancel()
+            try:
+                await scheduler_task
+            except (asyncio.CancelledError, Exception):
+                pass
+        # 二次保险：关闭全局 token store 连接（若实现了 close）
         try:
-            await scheduler_task
-        except (asyncio.CancelledError, Exception):
-            pass
+            from bilibot.services.token_usage import get_global_token_store
+            store = get_global_token_store()
+            closer = getattr(store, "close", None) if store is not None else None
+            if callable(closer):
+                await asyncio.to_thread(closer)
+        except Exception as e:
+            logger.debug("token store close skipped: %s", e)
+        # 二次保险：关闭全局 Whisper 工作池与视频清理定时器（账号 close 已调，防漏）
+        try:
+            from bilibot.video_understanding.cleanup import cancel_all_scheduled
+            cancel_all_scheduled()
+        except Exception as e:
+            logger.debug("video cleanup cancel skipped: %s", e)
+        try:
+            from bilibot.video_understanding.audio_track import shutdown_whisper_executor
+            await asyncio.to_thread(shutdown_whisper_executor)
+        except Exception as e:
+            logger.debug("whisper executor shutdown skipped: %s", e)
+        # 审计库：若暴露 close/checkpoint 则收尾
+        try:
+            audit = getattr(self, "audit_store", None)
+            if audit is not None:
+                closer = getattr(audit, "close", None)
+                if callable(closer):
+                    await asyncio.to_thread(closer)
+                else:
+                    ck = getattr(audit, "checkpoint", None)
+                    if callable(ck):
+                        await asyncio.to_thread(ck)
+        except Exception as e:
+            logger.debug("audit store close skipped: %s", e)
+        # 备份根目录：进程退出前再扫一遍过期 .*.creating
+        try:
+            from pathlib import Path
+            from bilibot.api.backup import _cleanup_stale_staging
+            root = Path(self.data_root or "./data") / "backups"
+            n = await asyncio.to_thread(_cleanup_stale_staging, root)
+            if n:
+                logger.info("关闭时清理过期备份 staging %s 个", n)
+        except Exception as e:
+            logger.debug("backup staging cleanup on shutdown skipped: %s", e)
         logger.info("BiliBot 已关闭")
 
     def get_status(self) -> dict:
@@ -570,7 +635,16 @@ def main():
             console.print("[red]错误: 找不到 config.example.yaml[/]")
             sys.exit(1)
 
-    # 加载配置
+    # PRD V4 MIG-001：CLI 启动边界负责迁移实际配置文件。BiliBotApp
+    # 构造器只消费调用方传入的 dict，绝不能因为一个相对 config_path
+    # 静默读写当前工作目录中的另一份生产配置。
+    try:
+        from bilibot.services.config_migrator import run_migration
+        run_migration(config_path)
+    except Exception as e:
+        logging.getLogger("bilibot").warning("配置迁移失败（继续加载原配置）: %s", e)
+
+    # 加载配置（迁移成功时读取迁移后的内容）
     import yaml
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
