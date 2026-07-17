@@ -1496,6 +1496,28 @@ class RecallEngine:
                 candidate.final_score = min(
                     1.0, candidate.final_score + 0.05 * min(content_term_count, 4)
                 )
+            # Soft source priors: self-authored continuity beats search dumps.
+            source = str(candidate.source_type or "").strip().casefold()
+            if source in {
+                "bot_action",
+                "diary",
+                "dream",
+                "life_plan",
+                "weekly_summary",
+                "video_experience",
+            }:
+                candidate.final_score = min(1.0, candidate.final_score + 0.03)
+            elif source in {"web_reference", "video_metadata"}:
+                candidate.final_score = max(0.0, candidate.final_score - 0.05)
+            # Title-term exact-ish bonus: if a content term appears in the title,
+            # rank it above body-only weak hits with the same coverage.
+            title = str(candidate.title or "").casefold()
+            if title and any(
+                term.casefold() in title
+                for term in (candidate.lexical_matched_terms or set())
+                if _is_content_lexical_term(term) and len(term) >= 3
+            ):
+                candidate.final_score = min(1.0, candidate.final_score + 0.04)
             eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
