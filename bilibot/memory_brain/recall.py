@@ -1800,11 +1800,31 @@ class RecallEngine:
             if candidate.final_score <= 0.0:
                 continue
             eligible.append(candidate)
-        return RecallEngine._bounded_selection(
+        selected = RecallEngine._bounded_selection(
             eligible,
             max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
             max_associations=self.max_associations,
         )
+        # Self-dynamic questions often retrieve three near-identical 动态 rows.
+        # Diversify by summary fingerprint so different posts can surface.
+        if self_query and "动态" in query_text and len(selected) > 1:
+            diversified: list[RecallCandidate] = []
+            seen_fp: set[str] = set()
+            overflow: list[RecallCandidate] = []
+            for cand in sorted(selected, key=lambda c: (-c.final_score, c.event_id)):
+                summary = str(cand.summary or cand.title or "")
+                fp = summary[:48]
+                if fp in seen_fp:
+                    overflow.append(cand)
+                    continue
+                seen_fp.add(fp)
+                diversified.append(cand)
+            for cand in overflow:
+                if len(diversified) >= min(MAX_FALLBACK_EVENTS, self.max_events):
+                    break
+                diversified.append(cand)
+            selected = diversified[: min(MAX_FALLBACK_EVENTS, self.max_events)]
+        return selected
 
     @staticmethod
     def _fallback_has_content_evidence(candidate: RecallCandidate) -> bool:
