@@ -1354,7 +1354,8 @@ class BangumiService:
             )
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="bangumi_eval", account_id=getattr(self, "account_id", "") or ""):
-                text = await provider.generate(prompt, max_tokens=350)
+                # Reasoning models need headroom before JSON content appears.
+                text = await provider.generate(prompt, max_tokens=1500)
             if not text:
                 return None
 
@@ -1406,7 +1407,7 @@ class BangumiService:
             )
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="bangumi_comment", account_id=getattr(self, "account_id", "") or ""):
-                return await provider.generate(prompt, max_tokens=80) or ""
+                return await provider.generate(prompt, max_tokens=1200) or ""
         except Exception:
             return ""
 

@@ -1283,7 +1283,7 @@ class CompanionLifeService:
         detail_memory = str(detail_recall.get("memory_evidence") or "").strip()
         if detail_memory:
             user = f"{user}\n\n【近期活动记忆】\n{detail_memory[:1200]}"
-        raw = await self._llm_text(system, user, max_tokens=500, scene="life_plan")
+        raw = await self._llm_text(system, user, max_tokens=1500, scene="life_plan")
         summary = target.activity
         events: List[str] = []
         hooks: List[str] = []
@@ -1722,7 +1722,7 @@ class CompanionLifeService:
             ),
             plan_summary=plan_sum,
         )
-        raw = await self._llm_text(system, user, max_tokens=220, scene="exploration")
+        raw = await self._llm_text(system, user, max_tokens=1200, scene="exploration")
         query, motive = "", "随便看看公开资料"
         if raw:
             data = _extract_json(raw)
@@ -1934,7 +1934,7 @@ class CompanionLifeService:
                     persona_prompt=bits["base_prompt"] + (("\n" + bits.get("creative_rules", "")) if bits.get("creative_rules") else ""),
                     inspiration=insp,
                 )
-                raw = await self._llm_text(system, user, max_tokens=500, scene="creative")
+                raw = await self._llm_text(system, user, max_tokens=1500, scene="creative")
                 meta = _extract_json(raw) if raw else None
                 if isinstance(meta, dict) and meta.get("title"):
                     proj = CreativeProject.from_dict(
