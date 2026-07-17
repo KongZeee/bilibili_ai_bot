@@ -1753,28 +1753,42 @@ class MemoryBrainStore:
         batch_size: int,
         np: Any,
     ) -> list[dict[str, Any]]:
-        ranked: list[dict[str, Any]] = []
+        # Full matvec + top-k partition: avoid per-row Python dicts and mid-scan sorts.
+        # batch_size kept for API compatibility with callers; unused on the hot path.
+        _ = batch_size
+        if not entry.metadata:
+            return []
         query_array = np.asarray(query, dtype=np.dtype("<f4"))
-        for start in range(0, len(entry.metadata), batch_size):
-            stop = min(start + batch_size, len(entry.metadata))
-            scores = entry.matrix[start:stop] @ query_array
-            for index, score in enumerate(scores.tolist(), start=start):
-                embedding_id, target_id, event_id = entry.metadata[index]
-                ranked.append(
-                    {
-                        "embedding_id": embedding_id,
-                        "target_id": target_id,
-                        "event_id": event_id,
-                        "target_type": target_type,
-                        "model_id": model_id,
-                        "score": float(score),
-                    }
-                )
-            if len(ranked) > result_limit * 4:
-                ranked.sort(key=lambda item: (-item["score"], item["target_id"]))
-                del ranked[result_limit:]
-        ranked.sort(key=lambda item: (-item["score"], item["target_id"]))
-        return ranked[:result_limit]
+        scores = entry.matrix @ query_array
+        n = int(scores.shape[0])
+        k = min(int(result_limit), n)
+        if k <= 0:
+            return []
+        if k < n:
+            candidate_idx = np.argpartition(scores, n - k)[n - k :]
+        else:
+            candidate_idx = np.arange(n)
+        cand_scores = scores[candidate_idx]
+        cand_target_ids = [entry.metadata[int(i)][1] for i in candidate_idx.tolist()]
+        order = sorted(
+            range(len(candidate_idx)),
+            key=lambda j: (-float(cand_scores[j]), cand_target_ids[j]),
+        )
+        ranked: list[dict[str, Any]] = []
+        for j in order:
+            idx = int(candidate_idx[j])
+            embedding_id, target_id, event_id = entry.metadata[idx]
+            ranked.append(
+                {
+                    "embedding_id": embedding_id,
+                    "target_id": target_id,
+                    "event_id": event_id,
+                    "target_type": target_type,
+                    "model_id": model_id,
+                    "score": float(cand_scores[j]),
+                }
+            )
+        return ranked
 
     def search_embeddings(
         self,
