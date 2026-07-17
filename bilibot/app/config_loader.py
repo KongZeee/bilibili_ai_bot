@@ -92,7 +92,9 @@ class LLMConfig:
     api_key: str = ""
     base_url: str = "https://api.siliconflow.cn/v1"
     model: str = "Qwen/Qwen2.5-72B-Instruct"
-    max_tokens: int = 1024
+    # Default budget for reasoning chat models (agnes-class) that spend many
+    # completion tokens before emitting visible content.
+    max_tokens: int = 1500
     temperature: float = 0.8
     
     # Vision

@@ -1289,7 +1289,15 @@ class RecallEngine:
         method = self._resolve_chat_callable()
         if method is None:
             return None, "provider_unavailable", 0
-        prompt, system = self._rerank_prompt(query, candidates)
+        # Reasoning models pay a large fixed CoT cost per call. Ranking more than
+        # ~12 candidates mostly adds noise and token pressure; keep the top slice.
+        ranked = list(candidates)
+        if len(ranked) > 12:
+            ranked = sorted(
+                ranked,
+                key=lambda item: (-item.deterministic_score, item.event_id),
+            )[:12]
+        prompt, system = self._rerank_prompt(query, ranked)
 
         async def invoke_once() -> Any:
             result = method(
@@ -1306,7 +1314,7 @@ class RecallEngine:
             return None, "timeout", 1
         except Exception as exc:
             return None, f"error:{type(exc).__name__}", 1
-        decisions = self._parse_rerank(raw, candidates)
+        decisions = self._parse_rerank(raw, ranked)
         if decisions is None:
             return None, "invalid_json", 1
         return decisions, "ok", 1
