@@ -989,9 +989,12 @@ class RecallEngine:
                         cand.channel_ranks.get("global_recent", 99),
                         cand.channel_ranks.get("speaker_recent", 99),
                     )
-                    cand.final_score = max(0.55, 0.95 - 0.03 * max(0, recent_rank - 1))
-                    if source == "video_experience" or "看完" in summary:
-                        cand.final_score = min(1.0, cand.final_score + 0.05)
+                    # Steeper recency decay so the newest 1-2 watches dominate.
+                    cand.final_score = max(0.40, 0.98 - 0.08 * max(0, recent_rank - 1))
+                    if "看完" in summary or source == "bot_action":
+                        cand.final_score = min(1.0, cand.final_score + 0.08)
+                    elif source == "video_experience":
+                        cand.final_score = min(1.0, cand.final_score + 0.03)
                     cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
                     recent_watch.append(cand)
                 if recent_watch:

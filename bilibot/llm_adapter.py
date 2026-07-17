@@ -192,16 +192,23 @@ class LLMAdapter:
                 continue
             if line.startswith(("1.", "2.", "**", "#", "-", "*")):
                 continue
+            low = line.casefold()
             if any(
-                marker in line.casefold()
+                marker in low
                 for marker in (
                     "thinking",
                     "analyze",
                     "user says",
                     "constraint",
                     "language:",
+                    "[done",
+                    "done.",
+                    "output generation",
+                    "proceeds.",
                 )
             ):
+                continue
+            if line.strip() in {"[Done.]", "Done.", "DONE", "OK", "ok"}:
                 continue
             if len(line) <= 400:
                 return line
