@@ -980,18 +980,23 @@ class RecallEngine:
                     summary = str(cand.summary or "")
                     is_watch = (
                         source in {"video_experience", "video"}
-                        or "看完" in summary
-                        or "观看了" in summary
                         or (
                             source == "bot_action"
                             and (
-                                "看完" in summary
-                                or "观看" in summary
-                                or "evaluate_proactive_video" in summary
+                                "evaluate_proactive_video" in summary
+                                or (
+                                    ("看完" in summary or "观看了" in summary)
+                                    and "话" not in summary
+                                    and "番剧" not in summary
+                                    and "evaluate_bangumi" not in summary
+                                )
                             )
                         )
                     )
                     if not is_watch:
+                        continue
+                    title = str(cand.title or "")
+                    if re.search(r"第\s*\d+\s*话", title) or "番剧" in title:
                         continue
                     if not (
                         "global_recent" in (cand.channel_ranks or {})
