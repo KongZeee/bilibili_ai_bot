@@ -172,7 +172,8 @@ _LEXICAL_STOP_TERMS = frozenset(
 
 # Queries about the bot's own prior posts / writings (not topical "动态" alone).
 _SELF_MEMORY_QUERY_RE = re.compile(
-    r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发)"
+    r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发|"
+    r"评论说了|发过评论|刚给.*评论|你回复)"
 )
 
 _UTILITY_QUERY_RE = re.compile(
