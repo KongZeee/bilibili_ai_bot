@@ -16,11 +16,11 @@ from .prompt import DEFAULT_MEMORY_PROMPT_BUDGET, RenderedMemoryEvidence, render
 
 RRF_K = 60
 MAX_RERANK_CANDIDATES = 20
-# Reasoning chat models often need 15–40s for a 20-candidate JSON decision.
-RERANK_TIMEOUT_SECONDS = 45.0
-# Reasoning chat models (e.g. agnes-2.0-flash) spend many tokens on hidden
-# chain-of-thought before emitting JSON; 600–800 often yields empty content.
-RERANK_MAX_TOKENS = 2000
+# Reasoning chat models often need 15–40s for a multi-candidate JSON decision.
+RERANK_TIMEOUT_SECONDS = 90.0
+# agnes-2.0-flash measured ~1600 reasoning + ~50 content tokens for a tiny
+# rerank; leave headroom for 8–20 candidates.
+RERANK_MAX_TOKENS = 3200
 RERANK_RELEVANCE_BASELINE = 0.65
 DIRECT_THRESHOLD = 0.72
 ASSOCIATION_THRESHOLD = 0.80
@@ -1317,14 +1317,32 @@ class RecallEngine:
     ) -> list[_RerankDecision] | None:
         if not isinstance(raw, str):
             return None
+        text = raw.strip()
         try:
-            payload = json.loads(raw)
+            payload = json.loads(text)
         except (json.JSONDecodeError, TypeError):
+            # Tolerate prose wrappers / fences around the JSON object/array.
+            try:
+                from bilibot.llm_adapter import LLMAdapter
+
+                salvaged = LLMAdapter._salvage_from_reasoning(text)
+                payload = json.loads(salvaged) if salvaged else None
+            except Exception:
+                payload = None
+            if payload is None:
+                return None
+        if isinstance(payload, list):
+            rows = payload
+        elif isinstance(payload, dict):
+            if "results" in payload and isinstance(payload["results"], list):
+                rows = payload["results"]
+            elif "candidates" in payload and isinstance(payload["candidates"], list):
+                rows = payload["candidates"]
+            else:
+                return None
+        else:
             return None
-        if not isinstance(payload, dict) or set(payload) != {"results"}:
-            return None
-        rows = payload["results"]
-        if not isinstance(rows, list) or len(rows) > len(candidates):
+        if len(rows) > len(candidates):
             return None
         if not rows:
             # A syntactically valid empty result is an explicit "nothing is
@@ -1335,9 +1353,25 @@ class RecallEngine:
         seen: set[str] = set()
         decisions: list[_RerankDecision] = []
         required = {"candidate_id", "relevance", "kind", "evidence_ids", "reason"}
+        kind_aliases = {
+            "direct": "direct",
+            "direct_reference": "direct",
+            "reference": "direct",
+            "exact": "direct",
+            "association": "association",
+            "related": "association",
+            "associative": "association",
+        }
         for row in rows:
             # 单 candidate 违规只跳过该条，不废整批（避免 LLM 输出抖动导致全量降级）
-            if not isinstance(row, dict) or not required.issubset(row):
+            if not isinstance(row, dict):
+                continue
+            # Accept common key aliases from smaller/weaker models.
+            if "candidate_id" not in row and "id" in row:
+                row = {**row, "candidate_id": row["id"]}
+            if "evidence_ids" not in row and "evidence" in row:
+                row = {**row, "evidence_ids": row["evidence"]}
+            if not required.issubset(row):
                 continue
             candidate_id = row["candidate_id"]
             if not isinstance(candidate_id, str) or candidate_id not in by_id or candidate_id in seen:
@@ -1346,10 +1380,18 @@ class RecallEngine:
             if isinstance(relevance, bool) or not isinstance(relevance, (int, float)):
                 continue
             relevance = float(relevance)
-            if not math.isfinite(relevance) or not 0 <= relevance <= 100:
+            if not math.isfinite(relevance):
                 continue
-            kind = row["kind"]
-            if kind not in ("direct", "association"):
+            # Models sometimes emit 0..1 floats instead of 0..100.
+            if 0.0 <= relevance <= 1.0:
+                relevance_norm = relevance
+            elif 0.0 <= relevance <= 100.0:
+                relevance_norm = relevance / 100.0
+            else:
+                continue
+            kind_raw = str(row["kind"] or "").strip().casefold()
+            kind = kind_aliases.get(kind_raw)
+            if kind is None:
                 continue
             evidence_ids = row["evidence_ids"]
             if not isinstance(evidence_ids, list) or not evidence_ids or len(evidence_ids) > 12:
@@ -1358,14 +1400,21 @@ class RecallEngine:
                 continue
             if len(set(evidence_ids)) != len(evidence_ids):
                 continue
-            if not set(evidence_ids).issubset(by_id[candidate_id].evidence_ids):
-                continue
+            allowed = set(by_id[candidate_id].evidence_ids)
+            # If the model only echoed the event id, accept it as evidence.
+            if not set(evidence_ids).issubset(allowed):
+                if set(evidence_ids) == {candidate_id}:
+                    evidence_ids = [candidate_id]
+                else:
+                    continue
             snippet_ids = {
                 evidence_id
                 for evidence_id, _text in by_id[candidate_id].evidence_snippets
             }
             if kind == "direct" and snippet_ids and not snippet_ids.intersection(evidence_ids):
-                continue
+                # Allow event-id-only evidence when the model did not quote chunks.
+                if set(evidence_ids) != {candidate_id} and candidate_id not in evidence_ids:
+                    continue
             reason = row["reason"]
             if not isinstance(reason, str) or not reason.strip() or len(reason) > 240:
                 continue
@@ -1373,7 +1422,7 @@ class RecallEngine:
             decisions.append(
                 _RerankDecision(
                     candidate_id,
-                    relevance / 100.0,
+                    relevance_norm,
                     "association" if by_id[candidate_id].relation_only else kind,
                     tuple(evidence_ids),
                     reason.strip(),
