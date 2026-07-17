@@ -146,15 +146,20 @@ class ReplyGenerator:
         reply_context: Optional[ReplyContext],
         comment_context: str,
         scene: str,
-    ) -> Optional[ReplyContext]:
-        """Persist current reply intent and attach cross-scene self memory."""
+    ) -> tuple[Optional[ReplyContext], dict[str, str]]:
+        """Persist current reply intent and attach cross-scene self memory.
+
+        Returns ``(reply_context, activity_meta)`` where activity_meta carries
+        action_key/action_type for a later ``finish_activity`` commit.
+        """
+        activity_meta: dict[str, str] = {}
         begin_activity = getattr(self.knowledge_memory, "begin_activity", None)
         supports_activity = callable(begin_activity) and (
             inspect.iscoroutinefunction(begin_activity)
             or callable(getattr(type(self.knowledge_memory), "begin_activity", None))
         )
         if not supports_activity or scene not in {"reply_comment", "private_message"}:
-            return reply_context
+            return reply_context, activity_meta
 
         activity_query = str(comment or "")[:800]
         activity_speaker = str(user_id or "")
@@ -163,21 +168,23 @@ class ReplyGenerator:
             if not callable(redact):
                 # Never place an unredacted private message in generic activity
                 # traces merely to improve recall.
-                return reply_context
+                return reply_context, activity_meta
             safe = redact(activity_query, actor_id=user_id, username=username)
             activity_query = str(getattr(safe, "text", "") or "")
             activity_speaker = str(getattr(safe, "actor_pseudonym", "") or "")
             if not activity_query:
-                return reply_context
+                return reply_context, activity_meta
 
         video = getattr(reply_context, "video", None) if reply_context else None
+        action_key = (
+            f"comment_reply:{comment_type}:{thread_id}"
+            if scene == "reply_comment"
+            else f"private_reply:{thread_id}"
+        )
+        action_type = "reply_comment" if scene == "reply_comment" else "private_reply"
         activity = await begin_activity(
-            action_key=(
-                f"comment_reply:{comment_type}:{thread_id}"
-                if scene == "reply_comment"
-                else f"private_reply:{thread_id}"
-            ),
-            action_type="reply_comment" if scene == "reply_comment" else "private_reply",
+            action_key=action_key,
+            action_type=action_type,
             current_activity=(
                 "正在回复一条公开评论，并结合评论线程、视频上下文和最近经历组织自然回复。"
                 if scene == "reply_comment"
@@ -198,6 +205,12 @@ class ReplyGenerator:
                 "comment_type": str(comment_type),
             },
         )
+        activity_meta = {
+            "action_key": action_key,
+            "action_type": action_type,
+            "scene": scene,
+            "title": str(getattr(video, "title", "") or action_type),
+        }
         activity_prompt = str(getattr(activity, "prompt_text", "") or "").strip()
         activity_actions = list(getattr(activity, "recent_self_actions", ()) or ())
         if reply_context is None:
@@ -219,7 +232,38 @@ class ReplyGenerator:
             if line and line not in merged_actions:
                 merged_actions.append(line)
         reply_context.recent_bot_actions = merged_actions[:8]
-        return reply_context
+        return reply_context, activity_meta
+
+    async def _finish_activity_memory(
+        self,
+        activity_meta: dict[str, str],
+        *,
+        result_text: str,
+        state: str = "completed",
+    ) -> None:
+        """Commit terminal reply outcome when begin_activity succeeded."""
+        action_key = str((activity_meta or {}).get("action_key") or "").strip()
+        action_type = str((activity_meta or {}).get("action_type") or "").strip()
+        if not action_key or not action_type:
+            return
+        finish = getattr(self.knowledge_memory, "finish_activity", None)
+        if not callable(finish):
+            return
+        try:
+            await finish(
+                action_key=action_key,
+                action_type=action_type,
+                result_text=str(result_text or "").strip()[:1200],
+                state=state,
+                scene=str((activity_meta or {}).get("scene") or "reply_comment"),
+                title=str((activity_meta or {}).get("title") or action_type),
+            )
+        except Exception as exc:
+            logger.warning(
+                "reply activity finish failed: action=%s error=%s",
+                action_key,
+                type(exc).__name__,
+            )
 
     async def _generate_reply_impl(
         self,
@@ -261,7 +305,7 @@ class ReplyGenerator:
 
         try:
             # 1. 通过 orchestrator + reply_context 构建 prompt
-            reply_context = await self._attach_activity_memory(
+            reply_context, activity_meta = await self._attach_activity_memory(
                 user_id=user_id,
                 username=username,
                 comment=comment,
@@ -444,6 +488,14 @@ class ReplyGenerator:
             outcome_meta = dict(context_meta)
             outcome_meta["affection_delta"] = 0
             outcome_meta["persona_id"] = persona_id
+
+            # Close the activity lifecycle so subsequent scenes can see this reply
+            # as completed self memory, not only as an open intent.
+            await self._finish_activity_memory(
+                activity_meta,
+                result_text=reply_text,
+                state="completed",
+            )
 
             return GenerationOutcome.generated(
                 text=reply_text,
