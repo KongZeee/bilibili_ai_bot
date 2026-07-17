@@ -531,18 +531,19 @@ class MemoryBrainService:
         recall_cap = max(1, min(int(recall_limit or 1), 10))
 
         async def load_recent() -> list[Mapping[str, Any]]:
+            # Deep scan: automation bursts can write dozens of intent/finish
+            # pairs; the guaranteed recent lane still needs older distinctive
+            # experiences in the candidate pool before type/content ranking.
             rows = await asyncio.to_thread(
-                self.store.recent_events, max(40, recent_cap * 8)
+                self.store.recent_events, max(200, recent_cap * 24)
             )
-            # Scan deeper than recent_cap so type-diversity can still surface
-            # older distinctive experiences when the newest window is homogeneous.
             selected = [
                 row
                 for row in rows
                 if isinstance(row, Mapping)
                 and str(row.get("id") or "") != str(intent_event_id or "")
                 and self._is_self_activity_event(row)
-            ][: max(recent_cap * 16, 80)]
+            ][: max(recent_cap * 20, 100)]
             ids = [str(row.get("id") or "") for row in selected if row.get("id")]
             if not ids:
                 return []
