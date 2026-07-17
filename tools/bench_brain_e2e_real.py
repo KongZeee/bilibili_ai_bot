@@ -382,6 +382,11 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 ["日记"],
                 ["狼王", "网络热传生物"],
             ),
+            (
+                "你刚看了什么视频",
+                [],  # non-empty is enough; validated by forbid + not comment-only
+                ["空泽同学 评论：@亚托莉小姐 这个视频讲了什么"],
+            ),
         ]
         for q, must_any, forbid_any in probe_cases:
             result = await brain.recall(
@@ -400,6 +405,15 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
             blob = titles + "\n" + evidence
             has_must = (not must_any) or any(m in blob for m in must_any if m)
             has_forbid = any(f in blob for f in forbid_any if f)
+            if q.startswith("你刚看了什么视频"):
+                types = [
+                    str(ev.get("source_type") or "")
+                    for ev in (getattr(result, "events", ()) or [])
+                    if isinstance(ev, dict)
+                ]
+                has_must = any(
+                    t in {"video", "video_experience", "bot_action"} for t in types
+                ) and not getattr(result, "is_empty", False)
             if has_must and not has_forbid and not getattr(result, "is_empty", False):
                 probe_ok += 1
                 print(f"probe_ok:{q[:24]}")
