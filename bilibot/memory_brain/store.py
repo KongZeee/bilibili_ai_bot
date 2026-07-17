@@ -1855,6 +1855,38 @@ class MemoryBrainStore:
             raise ValueError("target_type must be 'event' or 'chunk'")
         query = normalize_vector(query_vector)
         exact_model = model_id is None and bool(provider and model)
+        result_limit = max(1, min(int(limit), 1000))
+        batch_size = self.vector_batch_size if batch_size is None else max(1, int(batch_size))
+        try:
+            import numpy as np
+        except ImportError:  # pragma: no cover - optional acceleration
+            np = None
+
+        # Warm-cache short-circuit when model_id is known: no SQLite open.
+        if (
+            np is not None
+            and self.vector_cache_limit > 0
+            and model_id is not None
+            and not exact_model
+        ):
+            cache_key = (model_id, target_type)
+            with self._vector_cache_lock:
+                entry = self._vector_cache.get(cache_key)
+                if entry is not None:
+                    if entry.dimension != len(query):
+                        raise VectorDimensionError(
+                            f"query dimension {len(query)} does not match model dimension {entry.dimension}"
+                        )
+                    return self._rank_cached_vectors(
+                        entry,
+                        query,
+                        target_type=target_type,
+                        model_id=model_id,
+                        result_limit=result_limit,
+                        batch_size=batch_size,
+                        np=np,
+                    )
+
         conn = self._connect()
         try:
             if model_id is None:
@@ -1904,12 +1936,6 @@ class MemoryBrainStore:
                     return []
                 embedding_count = int(indexed)
 
-            result_limit = max(1, min(int(limit), 1000))
-            batch_size = self.vector_batch_size if batch_size is None else max(1, int(batch_size))
-            try:
-                import numpy as np
-            except ImportError:  # pragma: no cover - optional acceleration
-                np = None
             if np is not None and self.vector_cache_limit > 0:
                 cache_key = (model_id, target_type)
                 # Warm-cache fast path: skip COUNT(*) when entry already loaded.
