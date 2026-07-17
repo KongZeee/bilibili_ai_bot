@@ -1093,6 +1093,22 @@ class RecallEngine:
                 ]
                 if len(fts_hits) >= 2:
                     evidence_cap = max(evidence_cap, min(1.0, max(fts_hits) + 0.15))
+                # Title content-term hits are high precision under OR-FTS dilution
+                # (e.g. query 海龟汤第二集 / 心情日记). Raise the evidence floor so
+                # they can clear FALLBACK_DIRECT_THRESHOLD without opening pure
+                # body-only weak matches.
+                title = str(candidate.title or "")
+                content_terms = [
+                    term
+                    for term in (candidate.lexical_matched_terms or set())
+                    if _is_content_lexical_term(term)
+                ]
+                title_hits = [term for term in content_terms if term in title]
+                if title_hits:
+                    evidence_cap = max(
+                        evidence_cap,
+                        min(1.0, 0.42 + 0.08 * min(len(title_hits), 3)),
+                    )
                 candidate.deterministic_score = min(
                     candidate.deterministic_score,
                     evidence_cap,
@@ -1599,11 +1615,14 @@ class RecallEngine:
             return True
         if dual_ok and max_lex >= FALLBACK_DIRECT_THRESHOLD:
             return True
-        # Near-threshold rescue for durable self writings with a title hit when
-        # OR-FTS coverage is diluted by multi-term queries (e.g. 心情日记).
-        # Keep this narrow: title_hit alone on ordinary videos re-opens pollution.
+        # Title content-term hits: OR-FTS coverage can look weak when the query
+        # includes ordinals/fillers, but a title that literally contains a
+        # content term is high-precision evidence.
         title = str(candidate.title or "")
         title_hit = any(term in title for term in content_terms if len(term) >= 2)
+        if title_hit and max_lex >= 0.25:
+            return True
+        # Durable self writings with a title hit get a slightly softer floor.
         source = str(candidate.source_type or "").strip().casefold()
         durable_self = source in {
             "bot_action",

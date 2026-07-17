@@ -95,3 +95,61 @@ async def test_distinctive_content_still_recalls(seeded_store):
     assert "雨夜" in (dyn.prompt_evidence or "") or ids["bot:rain"] in [
         e["id"] for e in dyn.events
     ]
+
+
+@pytest.mark.asyncio
+async def test_multi_term_diary_title_rescue(seeded_store):
+    store, ids = seeded_store
+    archived = store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="diary:calm",
+            account_id="acc",
+            source_type="diary",
+            source_external_id="diary-1",
+            source_text="心情日记里写下了平静的一天。",
+            event_title="日记 2026-07-16",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="心情日记", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    event_ids = [e.get("id") for e in result.events if isinstance(e, dict)]
+    titles = [e.get("title") for e in result.events if isinstance(e, dict)]
+    assert archived.event_id in event_ids or any("日记" in (t or "") for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_episode_ordinal_does_not_outrank_title(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="noise-ep",
+            account_id="acc",
+            source_type="subtitle",
+            source_external_id="n1",
+            source_text="这是第二集的预告片，完全没提汤类内容。",
+            event_title="陪伴我10年的员工离开了....",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="hg-ep",
+            account_id="acc",
+            source_type="video_experience",
+            source_external_id="hg1",
+            source_text="观看了海龟汤（2）。",
+            event_title="海龟汤（2）",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="海龟汤第二集讲了啥", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") for e in result.events if isinstance(e, dict)]
+    assert any("海龟汤" in (t or "") for t in titles)
+    # Ordinal-only noise title should not be the sole winner.
+    assert not (len(titles) == 1 and "陪伴" in (titles[0] or ""))
