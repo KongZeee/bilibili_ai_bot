@@ -303,6 +303,7 @@ class ReplyGenerator:
             logger.debug("LLM client 未初始化，可重试")
             return GenerationOutcome.retryable(LLM_CLIENT_UNAVAILABLE)
 
+        activity_meta: dict[str, str] = {}
         try:
             # 1. 通过 orchestrator + reply_context 构建 prompt
             reply_context, activity_meta = await self._attach_activity_memory(
@@ -429,6 +430,8 @@ class ReplyGenerator:
                 )
 
             # 2. 调用 LLM（system_prompt 纯净，搜索结果在 user_prompt 的 Reference Block）
+            # Reasoning models spend many tokens before emitting text; 200 often
+            # yields empty content. Keep the public comment surface at 233 chars.
             from bilibot.services.token_usage import usage_context
             with usage_context(
                 scene=str(getattr(scene, "value", scene) or "reply_comment"),
@@ -437,7 +440,7 @@ class ReplyGenerator:
                 reply_text = await self.llm.generate(
                     prompt=final_user_prompt,
                     system_prompt=system_prompt,
-                    max_tokens=200,
+                    max_tokens=800,
                 )
 
             # 模型明确不回复 / 空回复 → skip
@@ -446,8 +449,18 @@ class ReplyGenerator:
                 # 若 client 在调用过程中变为不可用，视为可重试而非 skip
                 if not getattr(self.llm, "client", None):
                     logger.warning("LLM 返回空回复且 Provider client 不可用，retryable")
+                    await self._finish_activity_memory(
+                        activity_meta,
+                        result_text="回复失败：LLM client 不可用",
+                        state="failed",
+                    )
                     return GenerationOutcome.retryable(LLM_CLIENT_UNAVAILABLE)
                 logger.debug("LLM 返回空回复，skip")
+                await self._finish_activity_memory(
+                    activity_meta,
+                    result_text="回复跳过：模型空回复",
+                    state="skipped",
+                )
                 return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
 
             # PRD V3 §5.1 (P2-1)：B站评论限制 233 字，统一截断为 233 字
@@ -459,6 +472,11 @@ class ReplyGenerator:
 
             reply_text = reply_text.strip()
             if not reply_text:
+                await self._finish_activity_memory(
+                    activity_meta,
+                    result_text="回复跳过：截断后为空",
+                    state="skipped",
+                )
                 return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
 
             # 3. 写入 audit（含 persona_id / context_summary，PRD V3 §8.6 / V4 §4.5.3）
@@ -505,13 +523,28 @@ class ReplyGenerator:
 
         except asyncio.TimeoutError:
             logger.error("LLM 生成超时")
+            await self._finish_activity_memory(
+                activity_meta,
+                result_text="回复失败：LLM 超时",
+                state="failed",
+            )
             return GenerationOutcome.retryable(LLM_TIMEOUT)
         except ConnectionError:
             logger.error("LLM 连接错误")
+            await self._finish_activity_memory(
+                activity_meta,
+                result_text="回复失败：LLM 连接错误",
+                state="failed",
+            )
             return GenerationOutcome.retryable(LLM_CONNECTION_ERROR)
         except Exception as e:
             code, retry_after = _classify_exception(e)
             logger.error(f"生成回复失败: {e} (code={code})")
+            await self._finish_activity_memory(
+                activity_meta,
+                result_text=f"回复失败：{code}",
+                state="failed",
+            )
             return GenerationOutcome.retryable(code, retry_after=retry_after)
 
     # ── 含视频上下文的完整版（保留向后兼容，内部转发到主入口） ──
