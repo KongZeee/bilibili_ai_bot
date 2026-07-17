@@ -270,3 +270,77 @@ async def test_open_watch_query_prefers_recent_watch(seeded_store):
     assert not result.is_empty
     titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
     assert any("Never Gonna" in t or "Rick" in t for t in titles)
+
+
+
+@pytest.mark.asyncio
+async def test_schedule_and_weekly_self_queries(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="life-1",
+            account_id="acc",
+            source_type="life_plan",
+            source_external_id="lp1",
+            source_text="今天上午阅读，下午制作日程安排。",
+            event_title="日程 2026-07-16",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="week-1",
+            account_id="acc",
+            source_type="weekly_summary",
+            source_external_id="w1",
+            source_text="本周总结：看了视频，发了动态，心情不错。",
+            event_title="周总结 2026-W29",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="noise-sum",
+            account_id="acc",
+            source_type="comment",
+            source_external_id="csum",
+            source_text="空泽同学 评论：@亚托莉小姐 总结一下这个视频",
+            event_title="空泽同学 评论：@亚托莉小姐 总结一下这个视频",
+            job_types=(),
+        )
+    )
+    eng = RecallEngine(store)
+    sched = await eng.recall(
+        RecallQuery(current_message="你的日程安排", account_id="acc", scene="reply_comment")
+    )
+    assert not sched.is_empty
+    assert any("日程" in (e.get("title") or "") for e in sched.events if isinstance(e, dict))
+    week = await eng.recall(
+        RecallQuery(current_message="周总结写了啥", account_id="acc", scene="reply_comment")
+    )
+    assert not week.is_empty
+    titles = [e.get("title") or "" for e in week.events if isinstance(e, dict)]
+    assert any("周总结" in t for t in titles)
+    assert not any("总结一下这个视频" in t for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_exact_dream_title_not_polluted(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="dream-1",
+            account_id="acc",
+            source_type="dream",
+            source_external_id="d1",
+            source_text="梦见窗边的午后，夏生在看书。",
+            event_title="窗边的午后",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="窗边的午后", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert titles == ["窗边的午后"] or titles[0] == "窗边的午后"

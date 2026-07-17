@@ -167,6 +167,11 @@ _LEXICAL_STOP_TERMS = frozenset(
         "前几",
         "几天",
         "的心",
+        "你的",
+        "的日",
+        "程安",
+        "写了",
+        "了啥",
     }
 )
 
@@ -174,7 +179,8 @@ _LEXICAL_STOP_TERMS = frozenset(
 _SELF_MEMORY_QUERY_RE = re.compile(
     r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发|"
     r"评论说了|发过评论|刚给.*评论|你回复|"
-    r"刚看了|刚看过|看了什么视频|看过什么视频|最近看)"
+    r"刚看了|刚看过|看了什么视频|看过什么视频|最近看|"
+    r"日程|安排|周总结|追什么番|在追)"
 )
 
 _UTILITY_QUERY_RE = re.compile(
@@ -1679,7 +1685,7 @@ class RecallEngine:
             # numeric gate after OR-FTS dilution; content evidence check is the
             # real safety net.
             if candidate.final_score < threshold and not watch_rescue and not (
-                candidate.final_score >= 0.30
+                candidate.final_score >= 0.15
                 and RecallEngine._fallback_has_content_evidence(candidate)
             ):
                 continue
@@ -1742,6 +1748,12 @@ class RecallEngine:
                             candidate.final_score = min(1.0, candidate.final_score + 0.12)
                     elif source in {"comment", "comment_thread", "web_reference"}:
                         candidate.final_score = max(0.0, candidate.final_score - 0.20)
+                elif re.search(r"(日程|安排|周总结)", query_text):
+                    if source in {"life_plan", "weekly_summary", "diary"}:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.28)
+                    elif source in {"comment", "comment_thread", "web_reference"}:
+                        # "总结一下这个视频" comments are pure noise for weekly self-reflection.
+                        candidate.final_score = 0.0
                 elif source == "bot_action":
                     candidate.final_score = min(1.0, candidate.final_score + 0.12)
                 elif source in {"diary", "dream", "weekly_summary", "life_plan"}:
@@ -1750,6 +1762,7 @@ class RecallEngine:
                     candidate.final_score = max(0.0, candidate.final_score - 0.08)
             # Title-term exact-ish bonus: if a content term appears in the title,
             # rank it above body-only weak hits with the same coverage.
+            # Skip bonuses once a prior gate zeroed the candidate.
             title = str(candidate.title or "").casefold()
             title_content_hits = [
                 term
@@ -1758,7 +1771,7 @@ class RecallEngine:
                 and len(term) >= 2
                 and term.casefold() in title
             ]
-            if title_content_hits:
+            if title_content_hits and candidate.final_score > 0.0:
                 candidate.final_score = min(
                     1.0, candidate.final_score + 0.08 + 0.03 * min(len(title_content_hits), 2)
                 )
@@ -1767,11 +1780,12 @@ class RecallEngine:
                 source in {"video", "video_experience", "subtitle"}
                 and content_term_count <= 1
                 and not title_content_hits
+                and candidate.final_score > 0.0
             ):
                 candidate.final_score = max(0.0, candidate.final_score - 0.10)
             # ASCII entity in query: title hits are high-precision; body-only / alias
             # matches must not occupy fallback slots when a titled entity row exists.
-            if query_text:
+            if query_text and candidate.final_score > 0.0:
                 latin_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,24}", query_text)
                 if latin_tokens:
                     any_title_entity = any(
@@ -1803,6 +1817,18 @@ class RecallEngine:
             if candidate.final_score <= 0.0:
                 continue
             eligible.append(candidate)
+        # Exact durable-title queries (e.g. 窗边的午后): keep only matching durable self.
+        q_norm = "".join(query_text.split())
+        if q_norm and len(q_norm) >= 2:
+            exact = [
+                c
+                for c in eligible
+                if "".join(str(c.title or "").split()) == q_norm
+                and str(c.source_type or "").strip().casefold()
+                in {"dream", "diary", "life_plan", "weekly_summary", "bot_action"}
+            ]
+            if exact:
+                eligible = exact
         selected = RecallEngine._bounded_selection(
             eligible,
             max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
@@ -1878,7 +1904,7 @@ class RecallEngine:
         # Title content-term hits: OR-FTS coverage can look weak when the query
         # includes ordinals/fillers, but a title that literally contains a
         # content term is high-precision evidence.
-        if title_hit and max_lex >= 0.25:
+        if title_hit and max_lex >= 0.15:
             return True
         # Durable self writings with a title hit get a slightly softer floor.
         source = str(candidate.source_type or "").strip().casefold()
@@ -1889,7 +1915,9 @@ class RecallEngine:
             "life_plan",
             "weekly_summary",
         }
-        if max_lex >= 0.30 and durable_self and title_hit:
+        if durable_self and title_hit:
+            return True
+        if max_lex >= 0.25 and durable_self and len(content_terms) >= 1:
             return True
         return False
 
