@@ -136,11 +136,18 @@ class LLMAdapter:
                 if result:
                     logger.debug(f"LLM生成成功: {len(result)} 字符")
                     return result.strip()
-                # Reasoning models may put tokens only in reasoning_content when
-                # max_tokens is small; surface a short fallback rather than None
-                # so callers can distinguish "provider empty" vs silent fail.
+                # Reasoning models may put usable text only in reasoning_content
+                # when the budget is consumed by chain-of-thought. Prefer an
+                # extracted JSON object/array, then a short trailing answer line.
                 reasoning = getattr(message, "reasoning_content", None)
                 if isinstance(reasoning, str) and reasoning.strip():
+                    salvaged = self._salvage_from_reasoning(reasoning)
+                    if salvaged:
+                        logger.warning(
+                            "LLM content empty; salvaged %s chars from reasoning_content",
+                            len(salvaged),
+                        )
+                        return salvaged
                     logger.warning(
                         "LLM returned empty content with non-empty reasoning "
                         "(likely max_tokens too low for reasoning model)"
@@ -151,6 +158,54 @@ class LLMAdapter:
         except Exception as e:
             logger.error(f"LLM生成失败: {e}")
             raise
+
+    @staticmethod
+    def _salvage_from_reasoning(reasoning: str) -> Optional[str]:
+        """Best-effort extract usable assistant text from reasoning_content."""
+        text = str(reasoning or "").strip()
+        if not text:
+            return None
+        # Prefer a JSON object/array if present (rerank / structured jobs).
+        for opener, closer in (("{", "}"), ("[", "]")):
+            start = text.find(opener)
+            end = text.rfind(closer)
+            if start != -1 and end != -1 and end > start:
+                candidate = text[start : end + 1]
+                try:
+                    import json
+
+                    json.loads(candidate)
+                    return candidate
+                except Exception:
+                    fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
+                    try:
+                        import json
+
+                        json.loads(fixed)
+                        return fixed
+                    except Exception:
+                        pass
+        # Fall back to a short final line that looks like an answer.
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        for line in reversed(lines[-8:]):
+            if len(line) < 4:
+                continue
+            if line.startswith(("1.", "2.", "**", "#", "-", "*")):
+                continue
+            if any(
+                marker in line.casefold()
+                for marker in (
+                    "thinking",
+                    "analyze",
+                    "user says",
+                    "constraint",
+                    "language:",
+                )
+            ):
+                continue
+            if len(line) <= 400:
+                return line
+        return None
     
     async def generate_stream(
         self,
