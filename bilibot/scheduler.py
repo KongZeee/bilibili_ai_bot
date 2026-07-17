@@ -1064,6 +1064,30 @@ class Scheduler:
         importance: float = 0.6,
         status: str = "",
     ):
+        """Archive a terminal bot action; prefer finish_activity when available."""
+        brain = getattr(self, "memory_brain", None)
+        finish = getattr(brain, "finish_activity", None) if brain is not None else None
+        terminal = str(status or ("completed" if published else "failed")).strip().casefold()
+        if terminal == "intent":
+            terminal = "completed" if published else "failed"
+        if callable(finish) and callable(getattr(type(brain), "finish_activity", None)):
+            try:
+                return await finish(
+                    action_key=action_key,
+                    action_type=action_type,
+                    result_text=text,
+                    state=terminal if terminal != "rejected" else "rejected",
+                    scene=scene,
+                    title=title,
+                    persona_id=self._get_current_persona_id(),
+                    metadata=metadata or {},
+                )
+            except Exception:
+                logger.warning(
+                    "finish_activity failed, falling back to archive: action=%s",
+                    action_key,
+                    exc_info=True,
+                )
         from bilibot.memory_brain.ingestion import bot_action_observation
 
         return await self._archive_required(

@@ -131,10 +131,20 @@ class LLMAdapter:
             )
             
             if response.choices:
-                result = response.choices[0].message.content
+                message = response.choices[0].message
+                result = message.content
                 if result:
                     logger.debug(f"LLM生成成功: {len(result)} 字符")
                     return result.strip()
+                # Reasoning models may put tokens only in reasoning_content when
+                # max_tokens is small; surface a short fallback rather than None
+                # so callers can distinguish "provider empty" vs silent fail.
+                reasoning = getattr(message, "reasoning_content", None)
+                if isinstance(reasoning, str) and reasoning.strip():
+                    logger.warning(
+                        "LLM returned empty content with non-empty reasoning "
+                        "(likely max_tokens too low for reasoning model)"
+                    )
                 return None
             return None
 

@@ -17,7 +17,9 @@ from .prompt import DEFAULT_MEMORY_PROMPT_BUDGET, RenderedMemoryEvidence, render
 RRF_K = 60
 MAX_RERANK_CANDIDATES = 20
 RERANK_TIMEOUT_SECONDS = 8.0
-RERANK_MAX_TOKENS = 600
+# Reasoning chat models (e.g. agnes-2.0-flash) spend many tokens on hidden
+# chain-of-thought before emitting JSON; 600 often yields empty content.
+RERANK_MAX_TOKENS = 1600
 RERANK_RELEVANCE_BASELINE = 0.65
 DIRECT_THRESHOLD = 0.72
 ASSOCIATION_THRESHOLD = 0.80
