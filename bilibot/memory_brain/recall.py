@@ -47,6 +47,28 @@ _BVID_RE = re.compile(r"(?i)\bBV[0-9A-Za-z]{10}\b")
 _STABLE_ID_RE = re.compile(r"(?i)\b(?:evt|event|mem|memory)_[0-9A-Za-z_-]{4,}\b")
 _QUOTED_RE = re.compile(r"[\"'“‘《]([^\"'”’》]{1,80})[\"'”’》]")
 
+
+_CONVERSATIONAL_FILLER_RE = re.compile(
+    r"(你不是|是不是|有没有|能不能|可不可以|记得吗|还记得|发过|说过|看过|写过|吗|呢|啊|呀|吧|了)"
+)
+
+
+def _content_heavy_query(message: str) -> str:
+    """Drop conversational fillers so FTS coverage is not diluted by function words.
+
+    Candidate generation still uses the original message; this rewrite is only
+    used as an additional FTS channel when the raw query is long/chatty.
+    """
+    text_in = " ".join(str(message or "").replace("\x00", "").split())
+    if not text_in:
+        return ""
+    stripped = _CONVERSATIONAL_FILLER_RE.sub(" ", text_in)
+    stripped = re.sub(r"[？?！!。，,、：:；;…]+", " ", stripped)
+    stripped = " ".join(stripped.split())
+    if len(stripped) < 2 or stripped == text_in:
+        return ""
+    return stripped
+
 # Prefer content that helps answer "what is this video about?" over raw API
 # metadata JSON / search blobs when a video event is only hit by title/id.
 _PREFERRED_EVIDENCE_SOURCE_TYPES: Mapping[str, int] = {
@@ -635,6 +657,27 @@ class RecallEngine:
             await self._collect_store_channel(
                 candidates, errors, "chunk_fts", "search_chunks_fts", message, limit=40
             )
+            # Additional content-heavy rewrite for chatty Chinese questions so
+            # distinctive content terms are not drowned by function words in
+            # lexical_coverage (fallback gating uses that coverage).
+            content_query = _content_heavy_query(message)
+            if content_query and content_query != message:
+                await self._collect_store_channel(
+                    candidates,
+                    errors,
+                    "event_fts",
+                    "search_events_fts",
+                    content_query,
+                    limit=30,
+                )
+                await self._collect_store_channel(
+                    candidates,
+                    errors,
+                    "chunk_fts",
+                    "search_chunks_fts",
+                    content_query,
+                    limit=40,
+                )
 
         embedding = await self._embedding(message, errors, "main_embedding") if message else None
         if embedding:
