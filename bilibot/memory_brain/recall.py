@@ -16,7 +16,8 @@ from .prompt import DEFAULT_MEMORY_PROMPT_BUDGET, RenderedMemoryEvidence, render
 
 RRF_K = 60
 MAX_RERANK_CANDIDATES = 20
-RERANK_TIMEOUT_SECONDS = 8.0
+# Reasoning chat models often need 15–40s for a 20-candidate JSON decision.
+RERANK_TIMEOUT_SECONDS = 45.0
 # Reasoning chat models (e.g. agnes-2.0-flash) spend many tokens on hidden
 # chain-of-thought before emitting JSON; 600 often yields empty content.
 RERANK_MAX_TOKENS = 1600
@@ -705,6 +706,18 @@ class RecallEngine:
             inject_cap = self.max_events
 
         explicit = self._explicit_identifiers(query)
+        # Pure utility questions without explicit ids should not scan the library.
+        # Keeps weather/math/time queries fail-closed even if OR-FTS would match
+        # stopwords inside video titles (e.g. subtitle "现在几点啊").
+        message_early = str(query.current_message or "").strip()
+        if (
+            not explicit
+            and message_early
+            and _UTILITY_QUERY_RE.search(message_early)
+            and not self._title_entity_identifiers(query)
+        ):
+            return self._empty_result(started, errors)
+
         if explicit:
             await self._collect_store_channel(
                 candidates,
