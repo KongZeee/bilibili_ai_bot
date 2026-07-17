@@ -527,6 +527,7 @@ class _VectorCacheEntry:
         "embedding_ids",
         "target_ids",
         "event_ids",
+        "query_template",
     )
 
     def __init__(
@@ -546,6 +547,8 @@ class _VectorCacheEntry:
         self.embedding_ids = embedding_ids
         self.target_ids = target_ids
         self.event_ids = event_ids
+        # Reusable contiguous query buffer (filled under the cache lock).
+        self.query_template = None
 
 
 def _envelope_hash(envelope: ObservationEnvelope, sources: Sequence[SourceDocument]) -> str:
@@ -1782,7 +1785,17 @@ class MemoryBrainStore:
         _ = batch_size
         if not entry.metadata:
             return []
-        query_array = np.asarray(query, dtype=np.dtype("<f4"))
+        dtype = np.dtype("<f4")
+        qbuf = entry.query_template
+        if qbuf is None or int(qbuf.shape[0]) != int(entry.dimension):
+            qbuf = np.empty(int(entry.dimension), dtype=dtype)
+            entry.query_template = qbuf
+        # Fill without allocating a new array when query is a plain list.
+        if isinstance(query, np.ndarray) and query.dtype == dtype and query.flags["C_CONTIGUOUS"]:
+            query_array = query
+        else:
+            qbuf[:] = query
+            query_array = qbuf
         scores = entry.matrix @ query_array
         n = int(scores.shape[0])
         k = min(int(result_limit), n)
@@ -1806,6 +1819,7 @@ class MemoryBrainStore:
         ranked: list[dict[str, Any]] = []
         embedding_ids = entry.embedding_ids
         event_ids = entry.event_ids
+        append = ranked.append
         for j in order.tolist():
             idx = int(candidate_idx[j])
             if embedding_ids is not None and event_ids is not None:
@@ -1814,7 +1828,7 @@ class MemoryBrainStore:
                 event_id = event_ids[idx]
             else:
                 embedding_id, target_id, event_id = entry.metadata[idx]
-            ranked.append(
+            append(
                 {
                     "embedding_id": embedding_id,
                     "target_id": target_id,
