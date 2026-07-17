@@ -6967,7 +6967,7 @@ class Scheduler:
             )
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="image_prompt", account_id=self.account_id or ""):
-                result = await self.llm.generate(prompt, max_tokens=120, temperature=0.7)
+                result = await self.llm.generate(prompt, max_tokens=800, temperature=0.7)
             return result.strip() if result else None
         except Exception as e:
             logger.warning(f"生成图片 prompt 失败: {e}")
@@ -7247,7 +7247,7 @@ class Scheduler:
                     content = await self.llm.generate(
                         prompt=user_prompt,
                         system_prompt=system_prompt,
-                        max_tokens=200,
+                        max_tokens=1500,
                     )
 
             # LLM 失败时不再硬编码万能动态自动发布（PRD V3 §8.4）
@@ -8343,7 +8343,7 @@ class Scheduler:
                 summary = await self.llm.generate(
                     prompt=user_prompt,
                     system_prompt=system_prompt,
-                    max_tokens=800,
+                    max_tokens=2000,
                 )
 
             if not summary:
