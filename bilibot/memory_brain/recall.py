@@ -173,7 +173,8 @@ _LEXICAL_STOP_TERMS = frozenset(
 # Queries about the bot's own prior posts / writings (not topical "动态" alone).
 _SELF_MEMORY_QUERY_RE = re.compile(
     r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发|"
-    r"评论说了|发过评论|刚给.*评论|你回复)"
+    r"评论说了|发过评论|刚给.*评论|你回复|"
+    r"刚看了|刚看过|看了什么视频|看过什么视频|最近看)"
 )
 
 _UTILITY_QUERY_RE = re.compile(
@@ -783,6 +784,10 @@ class RecallEngine:
         started = time.perf_counter()
         errors: dict[str, str] = {}
         candidates: dict[str, RecallCandidate] = {}
+        message_for_flags = str(query.current_message or "")
+        self._watch_query_active = bool(
+            re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", message_for_flags)
+        )
 
         # Per-call inject cap (0 → engine default max_events)
         inject_cap = self.max_events
@@ -951,7 +956,55 @@ class RecallEngine:
         decisions, rerank_status, rerank_calls = await self._rerank(query, rough)
         if decisions is None:
             mode = "fallback"
-            selected = self._select_fallback(rough, query=query)
+            if getattr(self, "_watch_query_active", False):
+                recent_watch: list[RecallCandidate] = []
+                for cand in candidates.values():
+                    source = str(cand.source_type or "").strip().casefold()
+                    summary = str(cand.summary or "")
+                    is_watch = (
+                        source in {"video_experience", "video"}
+                        or "看完" in summary
+                        or "观看了" in summary
+                        or (
+                            source == "bot_action"
+                            and (
+                                "看完" in summary
+                                or "观看" in summary
+                                or "evaluate_proactive_video" in summary
+                            )
+                        )
+                    )
+                    if not is_watch:
+                        continue
+                    if not (
+                        "global_recent" in (cand.channel_ranks or {})
+                        or "speaker_recent" in (cand.channel_ranks or {})
+                        or "看完" in summary
+                        or "观看了" in summary
+                    ):
+                        continue
+                    cand.llm_score = None
+                    cand.kind = "direct"
+                    recent_rank = min(
+                        cand.channel_ranks.get("global_recent", 99),
+                        cand.channel_ranks.get("speaker_recent", 99),
+                    )
+                    cand.final_score = max(0.55, 0.95 - 0.03 * max(0, recent_rank - 1))
+                    if source == "video_experience" or "看完" in summary:
+                        cand.final_score = min(1.0, cand.final_score + 0.05)
+                    cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
+                    recent_watch.append(cand)
+                if recent_watch:
+                    selected = RecallEngine._bounded_selection(
+                        recent_watch,
+                        max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
+                        max_associations=0,
+                    )
+                else:
+                    selected = self._select_fallback(rough, query=query)
+            else:
+                selected = self._select_fallback(rough, query=query)
+
         else:
             mode = "llm"
             selected = self._apply_decisions(rough, decisions)
@@ -1168,8 +1221,9 @@ class RecallEngine:
             candidate.final_score = candidate.deterministic_score
             candidate.kind = "association" if candidate.relation_only else "direct"
 
-    @staticmethod
-    def _rough_order(candidates: Mapping[str, RecallCandidate]) -> list[RecallCandidate]:
+    def _rough_order(self, candidates: Mapping[str, RecallCandidate]) -> list[RecallCandidate]:
+        watch_active = bool(getattr(self, "_watch_query_active", False))
+
         def key(item: RecallCandidate) -> tuple:
             content_terms = {
                 term
@@ -1178,9 +1232,28 @@ class RecallEngine:
             }
             title = str(item.title or "").casefold()
             title_hits = sum(1 for term in content_terms if term.casefold() in title)
+            source = str(item.source_type or "").strip().casefold()
+            summary = str(item.summary or "")
+            recent_watch = 0
+            if watch_active:
+                is_watch = source in {"video_experience", "video", "bot_action"} and (
+                    "看完" in summary
+                    or "观看了" in summary
+                    or source == "video_experience"
+                    or "global_recent" in (item.channel_ranks or {})
+                )
+                if is_watch and (
+                    "global_recent" in (item.channel_ranks or {})
+                    or "speaker_recent" in (item.channel_ranks or {})
+                    or "看完" in summary
+                    or "观看了" in summary
+                ):
+                    recent_watch = 1
             # Prefer multi-term + title hits so distinctive self events survive
-            # the top-k cut before fallback ranking.
+            # the top-k cut before fallback ranking. For watch self-questions,
+            # also pin recent watch rows into the head of the rough list.
             return (
+                -recent_watch,
                 -len(content_terms),
                 -title_hits,
                 -item.rrf_score,
@@ -1575,6 +1648,7 @@ class RecallEngine:
     ) -> list[RecallCandidate]:
         query_text = str(getattr(query, "current_message", "") or "")
         self_query = bool(_SELF_MEMORY_QUERY_RE.search(query_text))
+        watch_query = bool(re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", query_text))
         eligible: list[RecallCandidate] = []
         for candidate in candidates:
             candidate.llm_score = None
@@ -1586,16 +1660,30 @@ class RecallEngine:
                 if candidate.kind == "association"
                 else FALLBACK_DIRECT_THRESHOLD
             )
+            source = str(candidate.source_type or "").strip().casefold()
+            summary_cf = str(candidate.summary or "").casefold()
+            is_watch_row = (
+                source in {"video_experience", "video"}
+                or "看完" in summary_cf
+                or "观看了" in summary_cf
+            )
+            watch_rescue = watch_query and is_watch_row and (
+                "global_recent" in (candidate.channel_ranks or {})
+                or "speaker_recent" in (candidate.channel_ranks or {})
+                or candidate.deterministic_score >= 0.15
+            )
             # Title/self near-threshold candidates may sit slightly under the
             # numeric gate after OR-FTS dilution; content evidence check is the
             # real safety net.
-            if candidate.final_score < threshold and not (
+            if candidate.final_score < threshold and not watch_rescue and not (
                 candidate.final_score >= 0.30
                 and RecallEngine._fallback_has_content_evidence(candidate)
             ):
                 continue
-            if not RecallEngine._fallback_has_content_evidence(candidate):
+            if not watch_rescue and not RecallEngine._fallback_has_content_evidence(candidate):
                 continue
+            if watch_rescue and candidate.final_score < 0.20:
+                candidate.final_score = 0.45
             # Prefer multi-term content matches over single common noun hits
             # (e.g. 日记+心情 beats many videos that only mention 心情).
             content_term_count = sum(
@@ -1643,6 +1731,14 @@ class RecallEngine:
                         candidate.final_score = max(0.0, candidate.final_score - 0.12)
                     elif source in {"video", "video_experience", "subtitle", "comment"}:
                         candidate.final_score = max(0.0, candidate.final_score - 0.08)
+                elif watch_query:
+                    if is_watch_row:
+                        if source in {"bot_action", "video_experience"}:
+                            candidate.final_score = min(1.0, candidate.final_score + 0.30)
+                        else:
+                            candidate.final_score = min(1.0, candidate.final_score + 0.12)
+                    elif source in {"comment", "comment_thread", "web_reference"}:
+                        candidate.final_score = max(0.0, candidate.final_score - 0.20)
                 elif source == "bot_action":
                     candidate.final_score = min(1.0, candidate.final_score + 0.12)
                 elif source in {"diary", "dream", "weekly_summary", "life_plan"}:
