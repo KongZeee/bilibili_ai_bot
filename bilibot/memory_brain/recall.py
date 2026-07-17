@@ -945,9 +945,19 @@ class RecallEngine:
                 # make a common-token or weak-vector hit deterministic proof
                 # when the reranker is unavailable. Exact identifiers remain
                 # independent high-confidence evidence.
+                evidence_cap = max(measured_evidence)
+                # Chatty Chinese queries dilute coverage fraction. Dual FTS
+                # channels with non-trivial coverage are still strong signal.
+                fts_hits = [
+                    cov
+                    for ch, cov in candidate.lexical_coverages.items()
+                    if ch in {"event_fts", "chunk_fts", "context"} and cov >= 0.35
+                ]
+                if len(fts_hits) >= 2:
+                    evidence_cap = max(evidence_cap, min(1.0, max(fts_hits) + 0.15))
                 candidate.deterministic_score = min(
                     candidate.deterministic_score,
-                    max(measured_evidence),
+                    evidence_cap,
                 )
             candidate.final_score = candidate.deterministic_score
             candidate.kind = "association" if candidate.relation_only else "direct"
