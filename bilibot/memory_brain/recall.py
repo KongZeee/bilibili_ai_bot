@@ -119,11 +119,25 @@ _LEXICAL_STOP_TERMS = frozenset(
         "你好",
         "哈哈",
         "嗯嗯",
+        "天怎",
+        "步的",
+        "的动",
+        "态吗",
+        "面吗",
+        "你不",
+        "是发",
+        "发过",
+        "过雨",
+        "夜散",
     }
 )
 
 _UTILITY_QUERY_RE = re.compile(
     r"(天气|预报|午饭|几点|几点了|现在几点|等于多少|算一下|\d+\s*[\*xX×]\s*\d+|换算|单位换算)"
+)
+
+_SMALLTALK_ONLY_RE = re.compile(
+    r"^(今天怎么样|怎么样啊?|还好吗|在吗|你好啊?|在不在|哈+|嗯+)[？?！!。.\s]*$"
 )
 
 
@@ -133,8 +147,8 @@ def _is_content_lexical_term(term: str) -> bool:
         return False
     if re.fullmatch(r"[0-9_.:-]+", t):
         return False
-    # Bigrams that are pure function-word glue (len 2 CJK often noisy) still ok
-    # if not stop-listed; multi-char content terms are preferred.
+    # Keep distinctive CJK bigrams (青铜/钥匙/雨夜). Function-word glue bigrams
+    # (天怎/步的/的动) are stop-listed above.
     return True
 
 
@@ -721,7 +735,10 @@ class RecallEngine:
         if (
             not explicit
             and message_early
-            and _UTILITY_QUERY_RE.search(message_early)
+            and (
+                _UTILITY_QUERY_RE.search(message_early)
+                or _SMALLTALK_ONLY_RE.match(message_early)
+            )
             and not self._title_entity_identifiers(query)
         ):
             return self._empty_result(started, errors)
