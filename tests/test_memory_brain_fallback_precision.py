@@ -223,3 +223,50 @@ async def test_self_dynamic_query_prefers_bot_action(seeded_store):
     titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
     assert "bot_action" in types or any(t == "动态" for t in titles)
     assert not any("迪奥" in t for t in titles)
+
+
+
+@pytest.mark.asyncio
+async def test_open_watch_query_prefers_recent_watch(seeded_store):
+    store, _ids = seeded_store
+    # Older topical videos that match 视频/看 tokens.
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="old-cheese",
+            account_id="acc",
+            source_type="video_experience",
+            source_external_id="old1",
+            source_text="看完这期视频你就懂了全世界将近2000种奶酪。",
+            event_title="全世界将近2000种奶酪，到底都有什么区别？看完这期视频你就懂了！",
+            job_types=(),
+        )
+    )
+    # Fresh watch outcome.
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="new-rick",
+            account_id="acc",
+            source_type="bot_action",
+            source_external_id="rick1",
+            source_text="看完 Never Gonna Give You Up，评分9。",
+            event_title="【官方 MV】Never Gonna Give You Up - Rick Astley",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="new-rick-video",
+            account_id="acc",
+            source_type="video",
+            source_external_id="rickv",
+            source_text="Never Gonna Give You Up official MV by Rick Astley.",
+            event_title="【官方 MV】Never Gonna Give You Up - Rick Astley",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你刚看了什么视频", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert any("Never Gonna" in t or "Rick" in t for t in titles)
