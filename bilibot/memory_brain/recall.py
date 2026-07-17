@@ -129,6 +129,22 @@ _LEXICAL_STOP_TERMS = frozenset(
         "发过",
         "过雨",
         "夜散",
+        # Episode/ordinal glue — common in many titles, not distinctive evidence.
+        "第一",
+        "第二",
+        "第三",
+        "第四",
+        "第五",
+        "第一集",
+        "第二集",
+        "第三集",
+        "一集",
+        "二集",
+        "三集",
+        "第几",
+        "讲了",
+        "说了",
+        "看了",
     }
 )
 
