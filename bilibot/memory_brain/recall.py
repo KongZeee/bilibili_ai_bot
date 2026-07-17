@@ -1625,11 +1625,25 @@ class RecallEngine:
                     candidate.final_score = max(0.0, candidate.final_score - 0.05)
             elif source in {"video_metadata"}:
                 candidate.final_score = max(0.0, candidate.final_score - 0.05)
-            # When the user asks what *I* posted/wrote, strongly prefer bot_action
-            # / diary over random videos that happen to contain 动态 tokens.
+            # When the user asks what *I* posted/wrote, strongly prefer the matching
+            # self genre. "发的动态" should not surface evaluate_proactive_video
+            # bot_actions that merely finished watching a video.
             if self_query:
-                if source == "bot_action" or title_cf == "动态":
-                    candidate.final_score = min(1.0, candidate.final_score + 0.18)
+                summary_cf = str(candidate.summary or "").casefold()
+                if "动态" in query_text:
+                    is_dynamic_post = (
+                        title_cf == "动态"
+                        or "发布了动态" in summary_cf
+                        or "发了一条" in summary_cf and "动态" in summary_cf
+                    )
+                    if is_dynamic_post:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.22)
+                    elif source == "bot_action":
+                        candidate.final_score = max(0.0, candidate.final_score - 0.12)
+                    elif source in {"video", "video_experience", "subtitle", "comment"}:
+                        candidate.final_score = max(0.0, candidate.final_score - 0.08)
+                elif source == "bot_action":
+                    candidate.final_score = min(1.0, candidate.final_score + 0.12)
                 elif source in {"diary", "dream", "weekly_summary", "life_plan"}:
                     candidate.final_score = min(1.0, candidate.final_score + 0.10)
                 elif source in {"video", "video_experience", "subtitle", "comment"}:
