@@ -414,3 +414,43 @@ async def test_open_watch_excludes_bangumi_episode(tmp_path):
     titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
     assert any("Never Gonna" in t or "Rick" in t for t in titles)
     assert not any("第3话" in t or "星际驿站" in t for t in titles)
+
+
+
+@pytest.mark.asyncio
+async def test_completed_activity_hides_intent_duplicate(tmp_path):
+    from bilibot.memory_brain import MemoryBrainService
+
+    brain = MemoryBrainService("acc", tmp_path / "acc")
+    await brain.begin_activity(
+        action_key="v:dup",
+        action_type="evaluate_proactive_video",
+        current_activity="观看 Never Gonna",
+        query="Never Gonna",
+        scene="proactive_video",
+        title="【官方 MV】Never Gonna Give You Up - Rick Astley",
+    )
+    await brain.finish_activity(
+        action_key="v:dup",
+        action_type="evaluate_proactive_video",
+        result_text="看完 Never Gonna Give You Up，评分9。",
+        state="completed",
+        scene="proactive_video",
+        title="【官方 MV】Never Gonna Give You Up - Rick Astley",
+    )
+    result = await brain.recall(
+        RecallQuery(current_message="Never Gonna", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    states = []
+    for e in result.events:
+        if not isinstance(e, dict):
+            continue
+        meta = e.get("metadata") or {}
+        if isinstance(meta, dict):
+            states.append(str(meta.get("action_state") or ""))
+    assert "intent" not in states
+    assert any(s == "completed" for s in states) or any(
+        "评分9" in str((e.get("summary") if isinstance(e, dict) else "") or "")
+        for e in result.events
+    )

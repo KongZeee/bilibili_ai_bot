@@ -429,6 +429,8 @@ class RecallCandidate:
     title: str = ""
     summary: str = ""
     source_type: str = ""
+    action_state: str = ""
+    activity_key: str = ""
     occurred_at: str = ""
     rrf_score: float = 0.0
     deterministic_score: float = 0.0
@@ -1322,6 +1324,17 @@ class RecallEngine:
             candidate.source_type = _short(
                 event.get("source_type") or candidate.source_type, 80
             )
+            meta = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
+            if not meta and isinstance(event.get("metadata_json"), str):
+                try:
+                    meta = json.loads(event.get("metadata_json") or "{}")
+                except Exception:
+                    meta = {}
+            if isinstance(meta, Mapping):
+                candidate.action_state = _short(meta.get("action_state") or "", 40)
+                candidate.activity_key = _short(
+                    meta.get("activity_key") or meta.get("action_key") or "", 120
+                )
             candidate.occurred_at = _short(
                 event.get("occurred_at") or event.get("created_at") or candidate.occurred_at,
                 80,
@@ -1853,7 +1866,25 @@ class RecallEngine:
             if candidate.final_score <= 0.0:
                 continue
             eligible.append(candidate)
+        # Prefer completed activity outcomes over open intents with same key.
+        terminal_keys = {
+            c.activity_key
+            for c in eligible
+            if c.activity_key
+            and str(c.action_state or "").strip().casefold()
+            in {"completed", "failed", "rejected", "skipped", "deferred"}
+        }
+        if terminal_keys:
+            eligible = [
+                c
+                for c in eligible
+                if not (
+                    c.activity_key in terminal_keys
+                    and str(c.action_state or "").strip().casefold() == "intent"
+                )
+            ]
         # Exact durable-title queries (e.g. 窗边的午后): keep only matching durable self.
+
         q_norm = "".join(query_text.split())
         if q_norm and len(q_norm) >= 2:
             exact = [
