@@ -1670,23 +1670,39 @@ class RecallEngine:
                 and not title_content_hits
             ):
                 candidate.final_score = max(0.0, candidate.final_score - 0.10)
-            # ASCII entity in query: title hits are high-precision; body-only mentions
-            # (e.g. "和 ATRI 无关") must not outrank a titled ATRI exploration row.
+            # ASCII entity in query: title hits are high-precision; body-only / alias
+            # matches must not occupy fallback slots when a titled entity row exists.
             if query_text:
-                for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,24}", query_text):
-                    tok = token.casefold()
-                    if tok in title:
-                        candidate.final_score = min(1.0, candidate.final_score + 0.12)
-                    else:
-                        body_blob = " ".join(
-                            str(t) for t in (candidate.lexical_matched_terms or set())
-                        ).casefold()
-                        summary_blob = str(candidate.summary or "").casefold()
-                        if tok in body_blob or tok in summary_blob:
-                            candidate.final_score = max(
-                                0.0, candidate.final_score - 0.15
+                latin_tokens = re.findall(r"[A-Za-z][A-Za-z0-9_-]{1,24}", query_text)
+                if latin_tokens:
+                    any_title_entity = any(
+                        any(
+                            tok.casefold() in str(c.title or "").casefold()
+                            for tok in latin_tokens
+                        )
+                        for c in candidates
+                    )
+                    for token in latin_tokens:
+                        tok = token.casefold()
+                        if tok in title:
+                            candidate.final_score = min(
+                                1.0, candidate.final_score + 0.12
                             )
-                    break
+                        elif any_title_entity:
+                            # Drop body/alias-only rows from eligibility entirely.
+                            candidate.final_score = 0.0
+                        else:
+                            body_blob = " ".join(
+                                str(t) for t in (candidate.lexical_matched_terms or set())
+                            ).casefold()
+                            summary_blob = str(candidate.summary or "").casefold()
+                            if tok in body_blob or tok in summary_blob:
+                                candidate.final_score = max(
+                                    0.0, candidate.final_score - 0.25
+                                )
+                        break
+            if candidate.final_score <= 0.0:
+                continue
             eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
