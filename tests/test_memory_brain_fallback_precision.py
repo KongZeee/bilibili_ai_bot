@@ -367,3 +367,50 @@ async def test_open_bangumi_query_seeds_atri(seeded_store):
     assert not result.is_empty
     titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
     assert any("ATRI" in t for t in titles)
+
+
+
+@pytest.mark.asyncio
+async def test_open_watch_excludes_bangumi_episode(tmp_path):
+    from bilibot.memory_brain import MemoryBrainService
+
+    brain = MemoryBrainService("acc", tmp_path / "acc")
+    await brain.begin_activity(
+        action_key="bg:1",
+        action_type="evaluate_bangumi_episode",
+        current_activity="观看番剧",
+        query="星际驿站",
+        scene="bangumi",
+        title="星际驿站 第3话",
+    )
+    await brain.finish_activity(
+        action_key="bg:1",
+        action_type="evaluate_bangumi_episode",
+        result_text="看完《星际驿站》第3话，评分8，想继续追。",
+        state="completed",
+        scene="bangumi",
+        title="星际驿站 第3话",
+    )
+    await brain.begin_activity(
+        action_key="v:1",
+        action_type="evaluate_proactive_video",
+        current_activity="观看视频",
+        query="Never Gonna",
+        scene="proactive_video",
+        title="【官方 MV】Never Gonna Give You Up - Rick Astley",
+    )
+    await brain.finish_activity(
+        action_key="v:1",
+        action_type="evaluate_proactive_video",
+        result_text="看完 Never Gonna Give You Up，评分9。",
+        state="completed",
+        scene="proactive_video",
+        title="【官方 MV】Never Gonna Give You Up - Rick Astley",
+    )
+    result = await brain.recall(
+        RecallQuery(current_message="你刚看了什么视频", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert any("Never Gonna" in t or "Rick" in t for t in titles)
+    assert not any("第3话" in t or "星际驿站" in t for t in titles)
