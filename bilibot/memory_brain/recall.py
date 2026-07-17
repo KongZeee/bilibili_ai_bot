@@ -52,6 +52,80 @@ _CONVERSATIONAL_FILLER_RE = re.compile(
     r"(你不是|是不是|有没有|能不能|可不可以|记得吗|还记得|发过|说过|看过|写过|吗|呢|啊|呀|吧|了)"
 )
 
+# Generic Chinese tokens that OR-FTS often matches across the whole library.
+# Matching only these (plus digits) is not deterministic proof under fallback.
+_LEXICAL_STOP_TERMS = frozenset(
+    {
+        "什么",
+        "怎么",
+        "怎样",
+        "为什么",
+        "哪个",
+        "哪些",
+        "这个",
+        "那个",
+        "今天",
+        "明天",
+        "昨天",
+        "现在",
+        "几点",
+        "在几",
+        "点了",
+        "一下",
+        "等于",
+        "多少",
+        "于多",
+        "帮我",
+        "我算",
+        "算一",
+        "建议",
+        "是什",
+        "的天",
+        "天的",
+        "可以",
+        "还是",
+        "没有",
+        "一个",
+        "我们",
+        "你们",
+        "他们",
+        "自己",
+        "进行",
+        "完成",
+        "开始",
+        "继续",
+        "通过",
+        "关于",
+        "以及",
+        "如果",
+        "还记得",
+        "记得",
+        "相关",
+        "内容",
+        "问题",
+        "时间",
+        "天气",
+        "午饭",
+        "预报",
+        "天气预报",
+    }
+)
+
+_UTILITY_QUERY_RE = re.compile(
+    r"(天气|预报|午饭|几点|几点了|现在几点|等于多少|算一下|\d+\s*[\*xX×]\s*\d+|换算|单位换算)"
+)
+
+
+def _is_content_lexical_term(term: str) -> bool:
+    t = str(term or "").strip().casefold()
+    if not t or t in _LEXICAL_STOP_TERMS:
+        return False
+    if re.fullmatch(r"[0-9_.:-]+", t):
+        return False
+    # Bigrams that are pure function-word glue (len 2 CJK often noisy) still ok
+    # if not stop-listed; multi-char content terms are preferred.
+    return True
+
 
 def _content_heavy_query(message: str) -> str:
     """Drop conversational fillers so FTS coverage is not diluted by function words.
@@ -253,6 +327,7 @@ class RecallCandidate:
     link_ids: set[str] = field(default_factory=set)
     vector_scores: dict[str, float] = field(default_factory=dict)
     lexical_coverages: dict[str, float] = field(default_factory=dict)
+    lexical_matched_terms: set[str] = field(default_factory=set)
     title: str = ""
     summary: str = ""
     source_type: str = ""
@@ -894,6 +969,12 @@ class RecallEngine:
                         lexical_coverage,
                         candidate.lexical_coverages.get(channel, 0.0),
                     )
+                matched = hit.get("lexical_matched_terms") or ()
+                if isinstance(matched, (list, tuple, set)):
+                    for term in matched:
+                        text = str(term or "").strip()
+                        if text:
+                            candidate.lexical_matched_terms.add(text)
             if vector_score is not None:
                 candidate.vector_scores[channel] = max(
                     vector_score,
@@ -1335,6 +1416,14 @@ class RecallEngine:
         if strong_vec:
             return True
         if not content_lex:
+            return False
+        content_terms = {
+            term
+            for term in (candidate.lexical_matched_terms or set())
+            if _is_content_lexical_term(term)
+        }
+        # Pure stopword/digit matches (现在/什么/等于/多少/17/19) are not evidence.
+        if not content_terms:
             return False
         max_lex = max(content_lex)
         dual_ok = sum(1 for cov in content_lex if cov >= 0.35) >= 2
