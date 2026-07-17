@@ -520,7 +520,14 @@ def decode_vector(blob: bytes, dimension: int) -> list[float]:
 class _VectorCacheEntry:
     """Immutable, model-scoped matrix and the rows represented by it."""
 
-    __slots__ = ("dimension", "matrix", "metadata")
+    __slots__ = (
+        "dimension",
+        "matrix",
+        "metadata",
+        "embedding_ids",
+        "target_ids",
+        "event_ids",
+    )
 
     def __init__(
         self,
@@ -528,10 +535,17 @@ class _VectorCacheEntry:
         dimension: int,
         matrix: Any,
         metadata: tuple[tuple[str, str, str], ...],
+        embedding_ids: Any = None,
+        target_ids: Any = None,
+        event_ids: Any = None,
     ) -> None:
         self.dimension = int(dimension)
         self.matrix = matrix
         self.metadata = metadata
+        # Parallel id arrays (optional) speed up top-k materialization.
+        self.embedding_ids = embedding_ids
+        self.target_ids = target_ids
+        self.event_ids = event_ids
 
 
 def _envelope_hash(envelope: ObservationEnvelope, sources: Sequence[SourceDocument]) -> str:
@@ -1736,10 +1750,20 @@ class MemoryBrainStore:
                 matrix = np.ascontiguousarray(matrix[finite], dtype=little_float32)
                 metadata = [metadata[index] for index in valid_indexes]
         matrix.setflags(write=False)
+        meta_tuple = tuple(metadata)
+        if meta_tuple:
+            embedding_ids = np.array([row[0] for row in meta_tuple], dtype=object)
+            target_ids = np.array([row[1] for row in meta_tuple], dtype=object)
+            event_ids = np.array([row[2] for row in meta_tuple], dtype=object)
+        else:
+            embedding_ids = target_ids = event_ids = None
         return _VectorCacheEntry(
             dimension=dimension,
             matrix=matrix,
-            metadata=tuple(metadata),
+            metadata=meta_tuple,
+            embedding_ids=embedding_ids,
+            target_ids=target_ids,
+            event_ids=event_ids,
         )
 
     @staticmethod
@@ -1769,15 +1793,27 @@ class MemoryBrainStore:
         else:
             candidate_idx = np.arange(n)
         cand_scores = scores[candidate_idx]
-        cand_target_ids = [entry.metadata[int(i)][1] for i in candidate_idx.tolist()]
-        order = sorted(
-            range(len(candidate_idx)),
-            key=lambda j: (-float(cand_scores[j]), cand_target_ids[j]),
-        )
+        target_ids = entry.target_ids
+        if target_ids is not None:
+            cand_target_ids = target_ids[candidate_idx]
+        else:
+            cand_target_ids = np.array(
+                [entry.metadata[int(i)][1] for i in candidate_idx.tolist()],
+                dtype=object,
+            )
+        # lexsort: last key is primary. Sort by target_id asc, then score desc.
+        order = np.lexsort((cand_target_ids, -cand_scores))
         ranked: list[dict[str, Any]] = []
-        for j in order:
+        embedding_ids = entry.embedding_ids
+        event_ids = entry.event_ids
+        for j in order.tolist():
             idx = int(candidate_idx[j])
-            embedding_id, target_id, event_id = entry.metadata[idx]
+            if embedding_ids is not None and event_ids is not None:
+                embedding_id = embedding_ids[idx]
+                target_id = target_ids[idx] if target_ids is not None else entry.metadata[idx][1]
+                event_id = event_ids[idx]
+            else:
+                embedding_id, target_id, event_id = entry.metadata[idx]
             ranked.append(
                 {
                     "embedding_id": embedding_id,
