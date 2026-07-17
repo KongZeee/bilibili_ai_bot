@@ -542,7 +542,7 @@ class MemoryBrainService:
                 if isinstance(row, Mapping)
                 and str(row.get("id") or "") != str(intent_event_id or "")
                 and self._is_self_activity_event(row)
-            ][: max(recent_cap * 8, 40)]
+            ][: max(recent_cap * 16, 80)]
             ids = [str(row.get("id") or "") for row in selected if row.get("id")]
             if not ids:
                 return []
