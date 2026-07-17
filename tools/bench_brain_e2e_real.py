@@ -359,6 +359,58 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
             else:
                 print(f"miss_hit:{a['source_type']}:{a['id']}:{a['needles'][:2]}:n={last_n}")
 
+        # Targeted continuity probes for ATRI noise + self dynamic paraphrase.
+        probe_ok = 0
+        probe_cases: list[tuple[str, list[str], list[str]]] = [
+            (
+                "追的那部 ATRI 怎么样了",
+                ["ATRI", "亚托莉", "探索 ATRI"],
+                ["90后", "鼓励式教育"],
+            ),
+            (
+                "你上次发的动态说了什么",
+                ["动态", "无限暖暖", "哈兰德", "白夜"],
+                ["迪奥の厨房", "炸鸡腿"],
+            ),
+            (
+                "你发过关于哈兰德的动态吗",
+                ["动态", "哈兰德", "无限暖暖", "白夜"],
+                [],
+            ),
+            (
+                "心情日记",
+                ["日记"],
+                ["狼王", "网络热传生物"],
+            ),
+        ]
+        for q, must_any, forbid_any in probe_cases:
+            result = await brain.recall(
+                RecallQuery(
+                    current_message=q,
+                    account_id=account_id,
+                    scene="reply_comment",
+                )
+            )
+            titles = " ".join(
+                str(ev.get("title") or "")
+                for ev in (getattr(result, "events", ()) or [])
+                if isinstance(ev, dict)
+            )
+            evidence = str(getattr(result, "prompt_evidence", "") or "")
+            blob = titles + "\n" + evidence
+            has_must = (not must_any) or any(m in blob for m in must_any if m)
+            has_forbid = any(f in blob for f in forbid_any if f)
+            if has_must and not has_forbid and not getattr(result, "is_empty", False):
+                probe_ok += 1
+                print(f"probe_ok:{q[:24]}")
+            else:
+                print(
+                    f"probe_fail:{q[:24]}:must={has_must}:forbid={has_forbid}"
+                    f":empty={getattr(result, 'is_empty', False)}"
+                )
+        probe_total = len(probe_cases)
+        probe_rate = 100.0 * probe_ok / probe_total if probe_total else 0.0
+
         reject_ok = 0
         reject_queries = (
             "今天的天气预报和午饭建议是什么？",
@@ -422,18 +474,21 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
         reject_rate = 100.0 * reject_ok / reject_total
         act_rate = 100.0 * act_ok / act_total
         e2e_score = (
-            0.50 * hit_rate
-            + 0.30 * reject_rate
-            + 0.15 * act_rate
+            0.40 * hit_rate
+            + 0.25 * reject_rate
+            + 0.20 * probe_rate
+            + 0.10 * act_rate
             + 0.05 * (100.0 * bili_ok)
         )
 
         print(f"e2e_score:{e2e_score:.4f}")
         print(f"hit_rate:{hit_rate:.4f}")
         print(f"reject_rate:{reject_rate:.4f}")
+        print(f"probe_rate:{probe_rate:.4f}")
         print(f"activity_rate:{act_rate:.4f}")
         print(f"hit_passed:{hit_ok}/{hit_total}")
         print(f"reject_passed:{reject_ok}/{reject_total}")
+        print(f"probe_passed:{probe_ok}/{probe_total}")
         print(f"activity_passed:{act_ok}/{act_total}")
         print("status:ok")
         return 0
