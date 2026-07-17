@@ -534,13 +534,15 @@ class MemoryBrainService:
             rows = await asyncio.to_thread(
                 self.store.recent_events, max(40, recent_cap * 8)
             )
+            # Scan deeper than recent_cap so type-diversity can still surface
+            # older distinctive experiences when the newest window is homogeneous.
             selected = [
                 row
                 for row in rows
                 if isinstance(row, Mapping)
                 and str(row.get("id") or "") != str(intent_event_id or "")
                 and self._is_self_activity_event(row)
-            ][: recent_cap * 2]
+            ][: max(recent_cap * 8, 40)]
             ids = [str(row.get("id") or "") for row in selected if row.get("id")]
             if not ids:
                 return []
