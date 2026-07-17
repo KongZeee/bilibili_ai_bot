@@ -1485,6 +1485,17 @@ class RecallEngine:
             # content-bearing evidence and strict coverage for single-channel hits.
             if not RecallEngine._fallback_has_content_evidence(candidate):
                 continue
+            # Prefer multi-term content matches over single common noun hits
+            # (e.g. 日记+心情 beats many videos that only mention 心情).
+            content_term_count = sum(
+                1
+                for term in (candidate.lexical_matched_terms or set())
+                if _is_content_lexical_term(term)
+            )
+            if content_term_count > 0:
+                candidate.final_score = min(
+                    1.0, candidate.final_score + 0.05 * min(content_term_count, 4)
+                )
             eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
