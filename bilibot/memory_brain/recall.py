@@ -1026,9 +1026,11 @@ class RecallEngine:
                     cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
                     recent_watch.append(cand)
                 if recent_watch:
+                    # Open watch questions need the latest 1-2 watches, not a
+                    # full MAX_FALLBACK_EVENTS dump of older video history.
                     selected = RecallEngine._bounded_selection(
                         recent_watch,
-                        max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
+                        max_events=min(2, MAX_FALLBACK_EVENTS, self.max_events),
                         max_associations=0,
                     )
                 else:
