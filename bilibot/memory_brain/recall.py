@@ -1301,7 +1301,10 @@ class RecallEngine:
         )
 
         self._score_candidates(candidates)
-        seeds = [item.event_id for item in self._rough_order(candidates)[:10]]
+        seed_n = 10
+        if str(getattr(policy, "mode", "") or "") in {"dream", "creative"}:
+            seed_n = 14  # broader associative frontier for high-entropy modes
+        seeds = [item.event_id for item in self._rough_order(candidates)[:seed_n]]
         hop_k = max(1, min(3, int(getattr(policy, "hop_k", 1) or 1)))
         graph_limit = 30 if hop_k <= 1 else 40
         frontier = list(seeds)
