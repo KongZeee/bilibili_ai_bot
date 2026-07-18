@@ -48,6 +48,11 @@ class LifeState:
     location: str = ""
     conditions: List[LifeCondition] = field(default_factory=list)
     dream_afterglow: str = ""
+    # Short continuous self: recent closed activities for prompt injection.
+    # Each item is a one-line human string, newest first, max ~8.
+    salient_recent: List[str] = field(default_factory=list)
+    # Open threads e.g. "小说:《xx》续写中" / "追番:ATRI" — free text, max ~6.
+    ongoing_threads: List[str] = field(default_factory=list)
     updated_at: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -61,6 +66,8 @@ class LifeState:
             "location": self.location,
             "conditions": [c.to_dict() for c in self.conditions],
             "dream_afterglow": self.dream_afterglow,
+            "salient_recent": list(self.salient_recent or [])[:8],
+            "ongoing_threads": list(self.ongoing_threads or [])[:6],
             "updated_at": self.updated_at,
         }
 
@@ -73,6 +80,16 @@ class LifeState:
             energy = max(0, min(100, int(energy)))
         except (TypeError, ValueError):
             energy = 70
+        salient = [
+            str(x).strip()
+            for x in (d.get("salient_recent") or [])
+            if str(x or "").strip()
+        ][:8]
+        threads = [
+            str(x).strip()
+            for x in (d.get("ongoing_threads") or [])
+            if str(x or "").strip()
+        ][:6]
         return cls(
             date=str(d.get("date") or ""),
             energy=energy,
@@ -83,6 +100,8 @@ class LifeState:
             location=str(d.get("location") or ""),
             conditions=conditions,
             dream_afterglow=str(d.get("dream_afterglow") or ""),
+            salient_recent=salient,
+            ongoing_threads=threads,
             updated_at=str(d.get("updated_at") or ""),
         )
 

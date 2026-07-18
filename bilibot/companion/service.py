@@ -588,6 +588,53 @@ class CompanionLifeService:
             "snippets": snippets[:limit],
         }
 
+    def _push_salient_self(
+        self,
+        *,
+        line: str,
+        thread: str = "",
+        close_thread_prefix: str = "",
+    ) -> None:
+        """Update continuous self surface after a closed companion activity."""
+        if not self.enabled:
+            return
+        text = " ".join(str(line or "").replace("\x00", "").split())
+        if not text:
+            return
+        try:
+            state = self.ensure_life_state()
+        except Exception:
+            return
+        recent = [
+            str(x).strip()
+            for x in (getattr(state, "salient_recent", None) or [])
+            if str(x or "").strip()
+        ]
+        # Dedupe exact / prefix-similar lines.
+        recent = [x for x in recent if x != text and not x.startswith(text[:16])]
+        recent.insert(0, text[:120])
+        state.salient_recent = recent[:8]
+        threads = [
+            str(x).strip()
+            for x in (getattr(state, "ongoing_threads", None) or [])
+            if str(x or "").strip()
+        ]
+        if close_thread_prefix:
+            pref = close_thread_prefix.strip()
+            threads = [t for t in threads if not t.startswith(pref)]
+        thr = " ".join(str(thread or "").replace("\x00", "").split())
+        if thr:
+            threads = [t for t in threads if t != thr and not t.startswith(thr[:12])]
+            threads.insert(0, thr[:80])
+        state.ongoing_threads = threads[:6]
+        state.updated_at = _now_iso()
+        try:
+            self.store.save_life_state(state)
+        except Exception:
+            logger.debug(
+                "[%s] salient self save failed", self.account_id, exc_info=True
+            )
+
     async def _finish_activity_memory(
         self,
         *,
@@ -599,6 +646,9 @@ class CompanionLifeService:
         metadata: Optional[Dict[str, Any]] = None,
         state: str = "completed",
         pause_on_error: bool = True,
+        salient_line: str = "",
+        ongoing_thread: str = "",
+        close_thread_prefix: str = "",
     ) -> bool:
         """Close an activity lifecycle after its domain output is archived.
 
@@ -626,6 +676,17 @@ class CompanionLifeService:
                     "source_module": "companion",
                 },
             )
+            if terminal == "completed":
+                line = (
+                    str(salient_line or "").strip()
+                    or str(result_text or "").strip()
+                    or str(title or action_type)
+                )
+                self._push_salient_self(
+                    line=line[:120],
+                    thread=ongoing_thread,
+                    close_thread_prefix=close_thread_prefix,
+                )
             return True
         except Exception as exc:
             # Domain output may already be committed; do not regenerate a
@@ -711,6 +772,20 @@ class CompanionLifeService:
             lines.append(f"念头：{seed}")
         if state.dream_afterglow:
             lines.append(f"梦境余韵：{state.dream_afterglow[:80]}")
+        threads = [
+            str(x).strip()
+            for x in (getattr(state, "ongoing_threads", None) or [])
+            if str(x or "").strip()
+        ]
+        if threads:
+            lines.append("进行中：" + "；".join(threads[:4]))
+        salient = [
+            str(x).strip()
+            for x in (getattr(state, "salient_recent", None) or [])
+            if str(x or "").strip()
+        ]
+        if salient:
+            lines.append("刚经历：" + "；".join(s[:40] for s in salient[:3]))
         if detail.summary and detail.date == _today():
             lines.append(f"时段细节：{detail.summary[:100]}")
         if near:
@@ -1228,6 +1303,7 @@ class CompanionLifeService:
             scene="life_plan",
             title=f"日程 {today}",
             metadata={"date": today},
+            salient_line=f"写好了今天的日程安排（{today}）",
         )
         self.store.save_daily_plan(plan)
         self._sync_state_from_plan(plan)
@@ -1345,6 +1421,7 @@ class CompanionLifeService:
             scene="life_plan",
             title=f"生活时段 {window}",
             metadata={"segment_key": seg_key, "date": plan.date},
+            salient_line=f"细化了生活时段：{window}",
         )
         self.store.save_story_detail(detail)
         state.activity = target.activity
@@ -1471,6 +1548,10 @@ class CompanionLifeService:
             scene="dream",
             title=f"梦境 {today}",
             metadata={"date": today},
+            salient_line=(
+                f"做了个梦「{dream.label or '无题'}」"
+                f"{('：' + (dream.content or '')[:36]) if dream.content else ''}"
+            ),
         )
         self.store.save_latest_dream(dream)
         # merge factors into fragment pool
@@ -1590,6 +1671,10 @@ class CompanionLifeService:
             scene="diary",
             title=f"日记 {today}",
             metadata={"date": today},
+            salient_line=(
+                f"写了日记"
+                f"{('：' + str(getattr(entry, 'summary', '') or '')[:40]) if getattr(entry, 'summary', '') else ''}"
+            ),
         )
         # prepend diary list only after the account brain confirms the source.
         diaries = [entry] + [d for d in diaries if d.date != today]
@@ -1857,6 +1942,8 @@ class CompanionLifeService:
             scene="exploration",
             title=f"主动探索 {_today()}",
             metadata={"date": _today()},
+            salient_line=f"探索了「{(query or '')[:40]}」",
+            ongoing_thread=f"兴趣：{(query or '')[:36]}" if query else "",
         )
         # Local companion surface becomes visible only after the brain commit.
         notes = [note] + self.store.get_explore_notes()
@@ -1993,6 +2080,8 @@ class CompanionLifeService:
                         scene="creative",
                         title=f"新创作项目 {_today()}",
                         metadata={"date": _today(), "project_slot": len(projects)},
+                        salient_line=f"开了新创作《{proj.title}》",
+                        ongoing_thread=f"小说：《{proj.title}》写作中",
                     )
                     projects = [proj] + projects
                     self.store.save_projects(projects[:20])
@@ -2108,6 +2197,15 @@ class CompanionLifeService:
                 "project_id": proj.id,
                 "chunk_index": creative_chunk_index,
             },
+            salient_line=f"续写了《{proj.title}》约{chunk.chars}字",
+            ongoing_thread=(
+                f"小说：《{proj.title}》已完成"
+                if proj.status == "finished"
+                else f"小说：《{proj.title}》写作中"
+            ),
+            close_thread_prefix=(
+                f"小说：《{proj.title}》" if proj.status == "finished" else ""
+            ),
         )
         # replace in list only after the account brain confirms the chunk.
         projects = [proj if p.id == proj.id else p for p in projects]
