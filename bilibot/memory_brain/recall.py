@@ -194,7 +194,15 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
             entropy="mid",
             hop_k=1,
             max_associations=2,
-            channel_weights=_weights_with(global_recent=0.35, graph=0.65),
+            channel_weights=_weights_with(
+                global_recent=0.40,
+                graph=0.75,
+                chunk_vector=1.7,
+                event_vector=1.35,
+                # Exploration blends interest + recent self; demote pure chat FTS.
+                chunk_fts=1.1,
+                event_fts=0.95,
+            ),
             prefer_self_recent=True,
             demote_inbound_comment=True,
         )
