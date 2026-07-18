@@ -39,7 +39,7 @@ from .store import (
     normalize_search_text,
     normalize_vector,
 )
-from .recall import RecallQuery, RecallResult
+from .recall import RecallQuery, RecallResult, RetrievalPolicy, policy_for_mode
 from .redaction import PrivateMessageRedactor, RedactionResult
 from .service import ActivityMemoryContext, MemoryBrainService
 from .worker import PersistentMemoryWorker, WorkerRunReport
@@ -67,7 +67,9 @@ __all__ = [
     "ReingestBlockedError",
     "RecallQuery",
     "RecallResult",
+    "RetrievalPolicy",
     "RedactionResult",
+    "policy_for_mode",
     "SourceDocument",
     "VectorDimensionError",
     "WorkerRunReport",

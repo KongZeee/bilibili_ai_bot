@@ -456,6 +456,23 @@ class MemoryBrainService:
                 f"RecallQuery account_id={query.account_id!r} does not match "
                 f"service account_id={self.account_id!r}"
             )
+        # Infer RetrievalPolicy mode before scene normalize collapses dream→companion.
+        if not str(getattr(query, "mode", "") or "").strip():
+            raw_scene = str(query.scene or "").strip().casefold()
+            if raw_scene in {
+                "dream",
+                "creative",
+                "diary",
+                "exploration",
+                "explore",
+                "life_plan",
+                "companion_dream",
+                "companion_diary",
+                "companion_creative",
+                "companion_explore",
+                "companion_exploration",
+            }:
+                object.__setattr__(query, "mode", raw_scene)
         # Normalize scene for traces / prompt consumers
         object.__setattr__(
             query, "scene", RecallQuery.normalize_scene(query.scene)
@@ -517,6 +534,9 @@ class MemoryBrainService:
         recent_limit: int = 8,
         recall_limit: int = 5,
         intent_event_id: str = "",
+        mode: str = "",
+        life_needles: Sequence[str] | None = None,
+        mood_cues: Sequence[str] | None = None,
     ) -> ActivityMemoryContext:
         """Read a cross-scene activity context with a guaranteed recent lane.
 
@@ -656,6 +676,33 @@ class MemoryBrainService:
                         break
             return filtered
 
+        raw_scene = str(scene or "").strip().casefold()
+        resolved_mode = str(mode or "").strip().casefold()
+        if not resolved_mode and raw_scene in {
+            "dream",
+            "creative",
+            "diary",
+            "exploration",
+            "explore",
+            "life_plan",
+            "companion_dream",
+            "companion_diary",
+            "companion_creative",
+            "companion_explore",
+            "companion_exploration",
+            "write_dream",
+            "write_diary",
+            "write_creative_chunk",
+        }:
+            resolved_mode = raw_scene
+        needle_list = tuple(
+            str(x).strip()
+            for x in (life_needles or ())
+            if str(x or "").strip()
+        )[:16]
+        mood_list = tuple(
+            str(x).strip() for x in (mood_cues or ()) if str(x or "").strip()
+        )[:8]
         recall_query = RecallQuery(
             current_message=(str(query or "").strip() or activity),
             account_id=self.account_id,
@@ -665,6 +712,9 @@ class MemoryBrainService:
             oid=str(oid or ""),
             scene=scene,
             limit=recall_cap,
+            mode=resolved_mode,
+            life_needles=needle_list,
+            mood_cues=mood_list,
         )
 
         recent_result, recall_result = await asyncio.gather(
@@ -763,6 +813,9 @@ class MemoryBrainService:
         metadata: Mapping[str, Any] | None = None,
         recent_limit: int = 8,
         recall_limit: int = 5,
+        mode: str = "",
+        life_needles: Sequence[str] | None = None,
+        mood_cues: Sequence[str] | None = None,
     ) -> ActivityMemoryContext:
         """Durably record current intent, then read the context for generation."""
         from .ingestion import bot_action_observation
@@ -809,6 +862,9 @@ class MemoryBrainService:
             recent_limit=recent_limit,
             recall_limit=recall_limit,
             intent_event_id=intent_event_id,
+            mode=mode,
+            life_needles=life_needles,
+            mood_cues=mood_cues,
         )
 
     async def finish_activity(

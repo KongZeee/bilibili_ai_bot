@@ -614,6 +614,23 @@ class CompanionLifeService:
                 # empty then archive-output behavior.
                 return empty
             try:
+                life_needles: List[str] = []
+                mood_cues: List[str] = []
+                try:
+                    needle_blob = self._self_state_recall_needles() or ""
+                    life_needles = [
+                        t
+                        for t in re.findall(
+                            r"[\u4e00-\u9fffA-Za-z0-9]{2,24}", needle_blob
+                        )
+                    ][:12]
+                    state = self.ensure_life_state()
+                    if getattr(state, "mood_bias", None):
+                        mood_cues.append(str(state.mood_bias)[:20])
+                    if getattr(state, "dream_afterglow", None):
+                        mood_cues.append(str(state.dream_afterglow)[:40])
+                except Exception:
+                    pass
                 activity = await begin(
                     action_key=action_key,
                     action_type=action_type or scene,
@@ -630,6 +647,9 @@ class CompanionLifeService:
                     },
                     recent_limit=max(6, limit),
                     recall_limit=limit,
+                    mode=str(scene or "").strip().casefold(),
+                    life_needles=life_needles,
+                    mood_cues=mood_cues,
                 )
             except Exception as exc:
                 self._pause_for_memory_failure(
@@ -672,11 +692,28 @@ class CompanionLifeService:
             if callable(getattr(self.memory_brain, "recall", None)):
                 from bilibot.memory_brain import RecallQuery
 
+                life_needles: List[str] = []
+                mood_cues: List[str] = []
+                try:
+                    needle_blob = self._self_state_recall_needles() or ""
+                    life_needles = [
+                        t for t in re.findall(r"[\u4e00-\u9fffA-Za-z0-9]{2,24}", needle_blob)
+                    ][:12]
+                    state = self.ensure_life_state()
+                    if getattr(state, "mood_bias", None):
+                        mood_cues.append(str(state.mood_bias)[:20])
+                    if getattr(state, "dream_afterglow", None):
+                        mood_cues.append(str(state.dream_afterglow)[:40])
+                except Exception:
+                    pass
                 result = await self.memory_brain.recall(
                     RecallQuery(
                         current_message=q,
                         account_id=self.account_id or "",
                         scene=scene,
+                        mode=str(scene or "").strip().casefold(),
+                        life_needles=life_needles,
+                        mood_cues=mood_cues,
                     )
                 )
                 if result is not None:

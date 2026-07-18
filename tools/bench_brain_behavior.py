@@ -627,6 +627,157 @@ async def _run() -> int:
             else:
                 notes.append(f"reject_fail:{q[:12]}:len={len(evidence)}")
 
+        # ── C14 living-brain probes (policy / multi-hop / life bias) ────
+        # These raise the bar above "same RecallEngine + query bag".
+        try:
+            from bilibot.memory_brain.recall import policy_for_mode
+
+            dream_pol = policy_for_mode("dream")
+            reply_pol = policy_for_mode("reply")
+            creative_pol = policy_for_mode("creative")
+            injection_total += 1
+            policy_diff = (
+                dream_pol.hop_k > reply_pol.hop_k
+                and dream_pol.weight("graph") > reply_pol.weight("graph")
+                and dream_pol.fallback_direct_threshold
+                < reply_pol.fallback_direct_threshold
+                and creative_pol.weight("graph") > reply_pol.weight("graph")
+                and dream_pol.demote_inbound_comment
+                and not reply_pol.demote_inbound_comment
+            )
+            if policy_diff:
+                injection_ok += 1
+                notes.append("injection_ok:policy_dream_neq_reply")
+            else:
+                notes.append(
+                    f"injection_fail:policy_same:"
+                    f"dream_hop={dream_pol.hop_k}:reply_hop={reply_pol.hop_k}:"
+                    f"dream_graph={dream_pol.weight('graph')}:"
+                    f"reply_graph={reply_pol.weight('graph')}"
+                )
+        except Exception as exc:
+            injection_total += 1
+            notes.append(f"injection_fail:policy:{type(exc).__name__}")
+
+        # Multi-hop: A→B→C chain; dream mode should surface C from seed A.
+        try:
+            inj_a = await brain.archive_observation_async(
+                text_observation(
+                    account_id="behavior",
+                    idempotency_key="graph:seed:a",
+                    source_type="bot_action",
+                    event_type="bot_experience",
+                    text="看完《星尘钥匙序章》，评分9，心情: 入迷。独特细节：蓝羽怀表。",
+                    title="星尘钥匙序章",
+                    scene="proactive_video",
+                    importance=0.75,
+                )
+            )
+            inj_b = await brain.archive_observation_async(
+                text_observation(
+                    account_id="behavior",
+                    idempotency_key="graph:mid:b",
+                    source_type="diary",
+                    event_type="diary",
+                    text="日记：白天看了星尘钥匙，夜里还想着蓝羽怀表滴答声。",
+                    title="日记 蓝羽怀表",
+                    scene="diary",
+                    importance=0.6,
+                )
+            )
+            inj_c = await brain.archive_observation_async(
+                text_observation(
+                    account_id="behavior",
+                    idempotency_key="graph:leaf:c",
+                    source_type="creative",
+                    event_type="creative_chunk",
+                    text="小说里出现了蓝羽怀表，齿轮刻着「星尘」二字。",
+                    title="蓝羽怀表续写",
+                    scene="creative",
+                    importance=0.55,
+                )
+            )
+            # A→B and B→C links (1-hop only would miss C from A alone).
+            brain.store.upsert_links(
+                inj_a.event_id,
+                [
+                    {
+                        "target_event_id": inj_b.event_id,
+                        "relation_type": "related_to",
+                        "weight": 0.85,
+                        "evidence_ids": [inj_a.event_id, inj_b.event_id],
+                    }
+                ],
+            )
+            brain.store.upsert_links(
+                inj_b.event_id,
+                [
+                    {
+                        "target_event_id": inj_c.event_id,
+                        "relation_type": "related_to",
+                        "weight": 0.85,
+                        "evidence_ids": [inj_b.event_id, inj_c.event_id],
+                    }
+                ],
+            )
+            injection_total += 1
+            hop_ctx = await brain.begin_activity(
+                action_key="companion_dream:graph-hop",
+                action_type="write_dream",
+                current_activity="正在整理梦境，会联想到最近经历过的星尘与怀表。",
+                query="最近经历 看了 日记 创作",
+                scene="dream",
+                title="梦境 graph-hop",
+                mode="dream",
+                life_needles=["星尘钥匙", "蓝羽怀表", "入迷"],
+                mood_cues=["入迷"],
+            )
+            hop_blob = _blob(hop_ctx)
+            # Must surface either the leaf creative detail or the mid diary under
+            # associative dream policy (not only exact FTS on query bag).
+            sees_chain = _has_any(
+                hop_blob,
+                ["蓝羽怀表", "星尘钥匙", "齿轮", "星尘", "日记 蓝羽"],
+            )
+            if sees_chain:
+                injection_ok += 1
+                notes.append("injection_ok:dream_multihop_or_life_bias")
+            else:
+                notes.append(
+                    f"injection_fail:multihop_miss:chars={len(hop_blob)}"
+                )
+            await brain.finish_activity(
+                action_key="companion_dream:graph-hop",
+                action_type="write_dream",
+                result_text="梦见蓝羽怀表在星尘里旋转。",
+                state="completed",
+                scene="dream",
+                title="梦境 graph-hop",
+            )
+        except Exception as exc:
+            injection_total += 1
+            notes.append(f"injection_fail:multihop:{type(exc).__name__}:{exc}")
+
+        # Public scene must not leak PM body (hard gate probe, counted in reject).
+        try:
+            reject_total += 1
+            public = await brain.recall(
+                RecallQuery(
+                    current_message="你最近在忙什么有趣的事",
+                    account_id="behavior",
+                    scene="reply_comment",
+                )
+            )
+            pub_blob = str(getattr(public, "prompt_evidence", "") or "")
+            if "密钥ABC" in pub_blob or "不要泄露" in pub_blob:
+                notes.append("reject_fail:pm_leak_to_public")
+            else:
+                reject_ok += 1
+                notes.append("reject_ok:pm_no_public_leak")
+        except Exception as exc:
+            reject_total += 1
+            notes.append(f"reject_fail:pm_leak_probe:{type(exc).__name__}")
+
         inj_rate = 100.0 * injection_ok / injection_total if injection_total else 0.0
         life_rate = (
             100.0 * lifecycle_ok / lifecycle_total if lifecycle_total else 0.0

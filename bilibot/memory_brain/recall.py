@@ -46,6 +46,162 @@ CHANNEL_WEIGHTS: Mapping[str, float] = {
     "global_recent": 0.1,
 }
 
+
+@dataclass(frozen=True)
+class RetrievalPolicy:
+    """Mode-conditioned recall knobs (C14): not just query string rewrites.
+
+    ``entropy`` is a soft label for traces (low|mid|high). Channel weights and
+    thresholds actually change ranking; hop_k expands graph walk depth.
+    """
+
+    mode: str = "reply"
+    entropy: str = "low"
+    hop_k: int = 1
+    max_associations: int = 2
+    direct_threshold: float = DIRECT_THRESHOLD
+    association_threshold: float = ASSOCIATION_THRESHOLD
+    fallback_direct_threshold: float = FALLBACK_DIRECT_THRESHOLD
+    fallback_association_threshold: float = FALLBACK_ASSOCIATION_THRESHOLD
+    channel_weights: Mapping[str, float] = field(default_factory=lambda: dict(CHANNEL_WEIGHTS))
+    mood_bias: float = 0.0
+    prefer_self_recent: bool = False
+    demote_inbound_comment: bool = False
+
+    def weight(self, channel: str) -> float:
+        weights = self.channel_weights or CHANNEL_WEIGHTS
+        try:
+            return float(weights.get(channel, CHANNEL_WEIGHTS.get(channel, 0.0)))
+        except (TypeError, ValueError):
+            return float(CHANNEL_WEIGHTS.get(channel, 0.0))
+
+
+def _weights_with(**overrides: float) -> dict[str, float]:
+    base = dict(CHANNEL_WEIGHTS)
+    for key, value in overrides.items():
+        if key in base:
+            base[key] = float(value)
+    return base
+
+
+def policy_for_mode(mode: str | None) -> RetrievalPolicy:
+    """Map generation/QA mode onto a RetrievalPolicy (C14 scene recipes)."""
+    m = str(mode or "").strip().casefold()
+    aliases = {
+        "reply_comment": "reply",
+        "private_message": "reply",
+        "private_reply": "reply",
+        "pm": "reply",
+        "proactive_video": "reply",
+        "bangumi": "reply",
+        "dynamic_post": "reply",
+        "companion": "companion",
+        "exploration": "explore",
+        "explore": "explore",
+        "life_plan": "diary",
+        "weekly_summary": "diary",
+        "write_dream": "dream",
+        "write_diary": "diary",
+        "write_creative_chunk": "creative",
+        "companion_dream": "dream",
+        "companion_diary": "diary",
+        "companion_creative": "creative",
+        "companion_explore": "explore",
+    }
+    m = aliases.get(m, m)
+    if m in {"dream"}:
+        return RetrievalPolicy(
+            mode="dream",
+            entropy="high",
+            hop_k=2,
+            max_associations=3,
+            # Lower gates so weak associative / graph hits can enter the workspace.
+            direct_threshold=max(0.55, DIRECT_THRESHOLD - 0.12),
+            association_threshold=max(0.62, ASSOCIATION_THRESHOLD - 0.12),
+            fallback_direct_threshold=max(0.28, FALLBACK_DIRECT_THRESHOLD - 0.08),
+            fallback_association_threshold=max(0.40, FALLBACK_ASSOCIATION_THRESHOLD - 0.10),
+            channel_weights=_weights_with(
+                graph=1.35,
+                chunk_vector=1.9,
+                event_vector=1.5,
+                global_recent=0.45,
+                speaker_recent=0.15,
+                chunk_fts=1.25,
+                event_fts=1.0,
+                context=0.55,
+            ),
+            mood_bias=0.12,
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
+    if m in {"creative"}:
+        return RetrievalPolicy(
+            mode="creative",
+            entropy="high",
+            hop_k=2,
+            max_associations=3,
+            direct_threshold=max(0.58, DIRECT_THRESHOLD - 0.10),
+            association_threshold=max(0.65, ASSOCIATION_THRESHOLD - 0.10),
+            fallback_direct_threshold=max(0.30, FALLBACK_DIRECT_THRESHOLD - 0.06),
+            fallback_association_threshold=max(0.42, FALLBACK_ASSOCIATION_THRESHOLD - 0.08),
+            channel_weights=_weights_with(
+                graph=1.15,
+                chunk_vector=1.85,
+                event_vector=1.45,
+                global_recent=0.35,
+                chunk_fts=1.35,
+                event_fts=1.05,
+            ),
+            mood_bias=0.06,
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
+    if m in {"diary"}:
+        return RetrievalPolicy(
+            mode="diary",
+            entropy="mid",
+            hop_k=1,
+            max_associations=2,
+            channel_weights=_weights_with(
+                global_recent=0.55,
+                graph=0.7,
+                speaker_recent=0.2,
+            ),
+            mood_bias=0.08,
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
+    if m in {"explore", "exploration"}:
+        return RetrievalPolicy(
+            mode="explore",
+            entropy="mid",
+            hop_k=1,
+            max_associations=2,
+            channel_weights=_weights_with(global_recent=0.35, graph=0.65),
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
+    if m in {"companion"}:
+        return RetrievalPolicy(
+            mode="companion",
+            entropy="mid",
+            hop_k=1,
+            max_associations=2,
+            channel_weights=_weights_with(global_recent=0.4, graph=0.7),
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
+    # Social / reply / default: high precision, shallow graph.
+    return RetrievalPolicy(
+        mode="reply",
+        entropy="low",
+        hop_k=1,
+        max_associations=2,
+        channel_weights=dict(CHANNEL_WEIGHTS),
+        prefer_self_recent=False,
+        demote_inbound_comment=False,
+    )
+
 _BVID_RE = re.compile(r"(?i)\bBV[0-9A-Za-z]{10}\b")
 _STABLE_ID_RE = re.compile(r"(?i)\b(?:evt|event|mem|memory)_[0-9A-Za-z_-]{4,}\b")
 _QUOTED_RE = re.compile(r"[\"'“‘《]([^\"'”’》]{1,80})[\"'”’》]")
@@ -342,6 +498,10 @@ class RecallQuery:
     - Hybrid channels always include account-wide recent events (Bot self
       experiences: video / bangumi / dynamic / companion) plus optional
       speaker-recent; never speaker-only.
+    - ``mode`` / ``policy`` select RetrievalPolicy (dream/creative ≠ reply).
+      When omitted, mode is inferred from the pre-normalize scene string so
+      ``scene="dream"`` still keeps companion-facing traces while using dream
+      entropy (C14).
     """
 
     current_message: str
@@ -355,6 +515,10 @@ class RecallQuery:
     explicit_ids: Sequence[str] = field(default_factory=tuple)
     entity_hints: Sequence[str] = field(default_factory=tuple)
     limit: int = 0  # 0 → engine defaults (max_events); >0 caps injected events
+    mode: str = ""  # dream|creative|diary|explore|reply|… — drives RetrievalPolicy
+    policy: RetrievalPolicy | None = None
+    mood_cues: Sequence[str] = field(default_factory=tuple)
+    life_needles: Sequence[str] = field(default_factory=tuple)
 
     def recent_context(self, max_turns: int = 6, max_chars: int = 1200) -> str:
         parts = [_turn_text(item) for item in tuple(self.recent_turns)[-max_turns:]]
@@ -362,6 +526,34 @@ class RecallQuery:
         if len(text) > max_chars:
             text = text[-max_chars:]
         return text
+
+    def resolved_mode(self) -> str:
+        if str(self.mode or "").strip():
+            return str(self.mode).strip().casefold()
+        raw_scene = str(self.scene or "").strip().casefold()
+        if raw_scene in {
+            "dream",
+            "creative",
+            "diary",
+            "exploration",
+            "explore",
+            "life_plan",
+            "companion_dream",
+            "companion_diary",
+            "companion_creative",
+            "companion_explore",
+            "companion_exploration",
+            "write_dream",
+            "write_diary",
+            "write_creative_chunk",
+        }:
+            return raw_scene
+        return raw_scene or "reply"
+
+    def resolved_policy(self) -> RetrievalPolicy:
+        if isinstance(self.policy, RetrievalPolicy):
+            return self.policy
+        return policy_for_mode(self.resolved_mode())
 
     @classmethod
     def normalize_scene(cls, scene: str) -> str:
@@ -404,6 +596,24 @@ class RecallQuery:
         payload = dict(value)
         if "message" in payload and "current_message" not in payload:
             payload["current_message"] = payload.pop("message")
+        # Capture mode before scene normalize collapses dream→companion.
+        raw_scene = str(payload.get("scene") or "")
+        if not str(payload.get("mode") or "").strip() and raw_scene:
+            inferred = str(raw_scene).strip().casefold()
+            if inferred in {
+                "dream",
+                "creative",
+                "diary",
+                "exploration",
+                "explore",
+                "life_plan",
+                "companion_dream",
+                "companion_diary",
+                "companion_creative",
+                "companion_explore",
+                "companion_exploration",
+            }:
+                payload["mode"] = inferred
         # Drop unknown keys so older/newer callers stay compatible
         known = {f.name for f in cls.__dataclass_fields__.values()}  # type: ignore[attr-defined]
         cleaned = {k: v for k, v in payload.items() if k in known}
@@ -414,6 +624,15 @@ class RecallQuery:
                 cleaned["limit"] = max(0, int(cleaned["limit"] or 0))
             except (TypeError, ValueError):
                 cleaned["limit"] = 0
+        if "policy" in cleaned and cleaned["policy"] is not None:
+            if not isinstance(cleaned["policy"], RetrievalPolicy):
+                cleaned.pop("policy", None)
+        for seq_key in ("mood_cues", "life_needles", "explicit_ids", "entity_hints"):
+            if seq_key in cleaned and cleaned[seq_key] is not None:
+                if isinstance(cleaned[seq_key], str):
+                    cleaned[seq_key] = [cleaned[seq_key]]
+                elif not isinstance(cleaned[seq_key], (list, tuple)):
+                    cleaned[seq_key] = ()
         return cls(**cleaned)
 
 
@@ -450,7 +669,10 @@ class RecallCandidate:
         return tuple(
             sorted(
                 self.channel_ranks,
-                key=lambda channel: (-CHANNEL_WEIGHTS.get(channel, 0.0), channel),
+                key=lambda channel: (
+                    -float(CHANNEL_WEIGHTS.get(channel, 0.0)),
+                    channel,
+                ),
             )
         )
 
@@ -787,6 +1009,23 @@ class RecallEngine:
         if not isinstance(query, RecallQuery):
             query = RecallQuery.from_mapping(query)
         else:
+            # Infer mode from raw scene BEFORE normalize collapses dream→companion.
+            if not str(getattr(query, "mode", "") or "").strip():
+                raw_scene = str(query.scene or "").strip().casefold()
+                if raw_scene in {
+                    "dream",
+                    "creative",
+                    "diary",
+                    "exploration",
+                    "explore",
+                    "life_plan",
+                    "companion_dream",
+                    "companion_diary",
+                    "companion_creative",
+                    "companion_explore",
+                    "companion_exploration",
+                }:
+                    object.__setattr__(query, "mode", raw_scene)
             # Normalize scene even when constructed directly
             object.__setattr__(
                 query,
@@ -794,6 +1033,12 @@ class RecallEngine:
                 RecallQuery.normalize_scene(query.scene),
             )
         self._validate_account(query)
+        policy = query.resolved_policy()
+        self._active_policy = policy
+        # Per-call association budget may exceed engine default for high-entropy modes.
+        self._active_max_associations = max(
+            0, min(4, int(policy.max_associations or self.max_associations))
+        )
         started = time.perf_counter()
         errors: dict[str, str] = {}
         candidates: dict[str, RecallCandidate] = {}
@@ -1031,11 +1276,39 @@ class RecallEngine:
 
         self._score_candidates(candidates)
         seeds = [item.event_id for item in self._rough_order(candidates)[:10]]
-        if seeds:
+        hop_k = max(1, min(3, int(getattr(policy, "hop_k", 1) or 1)))
+        graph_limit = 30 if hop_k <= 1 else 40
+        frontier = list(seeds)
+        seen_graph_seeds: set[str] = set(frontier)
+        for _hop in range(hop_k):
+            if not frontier:
+                break
             await self._collect_store_channel(
-                candidates, errors, "graph", "related_events", seeds, limit=30
+                candidates,
+                errors,
+                "graph",
+                "related_events",
+                frontier,
+                limit=graph_limit,
             )
             self._score_candidates(candidates)
+            if _hop + 1 >= hop_k:
+                break
+            # Expand from newly strong graph hits for multi-hop (C14).
+            next_frontier: list[str] = []
+            for item in self._rough_order(candidates)[:16]:
+                eid = item.event_id
+                if eid in seen_graph_seeds:
+                    continue
+                if "graph" not in (item.channel_ranks or {}):
+                    continue
+                next_frontier.append(eid)
+                seen_graph_seeds.add(eid)
+                if len(next_frontier) >= 8:
+                    break
+            frontier = next_frontier
+        # Mood / LifeState needle soft boosts (ranking only).
+        self._apply_policy_life_bias(candidates, query, policy)
 
         rough = self._rough_order(candidates)[: self.max_candidates]
         rough = await self._validate_and_enrich(rough, errors)
@@ -1291,7 +1564,9 @@ class RecallEngine:
             validated_events,
             max_total_chars=self.prompt_budget,
             max_events=inject_cap,
-            max_associations=self.max_associations,
+            max_associations=getattr(
+                self, "_active_max_associations", self.max_associations
+            ),
         )
         included = set(evidence.event_ids)
         final_events = tuple(event for event in validated_events if _event_id(event) in included)
@@ -1431,7 +1706,12 @@ class RecallEngine:
             old_rank = candidate.channel_ranks.get(channel)
             if old_rank is None or rank < old_rank:
                 candidate.channel_ranks[channel] = rank
-                contribution = CHANNEL_WEIGHTS[channel] / (RRF_K + rank)
+                policy = getattr(self, "_active_policy", None)
+                if isinstance(policy, RetrievalPolicy):
+                    ch_weight = policy.weight(channel)
+                else:
+                    ch_weight = float(CHANNEL_WEIGHTS.get(channel, 0.0))
+                contribution = ch_weight / (RRF_K + rank)
                 candidate.rrf_contributions[channel] = contribution
             candidate.title = candidate.title or _short(
                 hit.get("title") or hit.get("event_title"), 160
@@ -1919,13 +2199,27 @@ class RecallEngine:
         for candidate in candidates:
             if candidate.llm_score is None or candidate.llm_score < self.relevance_baseline:
                 continue
-            threshold = ASSOCIATION_THRESHOLD if candidate.kind == "association" else DIRECT_THRESHOLD
+            policy = getattr(self, "_active_policy", None)
+            if isinstance(policy, RetrievalPolicy):
+                threshold = (
+                    policy.association_threshold
+                    if candidate.kind == "association"
+                    else policy.direct_threshold
+                )
+            else:
+                threshold = (
+                    ASSOCIATION_THRESHOLD
+                    if candidate.kind == "association"
+                    else DIRECT_THRESHOLD
+                )
             if candidate.final_score >= threshold:
                 eligible.append(candidate)
         return RecallEngine._bounded_selection(
             eligible,
             max_events=self.max_events,
-            max_associations=self.max_associations,
+            max_associations=getattr(
+                self, "_active_max_associations", self.max_associations
+            ),
         )
 
     def _postfilter_selected_by_genre(
@@ -2086,11 +2380,19 @@ class RecallEngine:
             candidate.final_score = candidate.deterministic_score
             candidate.kind = "association" if candidate.relation_only else "direct"
             candidate.selected_evidence_ids = tuple(sorted(candidate.evidence_ids))
-            threshold = (
-                FALLBACK_ASSOCIATION_THRESHOLD
-                if candidate.kind == "association"
-                else FALLBACK_DIRECT_THRESHOLD
-            )
+            policy = getattr(self, "_active_policy", None)
+            if isinstance(policy, RetrievalPolicy):
+                threshold = (
+                    policy.fallback_association_threshold
+                    if candidate.kind == "association"
+                    else policy.fallback_direct_threshold
+                )
+            else:
+                threshold = (
+                    FALLBACK_ASSOCIATION_THRESHOLD
+                    if candidate.kind == "association"
+                    else FALLBACK_DIRECT_THRESHOLD
+                )
             source = str(candidate.source_type or "").strip().casefold()
             summary_cf = str(candidate.summary or "").casefold()
             title_cf_early = str(candidate.title or "").strip().casefold()
@@ -2476,7 +2778,9 @@ class RecallEngine:
         selected = RecallEngine._bounded_selection(
             eligible,
             max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
-            max_associations=self.max_associations,
+            max_associations=getattr(
+                self, "_active_max_associations", self.max_associations
+            ),
         )
         # Self-dynamic questions often retrieve three near-identical 动态 rows.
         # Diversify by summary fingerprint so different posts can surface.
@@ -2656,15 +2960,93 @@ class RecallEngine:
         except Exception as exc:
             errors.setdefault("reinforcement", type(exc).__name__)
 
-    @staticmethod
-    def _threshold(candidate: RecallCandidate, mode: str) -> float:
+    def _threshold(self, candidate: RecallCandidate, mode: str) -> float:
+        policy = getattr(self, "_active_policy", None)
         if mode == "fallback":
+            if isinstance(policy, RetrievalPolicy):
+                return (
+                    policy.fallback_association_threshold
+                    if candidate.kind == "association"
+                    else policy.fallback_direct_threshold
+                )
             return (
                 FALLBACK_ASSOCIATION_THRESHOLD
                 if candidate.kind == "association"
                 else FALLBACK_DIRECT_THRESHOLD
             )
+        if isinstance(policy, RetrievalPolicy):
+            return (
+                policy.association_threshold
+                if candidate.kind == "association"
+                else policy.direct_threshold
+            )
         return ASSOCIATION_THRESHOLD if candidate.kind == "association" else DIRECT_THRESHOLD
+
+    def _apply_policy_life_bias(
+        self,
+        candidates: Mapping[str, RecallCandidate],
+        query: RecallQuery,
+        policy: RetrievalPolicy,
+    ) -> None:
+        """Soft rank bias from LifeState needles / mood and generation mode.
+
+        Ranking only — never deletes or hard-filters memory rows.
+        """
+        if not candidates:
+            return
+        needles = [
+            str(x).strip()
+            for x in (getattr(query, "life_needles", ()) or ())
+            if str(x or "").strip()
+        ]
+        mood_cues = [
+            str(x).strip()
+            for x in (getattr(query, "mood_cues", ()) or ())
+            if str(x or "").strip()
+        ]
+        prefer_self = bool(getattr(policy, "prefer_self_recent", False))
+        demote_cmt = bool(getattr(policy, "demote_inbound_comment", False))
+        mood_bias = float(getattr(policy, "mood_bias", 0.0) or 0.0)
+        self_sources = {
+            "bot_action",
+            "video_experience",
+            "video",
+            "dream",
+            "diary",
+            "creative",
+            "life_plan",
+            "weekly_summary",
+            "web_reference",
+            "private_message",
+        }
+        for candidate in candidates.values():
+            blob = f"{candidate.title or ''} {candidate.summary or ''}"
+            source = str(candidate.source_type or "").strip().casefold()
+            boost = 0.0
+            if prefer_self and source in self_sources:
+                boost += 0.04
+                if "global_recent" in (candidate.channel_ranks or {}):
+                    boost += 0.03
+            if demote_cmt and source in {"comment", "comment_thread"}:
+                boost -= 0.12
+            if needles:
+                hits = sum(1 for n in needles if n and n in blob)
+                if hits:
+                    boost += min(0.18, 0.05 * hits)
+            if mood_cues and mood_bias:
+                mood_hits = sum(1 for m in mood_cues if m and m in blob)
+                if mood_hits:
+                    boost += min(0.12, mood_bias * mood_hits)
+            if boost:
+                candidate.deterministic_score = max(
+                    0.0, min(1.0, candidate.deterministic_score + boost)
+                )
+                # Keep rrf_score aligned enough that rough_order still prefers
+                # life-relevant rows when scores are otherwise tight.
+                if boost > 0:
+                    candidate.rrf_score = candidate.rrf_score + boost * 0.002
+                else:
+                    candidate.rrf_score = max(0.0, candidate.rrf_score + boost * 0.002)
 
     def _trace(
         self,
@@ -2745,5 +3127,7 @@ __all__ = [
     "RecallResult",
     "RecallStore",
     "RecallTrace",
+    "RetrievalPolicy",
+    "policy_for_mode",
     "weighted_rrf",
 ]
