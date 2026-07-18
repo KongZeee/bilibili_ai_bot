@@ -1352,6 +1352,22 @@ class RecallEngine:
             return self._empty_result(started, errors)
 
         decisions, rerank_status, rerank_calls = await self._rerank(query, rough)
+        # Explicit empty LLM results mean "nothing relevant" for ordinary topical
+        # queries (frozen contract). Exclusive self-genre questions (comment/like/
+        # dream/PM/open-recent/watch) still need deterministic genre lanes when the
+        # model returns [] or connection-fails — otherwise lived bot_actions vanish.
+        exclusive_self_genre = bool(
+            getattr(self, "_watch_query_active", False)
+            or getattr(self, "_dream_query_active", False)
+            or getattr(self, "_pm_query_active", False)
+            or getattr(self, "_like_query_active", False)
+            or getattr(self, "_self_comment_query_active", False)
+            or getattr(self, "_open_recent_self_query_active", False)
+            or getattr(self, "_bangumi_query_active", False)
+        )
+        if decisions is not None and len(decisions) == 0 and exclusive_self_genre:
+            decisions = None
+            rerank_status = f"{rerank_status}+self_genre_fallback"
         if decisions is None:
             mode = "fallback"
             if getattr(self, "_watch_query_active", False):
