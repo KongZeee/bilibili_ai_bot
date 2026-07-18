@@ -3253,6 +3253,13 @@ class RecallEngine:
                 and not getattr(self, "_pm_query_active", False)
             ):
                 boost -= 0.15
+            # Dream prefers lived self over generic web dumps (continuity hypothesis).
+            if policy_mode == "dream" and source == "web_reference":
+                title_cf = str(candidate.title or "").strip().casefold()
+                if title_cf in {"联网搜索参考", "web reference", "search reference"}:
+                    boost -= 0.12
+                elif not title_cf.startswith("探索"):
+                    boost -= 0.05
             if boost:
                 candidate.deterministic_score = max(
                     0.0, min(1.0, candidate.deterministic_score + boost)
