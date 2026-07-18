@@ -184,7 +184,7 @@ _SELF_MEMORY_QUERY_RE = re.compile(
     r"刚看了|刚看过|看了什么视频|看过什么视频|最近看|"
     r"最近做了什么|做了什么|在忙什么|最近忙|"
     r"私信|回过私信|回过谁|"
-    r"点赞|赞过|点了赞|投币|收藏过|"
+    r"点赞|赞过|点了赞|投币|收藏过|收藏了|你收藏|"
     r"日程|安排|周总结|追什么番|在追|追番|番剧|看番)"
 )
 
@@ -805,12 +805,23 @@ class RecallEngine:
         self._bangumi_query_active = bool(
             re.search(r"(追什么番|在追|追番|番剧|看番)", message_for_flags)
         )
+        # Dream self-query: require self-oriented dream ask, not topical "做了什么梦".
         self._dream_query_active = bool(
-            re.search(r"(做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦)", message_for_flags)
+            re.search(
+                r"(你做过什么梦|做的梦|你的梦|做过什么梦|你.*梦见|你做过.*梦)",
+                message_for_flags,
+            )
         )
-        self._pm_query_active = bool(re.search(r"(私信|回过私信|回过谁)", message_for_flags))
+        # PM self-query must be exclusive (not mere mention of 私信 inside a
+        # broader open-recent seed). Match self-oriented PM questions only.
+        self._pm_query_active = bool(
+            re.search(
+                r"(你.*私信|私信吗|回过私信|回过谁私信|私信里说|发过私信|回了私信)",
+                message_for_flags,
+            )
+        )
         self._like_query_active = bool(
-            re.search(r"(点赞|赞过|点了赞|投币|收藏过)", message_for_flags)
+            re.search(r"(点赞|赞过|点了赞|投币|收藏过|收藏了|你收藏)", message_for_flags)
         )
         self._self_comment_query_active = bool(
             re.search(
@@ -854,11 +865,13 @@ class RecallEngine:
                 f"{message_for_flags} {seed_extra}",
             )
         # Open "what have you been doing" needs recent self rows, not web dumps.
+        # Do NOT seed the token 私信 — it would re-trigger pm_query hard-zero
+        # in _select_fallback when flags are re-derived from query_text.
         elif self._open_recent_self_query_active:
             object.__setattr__(
                 query,
                 "current_message",
-                f"{message_for_flags} 观看 评论 动态 日记 私信 日程",
+                f"{message_for_flags} 观看 动态 日记 日程 探索 创作",
             )
 
         # Per-call inject cap (0 → engine default max_events)
@@ -874,10 +887,15 @@ class RecallEngine:
         # Pure utility questions without explicit ids should not scan the library.
         # Keeps weather/math/time queries fail-closed even if OR-FTS would match
         # stopwords inside video titles (e.g. subtitle "现在几点啊").
-        message_early = str(query.current_message or "").strip()
+        # Utility short-circuit uses the ORIGINAL user message only. Seeded
+        # rewrite text must not trigger weather/time empty-outs, and pure
+        # self-memory questions that mention 天气/几点 as content must still run.
+        message_early = str(getattr(self, "_original_query_text", "") or query.current_message or "").strip()
+        self_memory_early = bool(_SELF_MEMORY_QUERY_RE.search(message_early))
         if (
             not explicit
             and message_early
+            and not self_memory_early
             and (
                 _UTILITY_QUERY_RE.search(message_early)
                 or _SMALLTALK_ONLY_RE.match(message_early)
@@ -1149,11 +1167,13 @@ class RecallEngine:
                 recent_self: list[RecallCandidate] = []
                 preferred_sources = {
                     "bot_action",
+                    "creative",
                     "diary",
                     "dream",
                     "life_plan",
                     "weekly_summary",
                     "private_message",
+                    "web_reference",
                     "video_experience",
                 }
                 for cand in candidates.values():
@@ -1911,20 +1931,34 @@ class RecallEngine:
         *,
         query: RecallQuery | None = None,
     ) -> list[RecallCandidate]:
-        query_text = str(getattr(query, "current_message", "") or "")
+        # Genre flags must use the original user question when available.
+        # Seeded rewrites (open-recent/dream/like) contain tokens that would
+        # falsely re-activate pm/dream hard-zeros.
+        original = str(getattr(self, "_original_query_text", "") or "")
+        query_text = original or str(getattr(query, "current_message", "") or "")
+        seeded_text = str(getattr(query, "current_message", "") or "")
         self_query = bool(_SELF_MEMORY_QUERY_RE.search(query_text))
-        watch_query = bool(re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", query_text))
+        watch_query = bool(
+            getattr(self, "_watch_query_active", False)
+            or re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", query_text)
+        )
         dream_query = bool(
             getattr(self, "_dream_query_active", False)
-            or re.search(r"(做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦)", query_text)
+            or re.search(
+                r"(你做过什么梦|做的梦|你的梦|做过.*梦)",
+                query_text,
+            )
         )
         pm_query = bool(
             getattr(self, "_pm_query_active", False)
-            or re.search(r"(私信|回过私信|回过谁)", query_text)
+            or re.search(
+                r"(你.*私信|私信吗|回过私信|回过谁私信|私信里说|发过私信|回了私信)",
+                query_text,
+            )
         )
         like_query = bool(
             getattr(self, "_like_query_active", False)
-            or re.search(r"(点赞|赞过|点了赞|投币|收藏过)", query_text)
+            or re.search(r"(点赞|赞过|点了赞|投币|收藏过|收藏了|你收藏)", query_text)
         )
         self_comment_query = bool(
             getattr(self, "_self_comment_query_active", False)
@@ -1938,6 +1972,8 @@ class RecallEngine:
             getattr(self, "_open_recent_self_query_active", False)
             or re.search(r"(最近做了什么|做了什么|在忙什么|最近忙)", query_text)
         )
+        # Keep seeded_text available for content matching if needed later.
+        _ = seeded_text
         if (
             dream_query
             or pm_query
@@ -2041,11 +2077,13 @@ class RecallEngine:
             )
             like_needles = ("点了赞", "点赞", "赞了", "了赞")
             coin_needles = ("投了币", "投币")
-            fav_needles = ("收藏了", "收藏")
+            # Prefer precise archival phrases; bare 收藏 matches noise titles
+            # like 「旧物收藏室」.
+            fav_needles = ("收藏了", "已收藏")
             if like_query:
                 if re.search(r"(投币|投了币)", original_q):
                     wanted_needles = coin_needles
-                elif re.search(r"(收藏)", original_q):
+                elif re.search(r"(收藏过|收藏了|你收藏)", original_q):
                     wanted_needles = fav_needles
                 else:
                     wanted_needles = like_needles

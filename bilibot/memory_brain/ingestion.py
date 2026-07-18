@@ -271,6 +271,7 @@ def bot_action_observation(
         "rejected",
         "deferred",
         "drafted",
+        "skipped",
     }
     if action_state not in allowed_states:
         raise ValueError(f"unsupported bot action state: {action_state}")

@@ -441,16 +441,20 @@ async def _run() -> int:
                 self_state_total += 1
                 try:
                     companion.on_private_message_replied(
-                        preview="你好呀，最近在看海龟汤呢",
+                        preview="密钥ABC不要泄露到公开回复",
                         actor_label="user_x",
                     )
                     surface = companion.get_prompt_surface() or ""
-                    if _has_any(surface, ["私信", "海龟汤", "刚经历"]):
+                    # Must record PM activity without leaking body into public surface.
+                    has_pm = _has_any(surface, ["私信", "刚经历", "回了"])
+                    leaked = "密钥ABC" in surface or "不要泄露" in surface
+                    if has_pm and not leaked:
                         self_state_ok += 1
-                        notes.append("self_state_ok:pm_surface")
+                        notes.append("self_state_ok:pm_surface_no_body_leak")
                     else:
                         notes.append(
-                            f"self_state_fail:pm_surface:chars={len(surface)}"
+                            f"self_state_fail:pm_surface:has_pm={has_pm}"
+                            f":leaked={leaked}:chars={len(surface)}"
                         )
                 except Exception as exc:
                     notes.append(f"self_state_fail:pm:{type(exc).__name__}")

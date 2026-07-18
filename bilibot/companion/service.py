@@ -498,6 +498,8 @@ class CompanionLifeService:
             )
             return core[:420]
         if scene_l in {"diary"}:
+            # Avoid bare 私信 token — it can re-trigger exclusive PM hard-zero
+            # if generation evidence is ever routed through QA fallback flags.
             core = " ".join(
                 x
                 for x in (
@@ -507,8 +509,8 @@ class CompanionLifeService:
                     "动态",
                     "梦境",
                     "探索",
-                    "私信",
-                    "评论",
+                    "创作",
+                    "日程",
                     title_s,
                     self_needles,
                     base[:160],
@@ -756,6 +758,15 @@ class CompanionLifeService:
             "snippets": snippets[: max(limit, 8)],
         }
 
+    @staticmethod
+    def _thread_category_prefix(thread: str) -> str:
+        """Known continuous-self thread categories replace previous same-prefix rows."""
+        t = str(thread or "").strip()
+        for pref in ("小说：", "最近在看：", "兴趣：", "追番："):
+            if t.startswith(pref):
+                return pref
+        return ""
+
     def _push_salient_self(
         self,
         *,
@@ -767,7 +778,7 @@ class CompanionLifeService:
         if not self.enabled:
             return
         text = " ".join(str(line or "").replace("\x00", "").split())
-        if not text:
+        if not text and not thread and not close_thread_prefix:
             return
         try:
             state = self.ensure_life_state()
@@ -778,10 +789,11 @@ class CompanionLifeService:
             for x in (getattr(state, "salient_recent", None) or [])
             if str(x or "").strip()
         ]
-        # Dedupe exact / prefix-similar lines.
-        recent = [x for x in recent if x != text and not x.startswith(text[:16])]
-        recent.insert(0, text[:120])
-        state.salient_recent = recent[:8]
+        if text:
+            # Dedupe exact / prefix-similar lines.
+            recent = [x for x in recent if x != text and not x.startswith(text[:16])]
+            recent.insert(0, text[:120])
+            state.salient_recent = recent[:8]
         threads = [
             str(x).strip()
             for x in (getattr(state, "ongoing_threads", None) or [])
@@ -792,8 +804,22 @@ class CompanionLifeService:
             threads = [t for t in threads if not t.startswith(pref)]
         thr = " ".join(str(thread or "").replace("\x00", "").split())
         if thr:
-            threads = [t for t in threads if t != thr and not t.startswith(thr[:12])]
-            threads.insert(0, thr[:80])
+            # Never keep terminal "已完成" markers as open threads.
+            if "已完成" in thr:
+                cat = self._thread_category_prefix(thr) or thr[:12]
+                if cat:
+                    threads = [t for t in threads if not t.startswith(cat)]
+            else:
+                cat = self._thread_category_prefix(thr)
+                if cat:
+                    threads = [t for t in threads if not t.startswith(cat)]
+                else:
+                    threads = [
+                        t
+                        for t in threads
+                        if t != thr and not t.startswith(thr[:12])
+                    ]
+                threads.insert(0, thr[:80])
         state.ongoing_threads = threads[:6]
         state.updated_at = _now_iso()
         try:
@@ -1182,7 +1208,9 @@ class CompanionLifeService:
                 salient += "，还发了评论"
             self._push_salient_self(
                 line=salient[:120],
+                # Category prefix 最近在看： replaces prior watch thread.
                 thread=f"最近在看：《{short_title}》" if sc >= 7 else "",
+                close_thread_prefix="" if sc >= 7 else "最近在看：",
             )
             # fragment pool: keep concrete words from title
             if title:
@@ -1277,24 +1305,26 @@ class CompanionLifeService:
         preview: str = "",
         actor_label: str = "",
     ) -> None:
-        """Soft life-state feedback after an outgoing private message is sent."""
+        """Soft life-state feedback after an outgoing private message is sent.
+
+        Never store PM body text into continuous self surface (message_seed /
+        salient_recent) — those fields are later injected into public replies.
+        ``preview`` is accepted for API compatibility but intentionally ignored.
+        """
         if not self.enabled:
             return
         try:
             state = self.ensure_life_state()
             state.energy = max(0, min(100, int(state.energy) - 1))
             state.activity = "刚回了私信"
-            safe_preview = " ".join(str(preview or "").replace("\x00", "").split())[:48]
-            if safe_preview:
-                state.message_seed = safe_preview[:60]
+            # Do not put private-message body into message_seed / salient.
+            _ = preview  # compatibility; body must not enter continuous self
             state.updated_at = _now_iso()
             self.store.save_life_state(state)
             who = " ".join(str(actor_label or "").replace("\x00", "").split())[:20]
             line = "回了私信"
             if who:
                 line += f"（{who}）"
-            if safe_preview:
-                line += f"：{safe_preview}"
             self._push_salient_self(line=line[:120])
             self.store.patch_runtime(last_private_message_at=_now_iso())
         except Exception as e:
@@ -1367,7 +1397,8 @@ class CompanionLifeService:
         state = self.store.get_life_state()
         today = _today()
         if state.date != today:
-            # day roll
+            # day roll — keep continuous self so overnight threads/recent acts
+            # still ground generation; only reset daily energy/mood shell.
             dream = self.store.get_latest_dream()
             energy = self._cfg.life_state.energy_default
             mood = "平稳"
@@ -1378,6 +1409,16 @@ class CompanionLifeService:
                 energy = max(0, min(100, energy + int(dream.energy_delta or 0)))
                 mood = dream.mood or mood
                 afterglow = dream.afterglow or ""
+            prev_salient = [
+                str(x).strip()
+                for x in (getattr(state, "salient_recent", None) or [])
+                if str(x or "").strip()
+            ][:5]
+            prev_threads = [
+                str(x).strip()
+                for x in (getattr(state, "ongoing_threads", None) or [])
+                if str(x or "").strip() and "已完成" not in str(x)
+            ][:6]
             state = LifeState(
                 date=today,
                 energy=energy,
@@ -1387,6 +1428,8 @@ class CompanionLifeService:
                 message_seed="",
                 conditions=[],
                 dream_afterglow=afterglow,
+                salient_recent=prev_salient,
+                ongoing_threads=prev_threads,
                 updated_at=_now_iso(),
             )
             self.store.save_life_state(state)
@@ -2451,9 +2494,14 @@ class CompanionLifeService:
                 "project_id": proj.id,
                 "chunk_index": creative_chunk_index,
             },
-            salient_line=f"续写了《{proj.title}》约{chunk.chars}字",
+            salient_line=(
+                f"写完了《{proj.title}》"
+                if proj.status == "finished"
+                else f"续写了《{proj.title}》约{chunk.chars}字"
+            ),
+            # Finished novels go to salient only — never stay as open threads.
             ongoing_thread=(
-                f"小说：《{proj.title}》已完成"
+                ""
                 if proj.status == "finished"
                 else f"小说：《{proj.title}》写作中"
             ),
