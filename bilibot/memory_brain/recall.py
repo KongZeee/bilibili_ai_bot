@@ -109,6 +109,27 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         "companion_explore": "explore",
     }
     m = aliases.get(m, m)
+    if m in {"mind_wander", "mind-wander", "wander"}:
+        # Idle associative replay policy (no speech). High graph, mid-high entropy.
+        return RetrievalPolicy(
+            mode="mind_wander",
+            entropy="high",
+            hop_k=2,
+            max_associations=3,
+            direct_threshold=max(0.50, DIRECT_THRESHOLD - 0.15),
+            association_threshold=max(0.58, ASSOCIATION_THRESHOLD - 0.15),
+            fallback_direct_threshold=max(0.25, FALLBACK_DIRECT_THRESHOLD - 0.10),
+            fallback_association_threshold=max(0.35, FALLBACK_ASSOCIATION_THRESHOLD - 0.12),
+            channel_weights=_weights_with(
+                graph=1.4,
+                global_recent=0.5,
+                chunk_vector=1.8,
+                event_vector=1.4,
+            ),
+            mood_bias=0.10,
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
     if m in {"pm"}:
         # PM generation: continuity with self + thread, still fail-closed on utility.
         return RetrievalPolicy(

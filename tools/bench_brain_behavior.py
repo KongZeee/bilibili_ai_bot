@@ -635,6 +635,7 @@ async def _run() -> int:
             dream_pol = policy_for_mode("dream")
             reply_pol = policy_for_mode("reply")
             creative_pol = policy_for_mode("creative")
+            wander_pol = policy_for_mode("mind_wander")
             injection_total += 1
             policy_diff = (
                 dream_pol.hop_k > reply_pol.hop_k
@@ -644,6 +645,8 @@ async def _run() -> int:
                 and creative_pol.weight("graph") > reply_pol.weight("graph")
                 and dream_pol.demote_inbound_comment
                 and not reply_pol.demote_inbound_comment
+                and wander_pol.weight("graph") > reply_pol.weight("graph")
+                and wander_pol.hop_k >= 2
             )
             if policy_diff:
                 injection_ok += 1
