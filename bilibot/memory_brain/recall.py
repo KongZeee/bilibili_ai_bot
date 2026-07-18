@@ -1808,7 +1808,10 @@ class RecallEngine:
                 candidate.final_score = min(1.0, candidate.final_score + 0.03)
             elif source == "web_reference":
                 if title_cf in {"联网搜索参考", "web reference", "search reference"}:
-                    candidate.final_score = max(0.0, candidate.final_score - 0.20)
+                    # Generic dumps rarely answer self-continuity questions.
+                    candidate.final_score = max(0.0, candidate.final_score - 0.35)
+                elif title_cf.startswith("探索"):
+                    candidate.final_score = min(1.0, candidate.final_score + 0.05)
                 else:
                     candidate.final_score = max(0.0, candidate.final_score - 0.05)
             elif source in {"video_metadata"}:

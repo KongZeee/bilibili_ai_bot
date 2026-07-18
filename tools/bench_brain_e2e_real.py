@@ -432,6 +432,11 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 ["小说", "青铜钥匙", "大衣"],
                 [],
             ),
+            (
+                "你最近探索了什么",
+                ["探索", "ATRI", "夏生"],
+                [],
+            ),
         ]
         for q, must_any, forbid_any in probe_cases:
             result = await brain.recall(
