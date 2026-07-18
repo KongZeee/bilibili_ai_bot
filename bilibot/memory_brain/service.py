@@ -1084,6 +1084,28 @@ class MemoryBrainService:
                     exc_info=True,
                 )
                 return {"reinforced": 0, "event_ids": [], "titles": []}
+            # Light associative mesh among wandered events (write-time organization).
+            if len(event_ids) >= 2:
+                try:
+                    for i, src in enumerate(event_ids[:-1]):
+                        tgt = event_ids[i + 1]
+                        self.store.upsert_links(
+                            src,
+                            [
+                                {
+                                    "target_event_id": tgt,
+                                    "relation_type": "related_to",
+                                    "weight": 0.48,
+                                    "evidence_ids": [src, tgt],
+                                }
+                            ],
+                        )
+                except Exception:
+                    logger.debug(
+                        "mind_wander link mesh skipped account=%s",
+                        self.account_id,
+                        exc_info=True,
+                    )
         return {
             "reinforced": len(event_ids),
             "event_ids": event_ids,
