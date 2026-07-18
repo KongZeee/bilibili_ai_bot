@@ -508,8 +508,15 @@ class CompanionLifeService:
             )
             return core[:420]
         if scene_l in {"diary"}:
-            # Avoid bare 私信 token — it can re-trigger exclusive PM hard-zero
-            # if generation evidence is ever routed through QA fallback flags.
+            # Diary = today's timeline + afterglow; avoid bare 私信 token (PM hard-zero).
+            mood_bits = ""
+            afterglow = ""
+            try:
+                st = self.ensure_life_state()
+                mood_bits = str(getattr(st, "mood_bias", "") or "").strip()[:20]
+                afterglow = str(getattr(st, "dream_afterglow", "") or "").strip()[:40]
+            except Exception:
+                pass
             core = " ".join(
                 x
                 for x in (
@@ -517,13 +524,14 @@ class CompanionLifeService:
                     "今天做过",
                     "看了",
                     "动态",
-                    "梦境",
-                    "探索",
+                    "梦境余韵",
                     "创作",
                     "日程",
+                    mood_bits,
+                    afterglow,
                     title_s,
                     self_needles,
-                    base[:160],
+                    base[:100],
                 )
                 if x
             )
