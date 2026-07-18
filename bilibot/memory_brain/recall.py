@@ -89,9 +89,9 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
     m = str(mode or "").strip().casefold()
     aliases = {
         "reply_comment": "reply",
-        "private_message": "reply",
-        "private_reply": "reply",
-        "pm": "reply",
+        "private_message": "pm",
+        "private_reply": "pm",
+        "pm": "pm",
         "proactive_video": "reply",
         "bangumi": "reply",
         "dynamic_post": "reply",
@@ -109,6 +109,21 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         "companion_explore": "explore",
     }
     m = aliases.get(m, m)
+    if m in {"pm"}:
+        # PM generation: continuity with self + thread, still fail-closed on utility.
+        return RetrievalPolicy(
+            mode="pm",
+            entropy="low",
+            hop_k=1,
+            max_associations=2,
+            channel_weights=_weights_with(
+                global_recent=0.35,
+                speaker_recent=0.55,
+                graph=0.6,
+            ),
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
     if m in {"dream"}:
         return RetrievalPolicy(
             mode="dream",
