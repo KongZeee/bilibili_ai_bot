@@ -212,7 +212,13 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
             entropy="mid",
             hop_k=1,
             max_associations=2,
-            channel_weights=_weights_with(global_recent=0.4, graph=0.7),
+            channel_weights=_weights_with(
+                global_recent=0.55,
+                graph=0.8,
+                speaker_recent=0.25,
+                chunk_vector=1.5,
+            ),
+            mood_bias=0.05,
             prefer_self_recent=True,
             demote_inbound_comment=True,
         )
