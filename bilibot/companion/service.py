@@ -478,21 +478,31 @@ class CompanionLifeService:
         title_s = " ".join(str(title or "").replace("\x00", "").split())[:60]
 
         if scene_l in {"dream"}:
-            # Dream needs lived self, not comment-thread tokens.
+            # Dream = high-entropy associative seeds (C14): mood / unfinished
+            # threads / afterglow first; avoid comment-thread token bags.
+            mood_bits = ""
+            afterglow = ""
+            try:
+                st = self.ensure_life_state()
+                mood_bits = str(getattr(st, "mood_bias", "") or "").strip()[:20]
+                afterglow = str(getattr(st, "dream_afterglow", "") or "").strip()[:40]
+            except Exception:
+                pass
             core = " ".join(
                 x
                 for x in (
                     today,
                     "最近经历",
                     "看了",
-                    "动态",
                     "日记",
-                    "日程",
-                    "探索",
                     "创作",
+                    "梦境余韵",
+                    mood_bits,
+                    afterglow,
                     title_s,
                     self_needles,
-                    base[:160],
+                    # Keep base short — do not reintroduce 评论 flood tokens.
+                    base[:80],
                 )
                 if x
             )
