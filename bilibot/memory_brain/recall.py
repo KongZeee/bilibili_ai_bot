@@ -3293,6 +3293,13 @@ class RecallEngine:
                     boost -= 0.12
                 elif not title_cf.startswith("探索"):
                     boost -= 0.05
+            # Public reply must not treat dream narratives as hard facts unless asked.
+            if (
+                policy_mode == "reply"
+                and source == "dream"
+                and not getattr(self, "_dream_query_active", False)
+            ):
+                boost -= 0.10
             if boost:
                 candidate.deterministic_score = max(
                     0.0, min(1.0, candidate.deterministic_score + boost)
