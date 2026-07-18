@@ -520,7 +520,15 @@ def decode_vector(blob: bytes, dimension: int) -> list[float]:
 class _VectorCacheEntry:
     """Immutable, model-scoped matrix and the rows represented by it."""
 
-    __slots__ = ("dimension", "matrix", "metadata")
+    __slots__ = (
+        "dimension",
+        "matrix",
+        "metadata",
+        "embedding_ids",
+        "target_ids",
+        "event_ids",
+        "query_template",
+    )
 
     def __init__(
         self,
@@ -528,10 +536,19 @@ class _VectorCacheEntry:
         dimension: int,
         matrix: Any,
         metadata: tuple[tuple[str, str, str], ...],
+        embedding_ids: Any = None,
+        target_ids: Any = None,
+        event_ids: Any = None,
     ) -> None:
         self.dimension = int(dimension)
         self.matrix = matrix
         self.metadata = metadata
+        # Parallel id arrays (optional) speed up top-k materialization.
+        self.embedding_ids = embedding_ids
+        self.target_ids = target_ids
+        self.event_ids = event_ids
+        # Reusable contiguous query buffer (filled under the cache lock).
+        self.query_template = None
 
 
 def _envelope_hash(envelope: ObservationEnvelope, sources: Sequence[SourceDocument]) -> str:
@@ -1736,10 +1753,20 @@ class MemoryBrainStore:
                 matrix = np.ascontiguousarray(matrix[finite], dtype=little_float32)
                 metadata = [metadata[index] for index in valid_indexes]
         matrix.setflags(write=False)
+        meta_tuple = tuple(metadata)
+        if meta_tuple:
+            embedding_ids = np.array([row[0] for row in meta_tuple], dtype=object)
+            target_ids = np.array([row[1] for row in meta_tuple], dtype=object)
+            event_ids = np.array([row[2] for row in meta_tuple], dtype=object)
+        else:
+            embedding_ids = target_ids = event_ids = None
         return _VectorCacheEntry(
             dimension=dimension,
             matrix=matrix,
-            metadata=tuple(metadata),
+            metadata=meta_tuple,
+            embedding_ids=embedding_ids,
+            target_ids=target_ids,
+            event_ids=event_ids,
         )
 
     @staticmethod
@@ -1753,28 +1780,65 @@ class MemoryBrainStore:
         batch_size: int,
         np: Any,
     ) -> list[dict[str, Any]]:
+        # Full matvec + top-k partition: avoid per-row Python dicts and mid-scan sorts.
+        # batch_size kept for API compatibility with callers; unused on the hot path.
+        _ = batch_size
+        if not entry.metadata:
+            return []
+        dtype = np.dtype("<f4")
+        qbuf = entry.query_template
+        if qbuf is None or int(qbuf.shape[0]) != int(entry.dimension):
+            qbuf = np.empty(int(entry.dimension), dtype=dtype)
+            entry.query_template = qbuf
+        # Fill without allocating a new array when query is a plain list.
+        if isinstance(query, np.ndarray) and query.dtype == dtype and query.flags["C_CONTIGUOUS"]:
+            query_array = query
+        else:
+            qbuf[:] = query
+            query_array = qbuf
+        scores = entry.matrix @ query_array
+        n = int(scores.shape[0])
+        k = min(int(result_limit), n)
+        if k <= 0:
+            return []
+        if k < n:
+            candidate_idx = np.argpartition(scores, n - k)[n - k :]
+        else:
+            candidate_idx = np.arange(n)
+        cand_scores = scores[candidate_idx]
+        target_ids = entry.target_ids
+        if target_ids is not None:
+            cand_target_ids = target_ids[candidate_idx]
+        else:
+            cand_target_ids = np.array(
+                [entry.metadata[int(i)][1] for i in candidate_idx.tolist()],
+                dtype=object,
+            )
+        # lexsort: last key is primary. Sort by target_id asc, then score desc.
+        order = np.lexsort((cand_target_ids, -cand_scores))
         ranked: list[dict[str, Any]] = []
-        query_array = np.asarray(query, dtype=np.dtype("<f4"))
-        for start in range(0, len(entry.metadata), batch_size):
-            stop = min(start + batch_size, len(entry.metadata))
-            scores = entry.matrix[start:stop] @ query_array
-            for index, score in enumerate(scores.tolist(), start=start):
-                embedding_id, target_id, event_id = entry.metadata[index]
-                ranked.append(
-                    {
-                        "embedding_id": embedding_id,
-                        "target_id": target_id,
-                        "event_id": event_id,
-                        "target_type": target_type,
-                        "model_id": model_id,
-                        "score": float(score),
-                    }
-                )
-            if len(ranked) > result_limit * 4:
-                ranked.sort(key=lambda item: (-item["score"], item["target_id"]))
-                del ranked[result_limit:]
-        ranked.sort(key=lambda item: (-item["score"], item["target_id"]))
-        return ranked[:result_limit]
+        embedding_ids = entry.embedding_ids
+        event_ids = entry.event_ids
+        append = ranked.append
+        for j in order.tolist():
+            idx = int(candidate_idx[j])
+            if embedding_ids is not None and event_ids is not None:
+                embedding_id = embedding_ids[idx]
+                target_id = target_ids[idx] if target_ids is not None else entry.metadata[idx][1]
+                event_id = event_ids[idx]
+            else:
+                embedding_id, target_id, event_id = entry.metadata[idx]
+            append(
+                {
+                    "embedding_id": embedding_id,
+                    "target_id": target_id,
+                    "event_id": event_id,
+                    "target_type": target_type,
+                    "model_id": model_id,
+                    "score": float(cand_scores[j]),
+                }
+            )
+        return ranked
 
     def search_embeddings(
         self,
@@ -1791,6 +1855,38 @@ class MemoryBrainStore:
             raise ValueError("target_type must be 'event' or 'chunk'")
         query = normalize_vector(query_vector)
         exact_model = model_id is None and bool(provider and model)
+        result_limit = max(1, min(int(limit), 1000))
+        batch_size = self.vector_batch_size if batch_size is None else max(1, int(batch_size))
+        try:
+            import numpy as np
+        except ImportError:  # pragma: no cover - optional acceleration
+            np = None
+
+        # Warm-cache short-circuit when model_id is known: no SQLite open.
+        if (
+            np is not None
+            and self.vector_cache_limit > 0
+            and model_id is not None
+            and not exact_model
+        ):
+            cache_key = (model_id, target_type)
+            with self._vector_cache_lock:
+                entry = self._vector_cache.get(cache_key)
+                if entry is not None:
+                    if entry.dimension != len(query):
+                        raise VectorDimensionError(
+                            f"query dimension {len(query)} does not match model dimension {entry.dimension}"
+                        )
+                    return self._rank_cached_vectors(
+                        entry,
+                        query,
+                        target_type=target_type,
+                        model_id=model_id,
+                        result_limit=result_limit,
+                        batch_size=batch_size,
+                        np=np,
+                    )
+
         conn = self._connect()
         try:
             if model_id is None:
@@ -1840,13 +1936,24 @@ class MemoryBrainStore:
                     return []
                 embedding_count = int(indexed)
 
-            result_limit = max(1, min(int(limit), 1000))
-            batch_size = self.vector_batch_size if batch_size is None else max(1, int(batch_size))
-            try:
-                import numpy as np
-            except ImportError:  # pragma: no cover - optional acceleration
-                np = None
             if np is not None and self.vector_cache_limit > 0:
+                cache_key = (model_id, target_type)
+                # Warm-cache fast path: skip COUNT(*) when entry already loaded.
+                with self._vector_cache_lock:
+                    entry = self._vector_cache.get(cache_key)
+                    if entry is not None and entry.dimension != dimension:
+                        self._vector_cache.pop(cache_key, None)
+                        entry = None
+                    if entry is not None:
+                        return self._rank_cached_vectors(
+                            entry,
+                            query,
+                            target_type=target_type,
+                            model_id=model_id,
+                            result_limit=result_limit,
+                            batch_size=batch_size,
+                            np=np,
+                        )
                 if embedding_count is None:
                     embedding_count = int(
                         conn.execute(
@@ -1855,7 +1962,6 @@ class MemoryBrainStore:
                         ).fetchone()[0]
                     )
                 if embedding_count <= self.vector_cache_limit:
-                    cache_key = (model_id, target_type)
                     with self._vector_cache_lock:
                         entry = self._vector_cache.get(cache_key)
                         if entry is not None and entry.dimension != dimension:
