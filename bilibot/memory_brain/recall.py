@@ -198,12 +198,13 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         return RetrievalPolicy(
             mode="diary",
             entropy="mid",
-            hop_k=1,
+            hop_k=2,
             max_associations=2,
             channel_weights=_weights_with(
-                global_recent=0.55,
-                graph=0.7,
+                global_recent=0.60,
+                graph=0.85,
                 speaker_recent=0.2,
+                chunk_vector=1.4,
             ),
             mood_bias=0.08,
             prefer_self_recent=True,
