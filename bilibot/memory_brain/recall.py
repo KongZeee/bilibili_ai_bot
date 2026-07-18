@@ -94,7 +94,10 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         "pm": "pm",
         "proactive_video": "reply",
         "bangumi": "reply",
-        "dynamic_post": "reply",
+        "dynamic_post": "dynamic",
+        "dynamic": "dynamic",
+        "post_dynamic": "dynamic",
+        "publish_dynamic": "dynamic",
         "companion": "companion",
         "exploration": "explore",
         "explore": "explore",
@@ -109,6 +112,24 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         "companion_explore": "explore",
     }
     m = aliases.get(m, m)
+    if m in {"dynamic"}:
+        # Dynamic post: self-recent continuity for what to share, not comment flood.
+        return RetrievalPolicy(
+            mode="dynamic",
+            entropy="mid",
+            hop_k=1,
+            max_associations=2,
+            channel_weights=_weights_with(
+                global_recent=0.50,
+                graph=0.75,
+                chunk_vector=1.45,
+                event_vector=1.2,
+                speaker_recent=0.2,
+            ),
+            mood_bias=0.06,
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
     if m in {"mind_wander", "mind-wander", "wander"}:
         # Idle associative replay policy (no speech). High graph, mid-high entropy.
         return RetrievalPolicy(

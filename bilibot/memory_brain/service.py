@@ -471,6 +471,10 @@ class MemoryBrainService:
                 "companion_creative",
                 "companion_explore",
                 "companion_exploration",
+                "dynamic_post",
+                "dynamic",
+                "private_message",
+                "pm",
             }:
                 object.__setattr__(query, "mode", raw_scene)
         # Normalize scene for traces / prompt consumers
@@ -693,6 +697,10 @@ class MemoryBrainService:
             "write_dream",
             "write_diary",
             "write_creative_chunk",
+            "dynamic_post",
+            "dynamic",
+            "private_message",
+            "pm",
         }:
             resolved_mode = raw_scene
         needle_list = tuple(
