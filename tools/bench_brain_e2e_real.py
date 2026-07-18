@@ -459,10 +459,12 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
             ),
             (
                 "你最近做了什么",
-                ["海龟汤", "点了赞", "日记", "动态", "私信回复", "日程", "主动评论"],
+                ["海龟汤", "点了赞", "日记", "动态", "私信回复", "日程", "主动评论", "观看"],
                 ["评论对话上下文", "空泽同学"],
             ),
         ]
+        # For open recent-self, also require a real self action source, not only
+        # durable companion writings, when bot_actions exist in the account DB.
         for q, must_any, forbid_any in probe_cases:
             result = await brain.recall(
                 RecallQuery(
@@ -498,6 +500,29 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 has_must = (
                     "bot_action" in types
                     and any(m in blob for m in must_any if m)
+                    and not getattr(result, "is_empty", False)
+                )
+            if q.startswith("你最近做了什么"):
+                types = [
+                    str(ev.get("source_type") or "")
+                    for ev in (getattr(result, "events", ()) or [])
+                    if isinstance(ev, dict)
+                ]
+                has_must = (
+                    has_must
+                    and any(
+                        t
+                        in {
+                            "bot_action",
+                            "video_experience",
+                            "diary",
+                            "dream",
+                            "life_plan",
+                            "private_message",
+                        }
+                        for t in types
+                    )
+                    and "bot_action" in types
                     and not getattr(result, "is_empty", False)
                 )
             if has_must and not has_forbid and not getattr(result, "is_empty", False):

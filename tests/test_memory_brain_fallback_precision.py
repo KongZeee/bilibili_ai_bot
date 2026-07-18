@@ -619,6 +619,7 @@ async def test_open_recent_self_prefers_bot_actions(seeded_store):
     # Open recent-self must not answer only with exploration web dumps / inbound comments.
     assert not any("夏生今天做了什么" in t for t in titles) or "bot_action" in types
     assert not any(t == "评论对话上下文" for t in titles)
+    assert "bot_action" in types
 
 
 @pytest.mark.asyncio

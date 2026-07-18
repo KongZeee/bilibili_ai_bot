@@ -1198,11 +1198,62 @@ class RecallEngine:
                     cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
                     recent_self.append(cand)
                 if recent_self:
-                    selected = RecallEngine._bounded_selection(
+                    # Diversify by source_type so diary/dream/life_plan do not
+                    # monopolize the three slots; keep one bot_action when present.
+                    cap = min(3, MAX_FALLBACK_EVENTS, self.max_events)
+                    ordered = sorted(
                         recent_self,
-                        max_events=min(3, MAX_FALLBACK_EVENTS, self.max_events),
-                        max_associations=0,
+                        key=lambda c: (-c.final_score, c.event_id),
                     )
+                    diversified: list[RecallCandidate] = []
+                    seen_sources: set[str] = set()
+                    overflow: list[RecallCandidate] = []
+                    for cand in ordered:
+                        src = str(cand.source_type or "").strip().casefold()
+                        # Allow up to two bot_actions (watch + comment) but only
+                        # one of each durable companion genre.
+                        if src == "bot_action":
+                            bot_count = sum(
+                                1
+                                for d in diversified
+                                if str(d.source_type or "").strip().casefold()
+                                == "bot_action"
+                            )
+                            if bot_count >= 2:
+                                overflow.append(cand)
+                                continue
+                        elif src in seen_sources:
+                            overflow.append(cand)
+                            continue
+                        else:
+                            seen_sources.add(src)
+                        diversified.append(cand)
+                        if len(diversified) >= cap:
+                            break
+                    for cand in overflow:
+                        if len(diversified) >= cap:
+                            break
+                        diversified.append(cand)
+                    # Guarantee at least one bot_action when any exist.
+                    if not any(
+                        str(c.source_type or "").strip().casefold() == "bot_action"
+                        for c in diversified
+                    ):
+                        best_bot = next(
+                            (
+                                c
+                                for c in ordered
+                                if str(c.source_type or "").strip().casefold()
+                                == "bot_action"
+                            ),
+                            None,
+                        )
+                        if best_bot is not None:
+                            if len(diversified) >= cap:
+                                diversified[-1] = best_bot
+                            else:
+                                diversified.append(best_bot)
+                    selected = diversified[:cap]
                 else:
                     selected = self._select_fallback(rough, query=query)
             else:
