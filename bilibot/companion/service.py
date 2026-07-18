@@ -537,6 +537,13 @@ class CompanionLifeService:
             )
             return core[:420]
         if scene_l in {"creative"}:
+            # Creative = remote association over lived self (C14), not comment bags.
+            mood_bits = ""
+            try:
+                st = self.ensure_life_state()
+                mood_bits = str(getattr(st, "mood_bias", "") or "").strip()[:20]
+            except Exception:
+                pass
             core = " ".join(
                 x
                 for x in (
@@ -545,8 +552,10 @@ class CompanionLifeService:
                     title_s,
                     "灵感",
                     "续写",
+                    "最近经历",
+                    mood_bits,
                     self_needles,
-                    base[:200],
+                    base[:120],
                 )
                 if x
             )
