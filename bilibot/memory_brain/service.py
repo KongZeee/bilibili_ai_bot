@@ -969,7 +969,8 @@ class MemoryBrainService:
             {
                 "target_event_id": peer,
                 "relation_type": "related_to",
-                "weight": 0.55 if i else 0.72,
+                # Same-title continuity (i==0 after insert) gets stronger weight.
+                "weight": 0.82 if i == 0 else max(0.50, 0.70 - 0.05 * i),
                 "evidence_ids": [source_event_id, peer],
             }
             for i, peer in enumerate(peers)
