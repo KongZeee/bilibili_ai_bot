@@ -1006,6 +1006,16 @@ class CompanionLifeService:
                 state.message_seed = str(comment)[:60]
             state.updated_at = _now_iso()
             self.store.save_life_state(state)
+            # Continuous self: recent watch must appear in reply surface without FTS.
+            salient = f"看了《{short_title}》"
+            if sc > 0:
+                salient += f"，评分{sc:g}"
+            if comment:
+                salient += "，还发了评论"
+            self._push_salient_self(
+                line=salient[:120],
+                thread=f"最近在看：《{short_title}》" if sc >= 7 else "",
+            )
             # fragment pool: keep concrete words from title
             if title:
                 pool = self.store.get_dream_fragments()
@@ -1071,6 +1081,13 @@ class CompanionLifeService:
             state.activity = "刚发了条动态"
             state.updated_at = _now_iso()
             self.store.save_life_state(state)
+            preview = (content or topic or "").strip().replace("\n", " ")
+            self._push_salient_self(
+                line=(
+                    f"发了动态"
+                    f"{('：' + preview[:48]) if preview else ''}"
+                )[:120]
+            )
             runtime_patch: Dict[str, Any] = {"last_dynamic_at": _now_iso()}
             if draft_id:
                 runtime_patch["last_dynamic_draft_id"] = str(draft_id)[:64]
@@ -1085,6 +1102,65 @@ class CompanionLifeService:
             self.store.patch_runtime(**runtime_patch)
         except Exception as e:
             logger.warning("[%s] on_dynamic_posted failed: %s", self.account_id, e)
+
+    def on_private_message_replied(
+        self,
+        *,
+        preview: str = "",
+        actor_label: str = "",
+    ) -> None:
+        """Soft life-state feedback after an outgoing private message is sent."""
+        if not self.enabled:
+            return
+        try:
+            state = self.ensure_life_state()
+            state.energy = max(0, min(100, int(state.energy) - 1))
+            state.activity = "刚回了私信"
+            safe_preview = " ".join(str(preview or "").replace("\x00", "").split())[:48]
+            if safe_preview:
+                state.message_seed = safe_preview[:60]
+            state.updated_at = _now_iso()
+            self.store.save_life_state(state)
+            who = " ".join(str(actor_label or "").replace("\x00", "").split())[:20]
+            line = "回了私信"
+            if who:
+                line += f"（{who}）"
+            if safe_preview:
+                line += f"：{safe_preview}"
+            self._push_salient_self(line=line[:120])
+            self.store.patch_runtime(last_private_message_at=_now_iso())
+        except Exception as e:
+            logger.warning("[%s] on_private_message_replied failed: %s", self.account_id, e)
+
+    def on_comment_replied(
+        self,
+        *,
+        title: str = "",
+        preview: str = "",
+        proactive: bool = False,
+    ) -> None:
+        """Soft life-state feedback after a public comment reply is published."""
+        if not self.enabled:
+            return
+        try:
+            state = self.ensure_life_state()
+            state.energy = max(0, min(100, int(state.energy) - 1))
+            short_title = (title or "").strip()[:40]
+            kind = "主动评论" if proactive else "回复评论"
+            state.activity = f"刚{kind}" + (f"《{short_title}》" if short_title else "")
+            safe_preview = " ".join(str(preview or "").replace("\x00", "").split())[:48]
+            if safe_preview:
+                state.message_seed = safe_preview[:60]
+            state.updated_at = _now_iso()
+            self.store.save_life_state(state)
+            line = kind
+            if short_title:
+                line += f"《{short_title}》"
+            if safe_preview:
+                line += f"：{safe_preview}"
+            self._push_salient_self(line=line[:120])
+        except Exception as e:
+            logger.warning("[%s] on_comment_replied failed: %s", self.account_id, e)
 
     def get_status_snapshot(self) -> Dict[str, Any]:
         state = self.store.get_life_state()

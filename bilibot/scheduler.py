@@ -2427,6 +2427,26 @@ class Scheduler:
                                 "published comment result could not be archived: reply_id=%s",
                                 reply_id,
                             )
+                        else:
+                            companion = getattr(self, "companion", None)
+                            on_cmt = (
+                                getattr(companion, "on_comment_replied", None)
+                                if companion is not None
+                                and getattr(companion, "enabled", False)
+                                else None
+                            )
+                            if callable(on_cmt):
+                                try:
+                                    on_cmt(
+                                        title=str(oid or "")[:40],
+                                        preview=str(reply_text or "")[:80],
+                                        proactive=False,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "companion comment feedback failed",
+                                        exc_info=True,
+                                    )
 
                         # PRD V4 REP-006：好感度仅在发布成功后应用
                         features = config.get("features", {})
@@ -3947,6 +3967,25 @@ class Scheduler:
                     "published proactive comment result could not be archived: action=%s",
                     action_id,
                 )
+            else:
+                companion = getattr(self, "companion", None)
+                on_cmt = (
+                    getattr(companion, "on_comment_replied", None)
+                    if companion is not None and getattr(companion, "enabled", False)
+                    else None
+                )
+                if callable(on_cmt):
+                    try:
+                        on_cmt(
+                            title=str(title or "")[:40],
+                            preview=str(comment_text or "")[:80],
+                            proactive=True,
+                        )
+                    except Exception:
+                        logger.debug(
+                            "companion proactive comment feedback failed",
+                            exc_info=True,
+                        )
             return comment_text
         else:
             # 9. API 返回 False → retry_wait（达 max_attempts 自动转 failed）
@@ -5191,6 +5230,27 @@ class Scheduler:
                                                 "platform_message_id": platform_msg_id,
                                             },
                                         )
+                                    # Continuous self surface for replies/dreams.
+                                    companion = getattr(self, "companion", None)
+                                    if companion is not None and getattr(
+                                        companion, "enabled", False
+                                    ):
+                                        on_pm = getattr(
+                                            companion, "on_private_message_replied", None
+                                        )
+                                        if callable(on_pm):
+                                            try:
+                                                on_pm(
+                                                    preview=str(safe_reply_text or "")[:80],
+                                                    actor_label=str(
+                                                        safe_pm.actor_pseudonym or ""
+                                                    )[:24],
+                                                )
+                                            except Exception:
+                                                logger.debug(
+                                                    "companion PM feedback failed",
+                                                    exc_info=True,
+                                                )
                                 except Exception:
                                     self._pause_for_memory_failure()
                                     logger.error(
@@ -6799,6 +6859,19 @@ class Scheduler:
                             scene="proactive_video",
                             metadata={"bvid": bvid, "oid": str(oid)},
                         )
+                        companion = getattr(self, "companion", None)
+                        if companion is not None and getattr(companion, "enabled", False):
+                            push = getattr(companion, "_push_salient_self", None)
+                            if callable(push):
+                                try:
+                                    push(
+                                        line=f"给《{(title or '')[:40]}》点了赞",
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "companion like salient push failed",
+                                        exc_info=True,
+                                    )
                     else:
                         self._check_bili_risk_control("proactive_like")
                         await self._archive_bot_action(
