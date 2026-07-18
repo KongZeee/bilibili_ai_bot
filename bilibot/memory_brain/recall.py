@@ -3245,6 +3245,14 @@ class RecallEngine:
                     boost += 0.03
                 elif age_d > 7.0:
                     boost -= 0.04
+            # Public/social modes must not prefer private_message bodies in rank.
+            # (Hard redaction remains elsewhere; this is ranking-only defense in depth.)
+            if (
+                policy_mode in {"reply", "explore", "companion", "creative", "dream", "diary"}
+                and source == "private_message"
+                and not getattr(self, "_pm_query_active", False)
+            ):
+                boost -= 0.15
             if boost:
                 candidate.deterministic_score = max(
                     0.0, min(1.0, candidate.deterministic_score + boost)
