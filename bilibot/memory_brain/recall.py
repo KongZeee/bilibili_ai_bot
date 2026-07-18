@@ -1350,7 +1350,12 @@ class RecallEngine:
                 break
             # Expand from newly strong graph hits for multi-hop (C14).
             next_frontier: list[str] = []
-            for item in self._rough_order(candidates)[:16]:
+            scan_n = 16
+            frontier_cap = 8
+            if str(getattr(policy, "mode", "") or "") in {"dream", "creative"}:
+                scan_n = 24
+                frontier_cap = 12
+            for item in self._rough_order(candidates)[:scan_n]:
                 eid = item.event_id
                 if eid in seen_graph_seeds:
                     continue
@@ -1358,7 +1363,7 @@ class RecallEngine:
                     continue
                 next_frontier.append(eid)
                 seen_graph_seeds.add(eid)
-                if len(next_frontier) >= 8:
+                if len(next_frontier) >= frontier_cap:
                     break
             frontier = next_frontier
         rough = self._rough_order(candidates)[: self.max_candidates]
