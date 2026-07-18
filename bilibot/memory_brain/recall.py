@@ -1609,6 +1609,27 @@ class RecallEngine:
             # Genre exclusivity must also apply when the LLM reranker is up;
             # otherwise hard-zeros only protect the fallback path.
             selected = self._postfilter_selected_by_genre(selected)
+            # If LLM accepted rows but genre postfilter wiped them (or open-recent
+            # lost every bot_action), fall back to deterministic self lanes.
+            need_self_rescue = False
+            if exclusive_self_genre and not selected:
+                need_self_rescue = True
+            elif getattr(self, "_open_recent_self_query_active", False):
+                if not any(
+                    str(c.source_type or "").strip().casefold() == "bot_action"
+                    for c in selected
+                ):
+                    need_self_rescue = True
+            elif getattr(self, "_self_comment_query_active", False):
+                if not any(
+                    str(c.source_type or "").strip().casefold() == "bot_action"
+                    for c in selected
+                ):
+                    need_self_rescue = True
+            if need_self_rescue:
+                mode = "fallback"
+                rerank_status = f"{rerank_status}+self_genre_postfilter_rescue"
+                selected = self._select_fallback(rough, query=query)
 
         validated_events = await self._read_selected_events(selected, errors)
         evidence = render_memory_evidence(
