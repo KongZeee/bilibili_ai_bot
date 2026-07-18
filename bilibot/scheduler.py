@@ -4779,6 +4779,9 @@ class Scheduler:
 
                             # 用 reply_gen 生成回复（复用评论回复逻辑）
                             # PRD-V5 §4.3 SEA-501：私信场景须传 scene=private_message
+                            pm_action_key = f"private_message:{platform_msg_id}:send"
+                            pm_action_type = "private_message"
+                            pm_activity_started = False
                             memory_evidence = ""
                             try:
                                 from bilibot.memory_brain import RecallQuery
@@ -4797,6 +4800,44 @@ class Scheduler:
                                     memory_evidence = recall_result.prompt_evidence
                             except Exception as exc:
                                 logger.warning("私信记忆召回降级为空: %s", type(exc).__name__)
+
+                            # Close the activity loop: begin intent before generation so
+                            # recent/self memory sees "正在回复私信", then finish on any
+                            # terminal outcome (publish / skip / fail / reject).
+                            try:
+                                pm_activity = await self._begin_activity_context(
+                                    action_key=pm_action_key,
+                                    action_type=pm_action_type,
+                                    current_activity=(
+                                        "正在回复一条已脱敏的私信，并结合对话上下文和最近经历组织自然回复。"
+                                    ),
+                                    query=str(safe_pm.text or "")[:800],
+                                    scene="private_message",
+                                    title="私信回复",
+                                    metadata={
+                                        "actor": safe_pm.actor_pseudonym,
+                                        "platform_message_id": platform_msg_id,
+                                    },
+                                )
+                                pm_activity_started = True
+                                activity_prompt = str(
+                                    getattr(pm_activity, "prompt_text", "") or ""
+                                ).strip()
+                                if activity_prompt and activity_prompt not in str(
+                                    memory_evidence or ""
+                                ):
+                                    memory_evidence = "\n\n".join(
+                                        item
+                                        for item in (
+                                            str(memory_evidence or "").strip(),
+                                            activity_prompt,
+                                        )
+                                        if item
+                                    )
+                            except Exception as exc:
+                                logger.warning(
+                                    "私信 activity begin 降级: %s", type(exc).__name__
+                                )
 
                             from bilibot.models import ReplyContext
                             # 直接调用 _generate_reply_impl 以获取 GenerationOutcome，
@@ -4817,6 +4858,23 @@ class Scheduler:
                                     "私信 LLM 生成失败，deferred actor=%s: %s",
                                     safe_pm.actor_pseudonym, llm_err,
                                 )
+                                if pm_activity_started:
+                                    try:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text=f"私信生成失败: {type(llm_err).__name__}",
+                                            published=False,
+                                            status="failed",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "reason_code": "LLM_ERROR",
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                                 self.pm_state_store.mark_deferred(
                                     pm_state.id,
                                     reason=f"llm_error: {llm_err}",
@@ -4826,6 +4884,23 @@ class Scheduler:
 
                             if outcome.is_skip:
                                 logger.debug("LLM 决定跳过私信回复 actor=%s", safe_pm.actor_pseudonym)
+                                if pm_activity_started:
+                                    try:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text="LLM 决定跳过私信回复",
+                                            published=False,
+                                            status="skipped",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "reason_code": outcome.error_code or "llm_no_reply",
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                                 self.pm_state_store.mark_ignored(
                                     pm_state.id, rule=outcome.error_code or "llm_no_reply",
                                 )
@@ -4836,6 +4911,23 @@ class Scheduler:
                                         "私信 LLM 永久失败 (code=%s)，标记 failed actor=%s",
                                         outcome.error_code, safe_pm.actor_pseudonym,
                                     )
+                                    if pm_activity_started:
+                                        try:
+                                            await self._archive_bot_action(
+                                                action_key=pm_action_key,
+                                                action_type=pm_action_type,
+                                                text=f"私信生成永久失败: {outcome.error_code}",
+                                                published=False,
+                                                status="failed",
+                                                title="私信回复",
+                                                scene="private_message",
+                                                metadata={
+                                                    "actor": safe_pm.actor_pseudonym,
+                                                    "reason_code": outcome.error_code or "PM_GEN_PERMANENT",
+                                                },
+                                            )
+                                        except Exception:
+                                            pass
                                     self.pm_state_store.mark_failed(
                                         pm_state.id,
                                         error_code=outcome.error_code or "PM_GEN_PERMANENT",
@@ -4846,6 +4938,23 @@ class Scheduler:
                                     "私信 LLM 生成未成功 (status=%s, code=%s)，deferred actor=%s",
                                     outcome.status, outcome.error_code, safe_pm.actor_pseudonym,
                                 )
+                                if pm_activity_started:
+                                    try:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text=f"私信生成未成功: {outcome.status}",
+                                            published=False,
+                                            status="failed",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "reason_code": outcome.error_code or "GEN_FAILED",
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                                 self.pm_state_store.mark_deferred(
                                     pm_state.id,
                                     reason=f"generation_{outcome.status}: {outcome.error_code}",
@@ -4880,6 +4989,23 @@ class Scheduler:
                                     "safety_checker 未初始化，拒绝发送私信（fail-closed）: actor=%s",
                                     safe_pm.actor_pseudonym,
                                 )
+                                if pm_activity_started:
+                                    try:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text="私信安全检查器未初始化，拒绝发送",
+                                            published=False,
+                                            status="deferred",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "reason_code": "NO_SAFETY_CHECKER",
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                                 self.pm_state_store.mark_deferred(
                                     pm_state.id, reason="safety_checker_missing",
                                     error_code="NO_SAFETY_CHECKER",
@@ -4893,6 +5019,23 @@ class Scheduler:
                             )
                             if not passed:
                                 logger.warning(f"私信回复安全检查未通过: {reason}")
+                                if pm_activity_started:
+                                    try:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text=f"私信安全检查未通过: {reason}",
+                                            published=False,
+                                            status="rejected",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "reason_code": "safety_check_failed",
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                                 self.pm_state_store.mark_rejected(
                                     pm_state.id, reason=reason or "safety_check_failed",
                                 )
@@ -4902,6 +5045,23 @@ class Scheduler:
                             )
                             if not rate_ok:
                                 logger.warning("私信频率限制触发: %s", rate_reason)
+                                if pm_activity_started:
+                                    try:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text=f"私信频率限制: {rate_reason}",
+                                            published=False,
+                                            status="deferred",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "reason_code": "PM_RATE_LIMITED",
+                                            },
+                                        )
+                                    except Exception:
+                                        pass
                                 self.pm_state_store.mark_deferred(
                                     pm_state.id, reason="rate_limited",
                                     error_code="PM_RATE_LIMITED",
@@ -5015,6 +5175,22 @@ class Scheduler:
                                             raise RuntimeError(
                                                 "PM outgoing source commit was not confirmed"
                                             )
+                                    # Close begin_activity intent even when durable PM
+                                    # observation is archived separately.
+                                    if pm_activity_started:
+                                        await self._archive_bot_action(
+                                            action_key=pm_action_key,
+                                            action_type=pm_action_type,
+                                            text=safe_reply_text,
+                                            published=True,
+                                            status="completed",
+                                            title="私信回复",
+                                            scene="private_message",
+                                            metadata={
+                                                "actor": safe_pm.actor_pseudonym,
+                                                "platform_message_id": platform_msg_id,
+                                            },
+                                        )
                                 except Exception:
                                     self._pause_for_memory_failure()
                                     logger.error(
@@ -6616,7 +6792,8 @@ class Scheduler:
                         await self._archive_bot_action(
                             action_key=f"video:{observation_key}:like",
                             action_type="like_video",
-                            text=f"已点赞视频《{title}》",
+                            # Phrase "点了赞" is the self-like recall needle.
+                            text=f"观看了视频《{title}》并点了赞。",
                             published=True,
                             title=title,
                             scene="proactive_video",
