@@ -577,15 +577,23 @@ class CompanionLifeService:
             )
             return core[:420]
         if scene_l in {"life_plan", "companion"}:
+            mood_bits = ""
+            try:
+                st = self.ensure_life_state()
+                mood_bits = str(getattr(st, "mood_bias", "") or "").strip()[:20]
+            except Exception:
+                pass
             core = " ".join(
                 x
                 for x in (
                     today,
                     "生活安排",
                     "最近做过",
+                    "最近经历",
+                    mood_bits,
                     title_s,
                     self_needles,
-                    base[:160],
+                    base[:100],
                 )
                 if x
             )
