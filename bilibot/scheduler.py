@@ -920,6 +920,54 @@ class Scheduler:
         except Exception as e:
             logger.debug("companion dynamic feedback failed: %s", e)
 
+    def _notify_companion_comment_replied(
+        self,
+        *,
+        title: str = "",
+        preview: str = "",
+        proactive: bool = False,
+    ) -> None:
+        """Soft continuous-self feedback after a comment is published (primary or retry)."""
+        companion = getattr(self, "companion", None)
+        if companion is None or not getattr(companion, "enabled", False):
+            return
+        on_cmt = getattr(companion, "on_comment_replied", None)
+        if not callable(on_cmt):
+            return
+        try:
+            on_cmt(
+                title=str(title or "")[:40],
+                preview=str(preview or "")[:80],
+                proactive=bool(proactive),
+            )
+        except Exception:
+            logger.debug(
+                "companion %scomment feedback failed",
+                "proactive " if proactive else "",
+                exc_info=True,
+            )
+
+    def _notify_companion_private_message_replied(
+        self,
+        *,
+        preview: str = "",
+        actor_label: str = "",
+    ) -> None:
+        """Soft continuous-self feedback after a PM is sent (primary or retry)."""
+        companion = getattr(self, "companion", None)
+        if companion is None or not getattr(companion, "enabled", False):
+            return
+        on_pm = getattr(companion, "on_private_message_replied", None)
+        if not callable(on_pm):
+            return
+        try:
+            on_pm(
+                preview=str(preview or "")[:80],
+                actor_label=str(actor_label or "")[:24],
+            )
+        except Exception:
+            logger.debug("companion PM feedback failed", exc_info=True)
+
     async def _recall_for_proactive_video(
         self,
         *,
@@ -2428,25 +2476,11 @@ class Scheduler:
                                 reply_id,
                             )
                         else:
-                            companion = getattr(self, "companion", None)
-                            on_cmt = (
-                                getattr(companion, "on_comment_replied", None)
-                                if companion is not None
-                                and getattr(companion, "enabled", False)
-                                else None
+                            self._notify_companion_comment_replied(
+                                title=str(oid or "")[:40],
+                                preview=str(reply_text or "")[:80],
+                                proactive=False,
                             )
-                            if callable(on_cmt):
-                                try:
-                                    on_cmt(
-                                        title=str(oid or "")[:40],
-                                        preview=str(reply_text or "")[:80],
-                                        proactive=False,
-                                    )
-                                except Exception:
-                                    logger.debug(
-                                        "companion comment feedback failed",
-                                        exc_info=True,
-                                    )
 
                         # PRD V4 REP-006：好感度仅在发布成功后应用
                         features = config.get("features", {})
@@ -2934,6 +2968,11 @@ class Scheduler:
                                 scene="reply_comment",
                                 metadata={"reply_id": rpid, "oid": str(oid)},
                             )
+                            self._notify_companion_comment_replied(
+                                title=str(oid or "")[:40],
+                                preview=str(reply_text or "")[:80],
+                                proactive=False,
+                            )
                             logger.info(f"重试发布成功: rpid={rpid}")
                         else:
                             if rate_reserved and self.safety_checker is not None:
@@ -3285,6 +3324,11 @@ class Scheduler:
                                 title=f"已回复评论 {rpid}",
                                 scene="reply_comment",
                                 metadata={"reply_id": rpid, "oid": str(oid)},
+                            )
+                            self._notify_companion_comment_replied(
+                                title=str(oid or "")[:40],
+                                preview=str(reply_text or "")[:80],
+                                proactive=False,
                             )
                             if self.safety_checker is not None:
                                 try:
@@ -3968,24 +4012,11 @@ class Scheduler:
                     action_id,
                 )
             else:
-                companion = getattr(self, "companion", None)
-                on_cmt = (
-                    getattr(companion, "on_comment_replied", None)
-                    if companion is not None and getattr(companion, "enabled", False)
-                    else None
+                self._notify_companion_comment_replied(
+                    title=str(title or "")[:40],
+                    preview=str(comment_text or "")[:80],
+                    proactive=True,
                 )
-                if callable(on_cmt):
-                    try:
-                        on_cmt(
-                            title=str(title or "")[:40],
-                            preview=str(comment_text or "")[:80],
-                            proactive=True,
-                        )
-                    except Exception:
-                        logger.debug(
-                            "companion proactive comment feedback failed",
-                            exc_info=True,
-                        )
             return comment_text
         else:
             # 9. API 返回 False → retry_wait（达 max_attempts 自动转 failed）
@@ -4301,6 +4332,12 @@ class Scheduler:
                         logger.error(
                             "retried proactive comment result could not be archived: action=%s",
                             action.action_id,
+                        )
+                    else:
+                        self._notify_companion_comment_replied(
+                            title=str(action.bvid or "")[:40],
+                            preview=str(reply_text or "")[:80],
+                            proactive=True,
                         )
                 else:
                     self.proactive_comment_store.mark_retry_wait(
@@ -5231,26 +5268,12 @@ class Scheduler:
                                             },
                                         )
                                     # Continuous self surface for replies/dreams.
-                                    companion = getattr(self, "companion", None)
-                                    if companion is not None and getattr(
-                                        companion, "enabled", False
-                                    ):
-                                        on_pm = getattr(
-                                            companion, "on_private_message_replied", None
-                                        )
-                                        if callable(on_pm):
-                                            try:
-                                                on_pm(
-                                                    preview=str(safe_reply_text or "")[:80],
-                                                    actor_label=str(
-                                                        safe_pm.actor_pseudonym or ""
-                                                    )[:24],
-                                                )
-                                            except Exception:
-                                                logger.debug(
-                                                    "companion PM feedback failed",
-                                                    exc_info=True,
-                                                )
+                                    self._notify_companion_private_message_replied(
+                                        preview=str(safe_reply_text or "")[:80],
+                                        actor_label=str(
+                                            safe_pm.actor_pseudonym or ""
+                                        )[:24],
+                                    )
                                 except Exception:
                                     self._pause_for_memory_failure()
                                     logger.error(
@@ -5600,6 +5623,7 @@ class Scheduler:
                     if success:
                         self.pm_state_store.mark_published(pm_state.id)
                         logger.info("重试私信发送成功: actor=%s", retry_actor)
+                        pm_retry_archived = True
                         try:
                             brain = getattr(self, "memory_brain", None)
                             if brain is not None:
@@ -5619,9 +5643,15 @@ class Scheduler:
                                         "PM retry outgoing source commit was not confirmed"
                                     )
                         except Exception:
+                            pm_retry_archived = False
                             self._pause_for_memory_failure()
                             logger.error(
                                 "重试私信结果归档失败: actor=%s", retry_actor
+                            )
+                        if pm_retry_archived:
+                            self._notify_companion_private_message_replied(
+                                preview=str(safe_retry_text or "")[:80],
+                                actor_label=str(retry_actor or "")[:24],
                             )
                         if self.safety_checker is not None:
                             try:
