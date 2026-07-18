@@ -3189,35 +3189,34 @@ class RecallEngine:
                 boost += min(0.08, (acc - 0.55) * 0.25)
             elif demote_cmt and acc < 0.35:
                 boost -= 0.03
-            # Dream-lag soft bimodal window (C14/S022): same-night + 5–7d lag.
-            if str(getattr(policy, "mode", "") or "") == "dream" and source in self_sources:
-                age_h = 0.0
+            # Time-window soft priors by mode (C14): dream-lag bimodal; diary day window.
+            policy_mode = str(getattr(policy, "mode", "") or "")
+            age_h = 0.0
+            raw_t = str(candidate.occurred_at or "")
+            if raw_t:
                 try:
-                    occurred = float(getattr(candidate, "last_recalled_at", 0.0) or 0.0)
-                    # Prefer occurred_at if parseable as unix; else skip lag.
-                    raw_t = str(candidate.occurred_at or "")
-                    if raw_t and raw_t[:1].isdigit():
-                        # ISO-ish: use accessibility age already folded; estimate
-                        # from accessibility recency inverse is noisy — parse ISO.
-                        from datetime import datetime, timezone
+                    from datetime import datetime
 
-                        try:
-                            dt = datetime.fromisoformat(raw_t.replace("Z", "+00:00"))
-                            age_h = max(
-                                0.0,
-                                (time.time() - dt.timestamp()) / 3600.0,
-                            )
-                        except Exception:
-                            age_h = 0.0
+                    dt = datetime.fromisoformat(raw_t.replace("Z", "+00:00"))
+                    age_h = max(0.0, (time.time() - dt.timestamp()) / 3600.0)
                 except Exception:
                     age_h = 0.0
-                age_d = age_h / 24.0
+            age_d = age_h / 24.0 if age_h else 0.0
+            if policy_mode == "dream" and source in self_sources and age_h > 0:
                 if age_d <= 1.2:
                     boost += 0.05  # same-night continuity
                 elif 4.5 <= age_d <= 7.5:
-                    boost += 0.06  # classic dream-lag band
+                    boost += 0.06  # classic dream-lag band (S022)
                 elif age_d > 14:
                     boost -= 0.02  # soft demote ancient chatter only in dream
+            elif policy_mode == "diary" and source in self_sources and age_h > 0:
+                # Diary wants today's timeline completeness over remote analogy.
+                if age_d <= 1.0:
+                    boost += 0.07
+                elif age_d <= 2.0:
+                    boost += 0.03
+                elif age_d > 7.0:
+                    boost -= 0.04
             if boost:
                 candidate.deterministic_score = max(
                     0.0, min(1.0, candidate.deterministic_score + boost)
