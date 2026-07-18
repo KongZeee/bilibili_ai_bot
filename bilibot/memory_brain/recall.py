@@ -2038,7 +2038,9 @@ class RecallEngine:
                     age_hours = max(0.0, (time.time() - occurred) / 3600.0)
             except (TypeError, ValueError):
                 age_hours = 0.0
-            recency = math.exp(-age_hours / 72.0)  # ~3-day half-ish soft decay
+            # Important events decay slower (emotional/high-value lived moments).
+            decay_tau = 72.0 + 48.0 * max(0.0, min(1.0, candidate.importance))
+            recency = math.exp(-age_hours / decay_tau)
             reinforce = min(0.35, 0.04 * math.log1p(candidate.recall_count))
             candidate.accessibility = max(
                 0.05,
