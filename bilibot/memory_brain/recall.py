@@ -1033,6 +1033,53 @@ class RecallEngine:
                         max_events=min(2, MAX_FALLBACK_EVENTS, self.max_events),
                         max_associations=0,
                     )
+                    # Prefer a completed bot_action evaluate over a raw video
+                    # archive with the same title in the same answer set.
+                    if len(selected) >= 2:
+                        by_title: dict[str, list[RecallCandidate]] = {}
+                        for cand in selected:
+                            key = str(cand.title or "").strip()
+                            by_title.setdefault(key, []).append(cand)
+                        diversified: list[RecallCandidate] = []
+                        for title, rows in by_title.items():
+                            bot_rows = [
+                                r
+                                for r in rows
+                                if str(r.source_type or "") == "bot_action"
+                            ]
+                            if bot_rows:
+                                diversified.append(
+                                    max(bot_rows, key=lambda r: r.final_score)
+                                )
+                            else:
+                                diversified.append(
+                                    max(rows, key=lambda r: r.final_score)
+                                )
+                        # Keep global order by score and fill remaining slots
+                        # with other titles if we collapsed duplicates.
+                        diversified.sort(key=lambda r: (-r.final_score, r.event_id))
+                        if len(diversified) < len(selected):
+                            seen = {c.event_id for c in diversified}
+                            for cand in sorted(
+                                recent_watch,
+                                key=lambda r: (-r.final_score, r.event_id),
+                            ):
+                                if cand.event_id in seen:
+                                    continue
+                                if any(
+                                    str(cand.title or "").strip()
+                                    == str(d.title or "").strip()
+                                    for d in diversified
+                                ):
+                                    continue
+                                diversified.append(cand)
+                                if len(diversified) >= min(
+                                    2, MAX_FALLBACK_EVENTS, self.max_events
+                                ):
+                                    break
+                        selected = diversified[
+                            : min(2, MAX_FALLBACK_EVENTS, self.max_events)
+                        ]
                 else:
                     selected = self._select_fallback(rough, query=query)
             else:
