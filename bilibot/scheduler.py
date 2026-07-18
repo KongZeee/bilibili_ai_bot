@@ -4334,6 +4334,12 @@ class Scheduler:
                             "retried proactive comment result could not be archived: action=%s",
                             action.action_id,
                         )
+                    else:
+                        self._notify_companion_comment_replied(
+                            title=str(action.bvid or "")[:40],
+                            preview=str(reply_text or "")[:80],
+                            proactive=True,
+                        )
                 else:
                     self.proactive_comment_store.mark_retry_wait(
                         action.action_id, "RETRY_PUBLISH_FAILED",
@@ -5641,6 +5647,7 @@ class Scheduler:
                     if success:
                         self.pm_state_store.mark_published(pm_state.id)
                         logger.info("重试私信发送成功: actor=%s", retry_actor)
+                        pm_retry_archived = True
                         try:
                             brain = getattr(self, "memory_brain", None)
                             if brain is not None:
@@ -5660,6 +5667,7 @@ class Scheduler:
                                         "PM retry outgoing source commit was not confirmed"
                                     )
                         except Exception:
+                            pm_retry_archived = False
                             self._pause_for_memory_failure()
                             logger.error(
                                 "重试私信结果归档失败: actor=%s", retry_actor

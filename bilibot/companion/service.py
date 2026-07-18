@@ -35,6 +35,8 @@ _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日
 
 _BUSY_MARKERS = ("上班", "工作", "学习", "考试", "通勤", "会议", "赶稿", "赶ddl")
 _IDLE_MARKERS = ("摸鱼", "休息", "闲逛", "刷", "放松", "发呆", "创作", "写作", "午睡")
+# Category prefixes for ongoing_threads — new thread replaces prior same-prefix entries.
+_THREAD_CATEGORY_PREFIXES = ("兴趣：", "最近在看：", "小说：")
 
 
 def _today() -> str:
@@ -848,7 +850,13 @@ class CompanionLifeService:
         thread: str = "",
         close_thread_prefix: str = "",
     ) -> None:
-        """Update continuous self surface after a closed companion activity."""
+        """Update continuous self surface after a closed companion activity.
+
+        Known category prefixes (兴趣：/最近在看：/小说：) replace prior same-prefix
+        threads so one-shot or successive activities do not accumulate forever.
+        When ``close_thread_prefix`` is set and no new ``thread`` is provided,
+        matching open threads are closed without re-inserting a finished marker.
+        """
         if not self.enabled:
             return
         text = " ".join(str(line or "").replace("\x00", "").split())
@@ -1298,6 +1306,7 @@ class CompanionLifeService:
                 salient += f"，评分{sc:g}"
             if comment:
                 salient += "，还发了评论"
+            # Replace any prior "最近在看：" thread; only keep when score is high.
             self._push_salient_self(
                 line=salient[:120],
                 # Category prefix 最近在看： replaces prior watch thread.
@@ -2650,6 +2659,8 @@ class CompanionLifeService:
                 if proj.status == "finished"
                 else f"小说：《{proj.title}》写作中"
             ),
+            # Finished: close this title's open thread only (no re-insert).
+            # In-progress: category prefix on ongoing_thread replaces prior 小说：.
             close_thread_prefix=(
                 f"小说：《{proj.title}》" if proj.status == "finished" else ""
             ),
