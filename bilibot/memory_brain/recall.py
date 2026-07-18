@@ -113,7 +113,7 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         return RetrievalPolicy(
             mode="dream",
             entropy="high",
-            hop_k=2,
+            hop_k=3,
             max_associations=3,
             # Lower gates so weak associative / graph hits can enter the workspace.
             direct_threshold=max(0.55, DIRECT_THRESHOLD - 0.12),
