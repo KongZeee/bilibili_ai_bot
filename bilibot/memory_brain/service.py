@@ -136,9 +136,11 @@ _SELF_ACTIVITY_SOURCE_TYPES = frozenset(
         "dynamic",
         "exploration",
         "life_plan",
+        "private_message",
         "summary",
         "video",
         "video_experience",
+        "web_reference",
         "weekly_summary",
     }
 )

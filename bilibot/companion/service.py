@@ -597,19 +597,26 @@ class CompanionLifeService:
         scene: str,
         title: str,
         metadata: Optional[Dict[str, Any]] = None,
+        state: str = "completed",
+        pause_on_error: bool = True,
     ) -> bool:
-        """Close an activity lifecycle after its domain output is archived."""
+        """Close an activity lifecycle after its domain output is archived.
+
+        ``state`` defaults to completed. Pass failed/skipped/rejected when the
+        activity opened begin_activity but did not produce a domain archive.
+        """
         finish = getattr(self.memory_brain, "finish_activity", None)
         if not callable(finish) or not callable(
             getattr(type(self.memory_brain), "finish_activity", None)
         ):
             return False
+        terminal = str(state or "completed").strip().casefold() or "completed"
         try:
             await finish(
                 action_key=action_key,
                 action_type=action_type,
                 result_text=result_text,
-                state="completed",
+                state=terminal,
                 scene=scene,
                 title=title,
                 persona_id=self._persona_bits().get("id") or "",
@@ -621,16 +628,20 @@ class CompanionLifeService:
             )
             return True
         except Exception as exc:
-            # The domain event was already committed, so do not regenerate a
-            # different diary/dream/chunk. Pause future automation and keep the
-            # successfully archived output as the source of truth.
-            self._pause_for_memory_failure(
-                f"activity_outcome_failed:{type(exc).__name__}"
-            )
+            # Domain output may already be committed; do not regenerate a
+            # different diary/dream/chunk. Pause future automation when this
+            # was a successful-path close. Soft-close failures (empty chunk)
+            # only log so a missing finish does not cascade into a full pause
+            # loop on every creative tick.
+            if pause_on_error:
+                self._pause_for_memory_failure(
+                    f"activity_outcome_failed:{type(exc).__name__}"
+                )
             logger.error(
-                "[%s] companion activity outcome failed action=%s",
+                "[%s] companion activity outcome failed action=%s state=%s",
                 self.account_id,
                 action_key,
+                terminal,
                 exc_info=True,
             )
             return False
@@ -2034,6 +2045,22 @@ class CompanionLifeService:
         )
         text = await self._llm_text(system, user, max_tokens=max(300, budget + 100), scene="creative")
         if not text or len(text.strip()) < 40:
+            # Close the begin_activity intent opened by _recall_life_evidence;
+            # otherwise orphan intents pollute recent-self / open-recent lanes.
+            await self._finish_activity_memory(
+                action_key=f"companion_creative_chunk:{proj.id}:{creative_chunk_index}",
+                action_type="write_creative_chunk",
+                result_text="续写未产出可用文本，稍后再试。",
+                scene="creative",
+                title=proj.title,
+                metadata={
+                    "project_id": proj.id,
+                    "chunk_index": creative_chunk_index,
+                    "reason_code": "empty_or_short_chunk",
+                },
+                state="failed",
+                pause_on_error=False,
+            )
             proj.next_advance_at = now + 30 * 60
             proj.updated_at = _now_iso()
             self.store.save_projects(projects[:20])
