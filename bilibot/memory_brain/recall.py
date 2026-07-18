@@ -1161,8 +1161,8 @@ class RecallEngine:
         )
         self._self_comment_query_active = bool(
             re.search(
-                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复|"
-                r"回复过评论|主动评论|评论过)",
+                r"(发过评论|发过.*评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复|"
+                r"回复过评论|主动评论|评论过|什么评论|做过什么评论)",
                 message_for_flags,
             )
         )
@@ -2568,8 +2568,8 @@ class RecallEngine:
         self_comment_query = bool(
             getattr(self, "_self_comment_query_active", False)
             or re.search(
-                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复|"
-                r"回复过评论|主动评论|评论过)",
+                r"(发过评论|发过.*评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复|"
+                r"回复过评论|主动评论|评论过|什么评论|做过什么评论)",
                 query_text,
             )
         )
@@ -2780,6 +2780,11 @@ class RecallEngine:
             # bot_actions that merely finished watching a video.
             if self_query:
                 summary_cf = str(candidate.summary or "").casefold()
+                # Joint "动态或者评论 / 动态或评论" asks should keep BOTH self
+                # genres; do not demote self-comments just because 动态 is present.
+                joint_dyn_comment = bool(
+                    re.search(r"动态.*(评论|回复)|评论.*动态", query_text)
+                )
                 if "动态" in query_text:
                     is_dynamic_post = (
                         title_cf == "动态"
@@ -2788,6 +2793,8 @@ class RecallEngine:
                     )
                     if is_dynamic_post:
                         candidate.final_score = min(1.0, candidate.final_score + 0.22)
+                    elif joint_dyn_comment and is_self_comment_row:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.20)
                     elif source == "bot_action":
                         candidate.final_score = max(0.0, candidate.final_score - 0.12)
                     elif source in {"video", "video_experience", "subtitle", "comment"}:
