@@ -1016,6 +1016,80 @@ class MemoryBrainService:
             ],
         }
 
+    def mind_wander(
+        self,
+        *,
+        limit: int = 3,
+        seed_needles: Sequence[str] | None = None,
+    ) -> dict[str, Any]:
+        """Idle associative replay: reinforce a few salient self events (C14).
+
+        Ranking-only side effect via recall_count / last_recalled_at. Never
+        deletes memory. No LLM, no public speech. Safe to call from companion
+        tick when the bot looks idle.
+        """
+        cap = max(1, min(int(limit or 1), 5))
+        needles = [
+            str(x).strip()
+            for x in (seed_needles or ())
+            if str(x or "").strip()
+        ][:12]
+        rows = self.store.recent_events(max(40, cap * 20))
+        scored: list[tuple[float, str, str]] = []
+        for row in rows or ():
+            if not isinstance(row, Mapping):
+                continue
+            if not self._is_self_activity_event(row):
+                continue
+            eid = str(row.get("id") or "")
+            if not eid:
+                continue
+            meta = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+            state = str((meta or {}).get("action_state") or "").strip().casefold()
+            if state == "intent":
+                continue
+            source = str(row.get("source_type") or "").strip().casefold()
+            if source in {"comment", "comment_thread", "private_message"}:
+                # Mind-wander stays public-self; never replay PM bodies into salience.
+                continue
+            title = str(row.get("title") or "")
+            summary = str(row.get("summary") or "")
+            blob = f"{title} {summary}"
+            try:
+                importance = float(row.get("importance") or 0.5)
+            except (TypeError, ValueError):
+                importance = 0.5
+            try:
+                recall_n = int(row.get("recall_count") or 0)
+            except (TypeError, ValueError):
+                recall_n = 0
+            score = importance + 0.02 * min(recall_n, 20)
+            if needles:
+                hits = sum(1 for n in needles if n and n in blob)
+                score += 0.08 * hits
+            # Prefer contentful experiences over empty ticks.
+            if len(summary) < 12 and len(title) < 8:
+                score -= 0.2
+            scored.append((score, eid, (title or summary)[:60]))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        picked = scored[:cap]
+        event_ids = [eid for _s, eid, _t in picked]
+        if event_ids:
+            try:
+                self.store.reinforce_recall(event_ids)
+            except Exception:
+                logger.debug(
+                    "mind_wander reinforce failed account=%s",
+                    self.account_id,
+                    exc_info=True,
+                )
+                return {"reinforced": 0, "event_ids": [], "titles": []}
+        return {
+            "reinforced": len(event_ids),
+            "event_ids": event_ids,
+            "titles": [t for _s, _e, t in picked],
+        }
+
     def redact_private_message(
         self, text: str, *, actor_id: str | int, username: str = ""
     ) -> RedactionResult:

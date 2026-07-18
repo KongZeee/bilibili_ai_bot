@@ -758,6 +758,28 @@ async def _run() -> int:
             injection_total += 1
             notes.append(f"injection_fail:multihop:{type(exc).__name__}:{exc}")
 
+        # Mind-wander: idle reinforce must touch self events without PM leak.
+        try:
+            injection_total += 1
+            wander = getattr(brain, "mind_wander", None)
+            if not callable(wander):
+                notes.append("injection_fail:mind_wander:missing")
+            else:
+                report = wander(
+                    limit=3,
+                    seed_needles=["海龟汤", "青铜钥匙", "写时建链"],
+                )
+                n = int((report or {}).get("reinforced") or 0)
+                ids = list((report or {}).get("event_ids") or [])
+                if n >= 1 and ids:
+                    injection_ok += 1
+                    notes.append(f"injection_ok:mind_wander:{n}")
+                else:
+                    notes.append(f"injection_fail:mind_wander:n={n}")
+        except Exception as exc:
+            injection_total += 1
+            notes.append(f"injection_fail:mind_wander:{type(exc).__name__}")
+
         # Write-time peer links: finish_activity should create related_to edges
         # so graph channel can walk without waiting for nightly worker.
         try:

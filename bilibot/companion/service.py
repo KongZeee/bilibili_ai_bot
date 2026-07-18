@@ -2719,6 +2719,39 @@ class CompanionLifeService:
                     if proj:
                         result["actions"].append(f"creative:{proj.title[:20]}")
 
+            # Mind-wander (C14): idle associative replay — accessibility only,
+            # no LLM speech. Rate-limited via runtime marker.
+            if self.memory_brain and self._looks_idle() and random.random() < 0.40:
+                try:
+                    rt = self.store.get_runtime() or {}
+                    last_mw = float(rt.get("mind_wander_at") or 0)
+                    if time.time() - last_mw >= 20 * 60:
+                        needles = (self._self_state_recall_needles() or "").split()
+                        wander = getattr(self.memory_brain, "mind_wander", None)
+                        report = None
+                        if callable(wander):
+                            report = wander(limit=3, seed_needles=needles[:8])
+                        if isinstance(report, dict) and int(report.get("reinforced") or 0) > 0:
+                            titles = list(report.get("titles") or [])[:2]
+                            if titles:
+                                self._push_salient_self(
+                                    line=f"走神想到：{titles[0][:36]}",
+                                )
+                            rt["mind_wander_at"] = time.time()
+                            saver = getattr(self.store, "save_runtime", None)
+                            if callable(saver):
+                                saver(rt)
+                            else:
+                                # Best-effort if store only has get_runtime dict mutability.
+                                pass
+                            result["actions"].append(
+                                f"mind_wander:{int(report.get('reinforced') or 0)}"
+                            )
+                except Exception:
+                    logger.debug(
+                        "[%s] mind_wander skipped", self.account_id, exc_info=True
+                    )
+
             return result
         except Exception as e:
             logger.error("[%s] companion tick failed: %s", self.account_id, e, exc_info=True)
