@@ -221,41 +221,125 @@ def _mine_real_self_anchors(
         LIMIT 8
         """
     ).fetchall()
+    # Extra bot_actions for genre coverage (dynamics / self-comments).
+    bot_action_rows = con.execute(
+        """
+        SELECT id, event_type, source_type, title, summary, importance,
+               scene, created_at
+        FROM memory_events
+        WHERE source_type = 'bot_action'
+          AND length(coalesce(summary, '')) > 30
+        ORDER BY created_at DESC
+        LIMIT 40
+        """
+    ).fetchall()
     con.close()
 
-    anchors: list[dict[str, Any]] = []
-    seen_titles: set[str] = set()
-    for r in rows:
+    def _row_to_anchor(r: sqlite3.Row) -> dict[str, Any] | None:
         title = (r["title"] or "").strip()
         summary = (r["summary"] or "").strip()
         if not title and len(summary) < 30:
-            continue
-        # Skip ultra-generic intent shells.
-        if title in {"动态", "私信回复"} and "观看" not in summary:
-            # keep dynamic if body is rich
-            if len(summary) < 40:
-                continue
-        key = title[:24] or summary[:24]
-        if key in seen_titles:
-            continue
+            return None
+        # Skip ultra-generic intent shells; keep rich dynamics.
+        if title in {"私信回复"}:
+            return None
+        if title == "动态" and len(summary) < 40:
+            return None
         tokens = _distinctive_tokens(title, summary)
+        # For title==动态, mine distinctive body tokens (哈兰德/无限暖暖/…).
+        if title == "动态" or not tokens:
+            body_toks = _distinctive_tokens("", summary, max_n=6)
+            tokens = list(dict.fromkeys((tokens or []) + body_toks))[:6]
         if not tokens:
-            continue
-        seen_titles.add(key)
-        anchors.append(
-            {
-                "id": r["id"],
-                "event_type": r["event_type"],
-                "source_type": r["source_type"],
-                "title": title,
-                "summary": summary[:240],
-                "importance": float(r["importance"] or 0.5),
-                "tokens": tokens,
-                "title_frag": (title[:10] if title else tokens[0]),
-            }
-        )
-        if len(anchors) >= limit:
+            return None
+        frag = title[:10] if title and title != "动态" else (tokens[0] if tokens else "")
+        return {
+            "id": r["id"],
+            "event_type": r["event_type"],
+            "source_type": r["source_type"],
+            "title": title,
+            "summary": summary[:240],
+            "importance": float(r["importance"] or 0.5),
+            "tokens": tokens,
+            "title_frag": frag,
+        }
+
+    anchors: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+
+    def _try_add(r: sqlite3.Row) -> bool:
+        item = _row_to_anchor(r)
+        if not item:
+            return False
+        key = (item["title"][:24] or item["summary"][:24]) + "|" + item["id"][:8]
+        # Dedupe near-identical dynamics by summary prefix.
+        soft = (item["title"][:16], item["summary"][:32])
+        if soft in seen_keys or key in seen_keys:
+            return False
+        seen_keys.add(key)
+        seen_keys.add(soft)
+        anchors.append(item)
+        return True
+
+    # Reserve a few slots for genre coverage (dynamic / self-comment) so
+    # importance-ranked experiences cannot crowd them out of the limit.
+    main_cap = max(4, int(limit) - 2)
+    for r in rows:
+        _try_add(r)
+        if len(anchors) >= main_cap:
             break
+
+    # Ensure genre coverage from the same real DB (still no invented titles).
+    def _has_dynamic() -> bool:
+        return any(
+            a.get("title") == "动态" or "发布了动态" in (a.get("summary") or "")
+            for a in anchors
+        )
+
+    def _has_self_comment() -> bool:
+        return any(
+            any(
+                k in (a.get("summary") or "")
+                for k in (
+                    "主动评论",
+                    "发表了主动",
+                    "发布评论",
+                    "回复了评论",
+                    "进行了主动评论",
+                )
+            )
+            for a in anchors
+        )
+
+    need_dynamic = not _has_dynamic()
+    need_comment = not _has_self_comment()
+    if need_dynamic or need_comment:
+        for r in bot_action_rows:
+            summary = (r["summary"] or "")
+            is_dyn = (r["title"] or "") == "动态" or "发布了动态" in summary
+            is_cmt = any(
+                k in summary
+                for k in (
+                    "主动评论",
+                    "发表了主动",
+                    "发布评论",
+                    "回复了评论",
+                    "进行了主动评论",
+                )
+            )
+            if need_dynamic and is_dyn and _try_add(r):
+                need_dynamic = False
+            elif need_comment and is_cmt and _try_add(r):
+                need_comment = False
+            if not need_dynamic and not need_comment:
+                break
+    # Fill remaining slots from importance list if under limit.
+    if len(anchors) < limit:
+        for r in rows:
+            _try_add(r)
+            if len(anchors) >= limit:
+                break
+    anchors = anchors[: max(limit, len(anchors))]
 
     pm_bodies: list[str] = []
     for r in pm_rows:
