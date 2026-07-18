@@ -145,14 +145,16 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
             fallback_direct_threshold=max(0.30, FALLBACK_DIRECT_THRESHOLD - 0.06),
             fallback_association_threshold=max(0.42, FALLBACK_ASSOCIATION_THRESHOLD - 0.08),
             channel_weights=_weights_with(
-                graph=1.15,
-                chunk_vector=1.85,
-                event_vector=1.45,
-                global_recent=0.35,
-                chunk_fts=1.35,
-                event_fts=1.05,
+                graph=1.25,
+                chunk_vector=2.05,
+                event_vector=1.55,
+                global_recent=0.30,
+                chunk_fts=1.25,
+                event_fts=0.95,
+                # Creative should not overweight exact comment FTS.
+                context=0.5,
             ),
-            mood_bias=0.06,
+            mood_bias=0.08,
             prefer_self_recent=True,
             demote_inbound_comment=True,
         )
