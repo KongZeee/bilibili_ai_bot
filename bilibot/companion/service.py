@@ -561,15 +561,17 @@ class CompanionLifeService:
             )
             return core[:420]
         if scene_l in {"exploration", "explore"}:
+            # Explore from interest gaps + recent self, not pure web bag.
             core = " ".join(
                 x
                 for x in (
                     "想了解",
                     "兴趣",
                     "探索",
+                    "最近经历",
                     title_s,
                     self_needles,
-                    base[:200],
+                    base[:120],
                 )
                 if x
             )
