@@ -351,6 +351,13 @@ _UTILITY_QUERY_RE = re.compile(
 _SMALLTALK_ONLY_RE = re.compile(
     r"^(今天怎么样|怎么样啊?|还好吗|在吗|你好啊?|在不在|哈+|嗯+)[？?！!。.\s]*$"
 )
+# Multi-token smalltalk stacks ("今天怎么样 还好吗 在吗") — still not a memory query.
+_SMALLTALK_STACK_RE = re.compile(
+    r"^(?:"
+    r"(?:今天怎么样|怎么样啊?|还好吗|在吗|你好啊?|在不在|哈+|嗯+)"
+    r"[？?！!。.\s]*"
+    r"){2,}$"
+)
 
 
 def _is_content_lexical_term(term: str) -> bool:
@@ -656,6 +663,10 @@ class RecallCandidate:
     action_state: str = ""
     activity_key: str = ""
     occurred_at: str = ""
+    importance: float = 0.5
+    recall_count: int = 0
+    last_recalled_at: float = 0.0
+    accessibility: float = 0.5
     rrf_score: float = 0.0
     deterministic_score: float = 0.0
     llm_score: float | None = None
@@ -1137,15 +1148,30 @@ class RecallEngine:
         # self-memory questions that mention 天气/几点 as content must still run.
         message_early = str(getattr(self, "_original_query_text", "") or query.current_message or "").strip()
         self_memory_early = bool(_SELF_MEMORY_QUERY_RE.search(message_early))
+        utility_early = bool(
+            message_early
+            and (
+                _UTILITY_QUERY_RE.search(message_early)
+                or _SMALLTALK_ONLY_RE.match(message_early)
+                or _SMALLTALK_STACK_RE.match(message_early)
+            )
+        )
+        # Short messages are also registered as title_entity identifiers for
+        # exact-title lookups. That must NOT defeat utility/smalltalk fail-closed
+        # when the only "entity" is the utility sentence itself (LLM path would
+        # otherwise inject unrelated library hits — e2e reject pollution).
+        title_entities_early = self._title_entity_identifiers(query)
+        real_title_entities = [
+            t
+            for t in title_entities_early
+            if str(t or "").strip() and str(t).strip() != message_early
+        ]
         if (
             not explicit
             and message_early
             and not self_memory_early
-            and (
-                _UTILITY_QUERY_RE.search(message_early)
-                or _SMALLTALK_ONLY_RE.match(message_early)
-            )
-            and not self._title_entity_identifiers(query)
+            and utility_early
+            and not real_title_entities
         ):
             return self._empty_result(started, errors)
 
@@ -1307,11 +1333,20 @@ class RecallEngine:
                 if len(next_frontier) >= 8:
                     break
             frontier = next_frontier
-        # Mood / LifeState needle soft boosts (ranking only).
-        self._apply_policy_life_bias(candidates, query, policy)
-
         rough = self._rough_order(candidates)[: self.max_candidates]
         rough = await self._validate_and_enrich(rough, errors)
+        # Mood / LifeState / accessibility soft boosts after enrich fills fields.
+        if rough:
+            enriched_map = {c.event_id: c for c in rough}
+            # Also copy accessibility onto the main candidate dict for later paths.
+            for eid, cand in enriched_map.items():
+                if eid in candidates:
+                    candidates[eid].importance = cand.importance
+                    candidates[eid].recall_count = cand.recall_count
+                    candidates[eid].last_recalled_at = cand.last_recalled_at
+                    candidates[eid].accessibility = cand.accessibility
+            self._apply_policy_life_bias(enriched_map, query, policy)
+            rough = self._rough_order(enriched_map)[: self.max_candidates]
         if not rough:
             # Empty candidate set: never call LLM rerank (cost + noise).
             return self._empty_result(started, errors)
@@ -1621,7 +1656,18 @@ class RecallEngine:
             values.append(query.title.strip())
         message = str(query.current_message or "").strip()
         values.extend(match.strip() for match in _QUOTED_RE.findall(message) if match.strip())
-        if 0 < len(message) <= 64 and "\n" not in message:
+        # Do not promote pure utility/smalltalk shells to title entities — they
+        # only create false-positive FTS/title hits under LLM rerank.
+        is_utility_shell = bool(
+            message
+            and (
+                _UTILITY_QUERY_RE.search(message)
+                or _SMALLTALK_ONLY_RE.match(message)
+                or _SMALLTALK_STACK_RE.match(message)
+            )
+            and not _SELF_MEMORY_QUERY_RE.search(message)
+        )
+        if 0 < len(message) <= 64 and "\n" not in message and not is_utility_shell:
             values.append(message)
         return list(dict.fromkeys(values))
 
@@ -1868,6 +1914,40 @@ class RecallEngine:
             candidate.occurred_at = _short(
                 event.get("occurred_at") or event.get("created_at") or candidate.occurred_at,
                 80,
+            )
+            try:
+                candidate.importance = max(
+                    0.0, min(1.0, float(event.get("importance") or 0.5))
+                )
+            except (TypeError, ValueError):
+                candidate.importance = 0.5
+            try:
+                candidate.recall_count = max(0, int(event.get("recall_count") or 0))
+            except (TypeError, ValueError):
+                candidate.recall_count = 0
+            try:
+                candidate.last_recalled_at = float(event.get("last_recalled_at") or 0.0)
+            except (TypeError, ValueError):
+                candidate.last_recalled_at = 0.0
+            # Accessibility: ranking-only decay/reinforce (C14 / C8 reconciliation).
+            # Never deletes; reinforce_recall already bumps recall_count.
+            age_hours = 0.0
+            try:
+                occurred = float(event.get("occurred_at") or event.get("created_at") or 0.0)
+                if occurred > 1e12:
+                    occurred = occurred / 1000.0
+                if occurred > 0:
+                    age_hours = max(0.0, (time.time() - occurred) / 3600.0)
+            except (TypeError, ValueError):
+                age_hours = 0.0
+            recency = math.exp(-age_hours / 72.0)  # ~3-day half-ish soft decay
+            reinforce = min(0.35, 0.04 * math.log1p(candidate.recall_count))
+            candidate.accessibility = max(
+                0.05,
+                min(
+                    1.0,
+                    0.45 * candidate.importance + 0.40 * recency + reinforce,
+                ),
             )
             chunks = event.get("chunks") or ()
             video_like = _is_video_like_event(event, candidate.source_type)
@@ -3037,6 +3117,12 @@ class RecallEngine:
                 mood_hits = sum(1 for m in mood_cues if m and m in blob)
                 if mood_hits:
                     boost += min(0.12, mood_bias * mood_hits)
+            # Accessibility soft prior (generation modes lean on lived salience).
+            acc = float(getattr(candidate, "accessibility", 0.5) or 0.5)
+            if prefer_self and acc > 0.55:
+                boost += min(0.08, (acc - 0.55) * 0.25)
+            elif demote_cmt and acc < 0.35:
+                boost -= 0.03
             if boost:
                 candidate.deterministic_score = max(
                     0.0, min(1.0, candidate.deterministic_score + boost)
