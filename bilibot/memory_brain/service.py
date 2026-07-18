@@ -910,7 +910,74 @@ class MemoryBrainService:
             ) from exc
         if archived is None or getattr(archived, "source_committed", True) is False:
             raise ActivityMemoryError("activity outcome source commit was not confirmed")
-        return str(getattr(archived, "event_id", "") or "")
+        event_id = str(getattr(archived, "event_id", "") or "")
+        # Write-time light linking (C14/A-MEM-lite): connect completed self acts to
+        # recent peer self experiences so dream/creative multi-hop has structure.
+        # Ranking only — never deletes. Failures are soft.
+        if event_id and terminal == "completed":
+            try:
+                await self._link_recent_self_peers(
+                    event_id,
+                    action_type=str(action_type or ""),
+                    title=str(title or ""),
+                )
+            except Exception:
+                logger.debug(
+                    "write-time self peer link skipped account=%s",
+                    self.account_id,
+                    exc_info=True,
+                )
+        return event_id
+
+    async def _link_recent_self_peers(
+        self,
+        source_event_id: str,
+        *,
+        action_type: str = "",
+        title: str = "",
+        limit: int = 4,
+    ) -> int:
+        """Upsert weak related_to edges from a finished act to recent self events."""
+        if not source_event_id:
+            return 0
+        rows = await asyncio.to_thread(self.store.recent_events, 40)
+        peers: list[str] = []
+        title_s = str(title or "").strip()
+        for row in rows or ():
+            if not isinstance(row, Mapping):
+                continue
+            eid = str(row.get("id") or "")
+            if not eid or eid == source_event_id:
+                continue
+            if not self._is_self_activity_event(row):
+                continue
+            meta = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+            state = str((meta or {}).get("action_state") or "").strip().casefold()
+            if state == "intent":
+                continue
+            # Prefer same-title continuity, else any recent self terminal.
+            row_title = str(row.get("title") or "")
+            if title_s and title_s[:8] and title_s[:8] in row_title:
+                peers.insert(0, eid)
+            else:
+                peers.append(eid)
+            if len(peers) >= max(1, min(int(limit), 6)):
+                break
+        if not peers:
+            return 0
+        links = [
+            {
+                "target_event_id": peer,
+                "relation_type": "related_to",
+                "weight": 0.55 if i else 0.72,
+                "evidence_ids": [source_event_id, peer],
+            }
+            for i, peer in enumerate(peers)
+        ]
+        link_ids = await asyncio.to_thread(
+            self.store.upsert_links, source_event_id, links
+        )
+        return len(link_ids or [])
 
     @staticmethod
     def _trace_payload(result: RecallResult) -> dict[str, Any]:

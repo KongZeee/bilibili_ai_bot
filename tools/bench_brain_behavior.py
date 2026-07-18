@@ -758,6 +758,40 @@ async def _run() -> int:
             injection_total += 1
             notes.append(f"injection_fail:multihop:{type(exc).__name__}:{exc}")
 
+        # Write-time peer links: finish_activity should create related_to edges
+        # so graph channel can walk without waiting for nightly worker.
+        try:
+            injection_total += 1
+            await brain.begin_activity(
+                action_key="video:writetime:link",
+                action_type="evaluate_proactive_video",
+                current_activity="正在观看《写时建链探测片》。",
+                query="写时建链探测片",
+                scene="proactive_video",
+                title="写时建链探测片",
+            )
+            finish_id = await brain.finish_activity(
+                action_key="video:writetime:link",
+                action_type="evaluate_proactive_video",
+                result_text="看完《写时建链探测片》，评分7，细节: WRITE_TIME_LINK_NEEDLE。",
+                state="completed",
+                scene="proactive_video",
+                title="写时建链探测片",
+            )
+            links = []
+            if finish_id and hasattr(brain.store, "related_events"):
+                links = brain.store.related_events([finish_id], limit=20) or []
+            if links:
+                injection_ok += 1
+                notes.append(f"injection_ok:write_time_links:{len(links)}")
+            else:
+                notes.append(
+                    f"injection_fail:write_time_links:finish={finish_id!r}:n=0"
+                )
+        except Exception as exc:
+            injection_total += 1
+            notes.append(f"injection_fail:write_time_links:{type(exc).__name__}")
+
         # Public scene must not leak PM body (hard gate probe, counted in reject).
         try:
             reject_total += 1
