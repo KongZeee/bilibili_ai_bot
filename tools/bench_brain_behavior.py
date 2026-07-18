@@ -5,9 +5,10 @@ Primary climb metric (higher better):
   behavior_score:<0-100>
 
 Weights:
-  injection 0.40  — begin_activity / build_activity_context contains prior needles
-  lifecycle 0.25  — begin + finish + domain archive closed cleanly
-  post_qa   0.20  — later self-memory questions still hit
+  injection 0.35  — begin_activity / build_activity_context contains prior needles
+  lifecycle 0.20  — begin + finish + domain archive closed cleanly
+  self_state 0.15 — LifeState salient/threads surface after operational finishes
+  post_qa   0.15  — later self-memory questions still hit
   reject    0.15  — utility / smalltalk stay empty
 
 This is the P0 "true brain" judge. Frozen QA harnesses
@@ -58,11 +59,47 @@ async def _run() -> int:
         injection_total = 0
         lifecycle_ok = 0
         lifecycle_total = 0
+        self_state_ok = 0
+        self_state_total = 0
         post_qa_ok = 0
         post_qa_total = 0
         reject_ok = 0
         reject_total = 0
         notes: list[str] = []
+        companion = None
+        try:
+            from types import SimpleNamespace
+
+            from bilibot.companion.service import CompanionLifeService
+            from bilibot.companion.store import CompanionStore
+
+            cfg = SimpleNamespace(
+                enabled=True,
+                life_state=SimpleNamespace(
+                    enabled=True, inject_into_replies=True, energy_default=70
+                ),
+                dream=SimpleNamespace(enabled=False),
+                diary=SimpleNamespace(enabled=False, max_entries=30),
+                exploration=SimpleNamespace(enabled=False),
+                creative=SimpleNamespace(
+                    enabled=False,
+                    max_active_projects=1,
+                    inspiration_probability=0,
+                    chars_per_session=200,
+                    offer_dynamic_draft=False,
+                ),
+                schedule=SimpleNamespace(enabled=False),
+            )
+            store = CompanionStore(acc_dir / "companion")
+            companion = object.__new__(CompanionLifeService)
+            companion.account_id = "behavior"
+            companion.store = store
+            companion.memory_brain = brain
+            companion._cfg = cfg
+            notes.append("companion_surface:ready")
+        except Exception as exc:
+            notes.append(f"companion_surface_warn:{type(exc).__name__}")
+            companion = None
 
         # ── Scenario A: watch + like → dream begin must see it ──────────
         lifecycle_total += 1
@@ -109,6 +146,28 @@ async def _run() -> int:
             )
             lifecycle_ok += 1
             notes.append("lifecycle_ok:watch_like")
+            if companion is not None:
+                self_state_total += 1
+                try:
+                    companion.on_proactive_video_finished(
+                        title="海龟汤（2）",
+                        score=8,
+                        mood="好玩",
+                        review="烧脑又好玩",
+                        comment="便便头套好搞笑",
+                        bvid="BV1HGTEST",
+                    )
+                    companion._push_salient_self(line="给《海龟汤（2）》点了赞")
+                    surface = companion.get_prompt_surface() or ""
+                    if _has_any(surface, ["海龟汤", "刚经历", "最近在看"]):
+                        self_state_ok += 1
+                        notes.append("self_state_ok:video_surface")
+                    else:
+                        notes.append(
+                            f"self_state_fail:video_surface:chars={len(surface)}"
+                        )
+                except Exception as exc:
+                    notes.append(f"self_state_fail:video:{type(exc).__name__}")
         except Exception as exc:
             notes.append(f"lifecycle_fail:watch_like:{type(exc).__name__}")
 
@@ -233,6 +292,23 @@ async def _run() -> int:
             )
             lifecycle_ok += 1
             notes.append("lifecycle_ok:dynamic")
+            if companion is not None:
+                self_state_total += 1
+                try:
+                    companion.on_dynamic_posted(
+                        content="哈兰德表情包和无限暖暖 PV 好可爱",
+                        topic="",
+                    )
+                    surface = companion.get_prompt_surface() or ""
+                    if _has_any(surface, ["动态", "哈兰德", "无限暖暖", "刚经历"]):
+                        self_state_ok += 1
+                        notes.append("self_state_ok:dynamic_surface")
+                    else:
+                        notes.append(
+                            f"self_state_fail:dynamic_surface:chars={len(surface)}"
+                        )
+                except Exception as exc:
+                    notes.append(f"self_state_fail:dynamic:{type(exc).__name__}")
         except Exception as exc:
             notes.append(f"lifecycle_fail:dynamic:{type(exc).__name__}")
 
@@ -361,6 +437,23 @@ async def _run() -> int:
             )
             lifecycle_ok += 1
             notes.append("lifecycle_ok:pm")
+            if companion is not None:
+                self_state_total += 1
+                try:
+                    companion.on_private_message_replied(
+                        preview="你好呀，最近在看海龟汤呢",
+                        actor_label="user_x",
+                    )
+                    surface = companion.get_prompt_surface() or ""
+                    if _has_any(surface, ["私信", "海龟汤", "刚经历"]):
+                        self_state_ok += 1
+                        notes.append("self_state_ok:pm_surface")
+                    else:
+                        notes.append(
+                            f"self_state_fail:pm_surface:chars={len(surface)}"
+                        )
+                except Exception as exc:
+                    notes.append(f"self_state_fail:pm:{type(exc).__name__}")
         except Exception as exc:
             notes.append(f"lifecycle_fail:pm:{type(exc).__name__}")
 
@@ -399,6 +492,36 @@ async def _run() -> int:
             )
             lifecycle_ok += 1
             notes.append("lifecycle_ok:explore")
+            if companion is not None:
+                self_state_total += 1
+                try:
+                    # Simulate companion explore finish hook path.
+                    companion._push_salient_self(
+                        line="探索了「海龟汤推理」",
+                        thread="兴趣：海龟汤推理",
+                    )
+                    # Generation recipe should prefer SelfState needles over QA bags.
+                    recipe = companion._generation_recall_query(
+                        scene="dream",
+                        base_query="",
+                        title="梦境 behavior-day",
+                    )
+                    surface = companion.get_prompt_surface() or ""
+                    recipe_ok = _has_any(
+                        recipe,
+                        ["海龟汤", "最近经历", "刚经历", "兴趣", "动态", "哈兰德"],
+                    ) and ("总结一下这个视频" not in recipe)
+                    surface_ok = _has_any(surface, ["探索", "海龟汤", "进行中", "刚经历"])
+                    if recipe_ok and surface_ok:
+                        self_state_ok += 1
+                        notes.append("self_state_ok:explore_recipe_surface")
+                    else:
+                        notes.append(
+                            f"self_state_fail:explore:recipe_ok={recipe_ok}"
+                            f":surface_ok={surface_ok}:recipe={recipe[:80]!r}"
+                        )
+                except Exception as exc:
+                    notes.append(f"self_state_fail:explore:{type(exc).__name__}")
         except Exception as exc:
             notes.append(f"lifecycle_fail:explore:{type(exc).__name__}")
 
@@ -504,20 +627,29 @@ async def _run() -> int:
         life_rate = (
             100.0 * lifecycle_ok / lifecycle_total if lifecycle_total else 0.0
         )
+        self_rate = (
+            100.0 * self_state_ok / self_state_total if self_state_total else 0.0
+        )
         qa_rate = 100.0 * post_qa_ok / post_qa_total if post_qa_total else 0.0
         rej_rate = 100.0 * reject_ok / reject_total if reject_total else 0.0
         behavior_score = (
-            0.40 * inj_rate + 0.25 * life_rate + 0.20 * qa_rate + 0.15 * rej_rate
+            0.35 * inj_rate
+            + 0.20 * life_rate
+            + 0.15 * self_rate
+            + 0.15 * qa_rate
+            + 0.15 * rej_rate
         )
 
         for line in notes:
             print(line)
         print(f"injection_passed:{injection_ok}/{injection_total}")
         print(f"lifecycle_passed:{lifecycle_ok}/{lifecycle_total}")
+        print(f"self_state_passed:{self_state_ok}/{self_state_total}")
         print(f"post_qa_passed:{post_qa_ok}/{post_qa_total}")
         print(f"reject_passed:{reject_ok}/{reject_total}")
         print(f"injection_rate:{inj_rate:.4f}")
         print(f"lifecycle_rate:{life_rate:.4f}")
+        print(f"self_state_rate:{self_rate:.4f}")
         print(f"post_qa_rate:{qa_rate:.4f}")
         print(f"reject_rate:{rej_rate:.4f}")
         print(f"behavior_score:{behavior_score:.4f}")

@@ -427,6 +427,142 @@ class CompanionLifeService:
                 pass
             return False
 
+    def _self_state_recall_needles(self) -> str:
+        """Short continuous-self needles for generation-time retrieval (not QA)."""
+        if not self.enabled:
+            return ""
+        try:
+            state = self.ensure_life_state()
+        except Exception:
+            return ""
+        parts: List[str] = []
+        for item in (getattr(state, "ongoing_threads", None) or [])[:4]:
+            t = str(item or "").strip()
+            if t:
+                parts.append(t)
+        for item in (getattr(state, "salient_recent", None) or [])[:4]:
+            t = str(item or "").strip()
+            if t:
+                parts.append(t[:48])
+        act = str(getattr(state, "activity", "") or "").strip()
+        if act:
+            parts.append(act[:40])
+        seed = str(getattr(state, "message_seed", "") or "").strip()
+        if seed:
+            parts.append(seed[:40])
+        # Dedupe preserve order
+        seen = set()
+        out: List[str] = []
+        for p in parts:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+        return " ".join(out)[:280]
+
+    def _generation_recall_query(
+        self,
+        *,
+        scene: str,
+        base_query: str = "",
+        title: str = "",
+    ) -> str:
+        """Build a task-conditioned retrieval query for generation (≠ user QA).
+
+        Avoid pure bag-of-function-words ("视频 评论 动态 心情") that dilute FTS
+        into inbound comment floods. Prefer SelfState needles + scene anchors.
+        """
+        today = _today()
+        scene_l = str(scene or "").strip().casefold()
+        base = " ".join(str(base_query or "").replace("\x00", "").split())
+        self_needles = self._self_state_recall_needles()
+        title_s = " ".join(str(title or "").replace("\x00", "").split())[:60]
+
+        if scene_l in {"dream"}:
+            # Dream needs lived self, not comment-thread tokens.
+            core = " ".join(
+                x
+                for x in (
+                    today,
+                    "最近经历",
+                    "看了",
+                    "动态",
+                    "日记",
+                    "日程",
+                    "探索",
+                    "创作",
+                    title_s,
+                    self_needles,
+                    base[:160],
+                )
+                if x
+            )
+            return core[:420]
+        if scene_l in {"diary"}:
+            core = " ".join(
+                x
+                for x in (
+                    today,
+                    "今天做过",
+                    "看了",
+                    "动态",
+                    "梦境",
+                    "探索",
+                    "私信",
+                    "评论",
+                    title_s,
+                    self_needles,
+                    base[:160],
+                )
+                if x
+            )
+            return core[:420]
+        if scene_l in {"creative"}:
+            core = " ".join(
+                x
+                for x in (
+                    "创作",
+                    "小说",
+                    title_s,
+                    "灵感",
+                    "续写",
+                    self_needles,
+                    base[:200],
+                )
+                if x
+            )
+            return core[:420]
+        if scene_l in {"exploration", "explore"}:
+            core = " ".join(
+                x
+                for x in (
+                    "想了解",
+                    "兴趣",
+                    "探索",
+                    title_s,
+                    self_needles,
+                    base[:200],
+                )
+                if x
+            )
+            return core[:420]
+        if scene_l in {"life_plan", "companion"}:
+            core = " ".join(
+                x
+                for x in (
+                    today,
+                    "生活安排",
+                    "最近做过",
+                    title_s,
+                    self_needles,
+                    base[:160],
+                )
+                if x
+            )
+            return core[:420]
+        # Fallback: keep caller base but still append continuous self.
+        core = " ".join(x for x in (base or today, self_needles, title_s) if x)
+        return (core or f"{today} 最近经历")[:420]
+
     async def _recall_life_evidence(
         self,
         *,
@@ -452,8 +588,14 @@ class CompanionLifeService:
         if not self.memory_brain:
             return empty
         today = _today()
-        q = (query or "").strip() or (
-            f"{today} 最近看的视频、番剧、评论、动态、日记、心情、想法"
+        # Generation recipe: scene-conditioned + SelfState needles.
+        # Callers may still pass a base query; we rewrite rather than use QA bags.
+        q = self._generation_recall_query(
+            scene=scene,
+            base_query=query or "",
+            title=title or action_type or scene,
+        ) or (
+            f"{today} 最近经历"
         )
         evidence = ""
         event_ids: List[str] = []
@@ -482,6 +624,7 @@ class CompanionLifeService:
                         **dict(metadata or {}),
                         "companion": True,
                         "source_module": "companion",
+                        "generation_recall_query": q[:240],
                     },
                     recent_limit=max(6, limit),
                     recall_limit=limit,
@@ -501,13 +644,26 @@ class CompanionLifeService:
             evidence = str(getattr(activity, "prompt_text", "") or "").strip()
             event_ids = list(getattr(activity, "event_ids", ()) or ())
             snippets = list(getattr(activity, "recent_self_actions", ()) or ())
+            # Always attach continuous self surface for generation continuity.
+            try:
+                life_surface = self.get_prompt_surface() or ""
+            except Exception:
+                life_surface = ""
+            if life_surface:
+                life_block = f"【连续自我状态】\n{life_surface}"
+                if life_block not in evidence:
+                    evidence = "\n\n".join(x for x in (evidence, life_block) if x)
+                for line in life_surface.splitlines():
+                    line = line.strip()
+                    if line and line not in snippets:
+                        snippets.append(line)
             if not evidence:
                 self._pause_for_memory_failure("activity_memory_empty")
                 raise RuntimeError("companion activity memory returned empty context")
             return {
                 "memory_evidence": evidence[:4000],
                 "memory_event_ids": event_ids[:20],
-                "snippets": snippets[:limit],
+                "snippets": snippets[: max(limit, 8)],
             }
 
         try:
@@ -574,6 +730,18 @@ class CompanionLifeService:
 
         if not evidence and snippets:
             evidence = "\n".join(f"- {s}" for s in snippets[:limit])
+        try:
+            life_surface = self.get_prompt_surface() or ""
+        except Exception:
+            life_surface = ""
+        if life_surface:
+            life_block = f"【连续自我状态】\n{life_surface}"
+            if life_block not in (evidence or ""):
+                evidence = "\n\n".join(x for x in (evidence, life_block) if x)
+            for line in life_surface.splitlines():
+                line = line.strip()
+                if line and line not in snippets:
+                    snippets.append(line)
         if evidence:
             logger.info(
                 "[%s] companion recall scene=%s events=%s chars=%s",
@@ -585,7 +753,7 @@ class CompanionLifeService:
         return {
             "memory_evidence": evidence[:2500],
             "memory_event_ids": event_ids[:20],
-            "snippets": snippets[:limit],
+            "snippets": snippets[: max(limit, 8)],
         }
 
     def _push_salient_self(
@@ -1545,10 +1713,8 @@ class CompanionLifeService:
         diary_hint = diaries[0].summary if diaries else ""
         # V6 混合召回：梦境生成侧读近期经历，避免「只写不读」
         dream_recall = await self._recall_life_evidence(
-            query=(
-                f"{today} 最近 看了 视频 番剧 评论 动态 日记 心情 念头 日程 "
-                f"{(self.ensure_life_state().activity if self.enabled else '') or ''}"
-            ),
+            # Scene recipe + SelfState needles are applied inside _recall_life_evidence.
+            query=(self.ensure_life_state().activity if self.enabled else "") or "",
             scene="dream",
             limit=5,
             action_key=f"companion_dream:{today}",
@@ -1674,10 +1840,7 @@ class CompanionLifeService:
             evidence_parts.append("事件：" + "；".join(detail.events[:4]))
         # V6 混合召回：近期视频/动态/番剧/评论 + 生活面，替代脆弱 search_memories 字符串
         recall_bundle = await self._recall_life_evidence(
-            query=(
-                f"{today} 今天 最近 看了 视频 番剧 评论 动态 日记 心情 想法 "
-                f"{state.activity or ''} {state.message_seed or ''}"
-            ),
+            query=f"{state.activity or ''} {state.message_seed or ''}".strip(),
             scene="diary",
             limit=6,
             action_key=f"companion_diary:{today}",
@@ -1869,9 +2032,13 @@ class CompanionLifeService:
         plan_sum = P.format_plan_summary([i.to_dict() for i in plan.items]) if plan.items else ""
         # 探索动机可吸收近期记忆/主动行为，避免只会空转兴趣词
         explore_recall = await self._recall_life_evidence(
-            query=(
-                f"最近想了解 感兴趣 视频 番剧 动态 {state.activity or ''} "
-                + " ".join((bits.get("interests") or [])[:6])
+            query=" ".join(
+                x
+                for x in (
+                    state.activity or "",
+                    " ".join((bits.get("interests") or [])[:6]),
+                )
+                if x
             ),
             scene="exploration",
             limit=4,
