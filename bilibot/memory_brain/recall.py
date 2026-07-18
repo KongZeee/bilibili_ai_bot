@@ -1282,6 +1282,9 @@ class RecallEngine:
         else:
             mode = "llm"
             selected = self._apply_decisions(rough, decisions)
+            # Genre exclusivity must also apply when the LLM reranker is up;
+            # otherwise hard-zeros only protect the fallback path.
+            selected = self._postfilter_selected_by_genre(selected)
 
         validated_events = await self._read_selected_events(selected, errors)
         evidence = render_memory_evidence(
@@ -1925,6 +1928,101 @@ class RecallEngine:
             max_associations=self.max_associations,
         )
 
+    def _postfilter_selected_by_genre(
+        self, selected: Sequence[RecallCandidate]
+    ) -> list[RecallCandidate]:
+        """Enforce exclusive self-genre gates after LLM selection.
+
+        Fallback already hard-zeros inside ``_select_fallback``. LLM path only
+        applied score thresholds, so cheese videos / inbound threads could win
+        dream/PM/like/self-comment/open-recent questions when rerank was up.
+        """
+        rows = list(selected or ())
+        if not rows:
+            return []
+
+        def src(c: RecallCandidate) -> str:
+            return str(c.source_type or "").strip().casefold()
+
+        def blob(c: RecallCandidate) -> str:
+            return f"{c.title or ''} {c.summary or ''}"
+
+        if getattr(self, "_dream_query_active", False):
+            kept = [c for c in rows if src(c) == "dream"]
+            return kept
+        if getattr(self, "_pm_query_active", False):
+            kept = [
+                c
+                for c in rows
+                if src(c) == "private_message" or "私信" in str(c.title or "")
+            ]
+            return kept
+        if getattr(self, "_like_query_active", False):
+            original = str(getattr(self, "_original_query_text", "") or "")
+            if re.search(r"(投币|投了币)", original):
+                needles = ("投了币", "投币")
+            elif re.search(r"(收藏过|收藏了|你收藏)", original):
+                needles = ("收藏了", "已收藏")
+            else:
+                needles = ("点了赞", "点赞", "赞了")
+            kept = [
+                c
+                for c in rows
+                if src(c) in {"bot_action", "video_experience", "behavior_log"}
+                and any(n in blob(c) for n in needles)
+            ]
+            return kept
+        if getattr(self, "_self_comment_query_active", False):
+            kept = []
+            for c in rows:
+                if src(c) in {"comment", "comment_thread"}:
+                    continue
+                state = str(getattr(c, "action_state", "") or "").strip().casefold()
+                if state == "intent":
+                    continue
+                if src(c) != "bot_action":
+                    continue
+                text = blob(c)
+                if any(
+                    k in text
+                    for k in (
+                        "主动评论",
+                        "发表了评论",
+                        "回复了评论",
+                        "进行了主动评论",
+                        "尝试发布主动评论",
+                    )
+                ) or ("评论" in text and any(k in text for k in ("发表", "回复", "主动"))):
+                    kept.append(c)
+            return kept
+        if getattr(self, "_open_recent_self_query_active", False):
+            preferred = {
+                "bot_action",
+                "creative",
+                "diary",
+                "dream",
+                "life_plan",
+                "weekly_summary",
+                "private_message",
+                "video_experience",
+                "web_reference",
+            }
+            kept = [c for c in rows if src(c) in preferred]
+            # Prefer non-generic web_reference titles when present.
+            if kept:
+                non_generic = [
+                    c
+                    for c in kept
+                    if not (
+                        src(c) == "web_reference"
+                        and str(c.title or "").strip().casefold()
+                        in {"联网搜索参考", "web reference", "search reference"}
+                    )
+                ]
+                return non_generic or kept
+            return kept
+        return rows
+
     def _select_fallback(
         self,
         candidates: Sequence[RecallCandidate],
@@ -2224,6 +2322,7 @@ class RecallEngine:
                         if "global_recent" in (candidate.channel_ranks or {}):
                             candidate.final_score = min(1.0, candidate.final_score + 0.10)
                     elif source in {
+                        "creative",
                         "diary",
                         "dream",
                         "life_plan",

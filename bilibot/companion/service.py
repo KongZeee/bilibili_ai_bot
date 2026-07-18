@@ -780,50 +780,60 @@ class CompanionLifeService:
         text = " ".join(str(line or "").replace("\x00", "").split())
         if not text and not thread and not close_thread_prefix:
             return
+        # Ensure day-roll happens before atomic mutate (may write once).
         try:
-            state = self.ensure_life_state()
+            self.ensure_life_state()
         except Exception:
             return
-        recent = [
-            str(x).strip()
-            for x in (getattr(state, "salient_recent", None) or [])
-            if str(x or "").strip()
-        ]
-        if text:
-            # Dedupe exact / prefix-similar lines.
-            recent = [x for x in recent if x != text and not x.startswith(text[:16])]
-            recent.insert(0, text[:120])
-            state.salient_recent = recent[:8]
-        threads = [
-            str(x).strip()
-            for x in (getattr(state, "ongoing_threads", None) or [])
-            if str(x or "").strip()
-        ]
-        if close_thread_prefix:
-            pref = close_thread_prefix.strip()
-            threads = [t for t in threads if not t.startswith(pref)]
-        thr = " ".join(str(thread or "").replace("\x00", "").split())
-        if thr:
-            # Never keep terminal "已完成" markers as open threads.
-            if "已完成" in thr:
-                cat = self._thread_category_prefix(thr) or thr[:12]
-                if cat:
-                    threads = [t for t in threads if not t.startswith(cat)]
-            else:
-                cat = self._thread_category_prefix(thr)
-                if cat:
-                    threads = [t for t in threads if not t.startswith(cat)]
+
+        def _mutate(state: LifeState) -> None:
+            recent = [
+                str(x).strip()
+                for x in (getattr(state, "salient_recent", None) or [])
+                if str(x or "").strip()
+            ]
+            if text:
+                recent = [
+                    x for x in recent if x != text and not x.startswith(text[:16])
+                ]
+                recent.insert(0, text[:120])
+                state.salient_recent = recent[:8]
+            threads = [
+                str(x).strip()
+                for x in (getattr(state, "ongoing_threads", None) or [])
+                if str(x or "").strip()
+            ]
+            if close_thread_prefix:
+                pref = close_thread_prefix.strip()
+                threads = [t for t in threads if not t.startswith(pref)]
+            thr = " ".join(str(thread or "").replace("\x00", "").split())
+            if thr:
+                if "已完成" in thr:
+                    cat = self._thread_category_prefix(thr) or thr[:12]
+                    if cat:
+                        threads = [t for t in threads if not t.startswith(cat)]
                 else:
-                    threads = [
-                        t
-                        for t in threads
-                        if t != thr and not t.startswith(thr[:12])
-                    ]
-                threads.insert(0, thr[:80])
-        state.ongoing_threads = threads[:6]
-        state.updated_at = _now_iso()
+                    cat = self._thread_category_prefix(thr)
+                    if cat:
+                        threads = [t for t in threads if not t.startswith(cat)]
+                    else:
+                        threads = [
+                            t
+                            for t in threads
+                            if t != thr and not t.startswith(thr[:12])
+                        ]
+                    threads.insert(0, thr[:80])
+            state.ongoing_threads = threads[:6]
+            state.updated_at = _now_iso()
+
         try:
-            self.store.save_life_state(state)
+            updater = getattr(self.store, "update_life_state", None)
+            if callable(updater):
+                updater(_mutate)
+            else:
+                state = self.store.get_life_state()
+                _mutate(state)
+                self.store.save_life_state(state)
         except Exception:
             logger.debug(
                 "[%s] salient self save failed", self.account_id, exc_info=True
@@ -1175,7 +1185,7 @@ class CompanionLifeService:
         if not self.enabled:
             return
         try:
-            state = self.ensure_life_state()
+            self.ensure_life_state()
             # energy: watching costs a bit; high score slightly recovers curiosity
             delta = -2
             try:
@@ -1188,18 +1198,26 @@ class CompanionLifeService:
                 delta = -1
             elif sc > 0:
                 delta = -3
-            state.energy = max(0, min(100, int(state.energy) + delta))
-            if mood:
-                state.mood_bias = str(mood)[:20]
-            # activity echo
             short_title = (title or "一个视频")[:40]
-            state.activity = f"刚看了《{short_title}》"
-            if review:
-                state.message_seed = str(review)[:60]
-            elif comment:
-                state.message_seed = str(comment)[:60]
-            state.updated_at = _now_iso()
-            self.store.save_life_state(state)
+            mood_s = str(mood or "")[:20]
+            seed = str(review or comment or "")[:60]
+
+            def _mutate_video(state: LifeState) -> None:
+                state.energy = max(0, min(100, int(state.energy) + delta))
+                if mood_s:
+                    state.mood_bias = mood_s
+                state.activity = f"刚看了《{short_title}》"
+                if seed:
+                    state.message_seed = seed
+                state.updated_at = _now_iso()
+
+            updater = getattr(self.store, "update_life_state", None)
+            if callable(updater):
+                state = updater(_mutate_video)
+            else:
+                state = self.store.get_life_state()
+                _mutate_video(state)
+                self.store.save_life_state(state)
             # Continuous self: recent watch must appear in reply surface without FTS.
             salient = f"看了《{short_title}》"
             if sc > 0:
@@ -1268,16 +1286,24 @@ class CompanionLifeService:
         if not self.enabled:
             return
         try:
-            state = self.ensure_life_state()
-            state.energy = max(0, min(100, int(state.energy) - 1))
-            if topic:
-                state.message_seed = str(topic)[:60]
-            elif content:
-                state.message_seed = str(content)[:60]
-            state.activity = "刚发了条动态"
-            state.updated_at = _now_iso()
-            self.store.save_life_state(state)
+            self.ensure_life_state()
+            seed = str(topic or content or "")[:60]
             preview = (content or topic or "").strip().replace("\n", " ")
+
+            def _mutate_dyn(state: LifeState) -> None:
+                state.energy = max(0, min(100, int(state.energy) - 1))
+                if seed:
+                    state.message_seed = seed
+                state.activity = "刚发了条动态"
+                state.updated_at = _now_iso()
+
+            updater = getattr(self.store, "update_life_state", None)
+            if callable(updater):
+                updater(_mutate_dyn)
+            else:
+                state = self.store.get_life_state()
+                _mutate_dyn(state)
+                self.store.save_life_state(state)
             self._push_salient_self(
                 line=(
                     f"发了动态"
@@ -1314,13 +1340,22 @@ class CompanionLifeService:
         if not self.enabled:
             return
         try:
-            state = self.ensure_life_state()
-            state.energy = max(0, min(100, int(state.energy) - 1))
-            state.activity = "刚回了私信"
+            self.ensure_life_state()
             # Do not put private-message body into message_seed / salient.
             _ = preview  # compatibility; body must not enter continuous self
-            state.updated_at = _now_iso()
-            self.store.save_life_state(state)
+
+            def _mutate_pm(state: LifeState) -> None:
+                state.energy = max(0, min(100, int(state.energy) - 1))
+                state.activity = "刚回了私信"
+                state.updated_at = _now_iso()
+
+            updater = getattr(self.store, "update_life_state", None)
+            if callable(updater):
+                updater(_mutate_pm)
+            else:
+                state = self.store.get_life_state()
+                _mutate_pm(state)
+                self.store.save_life_state(state)
             who = " ".join(str(actor_label or "").replace("\x00", "").split())[:20]
             line = "回了私信"
             if who:
@@ -1341,16 +1376,26 @@ class CompanionLifeService:
         if not self.enabled:
             return
         try:
-            state = self.ensure_life_state()
-            state.energy = max(0, min(100, int(state.energy) - 1))
+            self.ensure_life_state()
             short_title = (title or "").strip()[:40]
             kind = "主动评论" if proactive else "回复评论"
-            state.activity = f"刚{kind}" + (f"《{short_title}》" if short_title else "")
             safe_preview = " ".join(str(preview or "").replace("\x00", "").split())[:48]
-            if safe_preview:
-                state.message_seed = safe_preview[:60]
-            state.updated_at = _now_iso()
-            self.store.save_life_state(state)
+            activity = f"刚{kind}" + (f"《{short_title}》" if short_title else "")
+
+            def _mutate_cmt(state: LifeState) -> None:
+                state.energy = max(0, min(100, int(state.energy) - 1))
+                state.activity = activity
+                if safe_preview:
+                    state.message_seed = safe_preview[:60]
+                state.updated_at = _now_iso()
+
+            updater = getattr(self.store, "update_life_state", None)
+            if callable(updater):
+                updater(_mutate_cmt)
+            else:
+                state = self.store.get_life_state()
+                _mutate_cmt(state)
+                self.store.save_life_state(state)
             line = kind
             if short_title:
                 line += f"《{short_title}》"
@@ -2320,6 +2365,9 @@ class CompanionLifeService:
                 )
                 raw = await self._llm_text(system, user, max_tokens=1500, scene="creative")
                 meta = _extract_json(raw) if raw else None
+                project_action_key = (
+                    f"companion_creative_project:{_today()}:{len(projects)}"
+                )
                 if isinstance(meta, dict) and meta.get("title"):
                     proj = CreativeProject.from_dict(
                         {
@@ -2358,9 +2406,7 @@ class CompanionLifeService:
                             "companion creative project memory archive failed"
                         )
                     await self._finish_activity_memory(
-                        action_key=(
-                            f"companion_creative_project:{_today()}:{len(projects)}"
-                        ),
+                        action_key=project_action_key,
                         action_type="create_creative_project",
                         result_text="新的创作项目已经建立并归档。",
                         scene="creative",
@@ -2373,6 +2419,22 @@ class CompanionLifeService:
                     self.store.save_projects(projects[:20])
                     drafting = [p for p in projects if p.status == "drafting"]
                     self.store.patch_runtime(last_creative_project_at=_now_iso())
+                else:
+                    # begin_activity already opened via _recall_life_evidence.
+                    await self._finish_activity_memory(
+                        action_key=project_action_key,
+                        action_type="create_creative_project",
+                        result_text="构思新创作未产出可用标题，稍后再试。",
+                        scene="creative",
+                        title=f"新创作项目 {_today()}",
+                        metadata={
+                            "date": _today(),
+                            "project_slot": len(projects),
+                            "reason_code": "empty_or_invalid_project",
+                        },
+                        state="failed",
+                        pause_on_error=False,
+                    )
 
         # advance one due project
         due = [p for p in drafting if force or (p.next_advance_at or 0) <= now]

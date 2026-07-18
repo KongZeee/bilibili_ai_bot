@@ -73,6 +73,19 @@ class CompanionStore:
     def save_life_state(self, state: LifeState) -> None:
         self._save("life_state.json", state.to_dict())
 
+    def update_life_state(self, mutator) -> LifeState:
+        """Atomic read-modify-write for LifeState under the store lock.
+
+        Concurrent hooks (video + comment + like) previously loaded, mutated, and
+        saved independently so a later save could clobber earlier energy/salient
+        updates. ``mutator`` receives a ``LifeState`` and may mutate it in place.
+        """
+        with self._lock:
+            state = LifeState.from_dict(self._load("life_state.json", {}))
+            mutator(state)
+            self._save("life_state.json", state.to_dict())
+            return state
+
     # ── daily plan ──
 
     def get_daily_plan(self) -> DailyPlan:
