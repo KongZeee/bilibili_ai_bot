@@ -437,6 +437,26 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 ["探索", "ATRI", "夏生"],
                 [],
             ),
+            (
+                "你做过什么梦",
+                ["梦", "窗边", "梦见"],
+                ["奶酪", "迪奥"],
+            ),
+            (
+                "你最近回过谁私信",
+                ["私信"],
+                [],
+            ),
+            (
+                "你点赞过什么",
+                ["点了赞", "点赞", "海龟汤"],
+                [],
+            ),
+            (
+                "你发过评论吗",
+                ["主动评论", "发表了评论", "发表了主动评论", "回复了评论"],
+                [],
+            ),
         ]
         for q, must_any, forbid_any in probe_cases:
             result = await brain.recall(
@@ -464,6 +484,17 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 has_must = any(
                     t in {"video", "video_experience", "bot_action"} for t in types
                 ) and not getattr(result, "is_empty", False)
+            if q.startswith("你发过评论吗"):
+                types = [
+                    str(ev.get("source_type") or "")
+                    for ev in (getattr(result, "events", ()) or [])
+                    if isinstance(ev, dict)
+                ]
+                has_must = (
+                    "bot_action" in types
+                    and any(m in blob for m in must_any if m)
+                    and not getattr(result, "is_empty", False)
+                )
             if has_must and not has_forbid and not getattr(result, "is_empty", False):
                 probe_ok += 1
                 print(f"probe_ok:{q[:24]}")

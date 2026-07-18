@@ -454,3 +454,131 @@ async def test_completed_activity_hides_intent_duplicate(tmp_path):
         "评分9" in str((e.get("summary") if isinstance(e, dict) else "") or "")
         for e in result.events
     )
+
+
+@pytest.mark.asyncio
+async def test_open_dream_query_prefers_dream_source(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="dream-open",
+            account_id="acc",
+            source_type="dream",
+            source_external_id="d-open",
+            source_text="梦见窗边的午后，夏生在看书。",
+            event_title="窗边的午后",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="noise-what",
+            account_id="acc",
+            source_type="video",
+            source_external_id="v-what",
+            source_text="视频里反复出现什么什么什么，和做梦无关。",
+            event_title="全世界将近2000种奶酪，到底都有什么区别？",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你做过什么梦", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    types = [e.get("source_type") for e in result.events if isinstance(e, dict)]
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert "dream" in types or any("窗边" in t for t in titles)
+    assert not any("奶酪" in t for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_private_message_self_query(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="pm-1",
+            account_id="acc",
+            source_type="private_message",
+            source_external_id="pm1",
+            source_text="亚托莉在私信中发送消息：你好呀，我是亚托莉。",
+            event_title="私信回复",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你最近回过谁私信", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    types = [e.get("source_type") for e in result.events if isinstance(e, dict)]
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert "private_message" in types or any("私信" in t for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_like_query_prefers_like_bot_action(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="like-1",
+            account_id="acc",
+            source_type="bot_action",
+            source_external_id="like1",
+            source_text="亚托莉观看了视频《海龟汤（2）》并点了赞。",
+            event_title="海龟汤（2）",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="noise-like",
+            account_id="acc",
+            source_type="video",
+            source_external_id="vlike",
+            source_text="这个视频讲了点赞机制，但机器人并没有点赞。",
+            event_title="一口气看完「什么都能钓到」的空岛！",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你点赞过什么", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    types = [e.get("source_type") for e in result.events if isinstance(e, dict)]
+    assert any("海龟汤" in t for t in titles) or "bot_action" in types
+    assert not any("空岛" in t for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_self_comment_query_prefers_bot_action(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="self-cmt",
+            account_id="acc",
+            source_type="bot_action",
+            source_external_id="sc1",
+            source_text="亚托莉发表了主动评论：“便便头套好搞笑，海龟汤推理好烧脑”。",
+            event_title="海龟汤（2）",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="user-cmt",
+            account_id="acc",
+            source_type="comment_thread",
+            source_external_id="uct1",
+            source_text="在关于“神气小鹿”推广其“小冰被”的评论区中，博主发布了多条宣传内容。",
+            event_title="评论对话上下文",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你发过评论吗", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    types = [e.get("source_type") for e in result.events if isinstance(e, dict)]
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert "bot_action" in types or any("海龟汤" in t for t in titles)
+    assert not any(t == "评论对话上下文" for t in titles)

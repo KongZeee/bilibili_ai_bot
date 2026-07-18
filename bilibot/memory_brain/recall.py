@@ -177,9 +177,12 @@ _LEXICAL_STOP_TERMS = frozenset(
 
 # Queries about the bot's own prior posts / writings (not topical "动态" alone).
 _SELF_MEMORY_QUERY_RE = re.compile(
-    r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|做的梦|梦见|你发|"
-    r"评论说了|发过评论|刚给.*评论|你回复|"
+    r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|"
+    r"做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦|"
+    r"你发|评论说了|发过评论|刚给.*评论|你回复|你评论|评论了什么|最近评论|"
     r"刚看了|刚看过|看了什么视频|看过什么视频|最近看|"
+    r"私信|回过私信|回过谁|"
+    r"点赞|赞过|点了赞|"
     r"日程|安排|周总结|追什么番|在追|追番|番剧|看番)"
 )
 
@@ -799,6 +802,17 @@ class RecallEngine:
         self._bangumi_query_active = bool(
             re.search(r"(追什么番|在追|追番|番剧|看番)", message_for_flags)
         )
+        self._dream_query_active = bool(
+            re.search(r"(做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦)", message_for_flags)
+        )
+        self._pm_query_active = bool(re.search(r"(私信|回过私信|回过谁)", message_for_flags))
+        self._like_query_active = bool(re.search(r"(点赞|赞过|点了赞)", message_for_flags))
+        self._self_comment_query_active = bool(
+            re.search(
+                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复)",
+                message_for_flags,
+            )
+        )
         # Open bangumi questions have almost no distinctive FTS terms. Seed the
         # bot's known anime/visual-novel anchors so hybrid recall can fire.
         if self._bangumi_query_active:
@@ -806,6 +820,22 @@ class RecallEngine:
                 query,
                 "current_message",
                 f"{message_for_flags} ATRI 亚托莉 视觉小说 夏生 番剧",
+            )
+        # Open dream questions often only contain stopwordy shells ("什么/做过");
+        # seed the archival verb used by dream rows. Avoid bare "梦/做梦" —
+        # those match generic video bodies ("和做梦无关").
+        elif self._dream_query_active:
+            object.__setattr__(
+                query,
+                "current_message",
+                f"{message_for_flags} 梦见",
+            )
+        # Like questions: seed the archival phrasing used by watch+like bot_actions.
+        elif self._like_query_active:
+            object.__setattr__(
+                query,
+                "current_message",
+                f"{message_for_flags} 点了赞 点赞",
             )
 
         # Per-call inject cap (0 → engine default max_events)
@@ -1748,6 +1778,27 @@ class RecallEngine:
         query_text = str(getattr(query, "current_message", "") or "")
         self_query = bool(_SELF_MEMORY_QUERY_RE.search(query_text))
         watch_query = bool(re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", query_text))
+        dream_query = bool(
+            getattr(self, "_dream_query_active", False)
+            or re.search(r"(做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦)", query_text)
+        )
+        pm_query = bool(
+            getattr(self, "_pm_query_active", False)
+            or re.search(r"(私信|回过私信|回过谁)", query_text)
+        )
+        like_query = bool(
+            getattr(self, "_like_query_active", False)
+            or re.search(r"(点赞|赞过|点了赞)", query_text)
+        )
+        self_comment_query = bool(
+            getattr(self, "_self_comment_query_active", False)
+            or re.search(
+                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复)",
+                query_text,
+            )
+        )
+        if dream_query or pm_query or like_query or self_comment_query:
+            self_query = True
         eligible: list[RecallCandidate] = []
         for candidate in candidates:
             candidate.llm_score = None
@@ -1761,28 +1812,85 @@ class RecallEngine:
             )
             source = str(candidate.source_type or "").strip().casefold()
             summary_cf = str(candidate.summary or "").casefold()
+            title_cf_early = str(candidate.title or "").strip().casefold()
+            # Tests/archives may keep the full body only in chunks; fold lexical
+            # matched terms into the evidence blob used for genre detection.
+            lex_blob = " ".join(
+                str(t) for t in (candidate.lexical_matched_terms or set())
+            ).casefold()
+            evidence_blob = f"{summary_cf} {title_cf_early} {lex_blob}"
+            snippet_blob = " ".join(
+                str(text)
+                for _cid, text in (getattr(candidate, "evidence_snippets", ()) or ())
+            ).casefold()
+            if snippet_blob:
+                evidence_blob = f"{evidence_blob} {snippet_blob}"
             is_watch_row = (
                 source in {"video_experience", "video"}
                 or "看完" in summary_cf
                 or "观看了" in summary_cf
+            )
+            is_like_row = source in {
+                "bot_action",
+                "video_experience",
+                "behavior_log",
+            } and any(
+                k in evidence_blob
+                for k in ("点了赞", "点赞", "赞了", "了赞", "点了")
+            )
+            is_pm_row = source == "private_message" or "私信" in title_cf_early
+            # Dream genre is source-primary. Body mentions of "做梦" on videos are noise.
+            is_dream_row = source == "dream" or (
+                source in {"bot_action", "diary"}
+                and ("梦见" in evidence_blob or "做的梦" in evidence_blob)
+            )
+            is_self_comment_row = source == "bot_action" and (
+                any(
+                    k in evidence_blob
+                    for k in (
+                        "主动评论",
+                        "发表了评论",
+                        "发表了主动评论",
+                        "回复了评论",
+                        "进行了主动评论",
+                        "尝试发布主动评论",
+                        "发表了主动",
+                    )
+                )
+                or (
+                    "评论" in evidence_blob
+                    and any(k in evidence_blob for k in ("发表", "回复", "主动", "尝试"))
+                )
             )
             watch_rescue = watch_query and is_watch_row and (
                 "global_recent" in (candidate.channel_ranks or {})
                 or "speaker_recent" in (candidate.channel_ranks or {})
                 or candidate.deterministic_score >= 0.15
             )
+            genre_rescue = (
+                (dream_query and is_dream_row)
+                or (pm_query and is_pm_row)
+                or (like_query and is_like_row)
+                or (self_comment_query and is_self_comment_row)
+            ) and candidate.deterministic_score >= 0.12
             # Title/self near-threshold candidates may sit slightly under the
             # numeric gate after OR-FTS dilution; content evidence check is the
             # real safety net.
-            if candidate.final_score < threshold and not watch_rescue and not (
+            if candidate.final_score < threshold and not watch_rescue and not genre_rescue and not (
                 candidate.final_score >= 0.15
                 and RecallEngine._fallback_has_content_evidence(candidate)
             ):
                 continue
-            if not watch_rescue and not RecallEngine._fallback_has_content_evidence(candidate):
+            if (
+                not watch_rescue
+                and not genre_rescue
+                and not RecallEngine._fallback_has_content_evidence(candidate)
+            ):
                 continue
             if watch_rescue and candidate.final_score < 0.20:
                 candidate.final_score = 0.45
+            if genre_rescue and candidate.final_score < 0.40:
+                candidate.final_score = 0.48
             # Prefer multi-term content matches over single common noun hits
             # (e.g. 日记+心情 beats many videos that only mention 心情).
             content_term_count = sum(
@@ -1841,6 +1949,34 @@ class RecallEngine:
                             candidate.final_score = min(1.0, candidate.final_score + 0.12)
                     elif source in {"comment", "comment_thread", "web_reference"}:
                         candidate.final_score = max(0.0, candidate.final_score - 0.20)
+                elif dream_query:
+                    if is_dream_row or source == "dream":
+                        candidate.final_score = min(1.0, candidate.final_score + 0.32)
+                    else:
+                        # Open dream questions should not surface generic videos
+                        # that only share stopwordy tokens like 什么/做过.
+                        candidate.final_score = 0.0
+                elif pm_query:
+                    if is_pm_row or source == "private_message":
+                        candidate.final_score = min(1.0, candidate.final_score + 0.32)
+                    else:
+                        candidate.final_score = 0.0
+                elif like_query:
+                    if is_like_row:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.32)
+                    else:
+                        # Only explicit like bot_actions answer "你点赞过什么".
+                        # Generic video bodies that mention 点赞 are pure noise.
+                        candidate.final_score = 0.0
+                elif self_comment_query:
+                    if is_self_comment_row:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.30)
+                    elif source in {"comment", "comment_thread"}:
+                        # Inbound user comments / generic threads are not "你发过评论".
+                        # Hard-zero so title-term bonuses cannot re-raise them.
+                        candidate.final_score = 0.0
+                    elif source in {"video", "video_experience", "subtitle", "web_reference"}:
+                        candidate.final_score = max(0.0, candidate.final_score - 0.12)
                 elif re.search(r"(日程|安排|周总结)", query_text):
                     if source in {"life_plan", "weekly_summary", "diary"}:
                         candidate.final_score = min(1.0, candidate.final_score + 0.28)
@@ -1869,7 +2005,7 @@ class RecallEngine:
                         candidate.final_score = max(0.0, candidate.final_score - 0.15)
                 elif source == "bot_action":
                     candidate.final_score = min(1.0, candidate.final_score + 0.12)
-                elif source in {"diary", "dream", "weekly_summary", "life_plan"}:
+                elif source in {"diary", "dream", "weekly_summary", "life_plan", "private_message"}:
                     candidate.final_score = min(1.0, candidate.final_score + 0.10)
                 elif source in {"video", "video_experience", "subtitle", "comment"}:
                     candidate.final_score = max(0.0, candidate.final_score - 0.08)
@@ -2045,6 +2181,7 @@ class RecallEngine:
             "dream",
             "life_plan",
             "weekly_summary",
+            "private_message",
         }
         if durable_self and title_hit:
             return True
