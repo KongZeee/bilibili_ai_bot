@@ -22,9 +22,9 @@ Snapshot after exp59 + behavior harness. Update when paths change.
 
 1. like/coin/fav: terminal archive only, no begin context (acceptable write-only).
 2. creative chunk archive is a short status line, not full prose (hurts chapter continuity retrieval).
-3. companion JSON store dual-track with memory_brain (SelfState not unified).
+3. companion JSON store dual-track with memory_brain (SelfState partial: salient_recent/threads exist, not full unify).
 4. generation queries still bag-of-words (task retrieval recipes not split from QA).
-5. no SelfState.ongoing_threads yet.
+5. scheduler video/PM paths do not yet push LifeState.salient_recent (companion-only hooks).
 
 ## Metrics
 
