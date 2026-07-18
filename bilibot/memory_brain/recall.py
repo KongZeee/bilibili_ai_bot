@@ -413,13 +413,19 @@ _SELF_MEMORY_QUERY_RE = re.compile(
     r"回复过评论|主动评论|评论过|"
     r"刚看了|刚看过|看了什么视频|看过什么视频|最近看|"
     r"最近做了什么|做了什么|在忙什么|最近忙|"
+    # Spontaneous / human-like open self probes (no concrete title required).
+    # Note: bare 发过动态 already covered by 发过|发的动态 above — do not
+    # re-route those into open-recent genre scoring.
+    r"印象比较深|印象深刻|有感觉|让你有感觉|自己最近|你自己最近|"
     r"私信|回过私信|回过谁|"
     r"点赞|赞过|点了赞|投币|收藏过|收藏了|你收藏|"
     r"日程|安排|周总结|追什么番|在追|追番|番剧|看番)"
 )
 
 _UTILITY_QUERY_RE = re.compile(
-    r"(天气|预报|午饭|几点|几点了|现在几点|等于多少|算一下|\d+\s*[\*xX×]\s*\d+|换算|单位换算)"
+    r"(天气|预报|午饭|几点|几点了|现在几点|等于多少|算一下|\d+\s*[\*xX×]\s*\d+|换算|单位换算|"
+    # Pure task shells that must not dredge the personal library.
+    r"总结一下这个视频|帮我写作业|写作业|帮我总结)"
 )
 
 _SMALLTALK_ONLY_RE = re.compile(
@@ -1161,7 +1167,13 @@ class RecallEngine:
             )
         )
         self._open_recent_self_query_active = bool(
-            re.search(r"(最近做了什么|做了什么|在忙什么|最近忙)", message_for_flags)
+            re.search(
+                # Keep "发过动态/评论" OUT of open-recent — those are genre-specific
+                # self-memory asks and already have dedicated ranking paths.
+                r"(最近做了什么|做了什么|在忙什么|最近忙|"
+                r"印象比较深|印象深刻|有感觉|让你有感觉|自己最近|你自己最近)",
+                message_for_flags,
+            )
         )
         # Open bangumi questions have almost no distinctive FTS terms. Seed the
         # bot's known anime/visual-novel anchors so hybrid recall can fire.
@@ -2563,7 +2575,11 @@ class RecallEngine:
         )
         open_recent_self_query = bool(
             getattr(self, "_open_recent_self_query_active", False)
-            or re.search(r"(最近做了什么|做了什么|在忙什么|最近忙)", query_text)
+            or re.search(
+                r"(最近做了什么|做了什么|在忙什么|最近忙|"
+                r"印象比较深|印象深刻|有感觉|让你有感觉|自己最近|你自己最近)",
+                query_text,
+            )
         )
         # Keep seeded_text available for content matching if needed later.
         _ = seeded_text
