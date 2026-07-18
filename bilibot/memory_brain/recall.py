@@ -1014,11 +1014,15 @@ class RecallEngine:
                         cand.channel_ranks.get("speaker_recent", 99),
                     )
                     # Steeper recency decay so the newest 1-2 watches dominate.
-                    cand.final_score = max(0.40, 0.98 - 0.08 * max(0, recent_rank - 1))
-                    if "看完" in summary or source == "bot_action":
-                        cand.final_score = min(1.0, cand.final_score + 0.08)
+                    cand.final_score = max(0.35, 0.99 - 0.12 * max(0, recent_rank - 1))
+                    if source == "bot_action" and "看完" in summary:
+                        cand.final_score = min(1.0, cand.final_score + 0.12)
                     elif source == "video_experience":
-                        cand.final_score = min(1.0, cand.final_score + 0.03)
+                        cand.final_score = min(1.0, cand.final_score + 0.04)
+                    elif source == "video":
+                        # Raw video archive without evaluate outcome is weaker for
+                        # "你刚看了什么视频" than the terminal bot_action.
+                        cand.final_score = max(0.20, cand.final_score - 0.08)
                     cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
                     recent_watch.append(cand)
                 if recent_watch:
