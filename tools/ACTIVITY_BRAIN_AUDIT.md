@@ -21,7 +21,7 @@ Snapshot after exp59 + behavior harness. Update when paths change.
 ## Known residual gaps (P1+)
 
 1. like/coin/fav: terminal archive only, no begin context (acceptable write-only).
-2. creative chunk archive is a short status line, not full prose (hurts chapter continuity retrieval).
+2. ~~creative chunk archive is a short status line~~ — fixed exp63 (full prose capped).
 3. companion JSON store dual-track with memory_brain (SelfState partial: salient_recent/threads exist, not full unify).
 4. generation queries still bag-of-words (task retrieval recipes not split from QA).
 5. ~~scheduler video/PM paths do not push LifeState~~ — fixed exp62 (video/dynamic/PM/comment/like).

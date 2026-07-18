@@ -257,24 +257,29 @@ async def _run() -> int:
                 notes.append(
                     f"injection_fail:creative_miss:chars={len(blob)}"
                 )
+            chapter1_body = (
+                "《小说第一章》续写第1段（86字）：\n"
+                "雨夜里，主角把青铜钥匙藏进大衣口袋，街灯把水渍照成碎金。"
+            )
             await brain.finish_activity(
                 action_key="creative:novel:1",
                 action_type="write_creative_chunk",
-                result_text="小说第一章写到主角把青铜钥匙藏进雨夜的大衣口袋。",
+                result_text=chapter1_body,
                 state="completed",
                 scene="creative",
                 title="小说第一章",
             )
             await brain.archive_observation_async(
-                bot_action_observation(
+                text_observation(
                     account_id="behavior",
-                    action_key="creative:seed-chapter",
-                    action_type="creative_chunk",
-                    text="小说第一章写到主角把青铜钥匙藏进雨夜的大衣口袋。",
-                    published=True,
-                    state="completed",
-                    scene="creative",
+                    idempotency_key="creative:seed-chapter",
+                    source_type="creative",
+                    event_type="creative_chunk",
+                    text=chapter1_body,
                     title="小说第一章",
+                    scene="creative",
+                    importance=0.55,
+                    metadata={"chunk_index": 0, "chars": 86},
                 )
             )
         except Exception as exc:

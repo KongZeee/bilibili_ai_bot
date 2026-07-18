@@ -2172,10 +2172,12 @@ class CompanionLifeService:
         prev = proj.draft_chunks[-1].text if proj.draft_chunks else ""
         budget = self._cfg.creative.chars_per_session
         creative_chunk_index = len(proj.draft_chunks)
-        # 续写前 V6 混合召回：可联想近期经历/兴趣，避免创作路径「只写不读」
+        # 续写前 V6 混合召回：可联想近期经历/兴趣 + 上一章正文针，避免创作路径「只写不读」
+        prev_needles = " ".join(str(prev or "").replace("\n", " ").split())[:120]
         creative_recall = await self._recall_life_evidence(
             query=(
                 f"{proj.title} {proj.premise or ''} 创作 灵感 最近 视频 番剧 日记 "
+                f"{prev_needles} "
                 f"{(self.ensure_life_state().activity if self.enabled else '') or ''}"
             ),
             scene="creative",
@@ -2247,16 +2249,25 @@ class CompanionLifeService:
             if self._cfg.creative.offer_dynamic_draft:
                 seed = f"写完了《{proj.title}》的一小节，自己还挺满意。"
                 self._offer_draft(seed, created_by="companion_creative")
+        # Archive full prose (capped) so later creative recall / self-QA can
+        # recover needles like 青铜钥匙 — not only a status line.
+        prose = str(chunk.text or "").strip()
+        archive_body = (
+            f"《{proj.title}》续写第{creative_chunk_index + 1}段（{chunk.chars}字）：\n"
+            f"{prose[:2400]}"
+        )
         archived = await self._archive_text(
             source_type="creative",
             event_type="creative_chunk",
-            text=f"《{proj.title}》续写 {chunk.chars} 字",
-            title=proj.title,
+            text=archive_body,
+            title=proj.title or f"创作片段 {creative_chunk_index + 1}",
             idempotency_key=f"creative:{proj.id}:{chunk.at}",
-            importance=0.4,
+            importance=0.55,
             metadata={
                 "project_id": proj.id,
                 "status": proj.status,
+                "chunk_index": creative_chunk_index,
+                "chars": chunk.chars,
                 "memory_grounded": bool(creative_mem),
                 "memory_event_ids": list(creative_recall.get("memory_event_ids") or [])[:8],
             },
@@ -2266,7 +2277,7 @@ class CompanionLifeService:
         await self._finish_activity_memory(
             action_key=f"companion_creative_chunk:{proj.id}:{creative_chunk_index}",
             action_type="write_creative_chunk",
-            result_text="当前创作项目的新一段已经续写并归档。",
+            result_text=archive_body[:500],
             scene="creative",
             title=proj.title,
             metadata={
