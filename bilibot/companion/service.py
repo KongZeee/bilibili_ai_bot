@@ -1333,20 +1333,22 @@ class CompanionLifeService:
     ) -> None:
         """Soft life-state feedback after an outgoing private message is sent.
 
-        Never store PM body text into continuous self surface (message_seed /
-        salient_recent) — those fields are later injected into public replies.
-        ``preview`` is accepted for API compatibility but intentionally ignored.
+        Privacy: PM body must never enter ``message_seed`` / ``salient_recent``
+        (those are injected into public replies). Body may only land on
+        non-injected runtime fields for operator debugging.
         """
         if not self.enabled:
             return
         try:
             self.ensure_life_state()
-            # Do not put private-message body into message_seed / salient.
-            _ = preview  # compatibility; body must not enter continuous self
+            safe_preview = " ".join(str(preview or "").replace("\x00", "").split())[:48]
+            who = " ".join(str(actor_label or "").replace("\x00", "").split())[:20]
 
             def _mutate_pm(state: LifeState) -> None:
                 state.energy = max(0, min(100, int(state.energy) - 1))
                 state.activity = "刚回了私信"
+                # Generic seed only — never the PM body.
+                state.message_seed = "刚回了私信"
                 state.updated_at = _now_iso()
 
             updater = getattr(self.store, "update_life_state", None)
@@ -1356,12 +1358,17 @@ class CompanionLifeService:
                 state = self.store.get_life_state()
                 _mutate_pm(state)
                 self.store.save_life_state(state)
-            who = " ".join(str(actor_label or "").replace("\x00", "").split())[:20]
             line = "回了私信"
             if who:
                 line += f"（{who}）"
             self._push_salient_self(line=line[:120])
-            self.store.patch_runtime(last_private_message_at=_now_iso())
+            runtime_patch: Dict[str, Any] = {"last_private_message_at": _now_iso()}
+            if safe_preview:
+                # Non-injected debug trail only (not in get_prompt_surface).
+                runtime_patch["last_private_message_preview"] = safe_preview[:120]
+            if who:
+                runtime_patch["last_private_message_actor"] = who
+            self.store.patch_runtime(**runtime_patch)
         except Exception as e:
             logger.warning("[%s] on_private_message_replied failed: %s", self.account_id, e)
 
@@ -2274,7 +2281,9 @@ class CompanionLifeService:
             title=f"主动探索 {_today()}",
             metadata={"date": _today()},
             salient_line=f"探索了「{(query or '')[:40]}」",
+            # Keep only the latest interest thread (replace prior 兴趣： entries).
             ongoing_thread=f"兴趣：{(query or '')[:36]}" if query else "",
+            close_thread_prefix="兴趣：",
         )
         # Local companion surface becomes visible only after the brain commit.
         notes = [note] + self.store.get_explore_notes()
