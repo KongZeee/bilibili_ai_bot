@@ -703,6 +703,10 @@ class MemoryBrainService:
         mood_list = tuple(
             str(x).strip() for x in (mood_cues or ()) if str(x or "").strip()
         )[:8]
+        # Life needles also seed title_entity channel (not only soft rank bias).
+        entity_hints = tuple(
+            n for n in needle_list if n and len(n) >= 2 and len(n) <= 32
+        )[:8]
         recall_query = RecallQuery(
             current_message=(str(query or "").strip() or activity),
             account_id=self.account_id,
@@ -715,6 +719,7 @@ class MemoryBrainService:
             mode=resolved_mode,
             life_needles=needle_list,
             mood_cues=mood_list,
+            entity_hints=entity_hints,
         )
 
         recent_result, recall_result = await asyncio.gather(
