@@ -457,6 +457,11 @@ async def _run(account_id: str, config_path: Path, use_llm: bool) -> int:
                 ["主动评论", "发表了评论", "发表了主动评论", "回复了评论"],
                 [],
             ),
+            (
+                "你最近做了什么",
+                ["海龟汤", "点了赞", "日记", "动态", "私信回复", "日程", "主动评论"],
+                ["评论对话上下文", "空泽同学"],
+            ),
         ]
         for q, must_any, forbid_any in probe_cases:
             result = await brain.recall(

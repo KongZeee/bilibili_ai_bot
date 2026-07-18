@@ -582,3 +582,80 @@ async def test_self_comment_query_prefers_bot_action(seeded_store):
     titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
     assert "bot_action" in types or any("海龟汤" in t for t in titles)
     assert not any(t == "评论对话上下文" for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_open_recent_self_prefers_bot_actions(seeded_store):
+    store, _ids = seeded_store
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="recent-watch",
+            account_id="acc",
+            source_type="bot_action",
+            source_external_id="rw1",
+            source_text="亚托莉观看了视频《海龟汤（2）》并点了赞。",
+            event_title="海龟汤（2）",
+            job_types=(),
+        )
+    )
+    store.archive_observation(
+        ObservationEnvelope(
+            idempotency_key="web-dump",
+            account_id="acc",
+            source_type="web_reference",
+            source_external_id="web1",
+            source_text="探索 夏生今天做了什么值得分享的事，搜索结果很长。",
+            event_title="探索 夏生今天做了什么值得分享的事",
+            job_types=(),
+        )
+    )
+    result = await RecallEngine(store).recall(
+        RecallQuery(current_message="你最近做了什么", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    types = [e.get("source_type") for e in result.events if isinstance(e, dict)]
+    titles = [e.get("title") or "" for e in result.events if isinstance(e, dict)]
+    assert "bot_action" in types or any("海龟汤" in t for t in titles)
+    # Open recent-self must not answer only with exploration web dumps / inbound comments.
+    assert not any("夏生今天做了什么" in t for t in titles) or "bot_action" in types
+    assert not any(t == "评论对话上下文" for t in titles)
+
+
+@pytest.mark.asyncio
+async def test_self_comment_hides_orphan_intent(tmp_path):
+    from bilibot.memory_brain import MemoryBrainService
+
+    brain = MemoryBrainService("acc", tmp_path / "acc")
+    await brain.begin_activity(
+        action_key="reply:orphan",
+        action_type="reply_comment",
+        current_activity="正在回复评论",
+        query="测试",
+        scene="reply_comment",
+        title="回复评论 111",
+    )
+    await brain.finish_activity(
+        action_key="cmt:done",
+        action_type="proactive_comment",
+        result_text="亚托莉发表了主动评论：烧脑海龟汤真有趣。",
+        state="completed",
+        scene="proactive_video",
+        title="海龟汤（2）",
+    )
+    result = await brain.recall(
+        RecallQuery(current_message="你最近评论了什么", account_id="acc", scene="reply_comment")
+    )
+    assert not result.is_empty
+    states = []
+    titles = []
+    for e in result.events:
+        if not isinstance(e, dict):
+            continue
+        titles.append(e.get("title") or "")
+        meta = e.get("metadata") or {}
+        if isinstance(meta, dict):
+            states.append(str(meta.get("action_state") or ""))
+    assert "intent" not in states
+    assert any("海龟汤" in t or "主动评论" in str(result.prompt_evidence or "") for t in titles) or any(
+        s == "completed" for s in states
+    )

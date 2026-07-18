@@ -180,9 +180,11 @@ _SELF_MEMORY_QUERY_RE = re.compile(
     r"(发过|发布过|你上次|上次发|发的动态|发了.*动态|我写的|写过|你的日记|"
     r"做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦|"
     r"你发|评论说了|发过评论|刚给.*评论|你回复|你评论|评论了什么|最近评论|"
+    r"回复过评论|主动评论|评论过|"
     r"刚看了|刚看过|看了什么视频|看过什么视频|最近看|"
+    r"最近做了什么|做了什么|在忙什么|最近忙|"
     r"私信|回过私信|回过谁|"
-    r"点赞|赞过|点了赞|"
+    r"点赞|赞过|点了赞|投币|收藏过|"
     r"日程|安排|周总结|追什么番|在追|追番|番剧|看番)"
 )
 
@@ -796,6 +798,7 @@ class RecallEngine:
         errors: dict[str, str] = {}
         candidates: dict[str, RecallCandidate] = {}
         message_for_flags = str(query.current_message or "")
+        self._original_query_text = message_for_flags
         self._watch_query_active = bool(
             re.search(r"(刚看|看了什么视频|看过什么视频|最近看)", message_for_flags)
         )
@@ -806,12 +809,18 @@ class RecallEngine:
             re.search(r"(做的梦|做过什么梦|做过.*梦|什么梦|你的梦|梦见|做梦)", message_for_flags)
         )
         self._pm_query_active = bool(re.search(r"(私信|回过私信|回过谁)", message_for_flags))
-        self._like_query_active = bool(re.search(r"(点赞|赞过|点了赞)", message_for_flags))
+        self._like_query_active = bool(
+            re.search(r"(点赞|赞过|点了赞|投币|收藏过)", message_for_flags)
+        )
         self._self_comment_query_active = bool(
             re.search(
-                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复)",
+                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复|"
+                r"回复过评论|主动评论|评论过)",
                 message_for_flags,
             )
+        )
+        self._open_recent_self_query_active = bool(
+            re.search(r"(最近做了什么|做了什么|在忙什么|最近忙)", message_for_flags)
         )
         # Open bangumi questions have almost no distinctive FTS terms. Seed the
         # bot's known anime/visual-novel anchors so hybrid recall can fire.
@@ -830,12 +839,26 @@ class RecallEngine:
                 "current_message",
                 f"{message_for_flags} 梦见",
             )
-        # Like questions: seed the archival phrasing used by watch+like bot_actions.
+        # Like / coin / fav questions: seed only the matching archival phrase.
+        # Do not mix 点赞+收藏 into one seed or subtype detection will flip.
         elif self._like_query_active:
+            if re.search(r"(投币|投了币)", message_for_flags):
+                seed_extra = "投了币 投币"
+            elif re.search(r"(收藏)", message_for_flags):
+                seed_extra = "收藏了 收藏"
+            else:
+                seed_extra = "点了赞 点赞"
             object.__setattr__(
                 query,
                 "current_message",
-                f"{message_for_flags} 点了赞 点赞",
+                f"{message_for_flags} {seed_extra}",
+            )
+        # Open "what have you been doing" needs recent self rows, not web dumps.
+        elif self._open_recent_self_query_active:
+            object.__setattr__(
+                query,
+                "current_message",
+                f"{message_for_flags} 观看 评论 动态 日记 私信 日程",
             )
 
         # Per-call inject cap (0 → engine default max_events)
@@ -1118,6 +1141,68 @@ class RecallEngine:
                             if c.final_score >= top - 0.18
                             or str(c.source_type or "") == "bot_action"
                         ][: min(2, MAX_FALLBACK_EVENTS, self.max_events)]
+                else:
+                    selected = self._select_fallback(rough, query=query)
+            elif getattr(self, "_open_recent_self_query_active", False):
+                # Open "what have you been doing" should answer from recent self
+                # activity, not FTS-polluted web dumps / inbound comments.
+                recent_self: list[RecallCandidate] = []
+                preferred_sources = {
+                    "bot_action",
+                    "diary",
+                    "dream",
+                    "life_plan",
+                    "weekly_summary",
+                    "private_message",
+                    "video_experience",
+                }
+                for cand in candidates.values():
+                    source = str(cand.source_type or "").strip().casefold()
+                    if source not in preferred_sources:
+                        continue
+                    if not (
+                        "global_recent" in (cand.channel_ranks or {})
+                        or "speaker_recent" in (cand.channel_ranks or {})
+                        or source
+                        in {
+                            "diary",
+                            "dream",
+                            "life_plan",
+                            "weekly_summary",
+                            "private_message",
+                            "bot_action",
+                        }
+                    ):
+                        continue
+                    # Skip open intents if a completed sibling exists later.
+                    if str(cand.action_state or "").strip().casefold() == "intent":
+                        continue
+                    cand.llm_score = None
+                    cand.kind = "direct"
+                    recent_rank = min(
+                        cand.channel_ranks.get("global_recent", 99),
+                        cand.channel_ranks.get("speaker_recent", 99),
+                    )
+                    base = max(0.40, 0.95 - 0.08 * max(0, recent_rank - 1))
+                    if source == "bot_action":
+                        base = min(1.0, base + 0.10)
+                    elif source in {
+                        "diary",
+                        "dream",
+                        "life_plan",
+                        "weekly_summary",
+                        "private_message",
+                    }:
+                        base = min(1.0, base + 0.06)
+                    cand.final_score = base
+                    cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
+                    recent_self.append(cand)
+                if recent_self:
+                    selected = RecallEngine._bounded_selection(
+                        recent_self,
+                        max_events=min(3, MAX_FALLBACK_EVENTS, self.max_events),
+                        max_associations=0,
+                    )
                 else:
                     selected = self._select_fallback(rough, query=query)
             else:
@@ -1788,16 +1873,27 @@ class RecallEngine:
         )
         like_query = bool(
             getattr(self, "_like_query_active", False)
-            or re.search(r"(点赞|赞过|点了赞)", query_text)
+            or re.search(r"(点赞|赞过|点了赞|投币|收藏过)", query_text)
         )
         self_comment_query = bool(
             getattr(self, "_self_comment_query_active", False)
             or re.search(
-                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复)",
+                r"(发过评论|你评论|评论了什么|最近评论|评论说了|刚给.*评论|你回复|"
+                r"回复过评论|主动评论|评论过)",
                 query_text,
             )
         )
-        if dream_query or pm_query or like_query or self_comment_query:
+        open_recent_self_query = bool(
+            getattr(self, "_open_recent_self_query_active", False)
+            or re.search(r"(最近做了什么|做了什么|在忙什么|最近忙)", query_text)
+        )
+        if (
+            dream_query
+            or pm_query
+            or like_query
+            or self_comment_query
+            or open_recent_self_query
+        ):
             self_query = True
         eligible: list[RecallCandidate] = []
         for candidate in candidates:
@@ -1836,8 +1932,19 @@ class RecallEngine:
                 "behavior_log",
             } and any(
                 k in evidence_blob
-                for k in ("点了赞", "点赞", "赞了", "了赞", "点了")
+                for k in (
+                    "点了赞",
+                    "点赞",
+                    "赞了",
+                    "了赞",
+                    "点了",
+                    "投了币",
+                    "投币",
+                    "收藏了",
+                    "收藏",
+                )
             )
+            # Default; refined under like_query with subtype needles below.
             is_pm_row = source == "private_message" or "私信" in title_cf_early
             # Dream genre is source-primary. Body mentions of "做梦" on videos are noise.
             is_dream_row = source == "dream" or (
@@ -1867,12 +1974,50 @@ class RecallEngine:
                 or "speaker_recent" in (candidate.channel_ranks or {})
                 or candidate.deterministic_score >= 0.15
             )
+            is_recent_self_row = source in {
+                "bot_action",
+                "diary",
+                "dream",
+                "life_plan",
+                "weekly_summary",
+                "private_message",
+                "video_experience",
+            }
+            # Match interaction subtype to the original user question (not seeded
+            # rewrite), so "点赞" and "收藏" stay exclusive.
+            original_q = str(
+                getattr(self, "_original_query_text", "") or query_text
+            )
+            like_needles = ("点了赞", "点赞", "赞了", "了赞")
+            coin_needles = ("投了币", "投币")
+            fav_needles = ("收藏了", "收藏")
+            if like_query:
+                if re.search(r"(投币|投了币)", original_q):
+                    wanted_needles = coin_needles
+                elif re.search(r"(收藏)", original_q):
+                    wanted_needles = fav_needles
+                else:
+                    wanted_needles = like_needles
+                is_like_row = source in {
+                    "bot_action",
+                    "video_experience",
+                    "behavior_log",
+                } and any(k in evidence_blob for k in wanted_needles)
             genre_rescue = (
                 (dream_query and is_dream_row)
                 or (pm_query and is_pm_row)
                 or (like_query and is_like_row)
                 or (self_comment_query and is_self_comment_row)
-            ) and candidate.deterministic_score >= 0.12
+                or (
+                    open_recent_self_query
+                    and is_recent_self_row
+                    and (
+                        "global_recent" in (candidate.channel_ranks or {})
+                        or "speaker_recent" in (candidate.channel_ranks or {})
+                        or candidate.deterministic_score >= 0.12
+                    )
+                )
+            ) and candidate.deterministic_score >= 0.10
             # Title/self near-threshold candidates may sit slightly under the
             # numeric gate after OR-FTS dilution; content evidence check is the
             # real safety net.
@@ -1969,7 +2114,14 @@ class RecallEngine:
                         # Generic video bodies that mention 点赞 are pure noise.
                         candidate.final_score = 0.0
                 elif self_comment_query:
-                    if is_self_comment_row:
+                    action_state = str(
+                        getattr(candidate, "action_state", "") or ""
+                    ).strip().casefold()
+                    if action_state == "intent":
+                        # Open intent rows without a finished comment are noise
+                        # next to completed self-comments.
+                        candidate.final_score = 0.0
+                    elif is_self_comment_row:
                         candidate.final_score = min(1.0, candidate.final_score + 0.30)
                     elif source in {"comment", "comment_thread"}:
                         # Inbound user comments / generic threads are not "你发过评论".
@@ -1977,6 +2129,28 @@ class RecallEngine:
                         candidate.final_score = 0.0
                     elif source in {"video", "video_experience", "subtitle", "web_reference"}:
                         candidate.final_score = max(0.0, candidate.final_score - 0.12)
+                elif open_recent_self_query:
+                    if source == "bot_action":
+                        candidate.final_score = min(1.0, candidate.final_score + 0.35)
+                        if "global_recent" in (candidate.channel_ranks or {}):
+                            candidate.final_score = min(1.0, candidate.final_score + 0.10)
+                    elif source in {
+                        "diary",
+                        "dream",
+                        "life_plan",
+                        "weekly_summary",
+                        "private_message",
+                        "video_experience",
+                    }:
+                        candidate.final_score = min(1.0, candidate.final_score + 0.28)
+                        if "global_recent" in (candidate.channel_ranks or {}):
+                            candidate.final_score = min(1.0, candidate.final_score + 0.08)
+                    elif source == "web_reference" and title_cf.startswith("探索"):
+                        # Keep exploration as a weak secondary signal only.
+                        candidate.final_score = max(0.0, candidate.final_score - 0.05)
+                    else:
+                        # Inbound comments / raw videos are not "what I did recently".
+                        candidate.final_score = 0.0
                 elif re.search(r"(日程|安排|周总结)", query_text):
                     if source in {"life_plan", "weekly_summary", "diary"}:
                         candidate.final_score = min(1.0, candidate.final_score + 0.28)
@@ -2083,6 +2257,21 @@ class RecallEngine:
                     and str(c.action_state or "").strip().casefold() == "intent"
                 )
             ]
+        # Self-comment questions: drop remaining intents even when activity_key
+        # does not line up with a completed sibling (reply vs proactive comment).
+        if self_comment_query:
+            has_terminal_self = any(
+                str(c.action_state or "").strip().casefold()
+                in {"completed", "failed", "rejected", "skipped"}
+                and str(c.source_type or "").strip().casefold() == "bot_action"
+                for c in eligible
+            )
+            if has_terminal_self:
+                eligible = [
+                    c
+                    for c in eligible
+                    if str(c.action_state or "").strip().casefold() != "intent"
+                ]
         # Exact durable-title queries (e.g. 窗边的午后): keep only matching durable self.
 
         q_norm = "".join(query_text.split())

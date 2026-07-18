@@ -6856,7 +6856,7 @@ class Scheduler:
                         await self._archive_bot_action(
                             action_key=f"video:{observation_key}:coin",
                             action_type="coin_video",
-                            text=f"已给视频《{title}》投币",
+                            text=f"给视频《{title}》投了币。",
                             published=True,
                             title=title,
                             scene="proactive_video",
@@ -6919,7 +6919,7 @@ class Scheduler:
                         await self._archive_bot_action(
                             action_key=f"video:{observation_key}:favorite",
                             action_type="favorite_video",
-                            text=f"已收藏视频《{title}》",
+                            text=f"收藏了视频《{title}》。",
                             published=True,
                             title=title,
                             scene="proactive_video",
