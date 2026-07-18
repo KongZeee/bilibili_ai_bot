@@ -174,7 +174,7 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         return RetrievalPolicy(
             mode="creative",
             entropy="high",
-            hop_k=2,
+            hop_k=3,
             max_associations=3,
             direct_threshold=max(0.58, DIRECT_THRESHOLD - 0.10),
             association_threshold=max(0.65, ASSOCIATION_THRESHOLD - 0.10),
