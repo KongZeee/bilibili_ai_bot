@@ -3160,6 +3160,35 @@ class RecallEngine:
                 boost += min(0.08, (acc - 0.55) * 0.25)
             elif demote_cmt and acc < 0.35:
                 boost -= 0.03
+            # Dream-lag soft bimodal window (C14/S022): same-night + 5–7d lag.
+            if str(getattr(policy, "mode", "") or "") == "dream" and source in self_sources:
+                age_h = 0.0
+                try:
+                    occurred = float(getattr(candidate, "last_recalled_at", 0.0) or 0.0)
+                    # Prefer occurred_at if parseable as unix; else skip lag.
+                    raw_t = str(candidate.occurred_at or "")
+                    if raw_t and raw_t[:1].isdigit():
+                        # ISO-ish: use accessibility age already folded; estimate
+                        # from accessibility recency inverse is noisy — parse ISO.
+                        from datetime import datetime, timezone
+
+                        try:
+                            dt = datetime.fromisoformat(raw_t.replace("Z", "+00:00"))
+                            age_h = max(
+                                0.0,
+                                (time.time() - dt.timestamp()) / 3600.0,
+                            )
+                        except Exception:
+                            age_h = 0.0
+                except Exception:
+                    age_h = 0.0
+                age_d = age_h / 24.0
+                if age_d <= 1.2:
+                    boost += 0.05  # same-night continuity
+                elif 4.5 <= age_d <= 7.5:
+                    boost += 0.06  # classic dream-lag band
+                elif age_d > 14:
+                    boost -= 0.02  # soft demote ancient chatter only in dream
             if boost:
                 candidate.deterministic_score = max(
                     0.0, min(1.0, candidate.deterministic_score + boost)
