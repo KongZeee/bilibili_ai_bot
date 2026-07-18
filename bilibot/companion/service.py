@@ -2747,14 +2747,31 @@ class CompanionLifeService:
                             if titles:
                                 self._push_salient_self(
                                     line=f"走神想到：{titles[0][:36]}",
+                                    thread=f"念头：{titles[0][:28]}",
                                 )
+                                # Drive layer write-back: seed next generation without speech.
+                                try:
+                                    def _mutate_mw(state: LifeState) -> None:
+                                        state.message_seed = f"走神：{titles[0][:40]}"
+                                        state.updated_at = _now_iso()
+
+                                    updater = getattr(self.store, "update_life_state", None)
+                                    if callable(updater):
+                                        updater(_mutate_mw)
+                                    else:
+                                        st = self.store.get_life_state()
+                                        _mutate_mw(st)
+                                        self.store.save_life_state(st)
+                                except Exception:
+                                    logger.debug(
+                                        "[%s] mind_wander life seed skip",
+                                        self.account_id,
+                                        exc_info=True,
+                                    )
                             rt["mind_wander_at"] = time.time()
                             saver = getattr(self.store, "save_runtime", None)
                             if callable(saver):
                                 saver(rt)
-                            else:
-                                # Best-effort if store only has get_runtime dict mutability.
-                                pass
                             result["actions"].append(
                                 f"mind_wander:{int(report.get('reinforced') or 0)}"
                             )
