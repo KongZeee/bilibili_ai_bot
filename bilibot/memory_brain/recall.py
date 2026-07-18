@@ -1423,7 +1423,7 @@ class RecallEngine:
                 if recent_watch:
                     # Open watch questions need the latest 1-2 watches, not a
                     # full MAX_FALLBACK_EVENTS dump of older video history.
-                    selected = RecallEngine._bounded_selection(
+                    selected = self._bounded_selection(
                         recent_watch,
                         max_events=min(2, MAX_FALLBACK_EVENTS, self.max_events),
                         max_associations=0,
@@ -2331,7 +2331,7 @@ class RecallEngine:
                 )
             if candidate.final_score >= threshold:
                 eligible.append(candidate)
-        return RecallEngine._bounded_selection(
+        return self._bounded_selection(
             eligible,
             max_events=self.max_events,
             max_associations=getattr(
@@ -2892,7 +2892,7 @@ class RecallEngine:
             ]
             if exact:
                 eligible = exact
-        selected = RecallEngine._bounded_selection(
+        selected = self._bounded_selection(
             eligible,
             max_events=min(MAX_FALLBACK_EVENTS, self.max_events),
             max_associations=getattr(
@@ -2987,9 +2987,12 @@ class RecallEngine:
             return True
         return False
 
-    @staticmethod
     def _bounded_selection(
-        candidates: Sequence[RecallCandidate], *, max_events: int, max_associations: int
+        self,
+        candidates: Sequence[RecallCandidate],
+        *,
+        max_events: int,
+        max_associations: int,
     ) -> list[RecallCandidate]:
         direct = sorted(
             (item for item in candidates if item.kind == "direct"),
@@ -3003,7 +3006,33 @@ class RecallEngine:
         # gives the graph expansion a grounded starting point.
         if not direct:
             return []
-        selected = direct[:max_events]
+        policy = getattr(self, "_active_policy", None)
+        high_entropy = isinstance(policy, RetrievalPolicy) and str(
+            getattr(policy, "entropy", "") or ""
+        ).casefold() in {"high", "mid"}
+        if high_entropy and max_events > 1:
+            # MMR-lite: diversify source_type so dream/creative workspace is not
+            # three near-identical bot_actions.
+            diversified: list[RecallCandidate] = []
+            seen_src: set[str] = set()
+            overflow: list[RecallCandidate] = []
+            for item in direct:
+                src = str(item.source_type or "").strip().casefold() or "other"
+                if src in seen_src:
+                    overflow.append(item)
+                    continue
+                seen_src.add(src)
+                diversified.append(item)
+                if len(diversified) >= max_events:
+                    break
+            if len(diversified) < max_events:
+                for item in overflow:
+                    diversified.append(item)
+                    if len(diversified) >= max_events:
+                        break
+            selected = diversified
+        else:
+            selected = direct[:max_events]
         remaining = max_events - len(selected)
         if remaining > 0:
             selected.extend(associations[: min(max_associations, remaining)])
