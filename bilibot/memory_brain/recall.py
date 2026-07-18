@@ -1080,6 +1080,14 @@ class RecallEngine:
                         selected = diversified[
                             : min(2, MAX_FALLBACK_EVENTS, self.max_events)
                         ]
+                    if selected:
+                        top = max(c.final_score for c in selected)
+                        selected = [
+                            c
+                            for c in selected
+                            if c.final_score >= top - 0.18
+                            or str(c.source_type or "") == "bot_action"
+                        ][: min(2, MAX_FALLBACK_EVENTS, self.max_events)]
                 else:
                     selected = self._select_fallback(rough, query=query)
             else:
