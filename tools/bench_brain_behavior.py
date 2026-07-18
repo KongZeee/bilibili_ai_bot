@@ -635,10 +635,14 @@ async def _run() -> int:
             dream_pol = policy_for_mode("dream")
             reply_pol = policy_for_mode("reply")
             creative_pol = policy_for_mode("creative")
+            diary_pol = policy_for_mode("diary")
             wander_pol = policy_for_mode("mind_wander")
+            pm_pol = policy_for_mode("pm")
             injection_total += 1
             policy_diff = (
-                dream_pol.hop_k > reply_pol.hop_k
+                dream_pol.hop_k >= 3
+                and creative_pol.hop_k >= 3
+                and diary_pol.hop_k >= 2
                 and dream_pol.weight("graph") > reply_pol.weight("graph")
                 and dream_pol.fallback_direct_threshold
                 < reply_pol.fallback_direct_threshold
@@ -647,6 +651,9 @@ async def _run() -> int:
                 and not reply_pol.demote_inbound_comment
                 and wander_pol.weight("graph") > reply_pol.weight("graph")
                 and wander_pol.hop_k >= 2
+                and pm_pol.prefer_self_recent
+                and pm_pol.weight("speaker_recent")
+                > reply_pol.weight("speaker_recent")
             )
             if policy_diff:
                 injection_ok += 1
