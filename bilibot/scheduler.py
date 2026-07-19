@@ -6944,7 +6944,22 @@ class Scheduler:
             # 执行点赞
             like_result = decisions.get("like", {})
             if like_result.get("planned"):
-                # PRD V6：不单独记录 intent，仅在结果时归档
+                # begin_activity so like is not write-only terminal archive
+                like_key = f"video:{observation_key}:like"
+                try:
+                    await self._begin_activity_context(
+                        action_key=like_key,
+                        action_type="like_video",
+                        current_activity=f"准备给视频《{title}》点赞。",
+                        query=str(title or ""),
+                        scene="proactive_video",
+                        title=title,
+                        bvid=bvid,
+                        oid=str(oid),
+                        metadata={"bvid": bvid, "oid": str(oid)},
+                    )
+                except Exception:
+                    logger.debug("like begin_activity failed", exc_info=True)
                 try:
                     ok = await self.bili.like_video(oid)
                 except Exception as e:
@@ -6954,7 +6969,7 @@ class Scheduler:
                         "like", bvid, str(oid), "failed", failure_reason=str(e)
                     )
                     await self._archive_bot_action(
-                        action_key=f"video:{observation_key}:like",
+                        action_key=like_key,
                         action_type="like_video",
                         text=f"点赞视频《{title}》失败",
                         published=False,
@@ -6977,7 +6992,7 @@ class Scheduler:
                     if ok:
                         logger.info("视频点赞成功")
                         await self._archive_bot_action(
-                            action_key=f"video:{observation_key}:like",
+                            action_key=like_key,
                             action_type="like_video",
                             # Phrase "点了赞" is the self-like recall needle.
                             text=f"观看了视频《{title}》并点了赞。",
@@ -7002,7 +7017,7 @@ class Scheduler:
                     else:
                         self._check_bili_risk_control("proactive_like")
                         await self._archive_bot_action(
-                            action_key=f"video:{observation_key}:like",
+                            action_key=like_key,
                             action_type="like_video",
                             text=f"点赞视频《{title}》失败",
                             published=False,
@@ -7021,7 +7036,21 @@ class Scheduler:
             # 执行投币
             coin_result = decisions.get("coin", {})
             if coin_result.get("planned"):
-                # PRD V6：不单独记录 intent，仅在结果时归档
+                coin_key = f"video:{observation_key}:coin"
+                try:
+                    await self._begin_activity_context(
+                        action_key=coin_key,
+                        action_type="coin_video",
+                        current_activity=f"准备给视频《{title}》投币。",
+                        query=str(title or ""),
+                        scene="proactive_video",
+                        title=title,
+                        bvid=bvid,
+                        oid=str(oid),
+                        metadata={"bvid": bvid, "oid": str(oid)},
+                    )
+                except Exception:
+                    logger.debug("coin begin_activity failed", exc_info=True)
                 try:
                     ok = await self.bili.coin_video(oid, num=1)
                 except Exception as e:
@@ -7031,7 +7060,7 @@ class Scheduler:
                         "coin", bvid, str(oid), "failed", failure_reason=str(e)
                     )
                     await self._archive_bot_action(
-                        action_key=f"video:{observation_key}:coin",
+                        action_key=coin_key,
                         action_type="coin_video",
                         text=f"给视频《{title}》投币失败",
                         published=False,
@@ -7054,7 +7083,7 @@ class Scheduler:
                     if ok:
                         logger.info("视频投币成功")
                         await self._archive_bot_action(
-                            action_key=f"video:{observation_key}:coin",
+                            action_key=coin_key,
                             action_type="coin_video",
                             text=f"给视频《{title}》投了币。",
                             published=True,
@@ -7065,7 +7094,7 @@ class Scheduler:
                     else:
                         self._check_bili_risk_control("proactive_coin")
                         await self._archive_bot_action(
-                            action_key=f"video:{observation_key}:coin",
+                            action_key=coin_key,
                             action_type="coin_video",
                             text=f"给视频《{title}》投币失败",
                             published=False,
