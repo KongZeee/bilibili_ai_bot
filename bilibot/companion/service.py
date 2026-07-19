@@ -191,6 +191,23 @@ class CompanionLifeService:
     def rebind_memory_brain(self, memory_brain) -> None:
         """Hot-reload: keep companion writing the current account brain."""
         self.memory_brain = memory_brain
+        # Wire consolidate → apply_reflection so nightly insights rewrite Self/Motive.
+        bind = getattr(memory_brain, "bind_reflection_apply_hook", None) if memory_brain else None
+        if callable(bind):
+            try:
+                bind(
+                    lambda summary, relation="reflection", evidence_event_ids=None, **_kw: self.apply_reflection(
+                        summary=summary,
+                        relation=relation,
+                        evidence_event_ids=list(evidence_event_ids or []),
+                    )
+                )
+            except Exception:
+                logger.debug(
+                    "[%s] bind_reflection_apply_hook failed",
+                    self.account_id,
+                    exc_info=True,
+                )
 
     def rebind_safety_checker(self, safety_checker) -> None:
         """Hot-reload: keep memory failures connected to account fail-closed state."""
@@ -1151,6 +1168,99 @@ class CompanionLifeService:
         if not self.enabled:
             return None
         return self.rank_motives(now=now).top()
+
+    def apply_reflection(
+        self,
+        *,
+        summary: str,
+        relation: str = "reflection",
+        evidence_event_ids: Optional[List[str]] = None,
+        energy_delta: int = 0,
+        mood: str = "",
+        thread: str = "",
+    ) -> None:
+        """Rewrite SelfState from a reflection/consolidate insight.
+
+        Called after nightly consolidate or diary/dream so reflection is not
+        archive-only — it updates energy/mood/salient and may open a thread.
+        """
+        if not self.enabled:
+            return
+        text = " ".join(str(summary or "").replace("\x00", "").split())
+        if not text:
+            return
+        try:
+            self.ensure_life_state()
+        except Exception:
+            return
+
+        def _mutate(state: LifeState) -> None:
+            if energy_delta:
+                state.energy = max(0, min(100, int(state.energy) + int(energy_delta)))
+            if mood:
+                state.mood_bias = str(mood)[:20]
+            # Soft seed for later dynamic/express motives.
+            if relation in {"reflection", "updates", "corrects"} and not state.message_seed:
+                state.message_seed = text[:60]
+            state.updated_at = _now_iso()
+
+        try:
+            updater = getattr(self.store, "update_life_state", None)
+            if callable(updater):
+                updater(_mutate)
+            else:
+                state = self.store.get_life_state()
+                _mutate(state)
+                self.store.save_life_state(state)
+        except Exception:
+            logger.debug("[%s] apply_reflection mutate failed", self.account_id, exc_info=True)
+
+        eid = ""
+        for raw in evidence_event_ids or []:
+            cand = str(raw or "").strip()
+            if cand:
+                eid = cand
+                break
+        line = f"反思：{text[:80]}"
+        self._push_salient_self(
+            line=line,
+            thread=str(thread or "").strip()[:80],
+            event_id=eid,
+        )
+
+    def reflection_to_motive(
+        self,
+        *,
+        summary: str,
+        prefer_action: str = "",
+    ) -> Optional[MotiveScore]:
+        """Map a reflection summary into a soft motive boost suggestion."""
+        if not self.enabled:
+            return None
+        text = str(summary or "")
+        action = str(prefer_action or "").strip()
+        if not action:
+            if any(k in text for k in ("想写", "创作", "小说", "续写")):
+                action = "creative"
+            elif any(k in text for k in ("想发", "动态", "分享")):
+                action = "post_dynamic"
+            elif any(k in text for k in ("累", "休息", "困")):
+                action = "rest"
+            elif any(k in text for k in ("探索", "查", "了解", "兴趣")):
+                action = "explore"
+            else:
+                action = "browse_video"
+        # Persist a light afterglow so rank_motives can see it.
+        try:
+            self.apply_reflection(summary=text[:120], relation="reflection")
+        except Exception:
+            pass
+        return MotiveScore(
+            name="反思驱动",
+            score=7.0,
+            reason=text[:80],
+            suggested_action=action,
+        )
 
     def get_self_snapshot(self) -> SelfSnapshot:
         """Unified generation-facing self read model (SelfSnapshot)."""

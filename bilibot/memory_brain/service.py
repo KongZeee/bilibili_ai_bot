@@ -231,6 +231,9 @@ class MemoryBrainService:
             chat_provider, embedding_provider, account_id=self.account_id
         )
         self.worker = PersistentMemoryWorker(self.store, self.gateway)
+        # Ephemeral mid-action working memory: survives across steps of one
+        # activity until finish/clear. Not durable — durable truth stays in store.
+        self._working_memory: dict[str, dict[str, Any]] = {}
         self.recall_engine = RecallEngine(
             self.store,
             self.gateway,
@@ -365,6 +368,85 @@ class MemoryBrainService:
             items.append(mood[:24])
         return tuple(items[:16])
 
+    # ── mid-action working memory (attention loop) ──────────────────────
+
+    def get_working_memory(self, action_key: str = "") -> dict[str, Any]:
+        """Return a copy of the ephemeral working_memory slot for ``action_key``."""
+        key = str(action_key or "").strip() or "_default"
+        slot = self._working_memory.get(key) or {}
+        return dict(slot)
+
+    def update_working_memory(
+        self,
+        action_key: str,
+        *,
+        phase: str = "",
+        belief: str = "",
+        draft: str = "",
+        notes: Mapping[str, Any] | None = None,
+        replan: bool = False,
+    ) -> dict[str, Any]:
+        """Update mid-action working_memory for a live activity.
+
+        Call between begin_activity and finish_activity when new evidence
+        arrives (e.g. watch 30% impression → full watch → interaction choice).
+        """
+        key = str(action_key or "").strip() or "_default"
+        slot = dict(self._working_memory.get(key) or {})
+        slot["action_key"] = key
+        slot["updated_at"] = time.time()
+        if phase:
+            slot["phase"] = str(phase)[:80]
+            history = list(slot.get("phase_history") or [])
+            history.append(str(phase)[:80])
+            slot["phase_history"] = history[-12:]
+        if belief:
+            slot["belief"] = str(belief)[:500]
+            beliefs = list(slot.get("beliefs") or [])
+            beliefs.append(str(belief)[:500])
+            slot["beliefs"] = beliefs[-8:]
+        if draft:
+            slot["draft"] = str(draft)[:800]
+        if notes:
+            merged = dict(slot.get("notes") or {})
+            merged.update({str(k): v for k, v in dict(notes).items()})
+            slot["notes"] = merged
+        if replan:
+            slot["replan_count"] = int(slot.get("replan_count") or 0) + 1
+            slot["last_replan_at"] = time.time()
+        self._working_memory[key] = slot
+        # Cap total open slots to avoid unbounded growth on abandoned keys.
+        if len(self._working_memory) > 64:
+            oldest = sorted(
+                self._working_memory.items(),
+                key=lambda kv: float((kv[1] or {}).get("updated_at") or 0),
+            )[: max(0, len(self._working_memory) - 48)]
+            for drop_key, _ in oldest:
+                self._working_memory.pop(drop_key, None)
+        return dict(slot)
+
+    def mid_action_replan(
+        self,
+        action_key: str,
+        *,
+        reason: str,
+        new_belief: str = "",
+        new_draft: str = "",
+    ) -> dict[str, Any]:
+        """Mark a mid-action replan (change of mind) on working_memory."""
+        return self.update_working_memory(
+            action_key,
+            phase="replan",
+            belief=new_belief or reason,
+            draft=new_draft,
+            notes={"replan_reason": str(reason or "")[:200]},
+            replan=True,
+        )
+
+    def clear_working_memory(self, action_key: str = "") -> None:
+        key = str(action_key or "").strip() or "_default"
+        self._working_memory.pop(key, None)
+
     def archive_observation(self, envelope: ObservationEnvelope):
         if isinstance(envelope, Mapping):
             envelope = ObservationEnvelope(**dict(envelope))
@@ -473,7 +555,28 @@ class MemoryBrainService:
                     }
                 )
         await asyncio.to_thread(self.store.upsert_links, result.event_id, links)
+        # Optional hook: let companion apply_reflection rewrite Self/Motive.
+        # Soft — brain must not hard-depend on companion.
+        apply_hook = getattr(self, "_reflection_apply_hook", None)
+        if callable(apply_hook):
+            for row in validated:
+                try:
+                    apply_hook(
+                        summary=str(row.get("summary") or ""),
+                        relation=str(row.get("relation") or "reflection"),
+                        evidence_event_ids=list(row.get("evidence") or []),
+                    )
+                except Exception:
+                    logger.debug(
+                        "reflection_apply_hook failed account=%s",
+                        self.account_id,
+                        exc_info=True,
+                    )
         return len(validated)
+
+    def bind_reflection_apply_hook(self, hook: Any) -> None:
+        """Bind companion.apply_reflection (or compatible) after consolidate."""
+        self._reflection_apply_hook = hook
 
     async def recall(self, query: RecallQuery | Mapping[str, Any]) -> RecallResult:
         if isinstance(query, Mapping):
@@ -901,6 +1004,19 @@ class MemoryBrainService:
         if archived is None or getattr(archived, "source_committed", True) is False:
             raise ActivityMemoryError("activity intent source commit was not confirmed")
         intent_event_id = str(getattr(archived, "event_id", "") or "")
+        # Seed mid-action working_memory so later steps can replan against it.
+        self.update_working_memory(
+            str(action_key),
+            phase="intent",
+            belief=activity[:240],
+            notes={
+                "scene": str(scene or ""),
+                "action_type": str(action_type or ""),
+                "intent_event_id": intent_event_id,
+                "title": str(title or ""),
+                "bvid": str(bvid or ""),
+            },
+        )
         return await self.build_activity_context(
             current_activity=activity,
             query=query,
@@ -935,6 +1051,16 @@ class MemoryBrainService:
         terminal = str(state or "completed").strip().casefold()
         if terminal == "intent":
             raise ValueError("finish_activity requires a terminal state")
+        wm = self.get_working_memory(str(action_key))
+        meta = {
+            **dict(metadata or {}),
+            "activity_context": True,
+        }
+        if wm:
+            meta.setdefault("working_memory_phase", wm.get("phase") or "")
+            meta.setdefault("replan_count", int(wm.get("replan_count") or 0))
+            if wm.get("belief"):
+                meta.setdefault("final_belief", str(wm.get("belief"))[:240])
         envelope = bot_action_observation(
             account_id=self.account_id,
             action_key=str(action_key),
@@ -945,8 +1071,7 @@ class MemoryBrainService:
             title=title or action_type,
             scene=scene,
             metadata={
-                **dict(metadata or {}),
-                "activity_context": True,
+                **meta,
                 "activity_key": str(action_key),
             },
             importance=0.65,
@@ -977,6 +1102,11 @@ class MemoryBrainService:
                     self.account_id,
                     exc_info=True,
                 )
+        # Close mid-action working_memory for this activity key.
+        try:
+            self.clear_working_memory(str(action_key))
+        except Exception:
+            pass
         return event_id
 
     async def _link_recent_self_peers(

@@ -6712,9 +6712,34 @@ class Scheduler:
                 except Exception:
                     companion_ctx = ""
 
+            # Mid-watch working_memory: impression phase before full evaluation.
+            # Enables mid_action replan if later evidence contradicts first impression.
+            eval_action_key = f"proactive_video:{observation_key}:evaluate"
+            brain_wm = getattr(self, "memory_brain", None)
+            if brain_wm is not None and callable(
+                getattr(brain_wm, "update_working_memory", None)
+            ):
+                try:
+                    first_impression = (
+                        f"watch_phase=impression title={str(title or '')[:40]} "
+                        f"owner={str(owner or '')[:20]}"
+                    )
+                    brain_wm.update_working_memory(
+                        eval_action_key,
+                        phase="watch_phase_impression",
+                        belief=first_impression,
+                        notes={
+                            "bvid": str(bvid or ""),
+                            "watch_phase": "impression",
+                            "belief_update": True,
+                        },
+                    )
+                except Exception:
+                    logger.debug("mid_watch working_memory seed failed", exc_info=True)
+
             # 账号级混合召回：近期视频/番剧/日记/评论，注入评价与后续主动评论
             activity_context = await self._begin_activity_context(
-                action_key=f"proactive_video:{observation_key}:evaluate",
+                action_key=eval_action_key,
                 action_type="evaluate_proactive_video",
                 current_activity=(
                     "正在观看并评价一条视频，结合最近经历决定真实感受、是否互动以及主动评论该说什么。"
@@ -6857,8 +6882,38 @@ class Scheduler:
             mood = evaluation.get("mood", "平静")
             review = evaluation.get("review", "")
             logger.info(f"视频评价: score={score}, mood={mood}, llm_ok={llm_ok}")
+            # belief_update after full watch evaluation (may replan vs impression).
+            if brain_wm is not None and callable(
+                getattr(brain_wm, "update_working_memory", None)
+            ):
+                try:
+                    belief = (
+                        f"watch_phase=evaluated score={score} mood={mood} "
+                        f"review={(review or '')[:80]}"
+                    )
+                    replan = score < 4  # low score → reconsider interaction impulse
+                    brain_wm.update_working_memory(
+                        eval_action_key,
+                        phase="watch_phase_evaluated",
+                        belief=belief,
+                        draft=str(evaluation.get("comment") or "")[:200],
+                        notes={
+                            "score": score,
+                            "mood": mood,
+                            "belief_update": True,
+                        },
+                        replan=replan,
+                    )
+                    if replan and callable(getattr(brain_wm, "mid_action_replan", None)):
+                        brain_wm.mid_action_replan(
+                            eval_action_key,
+                            reason=f"low_score_{score}",
+                            new_belief=belief,
+                        )
+                except Exception:
+                    logger.debug("mid_watch belief_update failed", exc_info=True)
             await self._archive_bot_action(
-                action_key=f"proactive_video:{observation_key}:evaluate",
+                action_key=eval_action_key,
                 action_type="evaluate_proactive_video",
                 text=(
                     f"已看完并评价视频《{title}》：评分 {score}/10，心情 {mood}。"

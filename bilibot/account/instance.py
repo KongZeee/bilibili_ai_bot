@@ -303,6 +303,14 @@ class AccountInstance:
                 web_search=None,  # filled after Scheduler creates WebSearchService
                 draft_store=None,  # filled after Scheduler draft store is available
             )
+            # Bind consolidate → Self rewrite when brain is present.
+            if self.memory_brain is not None and hasattr(
+                self.companion, "rebind_memory_brain"
+            ):
+                try:
+                    self.companion.rebind_memory_brain(self.memory_brain)
+                except Exception:
+                    pass
             # ContextBuilder 注入 companion 供回复上下文使用
             if self.context_builder is not None:
                 self.context_builder.companion = self.companion
