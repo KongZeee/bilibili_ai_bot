@@ -186,7 +186,14 @@ def _activity_source_text(row: Mapping[str, Any]) -> str:
 
 
 class MemoryBrainService:
-    """The only runtime owner of one account's memory brain."""
+    """The only runtime owner of one account's memory brain.
+
+    Generation paths should prefer a companion ``SelfSnapshot`` (see
+    ``bilibot.companion.models.SelfSnapshot``) as the living self surface,
+    then use this brain for evidence-backed recall. ``life_needles`` on
+    ``begin_activity`` / ``build_activity_context`` are the bridge: pass
+    snapshot salient/thread tokens so hybrid recall stays self-aligned.
+    """
 
     def __init__(
         self,
@@ -334,6 +341,29 @@ class MemoryBrainService:
 
     def health_check(self):
         return self.store.health_check()
+
+    def self_needles_from_snapshot(self, snapshot: Any) -> tuple[str, ...]:
+        """Extract recall needles from a companion SelfSnapshot-like object."""
+        if snapshot is None:
+            return ()
+        items: list[str] = []
+        for attr in ("salient_recent", "ongoing_threads", "standing_attitudes"):
+            rows = getattr(snapshot, attr, None) or ()
+            if isinstance(rows, Mapping):
+                rows = rows.values()
+            for row in rows:
+                text = str(row or "").strip()
+                if "|eid=" in text:
+                    text = text.split("|eid=", 1)[0].strip()
+                if text and text not in items:
+                    items.append(text[:48])
+        activity = str(getattr(snapshot, "activity", "") or "").strip()
+        if activity and activity not in items:
+            items.insert(0, activity[:48])
+        mood = str(getattr(snapshot, "mood_bias", "") or "").strip()
+        if mood and mood not in items:
+            items.append(mood[:24])
+        return tuple(items[:16])
 
     def archive_observation(self, envelope: ObservationEnvelope):
         if isinstance(envelope, Mapping):
@@ -703,13 +733,20 @@ class MemoryBrainService:
             "pm",
         }:
             resolved_mode = raw_scene
+        # Normalize SelfSnapshot-style lines (strip |eid=...) into bare needles.
+        def _bare_needle(value: Any) -> str:
+            text = str(value or "").strip()
+            if "|eid=" in text:
+                text = text.split("|eid=", 1)[0].strip()
+            return text
+
         needle_list = tuple(
-            str(x).strip()
+            _bare_needle(x)
             for x in (life_needles or ())
-            if str(x or "").strip()
+            if _bare_needle(x)
         )[:16]
         mood_list = tuple(
-            str(x).strip() for x in (mood_cues or ()) if str(x or "").strip()
+            _bare_needle(x) for x in (mood_cues or ()) if _bare_needle(x)
         )[:8]
         # Life needles also seed title_entity channel (not only soft rank bias).
         entity_hints = tuple(

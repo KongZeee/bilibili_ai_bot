@@ -38,6 +38,91 @@ class LifeCondition:
 
 
 @dataclass
+class SelfSnapshot:
+    """Unified read model of "who I am right now" for generation paths.
+
+    LifeState remains the durable JSON document; SelfSnapshot is the
+    generation-facing projection. Prefer this type at begin_activity /
+    dynamic / proactive prompt assembly so companion + memory_brain share
+    one self surface.
+
+    ``salient_recent`` items may carry ``|eid=<event_id>`` suffixes so
+    claims stay evidence-linkable without a second store.
+    """
+
+    energy: int = 70
+    mood_bias: str = "平稳"
+    activity: str = ""
+    message_seed: str = ""
+    dream_afterglow: str = ""
+    salient_recent: List[str] = field(default_factory=list)
+    ongoing_threads: List[str] = field(default_factory=list)
+    # Optional standing attitudes e.g. "UP:xxx=喜欢" — reserved for later.
+    standing_attitudes: List[str] = field(default_factory=list)
+    updated_at: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "energy": int(self.energy),
+            "mood_bias": self.mood_bias,
+            "activity": self.activity,
+            "message_seed": self.message_seed,
+            "dream_afterglow": self.dream_afterglow,
+            "salient_recent": list(self.salient_recent or [])[:8],
+            "ongoing_threads": list(self.ongoing_threads or [])[:6],
+            "standing_attitudes": list(self.standing_attitudes or [])[:8],
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_life_state(cls, state: "LifeState") -> "SelfSnapshot":
+        if state is None:
+            return cls()
+        return cls(
+            energy=int(getattr(state, "energy", 70) or 70),
+            mood_bias=str(getattr(state, "mood_bias", "") or "平稳"),
+            activity=str(getattr(state, "activity", "") or ""),
+            message_seed=str(getattr(state, "message_seed", "") or ""),
+            dream_afterglow=str(getattr(state, "dream_afterglow", "") or ""),
+            salient_recent=list(getattr(state, "salient_recent", None) or [])[:8],
+            ongoing_threads=list(getattr(state, "ongoing_threads", None) or [])[:6],
+            standing_attitudes=[],
+            updated_at=str(getattr(state, "updated_at", "") or ""),
+        )
+
+    def prompt_block(self, *, max_salient: int = 4, max_threads: int = 4) -> str:
+        """Compact Chinese block for injection into activity / dynamic prompts."""
+        lines = [f"【自我快照】精力 {int(self.energy)}/100 · 心情 {self.mood_bias or '平稳'}"]
+        if self.activity:
+            lines.append(f"当前活动：{self.activity[:80]}")
+        sal = [str(x).strip() for x in (self.salient_recent or []) if str(x or "").strip()]
+        if sal:
+            # Strip eid markers from human-facing lines but keep text.
+            shown = []
+            for item in sal[:max_salient]:
+                shown.append(item.split("|eid=")[0].strip())
+            lines.append("刚经历：" + "；".join(shown))
+        thr = [str(x).strip() for x in (self.ongoing_threads or []) if str(x or "").strip()]
+        if thr:
+            lines.append("进行中：" + "；".join(thr[:max_threads]))
+        if self.dream_afterglow:
+            lines.append(f"梦境余韵：{self.dream_afterglow[:80]}")
+        if self.message_seed:
+            lines.append(f"想说的话：{self.message_seed[:60]}")
+        return "\n".join(lines)
+
+    def event_ids(self) -> List[str]:
+        ids: List[str] = []
+        for item in list(self.salient_recent or []) + list(self.ongoing_threads or []):
+            s = str(item or "")
+            if "|eid=" in s:
+                eid = s.split("|eid=", 1)[-1].strip().split()[0]
+                if eid and eid not in ids:
+                    ids.append(eid)
+        return ids
+
+
+@dataclass
 class LifeState:
     date: str = ""
     energy: int = 70
@@ -50,6 +135,7 @@ class LifeState:
     dream_afterglow: str = ""
     # Short continuous self: recent closed activities for prompt injection.
     # Each item is a one-line human string, newest first, max ~8.
+    # Optional suffix ``|eid=<memory_event_id>`` binds the claim to brain evidence.
     salient_recent: List[str] = field(default_factory=list)
     # Open threads e.g. "小说:《xx》续写中" / "追番:ATRI" — free text, max ~6.
     ongoing_threads: List[str] = field(default_factory=list)

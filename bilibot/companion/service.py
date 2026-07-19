@@ -24,6 +24,7 @@ from .models import (
     ExploreNote,
     LifeState,
     PlanItem,
+    SelfSnapshot,
     StoryDetail,
 )
 from . import prompts as P
@@ -849,6 +850,7 @@ class CompanionLifeService:
         line: str,
         thread: str = "",
         close_thread_prefix: str = "",
+        event_id: str = "",
     ) -> None:
         """Update continuous self surface after a closed companion activity.
 
@@ -856,10 +858,17 @@ class CompanionLifeService:
         threads so one-shot or successive activities do not accumulate forever.
         When ``close_thread_prefix`` is set and no new ``thread`` is provided,
         matching open threads are closed without re-inserting a finished marker.
+
+        When ``event_id`` is provided, the salient line is stored as
+        ``{text}|eid={event_id}`` so SelfSnapshot claims stay evidence-bound.
         """
         if not self.enabled:
             return
         text = " ".join(str(line or "").replace("\x00", "").split())
+        eid = " ".join(str(event_id or "").replace("\x00", "").split())
+        if eid and text and "|eid=" not in text:
+            # Keep human text short; bind evidence after the display body.
+            text = f"{text[:100]}|eid={eid[:64]}"
         if not text and not thread and not close_thread_prefix:
             return
         # Ensure day-roll happens before atomic mutate (may write once).
@@ -875,10 +884,15 @@ class CompanionLifeService:
                 if str(x or "").strip()
             ]
             if text:
+                bare = text.split("|eid=")[0]
                 recent = [
-                    x for x in recent if x != text and not x.startswith(text[:16])
+                    x
+                    for x in recent
+                    if x != text
+                    and not x.startswith(bare[:16])
+                    and x.split("|eid=")[0] != bare
                 ]
-                recent.insert(0, text[:120])
+                recent.insert(0, text[:160])
                 state.salient_recent = recent[:8]
             threads = [
                 str(x).strip()
@@ -1015,6 +1029,38 @@ class CompanionLifeService:
 
     # ── public snapshot / inject ──
 
+    def get_self_snapshot(self) -> SelfSnapshot:
+        """Unified generation-facing self read model (SelfSnapshot)."""
+        try:
+            state = self.ensure_life_state() if self.enabled else self.store.get_life_state()
+        except Exception:
+            try:
+                state = self.store.get_life_state()
+            except Exception:
+                return SelfSnapshot()
+        snap = SelfSnapshot.from_life_state(state)
+        # Prefer schedule-derived current activity when available.
+        try:
+            plan = self.store.get_daily_plan()
+            if plan and getattr(plan, "items", None):
+                now_m = datetime.now().hour * 60 + datetime.now().minute
+                for it in plan.items:
+                    s = _parse_hhmm(it.time)
+                    e = _parse_hhmm(it.end)
+                    if s is None:
+                        continue
+                    if e is None:
+                        e = s + 60
+                    if s <= now_m < e or (e <= s and (now_m >= s or now_m < e)):
+                        if it.activity:
+                            snap.activity = it.activity
+                        if it.message_seed:
+                            snap.message_seed = it.message_seed
+                        break
+        except Exception:
+            pass
+        return snap
+
     def get_prompt_surface(self) -> str:
         """Short block for system/user prompt injection."""
         if not self.enabled or not self._cfg.life_state.enabled:
@@ -1024,9 +1070,10 @@ class CompanionLifeService:
         state = self.store.get_life_state()
         plan = self.store.get_daily_plan()
         detail = self.store.get_story_detail()
-        # current item
-        current = state.activity or ""
-        seed = state.message_seed or ""
+        # Prefer SelfSnapshot core (energy/mood/salient/threads), then schedule.
+        snap = SelfSnapshot.from_life_state(state)
+        current = snap.activity or state.activity or ""
+        seed = snap.message_seed or state.message_seed or ""
         if plan.items:
             now_m = datetime.now().hour * 60 + datetime.now().minute
             for it in plan.items:
@@ -1066,12 +1113,15 @@ class CompanionLifeService:
         if threads:
             lines.append("进行中：" + "；".join(threads[:4]))
         salient = [
-            str(x).strip()
+            str(x).strip().split("|eid=")[0]
             for x in (getattr(state, "salient_recent", None) or [])
             if str(x or "").strip()
         ]
         if salient:
             lines.append("刚经历：" + "；".join(s[:40] for s in salient[:3]))
+        # Expose SelfSnapshot marker so generation paths can detect unified self.
+        if snap.salient_recent or snap.ongoing_threads:
+            lines.append(snap.prompt_block(max_salient=2, max_threads=2).split("\n")[0])
         if detail.summary and detail.date == _today():
             lines.append(f"时段细节：{detail.summary[:100]}")
         if near:
@@ -1306,12 +1356,24 @@ class CompanionLifeService:
                 salient += f"，评分{sc:g}"
             if comment:
                 salient += "，还发了评论"
+            bound_eid = ""
+            if memory_event_ids:
+                for raw in memory_event_ids:
+                    cand = str(raw or "").strip()
+                    if cand:
+                        bound_eid = cand
+                        break
+            # Prefer durable brain event ids; fall back to bvid so SelfSnapshot
+            # lines stay evidence-linkable even when the caller omits ids.
+            if not bound_eid and bvid:
+                bound_eid = f"bvid:{str(bvid).strip()}"
             # Replace any prior "最近在看：" thread; only keep when score is high.
             self._push_salient_self(
                 line=salient[:120],
                 # Category prefix 最近在看： replaces prior watch thread.
                 thread=f"最近在看：《{short_title}》" if sc >= 7 else "",
                 close_thread_prefix="" if sc >= 7 else "最近在看：",
+                event_id=bound_eid,
             )
             # fragment pool: keep concrete words from title
             if title:
