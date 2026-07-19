@@ -23,6 +23,8 @@ from .models import (
     DreamRecord,
     ExploreNote,
     LifeState,
+    MotiveQueue,
+    MotiveScore,
     PlanItem,
     SelfSnapshot,
     StoryDetail,
@@ -1028,6 +1030,127 @@ class CompanionLifeService:
             return None
 
     # ── public snapshot / inject ──
+
+    def rank_motives(self, now: Optional[datetime] = None) -> MotiveQueue:
+        """Score competing desires from SelfSnapshot + schedule soft signals.
+
+        Higher score ⇒ more urgent. Callers (scheduler tick / proactive checks)
+        should prefer the top motive's ``suggested_action`` over blind cron slots.
+        """
+        now = now or datetime.now()
+        snap = self.get_self_snapshot() if self.enabled else SelfSnapshot()
+        energy = int(getattr(snap, "energy", 70) or 70)
+        threads = list(getattr(snap, "ongoing_threads", None) or [])
+        salient = list(getattr(snap, "salient_recent", None) or [])
+        seed = str(getattr(snap, "message_seed", "") or "")
+        afterglow = str(getattr(snap, "dream_afterglow", "") or "")
+
+        motives: List[MotiveScore] = []
+
+        # Rest when drained.
+        rest_score = 0.0
+        if energy <= 25:
+            rest_score = 9.0
+        elif energy <= 40:
+            rest_score = 6.0
+        elif energy <= 55:
+            rest_score = 3.0
+        motives.append(
+            MotiveScore(
+                name="疲惫",
+                score=rest_score,
+                reason=f"energy={energy}",
+                suggested_action="rest",
+            )
+        )
+
+        # Curiosity / browse
+        browse_score = 3.0 + max(0, (energy - 50) / 20.0)
+        if self.wants_browse_bilibili_now(now):
+            browse_score += 3.5
+        if any("最近在看" in str(t) for t in threads):
+            browse_score += 1.0
+        motives.append(
+            MotiveScore(
+                name="好奇",
+                score=min(10.0, browse_score),
+                reason="schedule_browse" if self.wants_browse_bilibili_now(now) else "energy_browse",
+                suggested_action="browse_video",
+            )
+        )
+
+        # Express / dynamic
+        express = 2.0
+        if seed:
+            express += 2.5
+        if afterglow:
+            express += 1.0
+        if any("想发" in str(s) or "动态" in str(s) for s in salient[:4]):
+            express += 2.0
+        if energy >= 45:
+            express += 1.0
+        else:
+            express -= 1.5
+        motives.append(
+            MotiveScore(
+                name="表达欲",
+                score=max(0.0, min(10.0, express)),
+                reason="seed_or_salient" if seed or afterglow else "baseline",
+                suggested_action="post_dynamic",
+            )
+        )
+
+        # Social — open reply-ish threads
+        social = 1.5
+        if any("私信" in str(s) or "评论" in str(s) for s in salient[:5]):
+            social += 2.5
+        if energy >= 40:
+            social += 1.0
+        motives.append(
+            MotiveScore(
+                name="社交欲",
+                score=min(10.0, social),
+                reason="recent_social" if social > 2.5 else "baseline",
+                suggested_action="reply",
+            )
+        )
+
+        # Explore
+        explore = 2.0 + max(0, (energy - 55) / 25.0)
+        if any(str(t).startswith("兴趣：") for t in threads):
+            explore += 2.0
+        motives.append(
+            MotiveScore(
+                name="探索",
+                score=min(10.0, explore),
+                reason="interest_thread" if explore > 3 else "baseline",
+                suggested_action="explore",
+            )
+        )
+
+        # Creative
+        creative = 1.5
+        if any(str(t).startswith("小说：") for t in threads):
+            creative += 3.5
+        if energy >= 50:
+            creative += 1.0
+        motives.append(
+            MotiveScore(
+                name="创作",
+                score=min(10.0, creative),
+                reason="open_novel" if creative > 3 else "baseline",
+                suggested_action="creative",
+            )
+        )
+
+        queue = MotiveQueue(motives=motives, updated_at=_now_iso())
+        return queue
+
+    def select_motive(self, now: Optional[datetime] = None) -> Optional[MotiveScore]:
+        """Return the highest-scoring motive (or None if companion disabled)."""
+        if not self.enabled:
+            return None
+        return self.rank_motives(now=now).top()
 
     def get_self_snapshot(self) -> SelfSnapshot:
         """Unified generation-facing self read model (SelfSnapshot)."""
@@ -2776,6 +2899,23 @@ class CompanionLifeService:
                 return result
 
             self.ensure_life_state()
+
+            # MotiveQueue: rank desires before companion side-effects so
+            # downstream scheduler can consult top motive (rest / browse / express).
+            try:
+                queue = self.rank_motives(now=now)
+                top = queue.top()
+                result["motive_queue"] = queue.to_dict()
+                if top is not None:
+                    result["top_motive"] = top.name
+                    result["top_action"] = top.suggested_action
+                    result["actions"].append(
+                        f"motive:{top.suggested_action}:{top.score:.1f}"
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "[%s] rank_motives failed: %s", self.account_id, type(exc).__name__
+                )
 
             # plan generation after generate_time
             if self._cfg.schedule.enabled and self._past_time(self._cfg.schedule.generate_time, now):

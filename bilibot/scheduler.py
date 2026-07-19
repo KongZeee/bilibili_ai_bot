@@ -5744,10 +5744,30 @@ class Scheduler:
         """
         features = self.config_loader.get_raw_config().get("features", {})
 
+        # MotiveQueue soft gate: when companion ranks "rest" highest with a
+        # strong score, skip spawning new proactive video/dynamic this tick.
+        # Scheduled TaskRuns remain claimable later when energy recovers.
+        motive_rest = False
+        companion = getattr(self, "companion", None)
+        if companion is not None and getattr(companion, "enabled", False):
+            try:
+                select = getattr(companion, "select_motive", None)
+                if callable(select):
+                    top = select()
+                    if top is not None and str(getattr(top, "suggested_action", "")) == "rest":
+                        if float(getattr(top, "score", 0) or 0) >= 6.0:
+                            motive_rest = True
+                            logger.info(
+                                "MotiveQueue rest gate: skip proactive spawn (score=%.1f)",
+                                float(top.score),
+                            )
+            except Exception:
+                motive_rest = False
+
         # PRD V4 COM-001：proactive_video 和 proactive_comment 解耦
         # proactive_video 控制视频获取/分析/评价/记忆；proactive_comment 只控制是否发布主动评论
         # 两个开关不再以 AND 方式决定整个视频任务是否运行
-        if features.get("proactive_video", True):
+        if features.get("proactive_video", True) and not motive_rest:
             for trigger_time in self._proactive_times:
                 time_str = f"{trigger_time[0]:02d}:{trigger_time[1]:02d}"
                 # Task 23 修复：范围匹配（slot ≤ 当前时间且当日未触发）
@@ -5781,7 +5801,7 @@ class Scheduler:
                     break
 
         # 发布动态
-        if features.get("dynamic_post", True):
+        if features.get("dynamic_post", True) and not motive_rest:
             for trigger_time in self._dynamic_times:
                 time_str = f"{trigger_time[0]:02d}:{trigger_time[1]:02d}"
                 if time_str == current_time and current_time not in self._dynamic_triggered:

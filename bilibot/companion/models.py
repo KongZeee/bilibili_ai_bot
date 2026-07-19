@@ -38,6 +38,49 @@ class LifeCondition:
 
 
 @dataclass
+class MotiveScore:
+    """One ranked desire competing for the next autonomous act."""
+
+    name: str
+    score: float
+    reason: str = ""
+    suggested_action: str = ""  # browse_video / post_dynamic / reply / explore / rest / creative
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "score": float(self.score),
+            "reason": self.reason,
+            "suggested_action": self.suggested_action,
+        }
+
+
+@dataclass
+class MotiveQueue:
+    """Desire layer sitting above TaskRun slots.
+
+    Scheduler / companion tick should call ``rank_motives`` then pick the top
+    motive before instantiating proactive_video / dynamic_post / explore.
+    This is intentionally lightweight — not a full planner.
+    """
+
+    motives: List[MotiveScore] = field(default_factory=list)
+    updated_at: str = ""
+
+    def top(self) -> Optional[MotiveScore]:
+        if not self.motives:
+            return None
+        return max(self.motives, key=lambda m: float(m.score))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "motives": [m.to_dict() for m in self.motives],
+            "updated_at": self.updated_at,
+            "top": (self.top().to_dict() if self.top() else None),
+        }
+
+
+@dataclass
 class SelfSnapshot:
     """Unified read model of "who I am right now" for generation paths.
 
