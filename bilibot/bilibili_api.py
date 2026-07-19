@@ -1735,14 +1735,18 @@ class BilibiliAPI:
     #  互动操作
     # ══════════════════════════════════════
     
-    async def like_video(self, oid: int, like: int = 1) -> bool:
+    async def like_video(self, oid: int, like: int = 1) -> Optional[bool]:
         """点赞/取消点赞视频
 
         Args:
             oid: 视频 aid
             like: 1=点赞, 2=取消点赞（B站 archive/like 约定）
+
+        Returns:
+            True 明确成功 / False 明确失败 / None transport 不确定
+            （超时/5xx/非 JSON 等；平台可能已接受，禁止自动当失败重试）
         """
-        data, _ = await self._http_post(
+        data, err = await self._http_post(
             "https://api.bilibili.com/x/web-interface/archive/like",
             data={
                 "aid": oid,
@@ -1750,19 +1754,25 @@ class BilibiliAPI:
                 "csrf": self._csrf_token,
             },
         )
-        return bool(data and data.get("code") == 0)
-    
-    async def coin_video(self, oid: int, num: int = 1) -> bool:
+        if err is not None or data is None:
+            return None
+        return bool(data.get("code") == 0)
+
+    async def coin_video(self, oid: int, num: int = 1) -> Optional[bool]:
         """
         投币
-        
+
         Args:
             oid: 视频aid
             num: 投币数量 (1或2)
+
+        Returns:
+            True 明确成功 / False 明确失败 / None transport 不确定
+            （超时后可能已扣币，禁止当 failed 自动重试）
         """
         # MISC-602：投币数量仅允许 1 或 2，越界时夹紧到合法区间
         num = max(1, min(2, int(num)))
-        data, _ = await self._http_post(
+        data, err = await self._http_post(
             "https://api.bilibili.com/x/web-interface/coin/add",
             data={
                 "sid": oid,
@@ -1771,23 +1781,31 @@ class BilibiliAPI:
                 "csrf": self._csrf_token,
             },
         )
-        return data and data.get("code") == 0
-    
-    async def fav_video(self, oid: int, fav_id: int = 0) -> bool:
-        """收藏视频"""
+        if err is not None or data is None:
+            return None
+        return bool(data.get("code") == 0)
+
+    async def fav_video(self, oid: int, fav_id: int = 0) -> Optional[bool]:
+        """收藏视频
+
+        Returns:
+            True 明确成功 / False 明确失败 / None transport 不确定
+        """
         # 先获取收藏夹列表
         if fav_id == 0:
-            data, _ = await self._http_get(
+            data, err = await self._http_get(
                 "https://api.bilibili.com/x/v3/fav/folder/created/list-all",
                 params={"up_mid": self.config.bilibili.dede_user_id},
             )
-            if data and data.get("data") and data["data"].get("list"):
+            if err is not None or data is None:
+                return None
+            if data.get("data") and data["data"].get("list"):
                 fav_id = data["data"]["list"][0].get("id", 0)
-        
+
         if fav_id == 0:
             return False
-        
-        data, _ = await self._http_post(
+
+        data, err = await self._http_post(
             "https://api.bilibili.com/x/v3/fav/resource/deal",
             data={
                 "rid": oid,
@@ -1797,7 +1815,9 @@ class BilibiliAPI:
                 "csrf": self._csrf_token,
             },
         )
-        return data and data.get("code") == 0
+        if err is not None or data is None:
+            return None
+        return bool(data.get("code") == 0)
     
     async def follow_user(self, mid: int) -> bool:
         """关注用户"""

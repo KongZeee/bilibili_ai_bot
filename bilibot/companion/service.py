@@ -417,10 +417,22 @@ class CompanionLifeService:
         except Exception as e:
             msg = str(e)
             err_name = type(e).__name__
-            # 同内容重入可静默；不同内容冲突仅 debug
-            if "already exists" in msg or "Idempotency" in err_name:
+            # C3：同内容软命中可静默；内容冲突（IdempotencyConflict）不得当成功，
+            # 否则本地 Life/日记更新而脑内仍是旧源。
+            soft_hit = (
+                "already exists" in msg
+                and "different content" not in msg
+                and err_name != "IdempotencyConflictError"
+            )
+            if soft_hit:
                 logger.debug("[%s] companion archive skip: %s", self.account_id, msg[:160])
                 return True
+            if err_name == "IdempotencyConflictError" or "different content" in msg:
+                logger.warning(
+                    "[%s] companion archive conflict (not success): %s",
+                    self.account_id,
+                    msg[:200],
+                )
             self._last_archive_error = f"{err_name}:{msg[:120]}"
             self._last_archive_fail_at = _now_iso()
             self._archive_fail_count = int(self._archive_fail_count or 0) + 1

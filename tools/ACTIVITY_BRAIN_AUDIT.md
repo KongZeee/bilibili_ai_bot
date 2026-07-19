@@ -14,15 +14,16 @@ Snapshot after research/jul19-brain SelfSnapshot + MotiveQueue + working_memory.
 | reply comment | yes | yes | bot_action | yes | OK |
 | private message | yes (exp57) | yes on terminals | `private_message` + bot_action | partial (recall + activity) | OK |
 | proactive video eval | yes | yes via archive | video + experience + bot_action | yes | OK |
-| video like | yes | yes | bot_action | yes | begin before API |
-| video coin | yes | yes | bot_action | yes | begin before API |
+| video like | yes | yes | bot_action | yes | begin before API; Optional[bool] result_unknown |
+| video coin | yes | yes | bot_action | yes | begin before API; Optional[bool] result_unknown |
+| video favorite | yes | yes | bot_action | yes | begin before API (aligned with like/coin) |
 | bangumi episode | yes | yes (exp47) | bangumi/bot_action | yes | OK |
 | weekly summary | yes | yes via archive | weekly | yes | OK |
 | dynamic post | yes | yes via archive | bot_action 动态 | yes | OK |
 
 ## Known residual gaps (P1+)
 
-1. favourite (fav) may still be terminal-only without begin context.
+1. ~~favourite (fav) may still be terminal-only without begin context.~~ — fixed: begin before API + three-state result.
 2. ~~creative chunk archive is a short status line~~ — fixed exp63 (full prose capped).
 3. companion JSON store dual-track with memory_brain (SelfSnapshot partial unify; not single SQLite self table).
 4. ~~generation queries still bag-of-words~~ — exp64 scene recipes + SelfState needles (QA path unchanged).

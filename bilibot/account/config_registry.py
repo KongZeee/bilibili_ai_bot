@@ -40,6 +40,29 @@ def is_sensitive_placeholder(value: Any) -> bool:
     return False
 
 
+def validate_account_id(account_id: str) -> str:
+    """C2：账号 ID 必须是安全的单路径分量，防止写穿 data/accounts/。
+
+    与 memory_brain.bootstrap._validate_account_id 规则对齐：
+    非空、非 . / ..、不含 / \\ \\x00 :。
+    """
+    value = str(account_id or "").strip()
+    if not value or value in {".", ".."}:
+        raise ValueError("account_id must be a non-empty path component")
+    if any(character in value for character in ("/", "\\", "\x00", ":")):
+        raise ValueError("account_id cannot contain path separators or a drive prefix")
+    # 额外拒绝 Windows 保留名与空白，避免后续目录异常
+    if value.lower() in {
+        "con", "prn", "aux", "nul",
+        "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8", "com9",
+        "lpt1", "lpt2", "lpt3", "lpt4", "lpt5", "lpt6", "lpt7", "lpt8", "lpt9",
+    }:
+        raise ValueError(f"account_id is a reserved name: {value}")
+    if value != value.strip() or " " in value:
+        raise ValueError("account_id cannot contain spaces")
+    return value
+
+
 class AccountConfigRegistry:
     """账号配置注册表：加载 config.yaml 全部合法账号配置
 
@@ -123,9 +146,10 @@ class AccountConfigRegistry:
             新账号 ID
 
         Raises:
-            ValueError: 账号 ID 已存在
+            ValueError: 账号 ID 已存在或路径不合法
         """
-        acc_id = acc_config.get("id") or f"account_{uuid.uuid4().hex[:8]}"
+        raw_id = acc_config.get("id") or f"account_{uuid.uuid4().hex[:8]}"
+        acc_id = validate_account_id(raw_id)
         if acc_id in self._configs:
             raise ValueError(f"账号 ID 已存在: {acc_id}")
         cfg = copy.deepcopy(acc_config)

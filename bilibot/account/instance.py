@@ -529,6 +529,16 @@ class AccountInstance:
             except Exception as e:
                 # M10：记录关闭 session 异常，不再静默
                 logger.warning(f"[{self.account_id}] 关闭 B站 session 失败: {e}")
+            self.bili = None
+        # C1：销毁运行时组件，强制下次 start 走完整 initialize()。
+        # 否则 stop→start 会复用已 close 的 memory_brain / bili / scheduler。
+        self.knowledge_memory = None
+        self.memory_brain = None
+        self.companion = None
+        self.comment_context_service = None
+        self.scheduler = None
+        self.video_understanding = None
+        self.image_provider = None
         logger.info(f"[{self.account_id}] 账号已关闭")
 
     # ══════════════════════════════════════

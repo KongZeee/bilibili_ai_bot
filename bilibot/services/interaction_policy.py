@@ -151,12 +151,17 @@ class InteractionPolicyEngine:
             conn.close()
 
     def _count_for_video(self, action: str, bvid: str) -> int:
-        """统计某视频的成功互动次数（用于投币去重）"""
+        """统计某视频已占位互动次数（成功 + 不确定结果）。
+
+        C5：result_unknown（transport 超时等）也占位，避免超时后当 failed
+        再投币导致重复扣币。
+        """
         conn = self._get_conn()
         try:
             row = conn.execute(
                 "SELECT COUNT(*) AS c FROM interaction_log "
-                "WHERE account_id = ? AND action = ? AND target_bvid = ? AND result = 'success'",
+                "WHERE account_id = ? AND action = ? AND target_bvid = ? "
+                "AND result IN ('success', 'result_unknown')",
                 (self.account_id or "", action, bvid),
             ).fetchone()
             return int(row["c"]) if row else 0
@@ -273,7 +278,7 @@ class InteractionPolicyEngine:
 
         Args:
             action: like/coin/favorite/comment
-            result: success / failed / skipped
+            result: success / failed / skipped / result_unknown
             api_code: B站 API 返回码
             failure_reason: 失败原因
             content_hash: 评论内容哈希（仅 comment）

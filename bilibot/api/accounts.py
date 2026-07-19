@@ -208,6 +208,14 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             acc_id = body.get("id") or ""
             if not acc_id:
                 return fail("VALIDATION_ERROR", "账号 ID 不能为空")
+            # C2：路径安全校验（与 bootstrap / config_registry 一致）
+            from bilibot.account.config_registry import validate_account_id
+            try:
+                acc_id = validate_account_id(acc_id)
+                body = dict(body)
+                body["id"] = acc_id
+            except ValueError as ve:
+                return fail("VALIDATION_ERROR", str(ve))
             if acc_id in account_manager:
                 return fail("DUPLICATE_ID", f"账号 ID 已存在: {acc_id}")
             # PRD-V5 §5.3 LLM-501：校验 llm_id 指向已存在且 enabled 的 Provider
@@ -426,7 +434,14 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 "task_id": id(acc._scheduler_task) if acc._scheduler_task else None,
             }, "账号已在运行中")
         try:
-            if acc.scheduler is None:
+            # C1：close() 会清空 brain/bili/scheduler；任一缺失都必须 re-init，
+            # 不能只看 scheduler is None（旧逻辑会带着死引用直接 start）。
+            needs_init = (
+                acc.scheduler is None
+                or getattr(acc, "memory_brain", None) is None
+                or getattr(acc, "bili", None) is None
+            )
+            if needs_init:
                 await acc.initialize()
             await acc.start()
             return ok({

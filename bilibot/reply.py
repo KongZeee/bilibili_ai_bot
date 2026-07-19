@@ -507,12 +507,12 @@ class ReplyGenerator:
             outcome_meta["affection_delta"] = 0
             outcome_meta["persona_id"] = persona_id
 
-            # Close the activity lifecycle so subsequent scenes can see this reply
-            # as completed self memory, not only as an open intent.
+            # C7：生成成功只表示 draft，真正 completed 由 scheduler 在平台 success 后 archive。
+            # 过早 completed 会在安全拒绝/API 失败时让记忆谎称已回复。
             await self._finish_activity_memory(
                 activity_meta,
                 result_text=reply_text,
-                state="completed",
+                state="drafted",
             )
 
             return GenerationOutcome.generated(

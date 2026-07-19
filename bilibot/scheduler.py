@@ -1103,12 +1103,42 @@ class Scheduler:
         importance: float = 0.6,
         status: str = "",
     ):
-        """Archive a terminal bot action; prefer finish_activity when available."""
+        """Archive a bot action intent or terminal outcome.
+
+        Semantics for ``status`` / ``published``:
+        - ``status=""`` + ``published=False`` → **intent** (open activity; not finish)
+        - ``status=""`` + ``published=True`` → **completed**
+        - explicit terminal (failed / result_unknown / rejected / drafted / …) → finish
+        - explicit ``status="intent"`` → intent archive (not finish)
+
+        Prefer ``finish_activity`` only for terminal states so intent rows stay distinct.
+        """
+        from bilibot.memory_brain.ingestion import bot_action_observation
+
         brain = getattr(self, "memory_brain", None)
         finish = getattr(brain, "finish_activity", None) if brain is not None else None
-        terminal = str(status or ("completed" if published else "failed")).strip().casefold()
-        if terminal == "intent":
-            terminal = "completed" if published else "failed"
+        status_s = str(status or "").strip().casefold()
+
+        # Open intent: empty status + not published, or explicit intent.
+        is_intent = (not status_s and not published) or status_s == "intent"
+        if is_intent:
+            return await self._archive_required(
+                bot_action_observation(
+                    account_id=self.account_id or "default",
+                    action_key=action_key,
+                    action_type=action_type,
+                    text=text,
+                    published=False,
+                    persona_id=self._get_current_persona_id(),
+                    title=title,
+                    scene=scene,
+                    metadata=metadata or {},
+                    importance=importance,
+                    state="intent",
+                )
+            )
+
+        terminal = status_s or ("completed" if published else "failed")
         if callable(finish) and callable(getattr(type(brain), "finish_activity", None)):
             try:
                 return await finish(
@@ -1127,7 +1157,6 @@ class Scheduler:
                     action_key,
                     exc_info=True,
                 )
-        from bilibot.memory_brain.ingestion import bot_action_observation
 
         return await self._archive_required(
             bot_action_observation(
@@ -1141,7 +1170,7 @@ class Scheduler:
                 scene=scene,
                 metadata=metadata or {},
                 importance=importance,
-                state=status,
+                state=terminal,
             )
         )
 
@@ -1507,6 +1536,20 @@ class Scheduler:
         except Exception as e:
             logger.warning(f"Task 4: 启动恢复 publishing 卡死失败: {e}")
 
+        # C6：启动时恢复卡在 claimed 的主动评论（生成前崩溃永久锁 bvid）
+        try:
+            recover_claimed = getattr(
+                self.proactive_comment_store, "recover_stuck_claimed", None
+            )
+            if callable(recover_claimed):
+                stuck_claimed = recover_claimed()
+                if stuck_claimed:
+                    logger.warning(
+                        f"C6: 启动恢复 {stuck_claimed} 个卡在 claimed 的主动评论"
+                    )
+        except Exception as e:
+            logger.warning(f"C6: 启动恢复 claimed 卡死失败: {e}")
+
         # Task 42：启动时恢复卡住的动态草稿（approved 超期 / publishing 超阈值）
         try:
             stuck_drafts = self._get_draft_store().recover_stuck_drafts()
@@ -1654,6 +1697,20 @@ class Scheduler:
                         )
                 except Exception as e:
                     logger.warning(f"Task 4: 恢复 publishing 卡死失败: {e}")
+
+                # C6：周期性恢复卡在 claimed 的主动评论
+                try:
+                    recover_claimed = getattr(
+                        self.proactive_comment_store, "recover_stuck_claimed", None
+                    )
+                    if callable(recover_claimed):
+                        stuck_claimed = recover_claimed()
+                        if stuck_claimed:
+                            logger.warning(
+                                f"C6: 恢复 {stuck_claimed} 个卡在 claimed 的主动评论"
+                            )
+                except Exception as e:
+                    logger.warning(f"C6: 恢复 claimed 卡死失败: {e}")
 
                 # Task 42：恢复卡住的动态草稿（approved 超期 / publishing 超阈值）
                 try:
@@ -2904,6 +2961,7 @@ class Scheduler:
                             action_type="reply_comment",
                             text=reply_text,
                             published=False,
+                            status="intent",
                             title=f"回复评论 {rpid}",
                             scene="reply_comment",
                             metadata={"reply_id": rpid, "oid": str(oid)},
@@ -3140,6 +3198,7 @@ class Scheduler:
                                 action_type="reply_comment",
                                 text=reply_text,
                                 published=False,
+                                status="intent",
                                 title=f"回复评论 {rpid}",
                                 scene="reply_comment",
                                 metadata={"reply_id": rpid, "oid": str(oid)},
@@ -5800,11 +5859,11 @@ class Scheduler:
                             )
                     break
 
-        # 发布动态
+        # 发布动态（H1：范围匹配，对齐 proactive_video，避免主循环跳分钟漏槽）
         if features.get("dynamic_post", True) and not motive_rest:
             for trigger_time in self._dynamic_times:
                 time_str = f"{trigger_time[0]:02d}:{trigger_time[1]:02d}"
-                if time_str == current_time and current_time not in self._dynamic_triggered:
+                if time_str <= current_time and time_str not in self._dynamic_triggered:
                     # PRD-V5 §7：原子 claim
                     task_id = self._claim_task_for_slot("dynamic", time_str)
                     if task_id:
@@ -5814,11 +5873,18 @@ class Scheduler:
                             self._do_post_dynamic(task_id=task_id),
                             tag="_do_post_dynamic",
                         )
-                        self._dynamic_triggered.add(current_time)
+                        self._dynamic_triggered.add(time_str)
                         self._save_dynamic_schedule_state()
                     else:
-                        self._dynamic_triggered.add(current_time)
-                        self._save_dynamic_schedule_state()
+                        # H2：区分 claim 失败（已处理）与 TaskRun 缺失（不 mark，等重建）
+                        if self._task_exists_for_slot("dynamic", time_str):
+                            self._dynamic_triggered.add(time_str)
+                            self._save_dynamic_schedule_state()
+                        else:
+                            logger.error(
+                                f"dynamic slot={time_str} 的 TaskRun 不存在，"
+                                f"调度持久化可能缺失，等待下次调度重建（不标记 triggered）"
+                            )
                     break
 
     def _claim_task_for_slot(self, scene: str, slot: str) -> Optional[str]:
@@ -6712,30 +6778,9 @@ class Scheduler:
                 except Exception:
                     companion_ctx = ""
 
-            # Mid-watch working_memory: impression phase before full evaluation.
-            # Enables mid_action replan if later evidence contradicts first impression.
+            # C4：先 begin_activity 再写 mid-watch impression，避免 intent 覆盖初印象。
             eval_action_key = f"proactive_video:{observation_key}:evaluate"
             brain_wm = getattr(self, "memory_brain", None)
-            if brain_wm is not None and callable(
-                getattr(brain_wm, "update_working_memory", None)
-            ):
-                try:
-                    first_impression = (
-                        f"watch_phase=impression title={str(title or '')[:40]} "
-                        f"owner={str(owner or '')[:20]}"
-                    )
-                    brain_wm.update_working_memory(
-                        eval_action_key,
-                        phase="watch_phase_impression",
-                        belief=first_impression,
-                        notes={
-                            "bvid": str(bvid or ""),
-                            "watch_phase": "impression",
-                            "belief_update": True,
-                        },
-                    )
-                except Exception:
-                    logger.debug("mid_watch working_memory seed failed", exc_info=True)
 
             # 账号级混合召回：近期视频/番剧/日记/评论，注入评价与后续主动评论
             activity_context = await self._begin_activity_context(
@@ -6760,6 +6805,27 @@ class Scheduler:
                 oid=str(oid),
                 metadata={"bvid": bvid, "oid": str(oid)},
             )
+            # Mid-watch working_memory: impression phase after intent is open.
+            if brain_wm is not None and callable(
+                getattr(brain_wm, "update_working_memory", None)
+            ):
+                try:
+                    first_impression = (
+                        f"watch_phase=impression title={str(title or '')[:40]} "
+                        f"owner={str(owner or '')[:20]}"
+                    )
+                    brain_wm.update_working_memory(
+                        eval_action_key,
+                        phase="watch_phase_impression",
+                        belief=first_impression,
+                        notes={
+                            "bvid": str(bvid or ""),
+                            "watch_phase": "impression",
+                            "belief_update": True,
+                        },
+                    )
+                except Exception:
+                    logger.debug("mid_watch working_memory seed failed", exc_info=True)
             if activity_context is not None:
                 memory_bundle = {
                     "memory_evidence": str(activity_context.prompt_text or ""),
@@ -6941,16 +7007,25 @@ class Scheduler:
             )
             action_outcomes: Dict[str, str] = {}
 
-            # 执行点赞
-            like_result = decisions.get("like", {})
-            if like_result.get("planned"):
-                # begin_activity so like is not write-only terminal archive
-                like_key = f"video:{observation_key}:like"
+            # 执行点赞 / 投币 / 收藏（C5 三态 + H3 begin fail-closed + H4 fav begin）
+            async def _run_interaction_action(
+                *,
+                action_name: str,
+                action_type: str,
+                action_key: str,
+                current_activity: str,
+                api_coro,
+                success_text: str,
+                fail_text: str,
+                risk_tag: str,
+                on_success=None,
+            ) -> None:
+                """begin → API(Optional[bool]) → archive。begin 失败不打平台 API。"""
                 try:
                     await self._begin_activity_context(
-                        action_key=like_key,
-                        action_type="like_video",
-                        current_activity=f"准备给视频《{title}》点赞。",
+                        action_key=action_key,
+                        action_type=action_type,
+                        current_activity=current_activity,
                         query=str(title or ""),
                         scene="proactive_video",
                         title=title,
@@ -6959,19 +7034,25 @@ class Scheduler:
                         metadata={"bvid": bvid, "oid": str(oid)},
                     )
                 except Exception:
-                    logger.debug("like begin_activity failed", exc_info=True)
+                    logger.warning(
+                        "%s begin_activity failed; skip API to preserve memory fail-closed",
+                        action_name,
+                        exc_info=True,
+                    )
+                    action_outcomes[action_name] = "skipped:begin_failed"
+                    return
                 try:
-                    ok = await self.bili.like_video(oid)
+                    ok = await api_coro()
                 except Exception as e:
-                    action_outcomes["like"] = f"error:{type(e).__name__}"
-                    logger.debug(f"点赞失败: {e}")
+                    action_outcomes[action_name] = f"error:{type(e).__name__}"
+                    logger.debug("%s 失败: %s", action_name, e)
                     await self.interaction_policy.record_result_async(
-                        "like", bvid, str(oid), "failed", failure_reason=str(e)
+                        action_name, bvid, str(oid), "failed", failure_reason=str(e)
                     )
                     await self._archive_bot_action(
-                        action_key=like_key,
-                        action_type="like_video",
-                        text=f"点赞视频《{title}》失败",
+                        action_key=action_key,
+                        action_type=action_type,
+                        text=fail_text,
                         published=False,
                         status="failed",
                         title=title,
@@ -6982,194 +7063,139 @@ class Scheduler:
                             "reason_code": type(e).__name__,
                         },
                     )
-                else:
-                    action_outcomes["like"] = "success" if ok else "failed"
+                    return
+                # C5：None = transport 不确定，禁止当 failed 自动重试 / 不占「可再试」语义
+                if ok is None:
+                    action_outcomes[action_name] = "result_unknown"
                     await self.interaction_policy.record_result_async(
-                        "like", bvid, str(oid), "success" if ok else "failed",
+                        action_name,
+                        bvid,
+                        str(oid),
+                        "result_unknown",
                         api_code=getattr(self.bili, "last_api_code", None),
-                        failure_reason="" if ok else "bili_api_false",
+                        failure_reason="transport_uncertain",
                     )
-                    if ok:
-                        logger.info("视频点赞成功")
-                        await self._archive_bot_action(
-                            action_key=like_key,
-                            action_type="like_video",
-                            # Phrase "点了赞" is the self-like recall needle.
-                            text=f"观看了视频《{title}》并点了赞。",
-                            published=True,
-                            title=title,
-                            scene="proactive_video",
-                            metadata={"bvid": bvid, "oid": str(oid)},
-                        )
-                        companion = getattr(self, "companion", None)
-                        if companion is not None and getattr(companion, "enabled", False):
-                            push = getattr(companion, "_push_salient_self", None)
-                            if callable(push):
-                                try:
-                                    push(
-                                        line=f"给《{(title or '')[:40]}》点了赞",
-                                    )
-                                except Exception:
-                                    logger.debug(
-                                        "companion like salient push failed",
-                                        exc_info=True,
-                                    )
-                    else:
-                        self._check_bili_risk_control("proactive_like")
-                        await self._archive_bot_action(
-                            action_key=like_key,
-                            action_type="like_video",
-                            text=f"点赞视频《{title}》失败",
-                            published=False,
-                            status="failed",
-                            title=title,
-                            scene="proactive_video",
-                            metadata={
-                                "bvid": bvid,
-                                "oid": str(oid),
-                                "reason_code": "BILI_API_FALSE",
-                            },
-                        )
+                    await self._archive_bot_action(
+                        action_key=action_key,
+                        action_type=action_type,
+                        text=f"{fail_text}（结果不确定，不自动重试）",
+                        published=False,
+                        status="result_unknown",
+                        title=title,
+                        scene="proactive_video",
+                        metadata={
+                            "bvid": bvid,
+                            "oid": str(oid),
+                            "reason_code": "TRANSPORT_UNCERTAIN",
+                        },
+                    )
+                    return
+                if ok:
+                    action_outcomes[action_name] = "success"
+                    await self.interaction_policy.record_result_async(
+                        action_name,
+                        bvid,
+                        str(oid),
+                        "success",
+                        api_code=getattr(self.bili, "last_api_code", None),
+                    )
+                    logger.info("视频%s成功", action_name)
+                    await self._archive_bot_action(
+                        action_key=action_key,
+                        action_type=action_type,
+                        text=success_text,
+                        published=True,
+                        title=title,
+                        scene="proactive_video",
+                        metadata={"bvid": bvid, "oid": str(oid)},
+                    )
+                    if callable(on_success):
+                        try:
+                            on_success()
+                        except Exception:
+                            logger.debug(
+                                "%s on_success hook failed", action_name, exc_info=True
+                            )
+                else:
+                    action_outcomes[action_name] = "failed"
+                    await self.interaction_policy.record_result_async(
+                        action_name,
+                        bvid,
+                        str(oid),
+                        "failed",
+                        api_code=getattr(self.bili, "last_api_code", None),
+                        failure_reason="bili_api_false",
+                    )
+                    self._check_bili_risk_control(risk_tag)
+                    await self._archive_bot_action(
+                        action_key=action_key,
+                        action_type=action_type,
+                        text=fail_text,
+                        published=False,
+                        status="failed",
+                        title=title,
+                        scene="proactive_video",
+                        metadata={
+                            "bvid": bvid,
+                            "oid": str(oid),
+                            "reason_code": "BILI_API_FALSE",
+                        },
+                    )
+
+            like_result = decisions.get("like", {})
+            if like_result.get("planned"):
+                like_key = f"video:{observation_key}:like"
+
+                def _like_salient():
+                    companion = getattr(self, "companion", None)
+                    if companion is not None and getattr(companion, "enabled", False):
+                        push = getattr(companion, "_push_salient_self", None)
+                        if callable(push):
+                            push(line=f"给《{(title or '')[:40]}》点了赞")
+
+                await _run_interaction_action(
+                    action_name="like",
+                    action_type="like_video",
+                    action_key=like_key,
+                    current_activity=f"准备给视频《{title}》点赞。",
+                    api_coro=lambda: self.bili.like_video(oid),
+                    success_text=f"观看了视频《{title}》并点了赞。",
+                    fail_text=f"点赞视频《{title}》失败",
+                    risk_tag="proactive_like",
+                    on_success=_like_salient,
+                )
             else:
                 logger.debug(f"点赞未执行: {like_result.get('reason')}")
 
-            # 执行投币
             coin_result = decisions.get("coin", {})
             if coin_result.get("planned"):
                 coin_key = f"video:{observation_key}:coin"
-                try:
-                    await self._begin_activity_context(
-                        action_key=coin_key,
-                        action_type="coin_video",
-                        current_activity=f"准备给视频《{title}》投币。",
-                        query=str(title or ""),
-                        scene="proactive_video",
-                        title=title,
-                        bvid=bvid,
-                        oid=str(oid),
-                        metadata={"bvid": bvid, "oid": str(oid)},
-                    )
-                except Exception:
-                    logger.debug("coin begin_activity failed", exc_info=True)
-                try:
-                    ok = await self.bili.coin_video(oid, num=1)
-                except Exception as e:
-                    action_outcomes["coin"] = f"error:{type(e).__name__}"
-                    logger.debug(f"投币失败: {e}")
-                    await self.interaction_policy.record_result_async(
-                        "coin", bvid, str(oid), "failed", failure_reason=str(e)
-                    )
-                    await self._archive_bot_action(
-                        action_key=coin_key,
-                        action_type="coin_video",
-                        text=f"给视频《{title}》投币失败",
-                        published=False,
-                        status="failed",
-                        title=title,
-                        scene="proactive_video",
-                        metadata={
-                            "bvid": bvid,
-                            "oid": str(oid),
-                            "reason_code": type(e).__name__,
-                        },
-                    )
-                else:
-                    action_outcomes["coin"] = "success" if ok else "failed"
-                    await self.interaction_policy.record_result_async(
-                        "coin", bvid, str(oid), "success" if ok else "failed",
-                        api_code=getattr(self.bili, "last_api_code", None),
-                        failure_reason="" if ok else "bili_api_false",
-                    )
-                    if ok:
-                        logger.info("视频投币成功")
-                        await self._archive_bot_action(
-                            action_key=coin_key,
-                            action_type="coin_video",
-                            text=f"给视频《{title}》投了币。",
-                            published=True,
-                            title=title,
-                            scene="proactive_video",
-                            metadata={"bvid": bvid, "oid": str(oid)},
-                        )
-                    else:
-                        self._check_bili_risk_control("proactive_coin")
-                        await self._archive_bot_action(
-                            action_key=coin_key,
-                            action_type="coin_video",
-                            text=f"给视频《{title}》投币失败",
-                            published=False,
-                            status="failed",
-                            title=title,
-                            scene="proactive_video",
-                            metadata={
-                                "bvid": bvid,
-                                "oid": str(oid),
-                                "reason_code": "BILI_API_FALSE",
-                            },
-                        )
+                await _run_interaction_action(
+                    action_name="coin",
+                    action_type="coin_video",
+                    action_key=coin_key,
+                    current_activity=f"准备给视频《{title}》投币。",
+                    api_coro=lambda: self.bili.coin_video(oid, num=1),
+                    success_text=f"给视频《{title}》投了币。",
+                    fail_text=f"给视频《{title}》投币失败",
+                    risk_tag="proactive_coin",
+                )
             else:
                 logger.debug(f"投币未执行: {coin_result.get('reason')}")
 
-            # 执行收藏
             fav_result = decisions.get("favorite", {})
             if fav_result.get("planned"):
-                # PRD V6：不单独记录 intent，仅在结果时归档
-                try:
-                    ok = await self.bili.fav_video(oid)
-                except Exception as e:
-                    action_outcomes["favorite"] = f"error:{type(e).__name__}"
-                    logger.debug(f"收藏失败: {e}")
-                    await self.interaction_policy.record_result_async(
-                        "favorite", bvid, str(oid), "failed", failure_reason=str(e)
-                    )
-                    await self._archive_bot_action(
-                        action_key=f"video:{observation_key}:favorite",
-                        action_type="favorite_video",
-                        text=f"收藏视频《{title}》失败",
-                        published=False,
-                        status="failed",
-                        title=title,
-                        scene="proactive_video",
-                        metadata={
-                            "bvid": bvid,
-                            "oid": str(oid),
-                            "reason_code": type(e).__name__,
-                        },
-                    )
-                else:
-                    action_outcomes["favorite"] = "success" if ok else "failed"
-                    await self.interaction_policy.record_result_async(
-                        "favorite", bvid, str(oid), "success" if ok else "failed",
-                        api_code=getattr(self.bili, "last_api_code", None),
-                        failure_reason="" if ok else "bili_api_false",
-                    )
-                    if ok:
-                        logger.info("视频收藏成功")
-                        await self._archive_bot_action(
-                            action_key=f"video:{observation_key}:favorite",
-                            action_type="favorite_video",
-                            text=f"收藏了视频《{title}》。",
-                            published=True,
-                            title=title,
-                            scene="proactive_video",
-                            metadata={"bvid": bvid, "oid": str(oid)},
-                        )
-                    else:
-                        self._check_bili_risk_control("proactive_fav")
-                        await self._archive_bot_action(
-                            action_key=f"video:{observation_key}:favorite",
-                            action_type="favorite_video",
-                            text=f"收藏视频《{title}》失败",
-                            published=False,
-                            status="failed",
-                            title=title,
-                            scene="proactive_video",
-                            metadata={
-                                "bvid": bvid,
-                                "oid": str(oid),
-                                "reason_code": "BILI_API_FALSE",
-                            },
-                        )
+                fav_key = f"video:{observation_key}:favorite"
+                await _run_interaction_action(
+                    action_name="favorite",
+                    action_type="favorite_video",
+                    action_key=fav_key,
+                    current_activity=f"准备收藏视频《{title}》。",
+                    api_coro=lambda: self.bili.fav_video(oid),
+                    success_text=f"收藏了视频《{title}》。",
+                    fail_text=f"收藏视频《{title}》失败",
+                    risk_tag="proactive_fav",
+                )
             else:
                 logger.debug(f"收藏未执行: {fav_result.get('reason')}")
 

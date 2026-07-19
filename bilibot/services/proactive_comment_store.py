@@ -59,6 +59,8 @@ DEFAULT_BACKOFF_CAP = 300
 
 # Task 4：publishing 状态租约时长（秒），超时视为崩溃
 DEFAULT_LEASE_SECONDS = 600
+# C6：claimed 状态租约（生成/安全检查阶段）；超时释放以便重 claim
+DEFAULT_CLAIMED_LEASE_SECONDS = 900
 
 
 def default_idempotency_key(account_id: str, bvid: str) -> str:
@@ -223,17 +225,20 @@ class ProactiveCommentStore:
         persona_id: str = "",
         max_attempts: int = DEFAULT_MAX_ATTEMPTS,
         now: Optional[float] = None,
+        lease_seconds: int = DEFAULT_CLAIMED_LEASE_SECONDS,
     ) -> Optional[ProactiveCommentAction]:
         """原子 claim：创建一条 claimed 状态的动作记录
 
         PRD-V5 §10.2 COM-501：
         - 部分唯一索引保证同账号同视频只能有一个活跃动作
         - 冲突时返回 None（调用方跳过，另一 worker 已在处理）
+        - C6：写入 lease_until，崩溃卡在 claimed 时可被 recover_stuck_claimed 释放
         """
         now = now or time.time()
         action_id = f"pca_{uuid.uuid4().hex[:16]}"
         if idempotency_key is None:
             idempotency_key = default_idempotency_key(account_id, bvid)
+        lease_until = now + max(60, int(lease_seconds or DEFAULT_CLAIMED_LEASE_SECONDS))
 
         conn = self._get_conn()
         try:
@@ -244,13 +249,14 @@ class ProactiveCommentStore:
                         (action_id, account_id, bvid, persona_id, task_id, status,
                          generation_text, generation_hash, idempotency_key,
                          attempt, max_attempts, last_error_code, last_error,
-                         created_at, updated_at, published_at, next_retry_at)
-                    VALUES (?, ?, ?, ?, ?, ?, '', '', ?, 0, ?, '', '', ?, ?, NULL, NULL)
+                         created_at, updated_at, published_at, next_retry_at,
+                         lease_until)
+                    VALUES (?, ?, ?, ?, ?, ?, '', '', ?, 0, ?, '', '', ?, ?, NULL, NULL, ?)
                     """,
                     (
                         action_id, account_id, bvid, persona_id, task_id,
                         STATUS_CLAIMED, idempotency_key, max_attempts,
-                        now, now,
+                        now, now, lease_until,
                     ),
                 )
                 conn.commit()
@@ -748,6 +754,54 @@ class ProactiveCommentStore:
             )
             conn.commit()
             return cur.rowcount
+        finally:
+            conn.close()
+
+    def recover_stuck_claimed(self, now: Optional[float] = None) -> int:
+        """C6：恢复卡在 claimed 状态的动作
+
+        claim 之后、mark_publishing 之前若进程崩溃，行会永久停在 claimed，
+        部分唯一索引阻止同 bvid 再次 claim。
+
+        - 已有 generation_text：转 retry_wait，允许重试发布
+        - 无 generation_text：转 failed，释放锁以便重新 claim
+        兼容旧数据：lease_until IS NULL 且 created_at 超过默认租约也视为过期。
+        """
+        now = now or time.time()
+        legacy_cutoff = now - DEFAULT_CLAIMED_LEASE_SECONDS
+        recovered = 0
+        conn = self._get_conn()
+        try:
+            # 有生成文本 → retry_wait（可重试发布，不自动重发到平台直到主循环拾取）
+            cur = conn.execute(
+                "UPDATE proactive_comment_actions "
+                "SET status=?, last_error_code='STUCK_CLAIMED', "
+                "last_error='claimed 超过 lease_until，已有生成文本，转 retry_wait', "
+                "next_retry_at=?, updated_at=?, lease_until=NULL "
+                "WHERE status=? AND generation_text IS NOT NULL AND TRIM(generation_text) != '' "
+                "AND ("
+                "  (lease_until IS NOT NULL AND lease_until < ?) "
+                "  OR (lease_until IS NULL AND created_at < ?)"
+                ")",
+                (STATUS_RETRY_WAIT, now, now, STATUS_CLAIMED, now, legacy_cutoff),
+            )
+            recovered += cur.rowcount
+            # 无生成文本 → failed，释放唯一索引
+            cur = conn.execute(
+                "UPDATE proactive_comment_actions "
+                "SET status=?, last_error_code='STUCK_CLAIMED', "
+                "last_error='claimed 超过 lease_until，生成前崩溃，释放锁', "
+                "updated_at=?, next_retry_at=NULL, lease_until=NULL "
+                "WHERE status=? AND (generation_text IS NULL OR TRIM(generation_text) = '') "
+                "AND ("
+                "  (lease_until IS NOT NULL AND lease_until < ?) "
+                "  OR (lease_until IS NULL AND created_at < ?)"
+                ")",
+                (STATUS_FAILED, now, STATUS_CLAIMED, now, legacy_cutoff),
+            )
+            recovered += cur.rowcount
+            conn.commit()
+            return recovered
         finally:
             conn.close()
 
