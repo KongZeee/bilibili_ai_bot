@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import inspect
 import json
 import math
@@ -16,12 +17,14 @@ from .prompt import DEFAULT_MEMORY_PROMPT_BUDGET, RenderedMemoryEvidence, render
 
 RRF_K = 60
 MAX_RERANK_CANDIDATES = 20
-# Reasoning chat models often need 15–40s for a multi-candidate JSON decision.
-RERANK_TIMEOUT_SECONDS = 90.0
+# Online recall must not wait behind a slow reasoning completion. When this
+# budget expires, deterministic FTS/vector/RRF selection remains available.
+RERANK_TIMEOUT_SECONDS = 8.0
 # agnes-2.0-flash measured ~1600 reasoning + ~50 content tokens for a tiny
 # rerank; leave headroom for 8–20 candidates.
-RERANK_MAX_TOKENS = 3200
+RERANK_MAX_TOKENS = 600
 RERANK_RELEVANCE_BASELINE = 0.65
+RECALL_TOTAL_TIMEOUT_SECONDS = 10.0
 DIRECT_THRESHOLD = 0.72
 ASSOCIATION_THRESHOLD = 0.80
 # Conversational Chinese queries often land ~0.43 lexical_coverage after OR-FTS
@@ -32,6 +35,10 @@ FALLBACK_DIRECT_THRESHOLD = 0.40
 FALLBACK_ASSOCIATION_THRESHOLD = 0.55
 MAX_FALLBACK_EVENTS = 3
 MIN_VECTOR_COSINE = 0.25
+
+_RECALL_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
+    "memory_recall_deadline", default=None
+)
 
 CHANNEL_WEIGHTS: Mapping[str, float] = {
     "explicit_id": 3.0,
@@ -98,10 +105,10 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
         "dynamic": "dynamic",
         "post_dynamic": "dynamic",
         "publish_dynamic": "dynamic",
-        "companion": "companion",
+        "companion": "life",
         "exploration": "explore",
         "explore": "explore",
-        "life_plan": "diary",
+        "life_plan": "life",
         "weekly_summary": "diary",
         "write_dream": "dream",
         "write_diary": "diary",
@@ -226,6 +233,23 @@ def policy_for_mode(mode: str | None) -> RetrievalPolicy:
                 graph=0.85,
                 speaker_recent=0.2,
                 chunk_vector=1.4,
+            ),
+            mood_bias=0.08,
+            prefer_self_recent=True,
+            demote_inbound_comment=True,
+        )
+    if m in {"life"}:
+        return RetrievalPolicy(
+            mode="life",
+            entropy="low",
+            hop_k=1,
+            max_associations=1,
+            channel_weights=_weights_with(
+                global_recent=0.75,
+                graph=0.55,
+                speaker_recent=0.15,
+                chunk_vector=1.25,
+                event_vector=1.05,
             ),
             mood_bias=0.08,
             prefer_self_recent=True,
@@ -740,6 +764,8 @@ class RecallCandidate:
     title: str = ""
     summary: str = ""
     source_type: str = ""
+    event_type: str = ""
+    index_status: str = ""
     action_state: str = ""
     activity_key: str = ""
     occurred_at: str = ""
@@ -786,6 +812,13 @@ class RecallCandidateTrace:
     evidence_ids: tuple[str, ...]
     reason: str
     accepted: bool
+    title: str
+    summary: str
+    source_type: str
+    event_type: str
+    index_status: str
+    action_state: str
+    occurred_at: str
 
     @property
     def d(self) -> float:
@@ -1077,6 +1110,7 @@ class RecallEngine:
         chat_provider: Any = None,
         embedding_provider: Any = None,
         rerank_timeout: float = RERANK_TIMEOUT_SECONDS,
+        total_timeout: float = RECALL_TOTAL_TIMEOUT_SECONDS,
         prompt_budget: int = DEFAULT_MEMORY_PROMPT_BUDGET,
         max_candidates: int = MAX_RERANK_CANDIDATES,
         max_events: int = 5,
@@ -1089,6 +1123,7 @@ class RecallEngine:
         self.chat_provider = chat_provider
         self.embedding_provider = embedding_provider
         self.rerank_timeout = float(rerank_timeout)
+        self.total_timeout = max(float(total_timeout), self.rerank_timeout)
         self.prompt_budget = min(DEFAULT_MEMORY_PROMPT_BUDGET, max(1, int(prompt_budget)))
         self.max_candidates = min(MAX_RERANK_CANDIDATES, max(1, int(max_candidates)))
         self.max_events = min(5, max(1, int(max_events)))
@@ -1097,6 +1132,23 @@ class RecallEngine:
         self.vector_batch_size = max(1, int(vector_batch_size))
 
     async def recall(self, query: RecallQuery | Mapping[str, Any]) -> RecallResult:
+        deadline = time.perf_counter() + self.total_timeout
+        token = _RECALL_DEADLINE.set(deadline)
+        try:
+            return await self._recall_impl(query)
+        finally:
+            _RECALL_DEADLINE.reset(token)
+
+    @staticmethod
+    def _remaining_budget() -> float:
+        deadline = _RECALL_DEADLINE.get()
+        if deadline is None:
+            return float("inf")
+        return max(0.0, deadline - time.perf_counter())
+
+    async def _recall_impl(
+        self, query: RecallQuery | Mapping[str, Any]
+    ) -> RecallResult:
         if not isinstance(query, RecallQuery):
             query = RecallQuery.from_mapping(query)
         else:
@@ -1427,7 +1479,11 @@ class RecallEngine:
                 if len(next_frontier) >= frontier_cap:
                     break
             frontier = next_frontier
-        rough = self._rough_order(candidates)[: self.max_candidates]
+        # Bound the one-shot rerank prompt. Twelve enriched candidates retain
+        # multi-channel diversity while avoiding 60–90s reasoning calls seen
+        # with the old twenty-row payload.
+        rerank_candidate_cap = min(self.max_candidates, 12)
+        rough = self._rough_order(candidates)[:rerank_candidate_cap]
         rough = await self._validate_and_enrich(rough, errors)
         # Mood / LifeState / accessibility soft boosts after enrich fills fields.
         if rough:
@@ -1440,7 +1496,7 @@ class RecallEngine:
                     candidates[eid].last_recalled_at = cand.last_recalled_at
                     candidates[eid].accessibility = cand.accessibility
             self._apply_policy_life_bias(enriched_map, query, policy)
-            rough = self._rough_order(enriched_map)[: self.max_candidates]
+            rough = self._rough_order(enriched_map)[:rerank_candidate_cap]
         if not rough:
             # Empty candidate set: never call LLM rerank (cost + noise).
             return self._empty_result(started, errors)
@@ -1593,6 +1649,7 @@ class RecallEngine:
                     "private_message",
                     "web_reference",
                     "video_experience",
+                    "video",
                 }
                 for cand in candidates.values():
                     source = str(cand.source_type or "").strip().casefold()
@@ -1632,6 +1689,12 @@ class RecallEngine:
                         "private_message",
                     }:
                         base = min(1.0, base + 0.06)
+                    elif source == "video_experience" or str(cand.event_type) == "bot_experience":
+                        base = min(1.0, base + 0.10)
+                    elif source == "video" and str(cand.event_type) == "video_observation":
+                        base = min(1.0, base + 0.08)
+                    elif source == "web_reference":
+                        base = max(0.0, base - 0.12)
                     cand.final_score = base
                     cand.selected_evidence_ids = tuple(sorted(cand.evidence_ids))
                     recent_self.append(cand)
@@ -1897,6 +1960,10 @@ class RecallEngine:
                 hit.get("summary") or hit.get("event_summary") or hit.get("text"), 500
             )
             candidate.source_type = candidate.source_type or _short(hit.get("source_type"), 80)
+            candidate.event_type = candidate.event_type or _short(hit.get("event_type"), 80)
+            candidate.index_status = candidate.index_status or _short(
+                hit.get("index_status") or hit.get("status"), 40
+            )
             candidate.occurred_at = candidate.occurred_at or _short(
                 hit.get("occurred_at") or hit.get("created_at"), 80
             )
@@ -2030,6 +2097,13 @@ class RecallEngine:
             )
             candidate.source_type = _short(
                 event.get("source_type") or candidate.source_type, 80
+            )
+            candidate.event_type = _short(
+                event.get("event_type") or candidate.event_type, 80
+            )
+            candidate.index_status = _short(
+                event.get("index_status") or event.get("status") or candidate.index_status,
+                40,
             )
             meta = event.get("metadata") if isinstance(event.get("metadata"), Mapping) else {}
             if not meta and isinstance(event.get("metadata_json"), str):
@@ -2180,7 +2254,16 @@ class RecallEngine:
                     return None
                 result = method(text)
             if inspect.isawaitable(result):
-                result = await result
+                remaining = self._remaining_budget()
+                if remaining <= 0:
+                    # The provider coroutine was already created; close it so a
+                    # budget exhausted by local candidate collection does not
+                    # leak an un-awaited coroutine warning/resource.
+                    close = getattr(result, "close", None)
+                    if callable(close):
+                        close()
+                    raise asyncio.TimeoutError("recall total budget exhausted")
+                result = await asyncio.wait_for(result, timeout=remaining)
             if hasattr(result, "vectors"):
                 provider = str(getattr(result, "provider", "") or "")
                 model = str(getattr(result, "model", "") or "")
@@ -2265,9 +2348,15 @@ class RecallEngine:
             return await result if inspect.isawaitable(result) else result
 
         try:
-            raw = await asyncio.wait_for(invoke_once(), timeout=self.rerank_timeout)
+            remaining = self._remaining_budget()
+            if remaining <= 0:
+                return None, "total_timeout", 0
+            raw = await asyncio.wait_for(
+                invoke_once(), timeout=min(self.rerank_timeout, remaining)
+            )
         except asyncio.TimeoutError:
-            return None, "timeout", 1
+            status = "total_timeout" if self._remaining_budget() <= 0 else "timeout"
+            return None, status, 1
         except Exception as exc:
             return None, f"error:{type(exc).__name__}", 1
         decisions = self._parse_rerank(raw, ranked)
@@ -2513,8 +2602,20 @@ class RecallEngine:
                 "private_message",
                 "video_experience",
                 "web_reference",
+                "video",
             }
-            kept = [c for c in rows if src(c) in preferred]
+            kept = [
+                c
+                for c in rows
+                if src(c) in preferred
+                and str(getattr(c, "action_state", "") or "").strip().casefold()
+                != "intent"
+                and not (
+                    src(c) == "video"
+                    and str(getattr(c, "event_type", "") or "").strip().casefold()
+                    != "video_observation"
+                )
+            ]
             # Prefer non-generic web_reference titles when present.
             if kept:
                 non_generic = [
@@ -2591,6 +2692,15 @@ class RecallEngine:
             or open_recent_self_query
         ):
             self_query = True
+        explicit_rows = [
+            candidate
+            for candidate in candidates
+            if "explicit_id" in (candidate.channel_ranks or {})
+        ]
+        if explicit_rows:
+            # An exact durable/platform identifier is stronger than coincidental
+            # common-token FTS hits. Keep fallback evidence scoped to that row.
+            candidates = explicit_rows
         eligible: list[RecallCandidate] = []
         for candidate in candidates:
             candidate.llm_score = None
@@ -2686,7 +2796,11 @@ class RecallEngine:
                 "weekly_summary",
                 "private_message",
                 "video_experience",
-            }
+            } or (
+                source == "video"
+                and str(candidate.event_type or "").strip().casefold()
+                == "video_observation"
+            )
             # Match interaction subtype to the original user question (not seeded
             # rewrite), so "点赞" and "收藏" stay exclusive.
             original_q = str(
@@ -2843,7 +2957,11 @@ class RecallEngine:
                     elif source in {"video", "video_experience", "subtitle", "web_reference"}:
                         candidate.final_score = max(0.0, candidate.final_score - 0.12)
                 elif open_recent_self_query:
-                    if source == "bot_action":
+                    action_state = str(candidate.action_state or "").strip().casefold()
+                    event_type = str(candidate.event_type or "").strip().casefold()
+                    if action_state == "intent":
+                        candidate.final_score = 0.0
+                    elif source == "bot_action":
                         candidate.final_score = min(1.0, candidate.final_score + 0.35)
                         if "global_recent" in (candidate.channel_ranks or {}):
                             candidate.final_score = min(1.0, candidate.final_score + 0.10)
@@ -2857,6 +2975,10 @@ class RecallEngine:
                         "video_experience",
                     }:
                         candidate.final_score = min(1.0, candidate.final_score + 0.28)
+                        if "global_recent" in (candidate.channel_ranks or {}):
+                            candidate.final_score = min(1.0, candidate.final_score + 0.08)
+                    elif source == "video" and event_type == "video_observation":
+                        candidate.final_score = min(1.0, candidate.final_score + 0.30)
                         if "global_recent" in (candidate.channel_ranks or {}):
                             candidate.final_score = min(1.0, candidate.final_score + 0.08)
                     elif source == "web_reference" and title_cf.startswith("探索"):
@@ -3044,7 +3166,7 @@ class RecallEngine:
         ]
         if not content_lex and not content_vec:
             return False
-        strong_vec = [s for s in content_vec if s >= 0.35]
+        strong_vec = [s for s in content_vec if s >= 0.55]
         if strong_vec:
             return True
         if not content_lex:
@@ -3324,6 +3446,29 @@ class RecallEngine:
                     boost += 0.03
                 elif age_d > 7.0:
                     boost -= 0.04
+            elif policy_mode == "life":
+                event_type = str(candidate.event_type or "").strip().casefold()
+                if event_type == "life_detail":
+                    boost += 0.30
+                elif event_type == "daily_plan":
+                    boost += 0.24
+                elif source == "life_plan":
+                    boost += 0.16
+                elif source in {"video", "web_reference", "comment", "comment_thread"}:
+                    boost -= 0.12
+                if age_h and age_h <= 24.0 and (
+                    source == "life_plan" or event_type in {"life_detail", "daily_plan"}
+                ):
+                    boost += 0.10
+            elif policy_mode == "explore":
+                event_type = str(candidate.event_type or "").strip().casefold()
+                title_cf = str(candidate.title or "").strip().casefold()
+                if event_type == "exploration" or title_cf.startswith("探索"):
+                    boost += 0.22
+                elif source == "web_reference":
+                    boost += 0.10
+                elif source in {"comment", "comment_thread"}:
+                    boost -= 0.12
             # Public/social modes must not prefer private_message bodies in rank.
             # (Hard redaction remains elsewhere; this is ranking-only defense in depth.)
             if (
@@ -3386,6 +3531,13 @@ class RecallEngine:
                 ),
                 reason=item.reason,
                 accepted=item.accepted,
+                title=item.title,
+                summary=item.summary,
+                source_type=item.source_type,
+                event_type=item.event_type,
+                index_status=item.index_status,
+                action_state=item.action_state,
+                occurred_at=item.occurred_at,
             )
             for item in candidates
         )

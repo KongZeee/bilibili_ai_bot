@@ -92,9 +92,12 @@ class BangumiService:
         self._ensure_dirs()
 
         brain_account_id = str(getattr(memory_brain, "account_id", "") or "")
-        derived_account_id = (
-            self.data_dir.name if self.data_dir.parent.name == "accounts" else "default"
-        )
+        if self.data_dir.name == "bot":
+            derived_account_id = brain_account_id or "default"
+        elif self.data_dir.parent.name == "accounts":
+            derived_account_id = self.data_dir.name
+        else:
+            derived_account_id = "default"
         self.account_id = str(account_id or brain_account_id or derived_account_id)
         if brain_account_id and brain_account_id != self.account_id:
             raise ValueError("bangumi memory brain belongs to a different account")

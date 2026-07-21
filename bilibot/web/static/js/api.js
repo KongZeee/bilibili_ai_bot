@@ -1,4 +1,5 @@
 // api.js - 统一 API 请求客户端
+import { isRouteMissError } from './api-fallback.js';
 
 const BASE_URL = '';
 
@@ -13,6 +14,30 @@ function buildQuery(params) {
         }
     }
     return sp.toString();
+}
+
+/** 解析唯一 bot 账号 id（单账号模式） */
+function resolveSoleId(explicit) {
+    if (explicit) return explicit;
+    try {
+        const st = window.appState;
+        if (st?.currentAccountId) return st.currentAccountId;
+        const a0 = st?.accounts?.[0];
+        if (a0) return a0.account_id || a0.id || null;
+    } catch (_) { /* ignore */ }
+    return null;
+}
+
+/** 先试 flat 路由，仅 route-miss（404/NOT_FOUND/NO_ACCOUNT）时回退 nested（带 sole id） */
+async function flatOrNested(flatUrl, nestedUrl, options = {}) {
+    try {
+        return await request(flatUrl, options);
+    } catch (e) {
+        if (nestedUrl && isRouteMissError(e)) {
+            return request(nestedUrl, options);
+        }
+        throw e;
+    }
 }
 
 async function request(url, options = {}) {
@@ -60,6 +85,7 @@ async function request(url, options = {}) {
         err.code = data?.error?.code;
         err.details = data?.error?.details;
         err.resp = data;
+        err.status = resp.status;
         throw err;
     }
 
@@ -72,45 +98,225 @@ export const api = {
     patch: (url, body) => request(url, { method: 'PATCH', body }),
     delete: (url) => request(url, { method: 'DELETE' }),
 
-    // 账号
+    // 账号（列表仍用 /api/accounts；单 bot 操作优先 flat /api/account）
     accounts: {
         list: () => api.get('/api/accounts'),
-        get: (id) => api.get(`/api/accounts/${id}`),
-        create: (data) => api.post('/api/accounts', data),
-        update: (id, data) => api.patch(`/api/accounts/${id}`, data),
-        delete: (id) => api.delete(`/api/accounts/${id}`),
-        setDefault: (id) => api.post(`/api/accounts/${id}/set-default`),
-        start: (id) => api.post(`/api/accounts/${id}/start`),
-        stop: (id) => api.post(`/api/accounts/${id}/stop`),
-        bindPersona: (id, data) => api.post(`/api/accounts/${id}/persona`, data),
-        switchPersona: (id, personaId) => api.post(`/api/accounts/${id}/switch-persona`, { persona_id: personaId }),
-        bindLlm: (id, llmId) => api.post(`/api/accounts/${id}/llm`, { llm_id: llmId }),
-        qrLogin: (id) => api.post(`/api/accounts/${id}/qr-login`),
-        // 后端返回 qr_session_id / status(created|scanned|confirmed|expired|cancelled)
-        qrPoll: (id, sid) => api.get(`/api/accounts/${id}/qr-login/${sid}`),
-        qrCancel: (id, sid) => api.post(`/api/accounts/${id}/qr-login/${sid}/cancel`),
-        profiles: () => api.get('/api/accounts/profiles'),
-        tasks: (id, params) => api.get(`/api/accounts/${id}/tasks?${buildQuery(params)}`),
-        getTask: (id, taskId) => api.get(`/api/accounts/${id}/tasks/${taskId}`),
-        cancelTask: (id, taskId) => api.post(`/api/accounts/${id}/tasks/${taskId}/cancel`),
-        retryTask: (id, taskId) => api.post(`/api/accounts/${id}/tasks/${taskId}/retry`),
-        triggerProactiveVideo: (id) => api.post(`/api/accounts/${id}/tasks/proactive-video`),
-        triggerDynamic: (id) => api.post(`/api/accounts/${id}/tasks/dynamic`),
-        triggerBangumi: (id) => api.post(`/api/accounts/${id}/tasks/bangumi`),
-        companion: {
-            state: (id) => api.get(`/api/accounts/${id}/companion/state`),
-            plan: (id) => api.get(`/api/accounts/${id}/companion/plan`),
-            regeneratePlan: (id) => api.post(`/api/accounts/${id}/companion/plan/regenerate`),
-            diaries: (id) => api.get(`/api/accounts/${id}/companion/diaries`),
-            dreams: (id) => api.get(`/api/accounts/${id}/companion/dreams`),
-            notes: (id) => api.get(`/api/accounts/${id}/companion/notes`),
-            bookshelf: (id) => api.get(`/api/accounts/${id}/companion/bookshelf`),
-            trigger: (id, action) => request(`/api/accounts/${id}/companion/trigger`, {
-                method: 'POST',
-                body: { action: action || 'tick' },
-                returnEnvelope: true,
-            }),
+        get: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested('/api/account', sole ? `/api/accounts/${sole}` : null);
         },
+        create: (data) => api.post('/api/accounts', data),
+        update: (id, data) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested('/api/account', sole ? `/api/accounts/${sole}` : null, {
+                method: 'PATCH',
+                body: data,
+            });
+        },
+        delete: (id) => api.delete(`/api/accounts/${id}`),
+        // 单 bot：无默认账号切换；保留 no-op 以免旧调用报错
+        setDefault: async (_id) => null,
+        start: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested('/api/account/start', sole ? `/api/accounts/${sole}/start` : null, { method: 'POST' });
+        },
+        stop: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested('/api/account/stop', sole ? `/api/accounts/${sole}/stop` : null, { method: 'POST' });
+        },
+        bindPersona: (id, data) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                '/api/account/persona',
+                sole ? `/api/accounts/${sole}/persona` : null,
+                { method: 'POST', body: data },
+            );
+        },
+        switchPersona: (id, personaId) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                '/api/account/switch-persona',
+                sole ? `/api/accounts/${sole}/switch-persona` : null,
+                { method: 'POST', body: { persona_id: personaId } },
+            );
+        },
+        bindLlm: (id, llmId) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                '/api/account/llm',
+                sole ? `/api/accounts/${sole}/llm` : null,
+                { method: 'POST', body: { llm_id: llmId } },
+            );
+        },
+        qrLogin: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested('/api/account/qr-login', sole ? `/api/accounts/${sole}/qr-login` : null, { method: 'POST' });
+        },
+        // 后端返回 qr_session_id / status(created|scanned|confirmed|expired|cancelled)
+        qrPoll: (id, sid) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                `/api/account/qr-login/${sid}`,
+                sole ? `/api/accounts/${sole}/qr-login/${sid}` : null,
+            );
+        },
+        qrCancel: (id, sid) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                `/api/account/qr-login/${sid}/cancel`,
+                sole ? `/api/accounts/${sole}/qr-login/${sid}/cancel` : null,
+                { method: 'POST' },
+            );
+        },
+        profiles: () => api.get('/api/accounts/profiles'),
+        tasks: (id, params) => {
+            const sole = resolveSoleId(id);
+            const q = buildQuery(params);
+            return flatOrNested(
+                `/api/account/tasks?${q}`,
+                sole ? `/api/accounts/${sole}/tasks?${q}` : null,
+            );
+        },
+        getTask: (id, taskId) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                `/api/account/tasks/${taskId}`,
+                sole ? `/api/accounts/${sole}/tasks/${taskId}` : null,
+            );
+        },
+        cancelTask: (id, taskId) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                `/api/account/tasks/${taskId}/cancel`,
+                sole ? `/api/accounts/${sole}/tasks/${taskId}/cancel` : null,
+                { method: 'POST' },
+            );
+        },
+        retryTask: (id, taskId) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                `/api/account/tasks/${taskId}/retry`,
+                sole ? `/api/accounts/${sole}/tasks/${taskId}/retry` : null,
+                { method: 'POST' },
+            );
+        },
+        triggerProactiveVideo: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                '/api/account/tasks/proactive-video',
+                sole ? `/api/accounts/${sole}/tasks/proactive-video` : null,
+                { method: 'POST' },
+            );
+        },
+        triggerDynamic: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                '/api/account/tasks/dynamic',
+                sole ? `/api/accounts/${sole}/tasks/dynamic` : null,
+                { method: 'POST' },
+            );
+        },
+        triggerBangumi: (id) => {
+            const sole = resolveSoleId(id);
+            return flatOrNested(
+                '/api/account/tasks/bangumi',
+                sole ? `/api/accounts/${sole}/tasks/bangumi` : null,
+                { method: 'POST' },
+            );
+        },
+        companion: {
+            state: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/state',
+                    sole ? `/api/accounts/${sole}/companion/state` : null,
+                );
+            },
+            plan: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/plan',
+                    sole ? `/api/accounts/${sole}/companion/plan` : null,
+                );
+            },
+            regeneratePlan: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/plan/regenerate',
+                    sole ? `/api/accounts/${sole}/companion/plan/regenerate` : null,
+                    { method: 'POST' },
+                );
+            },
+            diaries: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/diaries',
+                    sole ? `/api/accounts/${sole}/companion/diaries` : null,
+                );
+            },
+            dreams: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/dreams',
+                    sole ? `/api/accounts/${sole}/companion/dreams` : null,
+                );
+            },
+            notes: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/notes',
+                    sole ? `/api/accounts/${sole}/companion/notes` : null,
+                );
+            },
+            bookshelf: (id) => {
+                const sole = resolveSoleId(id);
+                return flatOrNested(
+                    '/api/companion/bookshelf',
+                    sole ? `/api/accounts/${sole}/companion/bookshelf` : null,
+                );
+            },
+            trigger: (id, action) => {
+                const sole = resolveSoleId(id);
+                const body = { action: action || 'tick' };
+                return flatOrNested(
+                    '/api/companion/trigger',
+                    sole ? `/api/accounts/${sole}/companion/trigger` : null,
+                    { method: 'POST', body, returnEnvelope: true },
+                );
+            },
+        },
+    },
+
+    // 单 bot flat 客户端：优先 /api/account/*，失败回退 nested + sole id
+    account: {
+        get: () => api.accounts.get(),
+        update: (body) => api.accounts.update(null, body),
+        start: () => api.accounts.start(),
+        stop: () => api.accounts.stop(),
+        qrLogin: () => api.accounts.qrLogin(),
+        qrPoll: (sid) => api.accounts.qrPoll(null, sid),
+        qrCancel: (sid) => api.accounts.qrCancel(null, sid),
+        tasks: {
+            list: (params) => api.accounts.tasks(null, params),
+            get: (taskId) => api.accounts.getTask(null, taskId),
+            cancel: (taskId) => api.accounts.cancelTask(null, taskId),
+            retry: (taskId) => api.accounts.retryTask(null, taskId),
+            triggerProactiveVideo: () => api.accounts.triggerProactiveVideo(),
+            triggerDynamic: () => api.accounts.triggerDynamic(),
+            triggerBangumi: () => api.accounts.triggerBangumi(),
+        },
+    },
+
+    // 陪伴生活 flat API（忽略 accountId，走 sole）
+    companion: {
+        state: (_id) => api.accounts.companion.state(_id),
+        plan: (_id) => api.accounts.companion.plan(_id),
+        regeneratePlan: (_id) => api.accounts.companion.regeneratePlan(_id),
+        diaries: (_id) => api.accounts.companion.diaries(_id),
+        dreams: (_id) => api.accounts.companion.dreams(_id),
+        notes: (_id) => api.accounts.companion.notes(_id),
+        bookshelf: (_id) => api.accounts.companion.bookshelf(_id),
+        trigger: (_id, action) => api.accounts.companion.trigger(_id, action),
     },
 
     // LLM（旧 V2 接口，仍用于账号绑定等场景）
@@ -148,22 +354,143 @@ export const api = {
         import: (data) => api.post('/api/personas/import', data),
     },
 
-    // 记忆
+    // 记忆：优先 flat /api/memory/*；旧签名 (accId, ...) 忽略 id 用 sole 回退
     memory: {
-        stats: (accId) => api.get(`/api/accounts/${accId}/memory/stats`),
-        list: (accId, params) => api.get(`/api/accounts/${accId}/memory?${buildQuery(params)}`),
-        detail: (accId, memId) => api.get(`/api/accounts/${accId}/memory/${memId}`),
-        search: (accId, data) => api.post(`/api/accounts/${accId}/memory/search`, data),
-        recall: (accId, data) => api.post(`/api/accounts/${accId}/memory/recall`, data),
-        recallTraces: (accId, params) => api.get(`/api/accounts/${accId}/memory/recall?${buildQuery(params)}`),
-        recallTrace: (accId, traceId) => api.get(`/api/accounts/${accId}/memory/recall/${traceId}`),
-        delete: (accId, memId) => api.delete(`/api/accounts/${accId}/memory/${memId}`),
-        graph: (accId) => api.get(`/api/accounts/${accId}/memory/graph`),
-        graphQuery: (accId, data) => api.post(`/api/accounts/${accId}/memory/graph/query`, data),
-        reindex: (accId, data = {}) => api.post(`/api/accounts/${accId}/memory/reindex`, data),
-        jobs: (accId, params) => api.get(`/api/accounts/${accId}/memory/jobs?${buildQuery(params)}`),
-        retryJob: (accId, jobId) => api.post(`/api/accounts/${accId}/memory/jobs/${jobId}/retry`, {}),
-        migrate: (accId) => api.post(`/api/accounts/${accId}/memory/migrate`),
+        stats: (accId) => {
+            const sole = resolveSoleId(accId);
+            return flatOrNested('/api/memory/stats', sole ? `/api/accounts/${sole}/memory/stats` : null);
+        },
+        list: (accId, params) => {
+            const sole = resolveSoleId(accId);
+            const q = buildQuery(params);
+            return flatOrNested(
+                `/api/memory?${q}`,
+                sole ? `/api/accounts/${sole}/memory?${q}` : null,
+            );
+        },
+        detail: (accId, memId) => {
+            const sole = resolveSoleId(accId);
+            // 兼容 flat 调用 detail(memId) 与旧 detail(accId, memId)
+            const id = memId != null ? memId : accId;
+            const soleForNested = memId != null ? sole : resolveSoleId(null);
+            return flatOrNested(
+                `/api/memory/${id}`,
+                soleForNested ? `/api/accounts/${soleForNested}/memory/${id}` : null,
+            );
+        },
+        search: (accId, data) => {
+            // 兼容 search(data) 与 search(accId, data)
+            const body = (data && typeof data === 'object') ? data : (typeof accId === 'object' ? accId : {});
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            return flatOrNested(
+                '/api/memory/search',
+                sole ? `/api/accounts/${sole}/memory/search` : null,
+                { method: 'POST', body },
+            );
+        },
+        recall: (accId, data) => {
+            const body = (data && typeof data === 'object') ? data : (typeof accId === 'object' ? accId : {});
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            return flatOrNested(
+                '/api/memory/recall',
+                sole ? `/api/accounts/${sole}/memory/recall` : null,
+                { method: 'POST', body },
+            );
+        },
+        recallTraces: (accId, params) => {
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            const p = (params && typeof params === 'object') ? params : (typeof accId === 'object' ? accId : {});
+            const q = buildQuery(p);
+            return flatOrNested(
+                `/api/memory/recall?${q}`,
+                sole ? `/api/accounts/${sole}/memory/recall?${q}` : null,
+            );
+        },
+        recallTrace: (accId, traceId) => {
+            const sole = resolveSoleId(accId);
+            const id = traceId != null ? traceId : accId;
+            const soleForNested = traceId != null ? sole : resolveSoleId(null);
+            return flatOrNested(
+                `/api/memory/recall/${id}`,
+                soleForNested ? `/api/accounts/${soleForNested}/memory/recall/${id}` : null,
+            );
+        },
+        delete: (accId, memId) => {
+            const sole = resolveSoleId(accId);
+            const id = memId != null ? memId : accId;
+            const soleForNested = memId != null ? sole : resolveSoleId(null);
+            return flatOrNested(
+                `/api/memory/${id}`,
+                soleForNested ? `/api/accounts/${soleForNested}/memory/${id}` : null,
+                { method: 'DELETE' },
+            );
+        },
+        graph: (accId) => {
+            const sole = resolveSoleId(accId);
+            return flatOrNested('/api/memory/graph', sole ? `/api/accounts/${sole}/memory/graph` : null);
+        },
+        graphQuery: (accId, data) => {
+            const body = (data && typeof data === 'object') ? data : (typeof accId === 'object' ? accId : {});
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            return flatOrNested(
+                '/api/memory/graph/query',
+                sole ? `/api/accounts/${sole}/memory/graph/query` : null,
+                { method: 'POST', body },
+            );
+        },
+        reindex: (accId, data = {}) => {
+            const body = (data && typeof data === 'object' && !Array.isArray(data)) ? data : {};
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            return flatOrNested(
+                '/api/memory/reindex',
+                sole ? `/api/accounts/${sole}/memory/reindex` : null,
+                { method: 'POST', body },
+            );
+        },
+        jobs: (accId, params) => {
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            const p = (params && typeof params === 'object') ? params : (typeof accId === 'object' ? accId : {});
+            const q = buildQuery(p);
+            return flatOrNested(
+                `/api/memory/jobs?${q}`,
+                sole ? `/api/accounts/${sole}/memory/jobs?${q}` : null,
+            );
+        },
+        retryJob: (accId, jobId) => {
+            const sole = resolveSoleId(accId);
+            const id = jobId != null ? jobId : accId;
+            const soleForNested = jobId != null ? sole : resolveSoleId(null);
+            return flatOrNested(
+                `/api/memory/jobs/${id}/retry`,
+                soleForNested ? `/api/accounts/${soleForNested}/memory/jobs/${id}/retry` : null,
+                { method: 'POST', body: {} },
+            );
+        },
+        retryDeadJobs: (accId, data = {}) => {
+            const body = (data && typeof data === 'object') ? data : {};
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            return flatOrNested(
+                '/api/memory/jobs/retry-dead',
+                sole ? `/api/accounts/${sole}/memory/jobs/retry-dead` : null,
+                { method: 'POST', body },
+            );
+        },
+        deadJobReport: (accId, params = {}) => {
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            const q = buildQuery(params && typeof params === 'object' ? params : {});
+            return flatOrNested(
+                `/api/memory/jobs/dead-report?${q}`,
+                sole ? `/api/accounts/${sole}/memory/jobs/dead-report?${q}` : null,
+            );
+        },
+        migrate: (accId) => {
+            const sole = resolveSoleId(accId);
+            return flatOrNested(
+                '/api/memory/migrate',
+                sole ? `/api/accounts/${sole}/memory/migrate` : null,
+                { method: 'POST' },
+            );
+        },
     },
 
     // 配置
@@ -254,6 +581,8 @@ export const api = {
     safety: {
         pauseStatus: () => api.get('/api/safety/pause-status'),
         pause: () => api.post('/api/safety/pause'),
+        accountPauseStatus: (accId) => api.get(`/api/safety/accounts/${accId}/pause-status`),
+        resumeAccount: (accId) => api.post(`/api/safety/accounts/${accId}/resume`, { confirm: true }),
         resume: () => api.post('/api/safety/resume'),
         blacklist: () => api.get('/api/safety/blacklist'),
         addBlacklist: (data) => api.post('/api/safety/blacklist', data),
@@ -276,13 +605,66 @@ export const api = {
         test: (data) => api.post('/api/image-generation/test', data),
     },
     drafts: {
-        list: (accId, params) => api.get(`/api/accounts/${accId}/dynamic-drafts?${buildQuery(params)}`),
-        get: (accId, id) => api.get(`/api/accounts/${accId}/dynamic-drafts/${id}`),
+        // 优先 flat /api/dynamic-drafts；旧签名 (accId, ...) 忽略 id 用 sole 回退
+        list: (accId, params) => {
+            const sole = resolveSoleId(typeof accId === 'string' ? accId : null);
+            const p = (params && typeof params === 'object') ? params : (typeof accId === 'object' ? accId : {});
+            const q = buildQuery(p);
+            return flatOrNested(
+                `/api/dynamic-drafts?${q}`,
+                sole ? `/api/accounts/${sole}/dynamic-drafts?${q}` : null,
+            );
+        },
+        get: (accId, id) => {
+            const draftId = id != null ? id : accId;
+            const sole = id != null ? resolveSoleId(accId) : resolveSoleId(null);
+            return flatOrNested(
+                `/api/dynamic-drafts/${draftId}`,
+                sole ? `/api/accounts/${sole}/dynamic-drafts/${draftId}` : null,
+            );
+        },
         // BUG F-004/F-006: approve 需 expected_revision；reject 后端读 note
-        approve: (accId, id, body) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/approve`, body || {}),
-        reject: (accId, id, reason) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/reject`, { note: reason }),
-        retry: (accId, id) => api.post(`/api/accounts/${accId}/dynamic-drafts/${id}/retry`),
-        update: (accId, id, data) => api.patch(`/api/accounts/${accId}/dynamic-drafts/${id}`, data),
+        approve: (accId, id, body) => {
+            const draftId = typeof id === 'string' || typeof id === 'number' ? id : accId;
+            const payload = (body && typeof body === 'object') ? body
+                : (id && typeof id === 'object' ? id : {});
+            const sole = (typeof accId === 'string') ? resolveSoleId(accId) : resolveSoleId(null);
+            return flatOrNested(
+                `/api/dynamic-drafts/${draftId}/approve`,
+                sole ? `/api/accounts/${sole}/dynamic-drafts/${draftId}/approve` : null,
+                { method: 'POST', body: payload || {} },
+            );
+        },
+        reject: (accId, id, reason) => {
+            const draftId = id != null ? id : accId;
+            const note = reason != null ? reason : '';
+            const sole = id != null ? resolveSoleId(accId) : resolveSoleId(null);
+            return flatOrNested(
+                `/api/dynamic-drafts/${draftId}/reject`,
+                sole ? `/api/accounts/${sole}/dynamic-drafts/${draftId}/reject` : null,
+                { method: 'POST', body: { note } },
+            );
+        },
+        retry: (accId, id) => {
+            const draftId = id != null ? id : accId;
+            const sole = id != null ? resolveSoleId(accId) : resolveSoleId(null);
+            return flatOrNested(
+                `/api/dynamic-drafts/${draftId}/retry`,
+                sole ? `/api/accounts/${sole}/dynamic-drafts/${draftId}/retry` : null,
+                { method: 'POST' },
+            );
+        },
+        update: (accId, id, data) => {
+            const draftId = id != null ? id : accId;
+            const body = (data && typeof data === 'object') ? data
+                : (id && typeof id === 'object' ? id : {});
+            const sole = (typeof accId === 'string' && data != null) ? resolveSoleId(accId) : resolveSoleId(null);
+            return flatOrNested(
+                `/api/dynamic-drafts/${draftId}`,
+                sole ? `/api/accounts/${sole}/dynamic-drafts/${draftId}` : null,
+                { method: 'PATCH', body },
+            );
+        },
     },
     backup: {
         create: () => api.post('/api/backup/create'),

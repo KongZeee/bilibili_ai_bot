@@ -3,7 +3,19 @@
 const { h, ref, reactive, onMounted, computed } = window.Vue;
 import { appState } from '../state.js';
 import { api } from '../api.js';
-import { Button, Badge, FormInput, FormTextarea, Toggle, FormHint, Loading, EmptyState } from '../components/common.js';
+import { Button, Badge, FormInput, FormSelect, FormTextarea, Toggle, FormHint, Loading, EmptyState } from '../components/common.js';
+
+const DEFAULT_STYLE_OPTIONS = [
+    { value: 'cinematic', label: '电影质感', description: '电影构图与层次光影' },
+    { value: 'anime', label: '二次元', description: '日系动画插画与赛璐璐上色' },
+    { value: 'photorealistic', label: '写实摄影', description: '真实材质与摄影镜头语言' },
+    { value: 'digital_illustration', label: '数字插画', description: '精致商业插画效果' },
+    { value: 'watercolor', label: '水彩', description: '透明晕染与纸张纹理' },
+    { value: 'cyberpunk', label: '赛博朋克', description: '霓虹未来科技氛围' },
+    { value: 'pixel_art', label: '像素艺术', description: '复古游戏像素画' },
+    { value: 'minimalist', label: '极简', description: '克制配色与大量留白' },
+    { value: 'custom', label: '自定义', description: '使用自定义风格描述' },
+];
 
 export const ImageGenPage = {
     name: 'ImageGenPage',
@@ -12,6 +24,10 @@ export const ImageGenPage = {
         const testing = ref(false);
         const withImage = ref(false);
         const savingWithImage = ref(false);
+        const savingStyle = ref(false);
+        const imageStyle = ref('cinematic');
+        const customStyle = ref('');
+        const styleOptions = ref(DEFAULT_STYLE_OPTIONS);
         const provider = ref(null);        // 路由到的 image provider
         const testResult = ref(null);      // {success, message}
         const genPrompt = ref('一只可爱的猫坐在窗台上，阳光明媚');
@@ -27,12 +43,39 @@ export const ImageGenPage = {
                     api.modelRouting.getOverview(),
                 ]);
                 withImage.value = igRes.with_image ?? false;
+                imageStyle.value = igRes.image_style || 'cinematic';
+                customStyle.value = igRes.image_style_custom || '';
+                if (Array.isArray(igRes.image_style_options) && igRes.image_style_options.length) {
+                    styleOptions.value = igRes.image_style_options;
+                }
                 const feat = overview.features?.image;
                 provider.value = feat?.routed_provider || null;
             } catch (e) {
                 appState.notify('加载配置失败：' + (e.message || e), 'danger');
             } finally {
                 loading.value = false;
+            }
+        }
+
+        async function saveImageStyle() {
+            const custom = customStyle.value.trim();
+            if (imageStyle.value === 'custom' && !custom) {
+                appState.notify('选择自定义风格时，请填写风格描述', 'warning');
+                return;
+            }
+            savingStyle.value = true;
+            try {
+                const res = await api.imageGen.updateConfig({
+                    image_style: imageStyle.value,
+                    image_style_custom: custom,
+                });
+                imageStyle.value = res.image_style || imageStyle.value;
+                customStyle.value = res.image_style_custom || custom;
+                appState.notify('动态配图风格已保存', 'success');
+            } catch (e) {
+                appState.notify('保存配图风格失败：' + (e.message || e), 'danger');
+            } finally {
+                savingStyle.value = false;
             }
         }
 
@@ -81,13 +124,18 @@ export const ImageGenPage = {
             generatedImage.value = null;
             genError.value = '';
             try {
-                const res = await api.imageGen.test({ prompt: p });
+                const res = await api.imageGen.test({
+                    prompt: p,
+                    style: imageStyle.value,
+                    custom_style: customStyle.value.trim(),
+                });
                 if (res && res.image_b64) {
                     generatedImage.value = {
                         src: 'data:image/png;base64,' + res.image_b64,
                         prompt: res.prompt || p,
                         model: res.model || '',
                         size: res.size || 0,
+                        style: res.style || imageStyle.value,
                     };
                 } else {
                     genError.value = '生成失败：返回空结果';
@@ -100,6 +148,10 @@ export const ImageGenPage = {
         }
 
         onMounted(loadData);
+
+        const currentStyle = computed(() => styleOptions.value.find(
+            item => item.value === imageStyle.value
+        ) || styleOptions.value[0] || { label: imageStyle.value, description: '' });
 
         const cardStyle = 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;';
 
@@ -149,6 +201,10 @@ export const ImageGenPage = {
                             h('div', { class: 'flex items-center justify-between' }, [
                                 h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '动态配图'),
                                 h(Badge, { type: withImage.value ? 'success' : 'muted' }, () => withImage.value ? '已启用' : '未启用'),
+                            ]),
+                            h('div', { class: 'flex items-center justify-between' }, [
+                                h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '配图风格'),
+                                h(Badge, { type: 'info' }, () => currentStyle.value.label || imageStyle.value),
                             ]),
                             h('div', { class: 'flex items-center justify-between' }, [
                                 h('span', { class: 'muted', style: 'font-size:0.88rem;' }, '最近测试'),
@@ -243,6 +299,28 @@ export const ImageGenPage = {
                                 h('span', { class: 'form-hint' }, withImage.value ? '已启用' : '已禁用'),
                             ]),
                             h(FormHint, '启用后，发布动态时将自动调用文生图服务商生成配图'),
+                            h(FormSelect, {
+                                modelValue: imageStyle.value,
+                                'onUpdate:modelValue': (v) => { imageStyle.value = v; },
+                                options: styleOptions.value,
+                                label: '配图风格',
+                                hint: currentStyle.value.description || '风格会同时用于自动动态和审核草稿',
+                                disabled: savingStyle.value,
+                            }),
+                            imageStyle.value === 'custom' && h(FormInput, {
+                                modelValue: customStyle.value,
+                                'onUpdate:modelValue': (v) => { customStyle.value = v.slice(0, 300); },
+                                label: '自定义风格描述',
+                                placeholder: '例如：国风工笔画，淡雅矿物色，宣纸纹理',
+                                hint: `${customStyle.value.length}/300 字符`,
+                                disabled: savingStyle.value,
+                            }),
+                            h(Button, {
+                                type: 'secondary',
+                                onClick: saveImageStyle,
+                                loading: savingStyle.value,
+                                disabled: imageStyle.value === 'custom' && !customStyle.value.trim(),
+                            }, () => '保存配图风格'),
                             !provider.value && withImage.value && h('div', {
                                 style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.88rem;',
                             }, '已启用动态配图但未配置服务商，动态发布时将跳过配图'),
@@ -281,7 +359,7 @@ export const ImageGenPage = {
                                     disabled: !provider.value || !genPrompt.value.trim(),
                                 }, () => '生成图片'),
                                 h('span', { class: 'muted', style: 'font-size:0.82rem;' },
-                                    provider.value ? `模型：${provider.value.model || '-'}` : '未配置服务商'),
+                                    provider.value ? `模型：${provider.value.model || '-'} · 风格：${currentStyle.value.label}` : '未配置服务商'),
                             ]),
                             genError.value && h('div', {
                                 style: 'padding: calc(var(--spacing) * 2); border-radius: calc(var(--radius) * 0.76); background: hsl(var(--destructive) / 0.08); color: hsl(var(--destructive)); font-size:0.88rem;',
@@ -300,7 +378,7 @@ export const ImageGenPage = {
                                     style: 'font-size:0.82rem; color: hsl(var(--muted-foreground));',
                                 }, [
                                     h('span', `提示词：${generatedImage.value.prompt}`),
-                                    h('span', `${generatedImage.value.size ? (generatedImage.value.size / 1024).toFixed(1) + ' KB' : ''} · ${generatedImage.value.model || ''}`),
+                                    h('span', `${generatedImage.value.size ? (generatedImage.value.size / 1024).toFixed(1) + ' KB' : ''} · ${generatedImage.value.model || ''} · ${currentStyle.value.label}`),
                                 ]),
                             ]),
                         ]),

@@ -2,7 +2,7 @@
 const { defineComponent, h, ref, reactive, computed, onMounted, watch } = window.Vue;
 import { api } from '../../api.js';
 import { Card, Button, Badge, Loading, EmptyState, Icon, HeroPanel } from '../common.js';
-import { appState, showToast } from '../../state.js';
+import { appState, showToast, refreshAccounts } from '../../state.js';
 import { formatTime } from '../../utils.js';
 
 // 节点类型 → chart 色号映射
@@ -23,6 +23,12 @@ const CATEGORY_LABELS = {
     action_outcome: '行为结果',
     web_observation: '联网参考',
     reflection: '反思总结',
+    daily_plan: '今日日程',
+    life_detail: '生活时段',
+    exploration: '主动探索',
+    diary: '日记',
+    dream: '梦境',
+    creative: '创作片段',
     observation: '观察',
     episodic: '情景记忆',
     factual: '事实记忆',
@@ -321,9 +327,17 @@ export const MemoryGraphPage = defineComponent({
             { key: 'radial', label: '环形' },
         ];
 
-        onMounted(loadData);
+        onMounted(async () => {
+            if (!appState.accountsLoaded) {
+                try { await refreshAccounts(); } catch (_) { /* toast */ }
+            }
+            await loadData();
+        });
         watch(() => appState.currentAccountId, (newId, prevId) => {
             if (newId && newId !== prevId) loadData();
+        });
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && !accountId.value) loadData();
         });
 
         // ── 边是否高亮（连接到悬停/选中节点） ──
@@ -344,8 +358,8 @@ export const MemoryGraphPage = defineComponent({
                 return h('div', { class: 'view-frame' }, [
                     h(EmptyState, {
                         icon: 'folder',
-                        title: '暂无账号',
-                        desc: '请先在账号管理中添加 B站 账号后查看记忆图谱。',
+                    title: '尚未登录 B站',
+                    desc: '请先在「B站登录」完成接入后查看记忆图谱。',
                     }),
                 ]);
             }

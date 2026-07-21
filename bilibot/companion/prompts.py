@@ -65,13 +65,24 @@ def build_detail_prompt(
     mood: str,
     persona_name: str,
     energy: int,
+    evidence: str = "",
 ) -> tuple[str, str]:
-    system = "你是角色生活细化助手。把一个时段展开成微事件。只输出 JSON。"
+    system = (
+        "你是角色生活细化助手。把一个时段展开成微事件。只输出 JSON。"
+        "日程是计划，不是已经发生的事实；只有证据块明确记录完成的事才能用完成时。"
+    )
     user = f"""角色：{persona_name or "Bot"}
 时段：{window}
 活动：{activity}
 情绪：{mood}
 精力：{energy}/100
+真实经历证据（可能为空）：
+{_clip(evidence, 1200) or "（暂无已完成事件证据）"}
+
+硬性规则：
+1. 当前或未来安排使用“准备、打算、可能、正在”，不要把计划写成已经完成。
+2. 不得声称看完视频、发出动态、回复评论或完成其他平台操作，除非证据明确支持。
+3. events 同时可包含已发生的小事和接下来准备做的事，但要在措辞中区分。
 
 输出：
 {{

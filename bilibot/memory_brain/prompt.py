@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import html
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Mapping, Sequence
 
 
@@ -77,10 +77,20 @@ def _event_time(event: Mapping[str, Any]) -> str:
         value = event.get("event_time") or event.get("created_at") or ""
     if isinstance(value, (int, float)):
         try:
-            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat().replace("+00:00", "Z")
+            return datetime.fromtimestamp(float(value)).astimezone().isoformat(timespec="seconds")
         except (OverflowError, OSError, ValueError):
             return ""
-    return _clean(value)
+    raw = _clean(value)
+    if raw.endswith("Z"):
+        try:
+            return (
+                datetime.fromisoformat(raw[:-1] + "+00:00")
+                .astimezone()
+                .isoformat(timespec="seconds")
+            )
+        except ValueError:
+            pass
+    return raw
 
 
 def _sources(event: Mapping[str, Any]) -> list[Mapping[str, Any]]:

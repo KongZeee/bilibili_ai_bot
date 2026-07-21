@@ -2,7 +2,7 @@
 const { defineComponent, h, ref, reactive, computed, onMounted, watch } = window.Vue;
 import { api } from '../../api.js';
 import { Button, Loading, EmptyState, Icon, ProgressBar, Pagination, Modal, ConfirmModal, createConfirmHelper } from '../common.js';
-import { appState, showToast } from '../../state.js';
+import { appState, showToast, refreshAccounts } from '../../state.js';
 import { navigate } from '../../router.js';
 import { formatTime } from '../../utils.js';
 
@@ -20,6 +20,12 @@ const CATEGORY_LABELS = {
     action_outcome: '行为结果',
     web_observation: '联网参考',
     reflection: '反思总结',
+    daily_plan: '今日日程',
+    life_detail: '生活时段',
+    exploration: '主动探索',
+    diary: '日记',
+    dream: '梦境',
+    creative: '创作片段',
     observation: '观察',
     // 旧 V5 兼容
     episodic: '情景记忆',
@@ -52,6 +58,10 @@ const SOURCE_LABELS = {
     subtitle: '字幕',
     visual_description: '画面描述',
     behavior_log: '行为日志',
+    life_plan: '生活计划',
+    diary: '日记',
+    dream: '梦境',
+    creative: '创作',
 };
 
 function categoryLabel(cat) {
@@ -109,8 +119,8 @@ const STATUS_LABELS = {
     processing: '执行中',
     retry: '等待重试',
     fts_only: '仅全文索引',
-    enrichment_blocked: '增强待配置',
-    degraded: '索引降级',
+    enrichment_blocked: '增强阻塞（查看任务错误）',
+    degraded: '增强降级（可查看错误）',
     blocked: '已阻塞',
     completed: '已完成',
     dead: '死信',
@@ -135,6 +145,15 @@ function jobBadgeClass(status) {
     return 'badge-info';
 }
 
+function formatDuration(seconds) {
+    const value = Number(seconds);
+    if (!Number.isFinite(value) || value < 0) return '-';
+    if (value < 60) return `${Math.round(value)} 秒`;
+    if (value < 3600) return `${Math.round(value / 60)} 分钟`;
+    if (value < 86400) return `${(value / 3600).toFixed(1)} 小时`;
+    return `${(value / 86400).toFixed(1)} 天`;
+}
+
 export const MemoryListPage = defineComponent({
     name: 'MemoryListPage',
     setup() {
@@ -145,6 +164,7 @@ export const MemoryListPage = defineComponent({
         const searchQuery = ref('');
         const filterCategory = ref('');
         const filterStatus = ref('');
+        const showIntents = ref(false);
         const page = ref(1);
         const pageSize = ref(20);
         const total = ref(0);
@@ -159,6 +179,10 @@ export const MemoryListPage = defineComponent({
         const jobsLoading = ref(false);
         const reindexing = ref(false);
         const retryingJobId = ref('');
+        const retryingDeadJobs = ref(false);
+        const deadReport = ref({ total: 0, by_error: {}, by_job_type: {}, samples: [] });
+        const accountPause = ref({ paused: false });
+        const resumingAccount = ref(false);
 
         const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
 
@@ -181,7 +205,7 @@ export const MemoryListPage = defineComponent({
         let loadSeq = 0;
 
         async function loadData() {
-            // 账号切换：只读 currentAccountId，禁止无账号时乱点默认账号造成串数据
+            // 单 bot：sole account；无切换器
             const nextId = appState.currentAccountId
                 || appState.accounts[0]?.account_id
                 || appState.accounts[0]?.id
@@ -191,11 +215,12 @@ export const MemoryListPage = defineComponent({
                 memories.value = [];
                 total.value = 0;
                 jobs.value = [];
+                deadReport.value = { total: 0, by_error: {}, by_job_type: {}, samples: [] };
+                accountPause.value = { paused: false };
                 loading.value = false;
                 return;
             }
             if (accountId.value && accountId.value !== nextId) {
-                // 切换账号时清空旧数据，避免短暂串屏
                 memories.value = [];
                 total.value = 0;
                 jobs.value = [];
@@ -205,18 +230,21 @@ export const MemoryListPage = defineComponent({
             const seq = ++loadSeq;
             loading.value = true;
             try {
-                const [statsData, listData, jobsData] = await Promise.all([
+                const [statsData, listData, jobsData, pauseData, deadReportData] = await Promise.all([
                     api.memory.stats(accountId.value).catch(() => ({ total: 0, categories: {}, health: {} })),
                     api.memory.list(accountId.value, {
                         page: page.value,
                         page_size: pageSize.value,
                         ...(filterCategory.value ? { category: filterCategory.value } : {}),
                         ...(filterStatus.value ? { status: filterStatus.value } : {}),
+                        include_intents: showIntents.value,
                     }).catch(() => ({ items: [], total: 0 })),
                     api.memory.jobs(accountId.value, {
                         limit: 50,
                         ...(jobFilter.value ? { status: jobFilter.value } : {}),
                     }).catch(() => ({ items: [] })),
+                    api.safety.accountPauseStatus(accountId.value).catch(() => ({ paused: false })),
+                    api.memory.deadJobReport(accountId.value, { limit: 10 }).catch(() => ({ total: 0, by_error: {}, by_job_type: {}, samples: [] })),
                 ]);
                 if (seq !== loadSeq) return;
                 // 再次校验：异步返回时账号可能已切走
@@ -225,6 +253,8 @@ export const MemoryListPage = defineComponent({
                 memories.value = listData?.items || [];
                 total.value = listData?.total || 0;
                 jobs.value = jobsData?.items || [];
+                accountPause.value = pauseData || { paused: false };
+                deadReport.value = deadReportData || { total: 0, by_error: {}, by_job_type: {}, samples: [] };
             } catch (e) {
                 if (seq !== loadSeq) return;
                 showToast('加载失败: ' + e.message, 'error');
@@ -243,7 +273,9 @@ export const MemoryListPage = defineComponent({
             loading.value = true;
             try {
                 const data = await api.memory.search(accountId.value, { query: searchQuery.value });
-                memories.value = data?.items || data || [];
+                memories.value = (data?.items || data || []).filter((item) =>
+                    showIntents.value || String(item?.metadata?.action_state || '').toLowerCase() !== 'intent'
+                );
                 total.value = memories.value.length;
             } catch (e) {
                 showToast('搜索失败: ' + e.message, 'error');
@@ -288,11 +320,15 @@ export const MemoryListPage = defineComponent({
             if (!accountId.value) return;
             jobsLoading.value = true;
             try {
-                const data = await api.memory.jobs(accountId.value, {
-                    limit: 50,
-                    ...(jobFilter.value ? { status: jobFilter.value } : {}),
-                });
+                const [data, report] = await Promise.all([
+                    api.memory.jobs(accountId.value, {
+                        limit: 50,
+                        ...(jobFilter.value ? { status: jobFilter.value } : {}),
+                    }),
+                    api.memory.deadJobReport(accountId.value, { limit: 10 }),
+                ]);
                 jobs.value = data?.items || [];
+                deadReport.value = report || { total: 0, by_error: {}, by_job_type: {}, samples: [] };
             } catch (e) {
                 showToast('读取索引任务失败: ' + e.message, 'error');
             } finally {
@@ -338,6 +374,66 @@ export const MemoryListPage = defineComponent({
             } finally {
                 retryingJobId.value = '';
             }
+        }
+
+        async function retryDeadEvent(eventId) {
+            if (!eventId) return;
+            retryingJobId.value = `event:${eventId}`;
+            try {
+                const result = await api.memory.retryDeadJobs(accountId.value, {
+                    event_id: eventId,
+                    limit: 20,
+                });
+                showToast(`该记忆已重新排队 ${result?.count || 0} 个死信任务`, 'success');
+                await loadData();
+            } catch (e) {
+                showToast('按记忆重试失败: ' + e.message, 'error');
+            } finally {
+                retryingJobId.value = '';
+            }
+        }
+
+        function requestRetryDeadJobs() {
+            const deadCount = Number(stats.value.jobs?.dead || 0);
+            if (!deadCount) return;
+            showConfirm({
+                title: '批量重试死信任务',
+                message: `将最多重新排队 ${Math.min(deadCount, 100)} 个死信任务。若上游模型仍不可用，任务可能再次失败。`,
+                confirmText: '确认重试',
+                action: async () => {
+                    retryingDeadJobs.value = true;
+                    try {
+                        const result = await api.memory.retryDeadJobs(accountId.value, { limit: 100 });
+                        showToast(`已重新排队 ${result?.count || 0} 个任务`, 'success');
+                        await loadData();
+                    } catch (e) {
+                        showToast('批量重试失败: ' + e.message, 'error');
+                    } finally {
+                        retryingDeadJobs.value = false;
+                    }
+                },
+            });
+        }
+
+        function requestResumeAccount() {
+            if (!accountPause.value?.paused) return;
+            showConfirm({
+                title: '恢复 Bot 运行',
+                message: `当前暂停原因：${accountPause.value.reason || '未提供'}。请确认记忆库或平台风控问题已经排除。`,
+                confirmText: '确认恢复',
+                action: async () => {
+                    resumingAccount.value = true;
+                    try {
+                        accountPause.value = await api.safety.resumeAccount(accountId.value);
+                        showToast('Bot 已恢复运行', 'success');
+                        await loadData();
+                    } catch (e) {
+                        showToast('恢复失败: ' + e.message, 'error');
+                    } finally {
+                        resumingAccount.value = false;
+                    }
+                },
+            });
         }
 
         async function runRecall() {
@@ -409,7 +505,12 @@ export const MemoryListPage = defineComponent({
             loadData();
         }
 
-        onMounted(loadData);
+        onMounted(async () => {
+            if (!appState.accountsLoaded) {
+                try { await refreshAccounts(); } catch (_) { /* toast in refreshAccounts */ }
+            }
+            await loadData();
+        });
 
         watch(() => appState.currentAccountId, (newId, prevId) => {
             if (newId && newId !== prevId) {
@@ -419,6 +520,9 @@ export const MemoryListPage = defineComponent({
                 loadData();
             }
         });
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && !accountId.value) loadData();
+        });
 
         return () => {
             // 无账号
@@ -426,8 +530,8 @@ export const MemoryListPage = defineComponent({
                 return h('div', { class: 'view-frame' }, [
                     h(EmptyState, {
                         icon: 'folder',
-                        title: '暂无账号',
-                        desc: '请先在账号管理中添加 B站 账号后再管理记忆。',
+                    title: '尚未登录 B站',
+                    desc: '请先在「B站登录」完成接入后再管理记忆。',
                     }),
                 ]);
             }
@@ -443,8 +547,25 @@ export const MemoryListPage = defineComponent({
             // 周新增数
             const weeklyNew = stats.value.weekly_new ?? stats.value.weeklyNew ?? 0;
             const totalCount = stats.value.total ?? total.value ?? 0;
+            const operations = stats.value.operations || {};
+            const recallOps = operations.recall_last_30m || {};
+            const canonicalOps = operations.canonical_documents || {};
+            const workerRuntime = stats.value.runtime?.worker || {};
+            const companionRuntime = stats.value.runtime?.companion || {};
 
             return h('div', { class: 'view-frame' }, [
+                accountPause.value?.paused
+                    ? h('section', {
+                        class: 'flex items-center justify-between gap-3',
+                        style: 'padding: calc(var(--spacing) * 3); border: 1px solid hsl(var(--warning)); border-radius: calc(var(--radius) * .7); background: hsl(var(--warning) / .12); flex-wrap: wrap;',
+                    }, [
+                        h('div', { class: 'grid gap-1' }, [
+                            h('strong', 'Bot 已暂停'),
+                            h('span', { class: 'muted memory-break' }, accountPause.value.reason || '未提供暂停原因'),
+                        ]),
+                        h(Button, { type: 'primary', size: 'sm', loading: resumingAccount.value, onClick: requestResumeAccount }, () => '确认问题已解除并恢复'),
+                    ])
+                    : null,
                 // ═══ Section 1: Hero band — 记忆统计 + 搜索 ═══
                 h('section', {
                     class: 'grid gap-3',
@@ -522,6 +643,14 @@ export const MemoryListPage = defineComponent({
                                 filterStatus.value ? statusLabel(filterStatus.value) : '全部索引状态',
                                 h(Icon, { name: 'chevron-down', size: '0.75rem' }),
                             ]),
+                            h(Button, {
+                                type: showIntents.value ? 'primary' : 'ghost',
+                                onClick: () => {
+                                    showIntents.value = !showIntents.value;
+                                    page.value = 1;
+                                    loadData();
+                                },
+                            }, () => showIntents.value ? '已显示意图' : '意图已折叠'),
                             h(Button, { type: 'ghost', onClick: () => { page.value = 1; loadData(); } }, () => [
                                 h(Icon, { name: 'arrow-up', size: '0.9rem' }),
                                 '刷新列表',
@@ -694,6 +823,9 @@ export const MemoryListPage = defineComponent({
                                     h('option', { value: 'completed' }, '已完成'),
                                 ]),
                                 h(Button, { type: 'ghost', size: 'sm', loading: jobsLoading.value, onClick: loadJobs }, () => '刷新'),
+                                Number(stats.value.jobs?.dead || 0) > 0
+                                    ? h(Button, { type: 'ghost', size: 'sm', loading: retryingDeadJobs.value, onClick: requestRetryDeadJobs }, () => '批量重试死信')
+                                    : null,
                                 h(Button, { type: 'primary', size: 'sm', loading: reindexing.value, onClick: () => requestReindex() }, () => '重建全部索引'),
                             ]),
                         ]),
@@ -702,6 +834,48 @@ export const MemoryListPage = defineComponent({
                                 h('span', { key: status, class: `badge ${jobBadgeClass(status)}` }, `${statusLabel(status)} ${count}`)
                             )
                         ),
+                        h('div', {
+                            class: 'grid gap-2',
+                            style: 'grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr)); padding: calc(var(--spacing) * 2.5); background: hsl(var(--muted) / .45); border-radius: calc(var(--radius) * .55); font-size: .82rem;',
+                        }, [
+                            h('span', `近 30 分钟新记忆：${operations.events_last_30m ?? 0}`),
+                            h('span', `最新记忆距今：${formatDuration(operations.event_freshness_seconds)}`),
+                            h('span', `活跃积压：${operations.active_jobs ?? 0}`),
+                            h('span', `最老积压：${formatDuration(operations.oldest_active_job_age_seconds)}`),
+                            h('span', `召回降级率：${Math.round(Number(recallOps.fallback_rate || 0) * 100)}%`),
+                            h('span', `召回 P50：${Math.round(Number(recallOps.latency_ms_p50 || 0))} ms / ${recallOps.prompt_chars_p50 ?? 0} 字`),
+                            h('span', `召回 P95：${Math.round(Number(recallOps.latency_ms_p95 || 0))} ms`),
+                            h('span', {
+                                class: Number(recallOps.timeout_count || 0) > 0 ? 'text-warning' : '',
+                            }, `召回超时/错误：${recallOps.timeout_count ?? 0}/${recallOps.error_count ?? 0}`),
+                            h('span', {
+                                class: Number(canonicalOps.mismatch || 0) > 0 ? 'text-warning' : '',
+                                title: Number(canonicalOps.missing_metadata || 0) > 0
+                                    ? `其中 ${canonicalOps.missing_metadata} 份旧档案缺少校验信息`
+                                    : '日程、生活细节、日记和梦境正文哈希校验',
+                            }, `档案一致性：${canonicalOps.verified ?? 0}/${canonicalOps.checked ?? 0}`),
+                            h('span', `自我刷新距今：${formatDuration(companionRuntime.freshness_seconds)}`),
+                            h('span', {
+                                class: Number(companionRuntime.salient_count || 0) > 0
+                                    && Number(companionRuntime.salient_evidence_rate || 0) < 1
+                                    ? 'text-warning'
+                                    : '',
+                            }, `显著记忆证据：${companionRuntime.salient_evidence_bound ?? 0}/${companionRuntime.salient_count ?? 0}`),
+                            h('span', `进行中线索：${companionRuntime.ongoing_threads_count ?? 0}`),
+                            h('span', `今日日程：${companionRuntime.daily_plan_date || '—'} · ${companionRuntime.daily_plan_source || '—'}`),
+                            h('span', { class: workerRuntime.throttled ? 'text-warning' : '' }, workerRuntime.throttled
+                                ? `Worker 已限流：${workerRuntime.throttle_reason || '资源隔离'}`
+                                : 'Worker 正常调度'),
+                        ]),
+                        Number(deadReport.value.total || 0) > 0
+                            ? h('div', {
+                                class: 'grid gap-1',
+                                style: 'padding: calc(var(--spacing) * 2.5); border: 1px solid hsl(var(--destructive) / .3); border-radius: calc(var(--radius) * .55); background: hsl(var(--destructive) / .06); font-size: .82rem;',
+                            }, [
+                                h('strong', `死信诊断：${deadReport.value.total} 个任务，影响 ${deadReport.value.affected_event_count || 0} 条记忆`),
+                                h('span', { class: 'muted memory-break' }, `主要原因：${Object.entries(deadReport.value.by_error || {}).slice(0, 3).map(([name, count]) => `${name} ×${count}`).join('；') || '未知'}`),
+                            ])
+                            : null,
                         jobsLoading.value && jobs.value.length === 0
                             ? h(Loading)
                             : jobs.value.length === 0
@@ -743,12 +917,20 @@ export const MemoryListPage = defineComponent({
                                             h('code', `${job.attempts || 0}/${job.max_attempts || 8}`),
                                             h('span', { class: 'muted', style: 'font-size: .84rem; white-space: nowrap;' }, formatTime(job.updated_at)),
                                             job.status === 'dead'
-                                                ? h(Button, {
-                                                    type: 'ghost',
-                                                    size: 'sm',
-                                                    loading: retryingJobId.value === job.id,
-                                                    onClick: () => retryJob(job.id),
-                                                }, () => '重试')
+                                                ? h('div', { class: 'grid gap-1' }, [
+                                                    h(Button, {
+                                                        type: 'ghost',
+                                                        size: 'sm',
+                                                        loading: retryingJobId.value === job.id,
+                                                        onClick: () => retryJob(job.id),
+                                                    }, () => '重试任务'),
+                                                    job.event_id ? h(Button, {
+                                                        type: 'ghost',
+                                                        size: 'sm',
+                                                        loading: retryingJobId.value === `event:${job.event_id}`,
+                                                        onClick: () => retryDeadEvent(job.event_id),
+                                                    }, () => '重试记忆') : null,
+                                                ])
                                                 : h('span', { class: 'muted' }, '-'),
                                         ])),
                                     ]),

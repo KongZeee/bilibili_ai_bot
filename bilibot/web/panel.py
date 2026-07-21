@@ -8,6 +8,7 @@ Web 面板 - 修复版
 多 worker / 多副本部署下会话不会共享，请勿横向扩展 Web 进程。
 """
 import logging
+import ipaddress
 import time
 import json
 import hashlib
@@ -33,6 +34,23 @@ logger = logging.getLogger("bilibot.web")
 
 # 默认弱口令（明文或 bcrypt 哈希匹配均视为弱）
 _DEFAULT_ADMIN_PASSWORD = "admin123"
+
+
+def _effective_cookie_secure(request: Request, configured: bool) -> bool:
+    """Allow direct loopback HTTP login while preserving Secure remotely."""
+    if not configured:
+        return False
+    if str(request.url.scheme or "").casefold() == "https":
+        return True
+    host = request.client.host if request.client else ""
+    if str(host).casefold() == "localhost":
+        return False
+    try:
+        if ipaddress.ip_address(str(host)).is_loopback:
+            return False
+    except ValueError:
+        pass
+    return True
 
 
 def is_weak_admin_password(stored: str) -> bool:
@@ -333,7 +351,9 @@ def create_web_app(
                 resp.set_cookie(
                     key="token", value=token,
                     httponly=True, max_age=_session_ttl,
-                    secure=config_loader.web.secure_cookies,
+                    secure=_effective_cookie_secure(
+                        request, config_loader.web.secure_cookies
+                    ),
                     samesite="lax",
                 )
                 return resp
@@ -363,7 +383,9 @@ def create_web_app(
             key="token",
             path="/",
             httponly=True,
-            secure=config_loader.web.secure_cookies,
+            secure=_effective_cookie_secure(
+                request, config_loader.web.secure_cookies
+            ),
             samesite="lax",
         )
         return resp
@@ -523,16 +545,24 @@ def create_web_app(
     ]
 
     # 人格
-    persona_routes = create_personas_routes(persona_store, orchestrator, llm_manager)
+    persona_routes = create_personas_routes(
+        persona_store, orchestrator, llm_manager, account_manager=account_manager
+    )
 
     # 记忆（旧路由，标记废弃）—— 显式 data_dir 参数，PRD V3 §9.2
     # PRD-V5 §9.2 MEM-502：传入 account_manager 以解析默认账号数据目录
     from ..api.memory import create_memory_routes, create_account_memory_routes
     data_dir = config_loader.get("data_dir", "./data") if hasattr(config_loader, "get") else "./data"
-    memory_routes = create_memory_routes(persona_store, scheduler, data_dir=data_dir, account_manager=account_manager)
-
-    # PRD V4 MEM-009：账号化记忆路由（新实现，从 account_manager 解析数据目录）
-    account_memory_routes = create_account_memory_routes(account_manager)
+    # Flat + nested memory: create_memory_routes delegates to account routes when
+    # account_manager is present (avoids double-registering flat paths).
+    if account_manager is not None:
+        memory_routes = create_account_memory_routes(account_manager)
+        account_memory_routes = []
+    else:
+        memory_routes = create_memory_routes(
+            persona_store, scheduler, data_dir=data_dir, account_manager=None
+        )
+        account_memory_routes = []
 
     # 日志（限制在 data_dir 下，防止路径穿越）
     from ..api.logs import create_logs_routes
@@ -648,6 +678,34 @@ def create_web_app(
         safety_checker.resume()
         return ok(safety_checker.get_pause_status(), message="Bot 已恢复")
 
+    async def api_safety_account_pause_status(request: Request) -> JSONResponse:
+        """Read an account-scoped pause reason for recovery diagnostics."""
+        from ..api.responses import ok, fail
+
+        account_id = str(request.path_params.get("account_id") or "").strip()
+        if not account_id or account_manager is None or not account_manager.has_account(account_id):
+            return fail("NOT_FOUND", "账号不存在", status_code=404)
+        return ok(safety_checker.get_account_pause_status(account_id))
+
+    async def api_safety_account_resume(request: Request) -> JSONResponse:
+        """Explicitly resume one paused account after an operator confirmation."""
+        from ..api.responses import ok, fail, fail_invalid_input
+
+        account_id = str(request.path_params.get("account_id") or "").strip()
+        if not account_id or account_manager is None or not account_manager.has_account(account_id):
+            return fail("NOT_FOUND", "账号不存在", status_code=404)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict) or body.get("confirm") is not True:
+            return fail_invalid_input("必须显式传入 confirm=true")
+        safety_checker.resume_account(account_id)
+        return ok(
+            safety_checker.get_account_pause_status(account_id),
+            message="账号已恢复运行",
+        )
+
     async def api_safety_blacklist_list(request: Request) -> JSONResponse:
         """列出黑名单（PRD §5.9）"""
         from ..api.responses import ok
@@ -680,6 +738,8 @@ def create_web_app(
         Route("/api/safety/pause-status", api_safety_pause_status, methods=["GET"]),
         Route("/api/safety/pause", api_safety_pause, methods=["POST"]),
         Route("/api/safety/resume", api_safety_resume, methods=["POST"]),
+        Route("/api/safety/accounts/{account_id}/pause-status", api_safety_account_pause_status, methods=["GET"]),
+        Route("/api/safety/accounts/{account_id}/resume", api_safety_account_resume, methods=["POST"]),
         Route("/api/safety/blacklist", api_safety_blacklist_list, methods=["GET"]),
         Route("/api/safety/blacklist", api_safety_blacklist_add, methods=["POST"]),
         Route("/api/safety/blacklist/{user_id}", api_safety_blacklist_remove, methods=["DELETE"]),

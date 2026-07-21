@@ -120,6 +120,8 @@ class BilibiliAPI:
         self._credential_update_cb = None
         self._cookie_refresh_lock = asyncio.Lock()
         self._last_cookie_check_ts: float = 0.0
+        self._nav_cache: Optional[Dict] = None
+        self._nav_cache_ts: float = 0.0
 
     def set_credential_update_callback(self, cb) -> None:
         """Register callback(updates: dict) after SESSDATA/buvid/etc. change."""
@@ -733,6 +735,51 @@ class BilibiliAPI:
             elif data.get("code") == 0 and nav_data.get("isLogin") is True:
                 self.clear_auth_backoff()
         return data
+
+    async def get_nav(
+        self,
+        *,
+        max_attempts: int = 3,
+        retry_delay_seconds: float = 0.25,
+    ) -> Optional[Dict]:
+        """Return nav/login identity using the name expected by the scheduler.
+
+        Keep ``get_nav_status`` as the canonical implementation because cookie
+        refresh also relies on its authentication bookkeeping. Transient nav
+        failures are retried briefly and fall back to the last successful
+        in-process identity instead of changing the displayed account to Bot.
+        """
+        attempts = max(1, min(int(max_attempts), 5))
+        last_response: Optional[Dict] = None
+        for attempt in range(attempts):
+            try:
+                response = await self.get_nav_status()
+                if isinstance(response, dict):
+                    last_response = response
+                    data = response.get("data") or {}
+                    if response.get("code") == 0 and isinstance(data, dict):
+                        self._nav_cache = response
+                        self._nav_cache_ts = time.time()
+                        return response
+                    # Authentication failures require credential recovery, not
+                    # three identical requests in a burst.
+                    if response.get("code") == AUTH_REQUIRED_CODE:
+                        break
+            except Exception as exc:
+                logger.warning(
+                    "Bilibili nav attempt %s/%s failed: %s",
+                    attempt + 1,
+                    attempts,
+                    type(exc).__name__,
+                )
+            if attempt + 1 < attempts:
+                await asyncio.sleep(max(0.0, float(retry_delay_seconds)) * (attempt + 1))
+
+        cached = getattr(self, "_nav_cache", None)
+        if isinstance(cached, dict) and cached.get("data"):
+            logger.warning("Bilibili nav unavailable; using last successful identity cache")
+            return cached
+        return last_response
     
     async def get_user_info(self, mid: int) -> Optional[Dict]:
         """获取用户信息"""

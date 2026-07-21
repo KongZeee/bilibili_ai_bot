@@ -5,7 +5,8 @@ BiliBot 是一个完全独立运行的 B站 AI Bot 服务，不再依赖 AstrBot
 ## 主要特性
 
 - **完全独立** - 不依赖 AstrBot，可独立部署运行
-- **多人格管理** - 支持保存多个人格，随时手动切换
+- **单 B站账号** - 每个实例只绑定一个 B站登录账号（见 `accounts` / `default_account`）
+- **多人格管理** - 人格库可保存多个人格，Web 面板随时切换；可选 `profiles` 分组
 - **统一 Prompt 编排** - 所有文本生成场景（评论、动态、周总结）统一受人格控制
 - **强化上下文理解** - 评论线、评论区、视频内容、Bot 历史发言完整纳入
 - **现代化 Web 控制台** - 清晰的控制台风格 UI
@@ -121,6 +122,17 @@ tests/                       # 测试套件（177 passed）
 
 ### B站账号
 
+仅支持 **一个** B站账号。多人格通过人格库 / `profiles` 切换，不是多开 B站号。
+
+运行时数据目录为扁平布局 **`data/bot/`**（记忆脑、任务、陪伴层等）。旧版 `data/accounts/{id}/` 可在停机后迁移：
+
+```bash
+python scripts/migrate_account_data_to_bot.py --config config.yaml --dry-run
+python scripts/migrate_account_data_to_bot.py --config config.yaml
+```
+
+启动时也会在安全条件下自动迁移（冲突时拒绝，需手动处理）。`config.yaml` 的 `accounts[]` 仍用于 Cookie/凭据，与磁盘目录解耦。
+
 | 字段 | 说明 |
 |------|------|
 | sessdata | B站登录凭证（必需） |
@@ -172,19 +184,25 @@ tests/                       # 测试套件（177 passed）
 - `POST /api/personas/{id}/copy` - 复制人格
 - `POST /api/personas/test` - 测试人格
 
-### B站
+### B站账号（单账号，扁平主路径）
 
-- `GET /api/bilibili/qrcode` - 获取登录二维码
-- `POST /api/bilibili/qrcode/status` - 查询扫码状态
+每个实例仅绑定 **一个** B站账号。日常操作优先用扁平路径（自动解析唯一账号）：
+
+- `GET /api/account` - 当前唯一账号状态
+- `PATCH /api/account` - 更新账号配置
+- `POST /api/account/start` / `POST /api/account/stop` - 启停
+- `POST /api/account/qr-login` - 二维码登录（及 poll/cancel）
+- `GET /api/account/tasks` - 任务列表与触发
+
+兼容别名：`/api/accounts/{id}/...` 仅当 `{id}` 为当前唯一账号时有效，否则 404。
+旧端点 `GET /api/bilibili/qrcode` 已 410，请改用 `/api/account/qr-login`。
 
 ### 记忆
 
-- `GET /api/memory` - 列出记忆（支持 `page` / `page_size` / `category` / `active` / `keyword` 筛选）
-- `GET /api/memory/{id}` - 获取单条记忆
-- `DELETE /api/memory/{id}` - 软删除（`is_active=0`）
-- `GET /api/memory/stats` - 记忆统计（按 category 分组、近 24h 新增等）
-- `POST /api/memory/search` - 关键词搜索
-- `POST /api/memory/migrate` - 从旧 JSON 记忆迁移到 SQLite（幂等）
+扁平主路径（无需选账号）：
+
+- `GET /api/memory` / `GET /api/memory/stats` / `POST /api/memory/search` 等
+- 嵌套别名 `/api/accounts/{id}/memory/*` 仅 sole id 可用
 
 ### 审计
 

@@ -15,6 +15,7 @@ PRD V3 §8.4 / §8.5 / §9.3：
 """
 import asyncio
 import hashlib
+import html
 import logging
 import random
 import json
@@ -1174,6 +1175,250 @@ class Scheduler:
             )
         )
 
+    @staticmethod
+    def _clean_platform_text(value: Any, limit: int = 160) -> str:
+        text = html.unescape(str(value or "")).replace("\x00", " ")
+        text = " ".join(text.split())
+        return text[: max(1, int(limit))]
+
+    async def _archive_proactive_video_failure(
+        self,
+        *,
+        bvid: str = "",
+        oid: str = "",
+        title: str = "",
+        owner: str = "",
+        reason: str,
+        task_id: str = "",
+        tags: Optional[List[str]] = None,
+        extra: Optional[Dict[str, Any]] = None,
+        partial_evidence: str = "",
+    ) -> str:
+        """Persist one honest failed watch attempt and feed it back to SelfState."""
+        from bilibot.memory_brain.ingestion import (
+            bot_action_observation,
+            text_observation,
+        )
+
+        clean_title = self._clean_platform_text(title or "未知视频", 120)
+        clean_owner = self._clean_platform_text(owner, 60)
+        reason_s = self._clean_platform_text(reason or "UNKNOWN", 160)
+        attempt_key = (
+            f"proactive_video_failure:{bvid or oid or 'feed'}:"
+            f"{task_id or time.time_ns()}:{time.time_ns()}"
+        )
+        metadata: Dict[str, Any] = {
+            "bvid": str(bvid or ""),
+            "oid": str(oid or ""),
+            "owner": clean_owner,
+            "tags": [self._clean_platform_text(x, 40) for x in (tags or [])[:12]],
+            "reason_code": reason_s.split(":", 1)[0],
+            "failure_detail": reason_s,
+            "task_id": str(task_id or ""),
+            "watch_state": "attempted_not_completed",
+        }
+        metadata.update(dict(extra or {}))
+        text = f"想看视频《{clean_title}》"
+        if clean_owner:
+            text += f"（UP主 {clean_owner}）"
+        text += f"，但这次没有看成：{reason_s}。"
+        partial_evidence_s = str(partial_evidence or "").strip()[:4000]
+
+        # When a concrete video is known, preserve a compact, explicitly
+        # metadata-only perception in addition to the action outcome.  This is
+        # evidence that the bot encountered the item, never evidence that it
+        # watched or understood it.
+        failure_observation_event_id = ""
+        if bvid or oid:
+            observation_metadata = {
+                **metadata,
+                "observation_state": "failed",
+                "metadata_only": True,
+                "watched": False,
+                "has_video_detail": False,
+                "partial_evidence": bool(partial_evidence_s),
+                "partial_evidence_chars": len(partial_evidence_s),
+            }
+            observation_text = text
+            if partial_evidence_s:
+                observation_text += (
+                    "\n\n【部分视听证据（提取未完成，不代表已看完）】\n"
+                    + partial_evidence_s
+                )
+            observation_result = await self._archive_required(
+                text_observation(
+                    account_id=self.account_id or "default",
+                    idempotency_key=f"failed_video:{attempt_key}",
+                    source_type="video_metadata",
+                    event_type="video_metadata_observation",
+                    text=observation_text,
+                    title=clean_title,
+                    persona_id=self._get_current_persona_id(),
+                    scene="proactive_video",
+                    metadata=observation_metadata,
+                    importance=0.35,
+                    # A failed metadata sighting is already fully structured;
+                    # do not feed it into expensive enrichment/vision work.
+                    job_types=(),
+                )
+            )
+            failure_observation_event_id = str(
+                getattr(observation_result, "event_id", "") or ""
+            )
+        if failure_observation_event_id:
+            metadata["failure_observation_event_id"] = failure_observation_event_id
+
+        result = await self._archive_required(
+            bot_action_observation(
+                account_id=self.account_id or "default",
+                action_key=attempt_key,
+                action_type="watch_proactive_video",
+                text=text,
+                published=False,
+                persona_id=self._get_current_persona_id(),
+                title=clean_title,
+                scene="proactive_video",
+                metadata=metadata,
+                importance=0.45,
+                state="failed",
+                job_types=(),
+            )
+        )
+        event_id = str(getattr(result, "event_id", "") or "")
+        brain_store = getattr(getattr(self, "memory_brain", None), "store", None)
+        if brain_store is not None:
+            try:
+                if failure_observation_event_id:
+                    await asyncio.to_thread(
+                        brain_store.set_event_index_status,
+                        failure_observation_event_id,
+                        "degraded",
+                    )
+                if event_id:
+                    await asyncio.to_thread(
+                        brain_store.set_event_index_status,
+                        event_id,
+                        "ready",
+                    )
+            except Exception:
+                logger.debug("failed video index status patch skipped", exc_info=True)
+        if event_id and failure_observation_event_id and brain_store is not None:
+            try:
+                await asyncio.to_thread(
+                    brain_store.upsert_links,
+                    event_id,
+                    [
+                        {
+                            "target_event_id": failure_observation_event_id,
+                            "relation_type": "is_about",
+                            "weight": 1.0,
+                            "evidence_ids": [event_id, failure_observation_event_id],
+                        }
+                    ],
+                )
+            except Exception:
+                logger.debug("failed video evidence link skipped", exc_info=True)
+        companion = getattr(self, "companion", None)
+        feedback = getattr(companion, "on_proactive_video_failed", None)
+        exhausted = getattr(companion, "on_proactive_video_candidates_exhausted", None)
+        if (bvid or oid) and callable(feedback):
+            try:
+                feedback(
+                    title=clean_title,
+                    bvid=str(bvid or ""),
+                    reason=reason_s,
+                    memory_event_id=event_id,
+                )
+            except Exception:
+                logger.debug("companion video failure feedback skipped", exc_info=True)
+        elif not (bvid or oid) and callable(exhausted):
+            try:
+                exhausted(reason=reason_s)
+            except Exception:
+                logger.debug("companion feed exhaustion feedback skipped", exc_info=True)
+        return event_id
+
+    async def _recent_failed_video_event_ids(self, bvid: str, limit: int = 12) -> List[str]:
+        brain = getattr(self, "memory_brain", None)
+        if not brain or not bvid:
+            return []
+        try:
+            hits = await asyncio.to_thread(brain.find_by_identifiers, [bvid], 40)
+        except Exception:
+            return []
+        result: List[str] = []
+        for hit in hits or []:
+            if not isinstance(hit, dict):
+                continue
+            meta = hit.get("metadata") or {}
+            if not isinstance(meta, dict):
+                meta = {}
+            if str(meta.get("bvid") or "") != str(bvid):
+                continue
+            if str(meta.get("action_state") or "").casefold() != "failed":
+                continue
+            event_id = str(hit.get("event_id") or hit.get("id") or "")
+            if event_id and event_id not in result:
+                result.append(event_id)
+            if len(result) >= max(1, int(limit)):
+                break
+        return result
+
+    async def _archive_video_web_reference(
+        self,
+        *,
+        bvid: str,
+        oid: str,
+        title: str,
+        query: str,
+        result: Any,
+    ) -> str:
+        """Archive a compact search observation independently of watch success."""
+        from bilibot.memory_brain.ingestion import text_observation
+
+        compact: Dict[str, Any] = {"query": self._clean_platform_text(query, 240)}
+        if isinstance(result, dict):
+            for key in ("answer", "content"):
+                if result.get(key):
+                    compact[key] = self._clean_platform_text(result.get(key), 1500)
+            rows = result.get("items") or result.get("results") or []
+            compact["items"] = [
+                {
+                    "title": self._clean_platform_text(row.get("title"), 160),
+                    "snippet": self._clean_platform_text(
+                        row.get("snippet") or row.get("content"), 500
+                    ),
+                    "url": self._clean_platform_text(row.get("url"), 500),
+                }
+                for row in rows[:6]
+                if isinstance(row, dict)
+            ]
+        else:
+            compact["content"] = self._clean_platform_text(result, 2500)
+        body = json.dumps(compact, ensure_ascii=False, sort_keys=True, indent=2)
+        digest = hashlib.sha256(body.encode("utf-8", errors="ignore")).hexdigest()[:16]
+        archived = await self._archive_required(
+            text_observation(
+                account_id=self.account_id or "default",
+                idempotency_key=f"video_web:{bvid or oid}:{digest}",
+                source_type="web_reference",
+                event_type="web_observation",
+                text=body,
+                title=f"视频搜索参考：{self._clean_platform_text(title, 60)}",
+                persona_id=self._get_current_persona_id(),
+                scene="proactive_video",
+                metadata={
+                    "bvid": str(bvid or ""),
+                    "oid": str(oid or ""),
+                    "query": compact["query"],
+                    "canonical_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+                    "canonical_chars": len(body),
+                },
+                importance=0.3,
+            )
+        )
+        return str(getattr(archived, "event_id", "") or "")
+
     def _bot_aliases(self) -> set[str]:
         aliases = {"bot", "亚托莉", "亚托莉小姐", "atri", "ATRI"}
         bot_name = str(getattr(self, "_bot_name", "") or "").strip()
@@ -1576,6 +1821,14 @@ class Scheduler:
         # 获取 Bot 自身昵称（优先用配置，其次从 B站 API 获取）
         self._bot_name = config.get("personality", {}).get("bot_name", "") or ""
         self._bot_uid = str(config.get("bilibili", {}).get("dede_user_id", "") or "")
+        identity_cache: Dict[str, Any] = {}
+        if self.ds is not None:
+            try:
+                loaded_identity = self.ds.load_json("bili_identity_cache.json", {}) or {}
+                if isinstance(loaded_identity, dict):
+                    identity_cache = loaded_identity
+            except Exception:
+                identity_cache = {}
         # 任一字段缺失都尝试从 nav API 补全
         if (not self._bot_name or not self._bot_uid) and self.bili:
             try:
@@ -1589,8 +1842,26 @@ class Scheduler:
                         logger.info(f"Bot 昵称: {self._bot_name} (UID: {self._bot_uid})")
                         # 回填到配置，让 personality 系统也能用
                         config.setdefault("personality", {})["bot_name"] = self._bot_name
+                        if self.ds is not None:
+                            self.ds.save_json(
+                                "bili_identity_cache.json",
+                                {
+                                    "uname": self._bot_name,
+                                    "mid": self._bot_uid,
+                                    "updated_at": datetime.now().isoformat(),
+                                },
+                            )
             except Exception as e:
                 logger.warning(f"获取 Bot 昵称失败: {e}")
+        if not self._bot_name and identity_cache.get("uname"):
+            self._bot_name = str(identity_cache.get("uname") or "")
+            if not self._bot_uid:
+                self._bot_uid = str(identity_cache.get("mid") or "")
+            logger.warning(
+                "B站 nav 暂不可用，沿用上次成功昵称: %s (UID: %s)",
+                self._bot_name,
+                self._bot_uid or "-",
+            )
         if not self._bot_name:
             self._bot_name = "Bot"
             logger.warning("未获取到 Bot 昵称，使用默认值 'Bot'")
@@ -4988,6 +5259,7 @@ class Scheduler:
                                     comment_type=0,
                                     reply_context=ReplyContext(memory_evidence=memory_evidence),
                                     scene="private_message",
+                                    private_redaction_username=talker_name,
                                 )
                             except Exception as llm_err:
                                 logger.error(
@@ -5807,18 +6079,33 @@ class Scheduler:
         # strong score, skip spawning new proactive video/dynamic this tick.
         # Scheduled TaskRuns remain claimable later when energy recovers.
         motive_rest = False
+        motive_top_action = ""
+        motive_top_score = 0.0
         companion = getattr(self, "companion", None)
         if companion is not None and getattr(companion, "enabled", False):
             try:
                 select = getattr(companion, "select_motive", None)
                 if callable(select):
                     top = select()
-                    if top is not None and str(getattr(top, "suggested_action", "")) == "rest":
-                        if float(getattr(top, "score", 0) or 0) >= 6.0:
+                    if top is not None:
+                        motive_top_action = str(
+                            getattr(top, "suggested_action", "") or ""
+                        )
+                        motive_top_score = float(getattr(top, "score", 0) or 0)
+                        store = getattr(companion, "store", None)
+                        patch_runtime = getattr(store, "patch_runtime", None)
+                        if callable(patch_runtime):
+                            patch_runtime(
+                                last_selected_motive=motive_top_action,
+                                last_selected_motive_score=motive_top_score,
+                                last_selected_motive_at=datetime.now().isoformat(),
+                            )
+                    if top is not None and motive_top_action == "rest":
+                        if motive_top_score >= 6.0:
                             motive_rest = True
                             logger.info(
                                 "MotiveQueue rest gate: skip proactive spawn (score=%.1f)",
-                                float(top.score),
+                                motive_top_score,
                             )
             except Exception:
                 motive_rest = False
@@ -5826,7 +6113,57 @@ class Scheduler:
         # PRD V4 COM-001：proactive_video 和 proactive_comment 解耦
         # proactive_video 控制视频获取/分析/评价/记忆；proactive_comment 只控制是否发布主动评论
         # 两个开关不再以 AND 方式决定整个视频任务是否运行
-        if features.get("proactive_video", True) and not motive_rest:
+        dynamic_due_now = any(
+            f"{hour:02d}:{minute:02d}" <= current_time
+            and f"{hour:02d}:{minute:02d}" not in self._dynamic_triggered
+            for hour, minute in self._dynamic_times
+        )
+        video_due_now = any(
+            f"{hour:02d}:{minute:02d}" <= current_time
+            and f"{hour:02d}:{minute:02d}" not in self._proactive_triggered
+            for hour, minute in self._proactive_times
+        )
+        prefer_dynamic_now = (
+            motive_top_action == "post_dynamic"
+            and motive_top_score >= 6.0
+            and dynamic_due_now
+        )
+        prefer_video_now = (
+            motive_top_action == "browse_video"
+            and motive_top_score >= 6.0
+            and video_due_now
+        )
+        if companion is not None and getattr(companion, "enabled", False):
+            try:
+                store = getattr(companion, "store", None)
+                patch_runtime = getattr(store, "patch_runtime", None)
+                if callable(patch_runtime):
+                    actionable = (
+                        motive_top_action == "rest"
+                        or (motive_top_action == "post_dynamic" and dynamic_due_now)
+                        or (motive_top_action == "browse_video" and video_due_now)
+                        or motive_top_action in {"reply", "explore", "creative"}
+                    )
+                    patch_runtime(
+                        last_selected_motive_actionable=bool(actionable),
+                        last_selected_motive_gate=(
+                            "ready"
+                            if actionable
+                            else "waiting_for_dynamic_slot"
+                            if motive_top_action == "post_dynamic"
+                            else "waiting_for_video_slot"
+                            if motive_top_action == "browse_video"
+                            else "unsupported_action"
+                        ),
+                    )
+            except Exception:
+                logger.debug("motive actionability runtime patch skipped", exc_info=True)
+
+        if (
+            features.get("proactive_video", True)
+            and not motive_rest
+            and not prefer_dynamic_now
+        ):
             for trigger_time in self._proactive_times:
                 time_str = f"{trigger_time[0]:02d}:{trigger_time[1]:02d}"
                 # Task 23 修复：范围匹配（slot ≤ 当前时间且当日未触发）
@@ -5860,7 +6197,11 @@ class Scheduler:
                     break
 
         # 发布动态（H1：范围匹配，对齐 proactive_video，避免主循环跳分钟漏槽）
-        if features.get("dynamic_post", True) and not motive_rest:
+        if (
+            features.get("dynamic_post", True)
+            and not motive_rest
+            and not prefer_video_now
+        ):
             for trigger_time in self._dynamic_times:
                 time_str = f"{trigger_time[0]:02d}:{trigger_time[1]:02d}"
                 if time_str <= current_time and time_str not in self._dynamic_triggered:
@@ -6164,7 +6505,6 @@ class Scheduler:
 
         同账号串行：若上一条主动看视频仍在执行，本条在锁上排队等待（不丢 slot、不叠跑）。
         """
-        logger.info("开始主动看视频...")
         if not self.bili:
             if task_id:
                 self._fail_task(task_id, "NO_BILI_API", "bili API 未初始化")
@@ -6186,6 +6526,8 @@ class Scheduler:
             if task_id:
                 self._fail_task(task_id, "ACCOUNT_PAUSED", "账号暂停状态", retryable=True)
             return
+
+        logger.info("开始主动看视频...")
 
         # PRD-V5 §7：claim → start
         # scheduled（manual / retry / 其它）须先 claim；已 claimed 的由调度/dispatch 完成
@@ -6280,11 +6622,23 @@ class Scheduler:
                 logger.warning("推荐流/分区热门获取失败，回退到热门视频")
                 data = await self.bili.get_hot_videos()
             if not data or not data.get("data"):
+                await self._archive_proactive_video_failure(
+                    title="推荐流",
+                    reason="NO_HOT_VIDEOS",
+                    task_id=task_id or "",
+                    extra={"feed_state": "unavailable"},
+                )
                 if task_id:
                     self._fail_task(task_id, "NO_HOT_VIDEOS", "获取视频失败", retryable=False)
                 return
             videos = data["data"].get("list", [])
             if not videos:
+                await self._archive_proactive_video_failure(
+                    title="推荐流",
+                    reason="NO_HOT_VIDEOS",
+                    task_id=task_id or "",
+                    extra={"feed_state": "empty"},
+                )
                 if task_id:
                     self._fail_task(task_id, "NO_HOT_VIDEOS", "视频列表为空", retryable=False)
                 return
@@ -6298,10 +6652,26 @@ class Scheduler:
                     continue
                 if await self._has_completed_proactive_video(bvid_value):
                     continue
+                cooldown_check = getattr(companion, "is_video_in_cooldown", None)
+                if callable(cooldown_check) and cooldown_check(bvid_value):
+                    logger.info("跳过失败冷却中的视频: bvid=%s", bvid_value)
+                    continue
                 available_videos.append(candidate)
 
             # 中断恢复：在「空列表提前 return」之前强制插入 saved_bvid
             # （否则 feed 为空/不全时永远轮不到中断视频）
+            if saved_bvid:
+                cooldown_check = getattr(companion, "is_video_in_cooldown", None)
+                if callable(cooldown_check) and cooldown_check(saved_bvid):
+                    logger.info("中断视频处于失败冷却，不再强制优先: %s", saved_bvid)
+                    saved_bvid = ""
+                    if task_id:
+                        try:
+                            self.task_store.update_input(
+                                task_id, {"bvid": "", "scene": "proactive_video"}
+                            )
+                        except Exception:
+                            pass
             if saved_bvid:
                 if await self._has_completed_proactive_video(saved_bvid):
                     logger.info(f"中断视频 {saved_bvid} 已完成闭环，不再优先")
@@ -6327,11 +6697,33 @@ class Scheduler:
 
             if not available_videos:
                 logger.info("所有候选视频均已完成主动观看闭环，跳过主动看视频")
+                valid_bvid_count = sum(
+                    1 for item in videos if str(item.get("bvid") or "").strip()
+                )
+                exhaustion_reason = (
+                    "ALL_WATCHED_OR_COOLDOWN" if valid_bvid_count else "NO_BVID"
+                )
+                try:
+                    await self._archive_proactive_video_failure(
+                        title="这一轮推荐",
+                        reason=exhaustion_reason,
+                        task_id=task_id or "",
+                        extra={
+                            "candidate_count": len(videos),
+                            "valid_bvid_count": valid_bvid_count,
+                        },
+                    )
+                except Exception:
+                    logger.warning("候选耗尽事件归档失败", exc_info=True)
                 if task_id:
                     self._fail_task(
                         task_id,
-                        "ALL_WATCHED",
-                        "所有候选视频均已完成主动观看闭环",
+                        "ALL_WATCHED" if valid_bvid_count else "NO_BVID",
+                        (
+                            "所有候选视频均已完成主动观看闭环"
+                            if valid_bvid_count
+                            else "候选视频均缺少 BVID"
+                        ),
                         retryable=False,
                     )
                 return
@@ -6381,6 +6773,12 @@ class Scheduler:
                         max_video_attempts,
                         bvid,
                     )
+                    await self._archive_proactive_video_failure(
+                        bvid=bvid,
+                        title=str(video.get("title") or "未知视频"),
+                        reason=last_skip_reason,
+                        task_id=task_id or "",
+                    )
                     continue
 
                 # 2. 获取视频详情
@@ -6393,12 +6791,23 @@ class Scheduler:
                         max_video_attempts,
                         bvid,
                     )
+                    await self._archive_proactive_video_failure(
+                        bvid=bvid,
+                        oid=str(oid),
+                        title=str(video.get("title") or "未知视频"),
+                        reason=last_skip_reason,
+                        task_id=task_id or "",
+                    )
                     continue
 
-                title = video_info.get("title", "未知视频")
-                owner = video_info.get("owner", {}).get("name", "未知UP")
+                title = self._clean_platform_text(
+                    video_info.get("title", "未知视频"), 160
+                )
+                owner = self._clean_platform_text(
+                    video_info.get("owner", {}).get("name", "未知UP"), 80
+                )
                 owner_mid = str(video_info.get("owner", {}).get("mid", ""))
-                desc = video_info.get("desc", "")
+                desc = self._clean_platform_text(video_info.get("desc", ""), 3000)
 
                 # 获取标签；标签接口异常时复用已拿到的详情/热门分区元数据。
                 tag_metadata = dict(video_info)
@@ -6416,6 +6825,12 @@ class Scheduler:
                     f"正在看视频: 《{title}》 by {owner} "
                     f"(candidate {video_attempt}/{max_video_attempts})"
                 )
+                started_feedback = getattr(companion, "on_proactive_video_started", None)
+                if callable(started_feedback):
+                    try:
+                        started_feedback(title=title, bvid=bvid)
+                    except Exception:
+                        logger.debug("companion video start feedback failed", exc_info=True)
 
                 # PRD-V5 VID-502：结构化视频上下文 — 各来源独立赋值，不互相覆盖
                 # 修复 scheduler.py 旧实现复用 video_content 字符串导致搜索结果被视听分析覆盖的 bug
@@ -6432,6 +6847,7 @@ class Scheduler:
                 video_content = ""  # 评价/评论输入；有 digest 后优先用 digest
                 video_detail = ""
                 skip_this_video = False
+                web_event_id = ""
 
                 try:
                     # 来源 1：联网搜索（UNTRUSTED Reference Block）— 失败不清空其他来源
@@ -6453,6 +6869,20 @@ class Scheduler:
                                 )
                                 if search_result:
                                     ctx.search_reference = search_result
+                                    try:
+                                        web_event_id = await self._archive_video_web_reference(
+                                            bvid=bvid,
+                                            oid=str(oid),
+                                            title=title,
+                                            query=search_query,
+                                            result=search_result,
+                                        )
+                                    except Exception:
+                                        logger.warning(
+                                            "视频联网参考归档失败 bvid=%s", bvid,
+                                            exc_info=True,
+                                        )
+                                        raise
                         except Exception as e:
                             ctx.degradation_reasons.append(f"search_failed: {e}")
 
@@ -6527,12 +6957,23 @@ class Scheduler:
 
                             logger.info(f"视频已下载，开始视听分析: {video_file}")
                             video_file_to_cleanup = video_file
-                            vu_result = await self.video_understanding.understand(
-                                video_file,
-                                defer_cleanup=True,
-                                require_complete_audio=True,
-                                require_complete_visual=True,
+                            throttle = getattr(
+                                getattr(self, "memory_brain", None),
+                                "set_enrichment_throttled",
+                                None,
                             )
+                            if callable(throttle):
+                                throttle(True, reason="video_understanding")
+                            try:
+                                vu_result = await self.video_understanding.understand(
+                                    video_file,
+                                    defer_cleanup=True,
+                                    require_complete_audio=True,
+                                    require_complete_visual=True,
+                                )
+                            finally:
+                                if callable(throttle):
+                                    throttle(False, reason="video_understanding")
                             if not isinstance(vu_result, dict):
                                 raise RuntimeError("视频理解返回了无效结果")
 
@@ -6726,6 +7167,26 @@ class Scheduler:
                             )
 
                 if skip_this_video:
+                    failure_event_id = await self._archive_proactive_video_failure(
+                        bvid=bvid,
+                        oid=str(oid),
+                        title=title,
+                        owner=owner,
+                        reason=last_skip_reason or "VIDEO_SKIPPED",
+                        task_id=task_id or "",
+                        tags=list(tags_list or []),
+                        extra={
+                            "degradation_reasons": list(
+                                getattr(ctx, "degradation_reasons", None) or []
+                            )[:12],
+                            "web_reference_event_id": str(
+                                locals().get("web_event_id") or ""
+                            ),
+                        },
+                        partial_evidence=str(
+                            getattr(ctx, "audiovisual_log", "") or ""
+                        ),
+                    )
                     continue
 
                 # 成功选定并归档本视频；跳出候选循环，继续评价/互动。
@@ -6914,7 +7375,7 @@ class Scheduler:
                     "LLM 评价失败，不写 experience、不标记任务成功 bvid=%s",
                     bvid,
                 )
-                await self._archive_bot_action(
+                failed_result = await self._archive_bot_action(
                     action_key=f"proactive_video:{observation_key}:evaluate",
                     action_type="evaluate_proactive_video",
                     text=f"评价视频《{title}》失败，等待后续重试",
@@ -6928,6 +7389,19 @@ class Scheduler:
                         "reason_code": "EVALUATION_FAILED",
                     },
                 )
+                failed_event_id = str(getattr(failed_result, "event_id", "") or "")
+                failure_feedback = getattr(
+                    getattr(self, "companion", None),
+                    "on_proactive_video_failed",
+                    None,
+                )
+                if callable(failure_feedback):
+                    failure_feedback(
+                        title=title,
+                        bvid=bvid,
+                        reason="EVALUATION_FAILED",
+                        memory_event_id=failed_event_id,
+                    )
                 if task_id:
                     self._fail_task(
                         task_id,
@@ -7165,7 +7639,12 @@ class Scheduler:
                     on_success=_like_salient,
                 )
             else:
-                logger.debug(f"点赞未执行: {like_result.get('reason')}")
+                logger.info(
+                    "点赞未执行: reason=%s used=%s max=%s",
+                    like_result.get("reason"),
+                    like_result.get("used", "-"),
+                    (like_result.get("cfg") or {}).get("max_per_day", "-"),
+                )
 
             coin_result = decisions.get("coin", {})
             if coin_result.get("planned"):
@@ -7181,7 +7660,12 @@ class Scheduler:
                     risk_tag="proactive_coin",
                 )
             else:
-                logger.debug(f"投币未执行: {coin_result.get('reason')}")
+                logger.info(
+                    "投币未执行: reason=%s used=%s max=%s",
+                    coin_result.get("reason"),
+                    coin_result.get("used", "-"),
+                    (coin_result.get("cfg") or {}).get("max_per_day", "-"),
+                )
 
             fav_result = decisions.get("favorite", {})
             if fav_result.get("planned"):
@@ -7197,7 +7681,12 @@ class Scheduler:
                     risk_tag="proactive_fav",
                 )
             else:
-                logger.debug(f"收藏未执行: {fav_result.get('reason')}")
+                logger.info(
+                    "收藏未执行: reason=%s used=%s max=%s",
+                    fav_result.get("reason"),
+                    fav_result.get("used", "-"),
+                    (fav_result.get("cfg") or {}).get("max_per_day", "-"),
+                )
 
             # 5. 生成评论并发表（PRD V4 COM-001/COM-002/COM-003 / PRD-V5 §10.2 COM-501）
             comment_text = ""
@@ -7228,7 +7717,12 @@ class Scheduler:
             elif not proactive_comment_enabled:
                 logger.debug("主动评论开关关闭（proactive_comment=false），跳过评论发布")
             elif not comment_decision.get("planned"):
-                logger.debug(f"主动评论策略未批准: {comment_decision.get('reason')}")
+                logger.info(
+                    "主动评论策略未批准: reason=%s used=%s max=%s",
+                    comment_decision.get("reason"),
+                    comment_decision.get("used", "-"),
+                    (comment_decision.get("cfg") or {}).get("max_per_day", "-"),
+                )
 
             # 6. Archive the complete evaluation and real outcomes. Source text is
             # never truncated; raw audiovisual observations are already in the
@@ -7251,9 +7745,11 @@ class Scheduler:
             )
             from bilibot.memory_brain.ingestion import text_observation
 
+            prior_failure_event_ids = await self._recent_failed_video_event_ids(bvid)
+
             # 同片重试时 score/comment/outcomes 可能不同 → content_hash 冲突。
             # 已有 experience 视为闭环完成，不得因此暂停账号。
-            await self._archive_required(
+            experience_result = await self._archive_required(
                 text_observation(
                     account_id=self.account_id or "default",
                     idempotency_key=observation_key,
@@ -7278,11 +7774,34 @@ class Scheduler:
                             (memory_evidence if "memory_evidence" in locals() else "")
                             or (companion_ctx if "companion_ctx" in locals() else "")
                         ),
+                        "supersedes_event_ids": prior_failure_event_ids,
+                        "web_reference_event_id": str(web_event_id or ""),
                     },
                     importance=max(0.1, min(1.0, score / 10.0)),
                 ),
                 treat_idempotent_as_ready=True,
             )
+            experience_event_id = str(
+                getattr(experience_result, "event_id", "") or ""
+            )
+            brain_store = getattr(getattr(self, "memory_brain", None), "store", None)
+            if experience_event_id and prior_failure_event_ids and brain_store is not None:
+                try:
+                    await asyncio.to_thread(
+                        brain_store.upsert_links,
+                        experience_event_id,
+                        [
+                            {
+                                "target_event_id": failed_id,
+                                "relation_type": "corrects",
+                                "weight": 0.95,
+                                "evidence_ids": [experience_event_id, failed_id],
+                            }
+                            for failed_id in prior_failure_event_ids
+                        ],
+                    )
+                except Exception:
+                    logger.debug("failed→success correlation link skipped", exc_info=True)
 
             # 更新情绪
             if self.behavior_sim:
@@ -7361,6 +7880,20 @@ class Scheduler:
         if not self.llm:
             return None
         try:
+            from bilibot.image.styles import apply_image_style, resolve_image_style
+
+            try:
+                raw_config = self.config_loader.get_raw_config()
+            except Exception:
+                raw_config = {}
+            dynamic_config = raw_config.get("dynamic_publish", {})
+            if not isinstance(dynamic_config, dict):
+                dynamic_config = {}
+            image_style, image_style_label, style_instruction = resolve_image_style(
+                dynamic_config.get("image_style", "cinematic"),
+                dynamic_config.get("image_style_custom", ""),
+            )
+
             # 取当前人格外貌（账号绑定优先，回退 current）
             appearance_desc = ""
             if self.persona_store is not None:
@@ -7392,7 +7925,9 @@ class Scheduler:
                 "根据以下动态内容，生成一个适合配图的英文图片描述 prompt（1-2 句话）。\n"
                 "要求：\n"
                 "- 只输出 prompt 本身，不要任何解释或前缀\n"
-                "- 风格关键词：cinematic, high quality, detailed, no text, no watermark\n"
+                f"- 用户选择的视觉风格：{image_style_label}（{image_style}）\n"
+                f"- 必须体现这些风格特征：{style_instruction}\n"
+                "- 保持 high quality, detailed, no text, no watermark\n"
                 "- 画面应与动态内容相关但不重复文字\n"
                 f"{persona_block}"
                 f"\n动态内容: {content}\n\nImage prompt:"
@@ -7400,7 +7935,15 @@ class Scheduler:
             from bilibot.services.token_usage import usage_context
             with usage_context(scene="image_prompt", account_id=self.account_id or ""):
                 result = await self.llm.generate(prompt, max_tokens=800, temperature=0.7)
-            return result.strip() if result else None
+            if not result:
+                return None
+            # Provider prompt receives a deterministic style lock even if the
+            # prompt-writing model ignores or weakens the selected style.
+            return apply_image_style(
+                result,
+                style=image_style,
+                custom_style=dynamic_config.get("image_style_custom", ""),
+            )
         except Exception as e:
             logger.warning(f"生成图片 prompt 失败: {e}")
             return None
@@ -7696,11 +8239,21 @@ class Scheduler:
             if len(content) > 200:
                 content = content[:200]
 
+            # The planned seed is provenance; the published body is canonical.
+            # Derive the UI/memory topic from the final text so topic and body
+            # cannot drift after generation or safety rewriting.
+            first_clause = re.split(r"[\n。！？!?；;]", content, maxsplit=1)[0]
+            first_clause = re.sub(r"^[#＃\s]+|[#＃\s]+$", "", first_clause)
+            canonical_topic = self._clean_platform_text(
+                first_clause or selected_topic or "动态", 60
+            )
+
             dynamic_key = dynamic_activity_key
             # PRD V6：动态发布作为内部任务，不单独记录 intent；
             # 仅在最终结果（成功/失败/拒绝/异常）时归档一次，避免同一动态出现两条记忆。
             dynamic_meta_base = {
-                "topic": selected_topic or "",
+                "topic": canonical_topic,
+                "planned_topic": selected_topic or "",
                 "task_id": task_id or "",
                 "memory_grounded": bool(memory_evidence or companion_life_block),
             }
@@ -7758,7 +8311,7 @@ class Scheduler:
                     text=content,
                     published=False,
                     status="rejected",
-                    title=selected_topic or "动态",
+                    title=canonical_topic,
                     scene="dynamic_post",
                     metadata={**dynamic_meta_base, "reason_code": "NO_SAFETY_CHECKER"},
                 )
@@ -7787,7 +8340,7 @@ class Scheduler:
                     text=content,
                     published=False,
                     status="rejected",
-                    title=selected_topic or "动态",
+                    title=canonical_topic,
                     scene="dynamic_post",
                     metadata={**dynamic_meta_base, "reason_code": "SAFETY_CHECK_ERROR"},
                 )
@@ -7816,7 +8369,7 @@ class Scheduler:
                     text=content,
                     published=False,
                     status="rejected",
-                    title=selected_topic or "动态",
+                    title=canonical_topic,
                     scene="dynamic_post",
                     metadata={**dynamic_meta_base, "reason_code": "SAFETY_REJECTED"},
                 )
@@ -7845,7 +8398,7 @@ class Scheduler:
                     text=content,
                     published=False,
                     status="deferred",
-                    title=selected_topic or "动态",
+                    title=canonical_topic,
                     scene="dynamic_post",
                     metadata={**dynamic_meta_base, "reason_code": "RATE_LIMITED"},
                 )
@@ -7907,7 +8460,7 @@ class Scheduler:
                         text=content,
                         published=False,
                         status="result_unknown",
-                        title=selected_topic or "动态",
+                        title=canonical_topic,
                         scene="dynamic_post",
                         metadata={
                             **dynamic_meta_base,
@@ -7931,7 +8484,7 @@ class Scheduler:
                         text=content,
                         published=False,
                         status="result_unknown",
-                        title=selected_topic or "动态",
+                        title=canonical_topic,
                         scene="dynamic_post",
                         metadata={**dynamic_meta_base, "reason_code": "RESULT_UNKNOWN"},
                     )
@@ -7977,7 +8530,7 @@ class Scheduler:
                         action_type="dynamic_post",
                         text=content,
                         published=True,
-                        title=selected_topic or "动态",
+                        title=canonical_topic,
                         scene="dynamic_post",
                         metadata={
                             **dynamic_meta_base,
@@ -7995,7 +8548,7 @@ class Scheduler:
                 logger.info(f"动态发布成功: {content[:50]}...")
                 self._notify_companion_dynamic_posted(
                     content=content or "",
-                    topic=selected_topic or "",
+                    topic=canonical_topic,
                     task_id=task_id or "",
                 )
                 # PRD-V5 §7：只有真正成功才 succeed
@@ -8022,7 +8575,7 @@ class Scheduler:
                     text=content,
                     published=False,
                     status="failed",
-                    title=selected_topic or "动态",
+                    title=canonical_topic,
                     scene="dynamic_post",
                     metadata={
                         **dynamic_meta_base,

@@ -122,6 +122,9 @@ class ReplyGenerator:
             reply_context=reply_context,
             comment_context=comment_context,
             scene=scene,
+            private_redaction_username=(
+                username if scene == "private_message" else ""
+            ),
         )
         if outcome.is_generated:
             return {
@@ -171,7 +174,17 @@ class ReplyGenerator:
                 return reply_context, activity_meta
             safe = redact(activity_query, actor_id=user_id, username=username)
             activity_query = str(getattr(safe, "text", "") or "")
-            activity_speaker = str(getattr(safe, "actor_pseudonym", "") or "")
+            activity_speaker = (
+                str(user_id)
+                if str(user_id).startswith("actor_")
+                else str(getattr(safe, "actor_pseudonym", "") or "")
+            )
+            safe_context = redact(
+                str(comment_context or "")[:600],
+                actor_id=user_id,
+                username=username,
+            )
+            comment_context = str(getattr(safe_context, "text", "") or "")
             if not activity_query:
                 return reply_context, activity_meta
 
@@ -276,6 +289,7 @@ class ReplyGenerator:
         reply_context: Optional[ReplyContext] = None,
         comment_context: str = "",
         scene: str = "reply_comment",
+        private_redaction_username: str = "",
     ) -> GenerationOutcome:
         """生成评论回复（可判别结果）
 
@@ -295,6 +309,23 @@ class ReplyGenerator:
             GenerationOutcome（永不返回 None）
         """
         _validate_search_scene(scene)
+        # A PM is allowed to reach the model only in redacted form.  The same
+        # boundary also protects audit/activity memory from a model that echoes
+        # secrets which were not present in its prompt (or were hallucinated).
+        private_scene = scene == "private_message"
+        private_username = str(private_redaction_username or username or "")
+        if private_scene:
+            from bilibot.memory_brain.redaction import redact_sensitive_text
+
+            comment = redact_sensitive_text(
+                comment,
+                current_username=private_username,
+            ).text
+            comment_context = redact_sensitive_text(
+                comment_context,
+                current_username=private_username,
+            ).text
+            username = "私信用户"
         # LLM 可用性检查
         if not self.llm:
             logger.debug("LLM 未配置，永久跳过回复")
@@ -478,6 +509,23 @@ class ReplyGenerator:
                     state="skipped",
                 )
                 return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
+
+            if private_scene:
+                # Do this before audit and finish_activity: scheduler-level
+                # redaction happens later and cannot protect these stores.
+                from bilibot.memory_brain.redaction import redact_sensitive_text
+
+                reply_text = redact_sensitive_text(
+                    reply_text,
+                    current_username=private_username,
+                ).text.strip()
+                if not reply_text:
+                    await self._finish_activity_memory(
+                        activity_meta,
+                        result_text="私信回复跳过：脱敏后为空",
+                        state="skipped",
+                    )
+                    return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
 
             # 3. 写入 audit（含 persona_id / context_summary，PRD V3 §8.6 / V4 §4.5.3）
             audit_id = await self._record_audit(

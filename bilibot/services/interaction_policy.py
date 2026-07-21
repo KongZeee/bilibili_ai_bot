@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import sqlite3
 import threading
 import time
@@ -86,6 +87,9 @@ class InteractionPolicyEngine:
             "max_per_video": int(cfg.get("max_per_video", 1)),
             "score_threshold": float(cfg.get("score_threshold",
                                              self.DEFAULT_THRESHOLDS.get(action, 7))),
+            # Spread scarce interactions across the day instead of consuming
+            # the entire budget shortly after midnight.
+            "pace_budget": bool(cfg.get("pace_budget", True)),
         }
 
     def reload_config(self, config: Dict):
@@ -252,6 +256,25 @@ class InteractionPolicyEngine:
             used_today = self._count_today(action)
             if used_today >= cfg["max_per_day"]:
                 return {"planned": False, "reason": "daily_budget_exhausted", "cfg": cfg, "used": used_today}
+            if cfg.get("pace_budget") and cfg["max_per_day"] > 0:
+                now = datetime.now()
+                elapsed_minutes = now.hour * 60 + now.minute + now.second / 60.0
+                allowance = max(
+                    1,
+                    min(
+                        cfg["max_per_day"],
+                        int(math.ceil(cfg["max_per_day"] * elapsed_minutes / 1440.0)),
+                    ),
+                )
+                if used_today >= allowance:
+                    return {
+                        "planned": False,
+                        "reason": "daily_budget_paced",
+                        "cfg": cfg,
+                        "used": used_today,
+                        "allowance_now": allowance,
+                        "remaining": max(0, cfg["max_per_day"] - used_today),
+                    }
 
         # 5. 视频级去重（VID-501：每个动作独立 per-video 限制 + 账号级去重）
         max_per_video = cfg.get("max_per_video", 1)

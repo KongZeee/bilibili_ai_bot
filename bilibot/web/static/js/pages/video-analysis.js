@@ -15,7 +15,7 @@ export const VideoAnalysisPage = {
             frame_extractor: 'ffmpeg',
             scenedetect_threshold: 27.0,
             image_max_size: 768,
-            max_keyframes: 150,
+            max_keyframes: 32,
             vision_window_size: 5,
             vision_requests_per_minute: 10,
             vision_frame_max_retries: 2,
@@ -84,7 +84,7 @@ export const VideoAnalysisPage = {
                 config.frame_extractor = data.frame_extractor || 'ffmpeg';
                 config.scenedetect_threshold = data.scenedetect_threshold ?? 27.0;
                 config.image_max_size = data.image_max_size ?? 768;
-                config.max_keyframes = data.max_keyframes ?? 150;
+                config.max_keyframes = data.max_keyframes ?? 32;
                 config.vision_window_size = data.vision_window_size ?? 5;
                 config.vision_requests_per_minute = data.vision_requests_per_minute ?? 10;
                 config.vision_frame_max_retries = data.vision_frame_max_retries ?? 2;
@@ -280,12 +280,12 @@ export const VideoAnalysisPage = {
                                     'onUpdate:modelValue': (v) => {
                                         const n = parseInt(v, 10);
                                         config.max_keyframes = Number.isFinite(n)
-                                            ? Math.max(1, Math.min(n, 500))
+                                            ? Math.max(1, Math.min(n, 64))
                                             : 150;
                                     },
                                     type: 'number',
                                 }),
-                                h(FormHint, '镜头数 ≤ 本值则按镜头全抽；超过则在镜头中等距抽本值张（默认 150，最大 500）'),
+                                h(FormHint, '镜头数 ≤ 本值则按镜头全抽；超过则等距抽样（默认 32，高细节可用 48-64）'),
                             ]),
                             h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '视觉窗口大小（帧数）'),

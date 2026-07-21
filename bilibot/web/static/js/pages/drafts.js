@@ -1,8 +1,8 @@
 // bilibot/web/static/js/pages/drafts.js - 动态草稿页（Golden Time 设计稿）
 const { h, ref, reactive, onMounted, onUnmounted, computed, watch } = window.Vue;
-import { appState, refreshAccounts } from '../state.js';
+import { appState, refreshAccounts, getSoleAccountId } from '../state.js';
 import { api } from '../api.js';
-import { Button, Badge, FormSelect, FormTextarea, Modal, ConfirmModal, createConfirmHelper, EmptyState, Pagination, Loading } from '../components/common.js';
+import { Button, Badge, FormTextarea, Modal, ConfirmModal, createConfirmHelper, EmptyState, Pagination, Loading } from '../components/common.js';
 import { formatTime } from '../utils.js';
 
 function draftId(d) {
@@ -30,13 +30,19 @@ export const DraftsPage = {
     setup() {
         const loading = ref(false);
         const drafts = ref([]);
-        const selectedAccount = ref(appState.currentAccountId || '');
+        const soleAccountId = ref(appState.currentAccountId || getSoleAccountId() || '');
         const filterStatus = ref('awaiting_review');
         const page = ref(1);
         const pageSize = 20;
         const total = ref(0);
         let refreshTimer = null;
         let loadSeq = 0;
+
+        function resolveSole() {
+            const id = getSoleAccountId() || appState.currentAccountId || '';
+            soleAccountId.value = id || '';
+            return soleAccountId.value;
+        }
 
         const editModal = reactive({
             visible: false,
@@ -65,11 +71,11 @@ export const DraftsPage = {
         ];
 
         async function refresh() {
-            if (!selectedAccount.value) return;
+            if (!resolveSole()) return;
             const seq = ++loadSeq;
             loading.value = true;
             try {
-                const data = await api.dynamicDrafts.list(selectedAccount.value, {
+                const data = await api.dynamicDrafts.list(soleAccountId.value, {
                     status: filterStatus.value === 'all' ? undefined : filterStatus.value,
                     page: page.value,
                     page_size: pageSize,
@@ -93,7 +99,7 @@ export const DraftsPage = {
                 confirmText: '通过',
                 action: async () => {
                     try {
-                        const res = await api.dynamicDrafts.approve(selectedAccount.value, id, {
+                        const res = await api.dynamicDrafts.approve(soleAccountId.value, id, {
                             expected_revision: draft.revision,
                         });
                         const taskId = res?.publish_task_id || res?.task_id || '';
@@ -127,7 +133,7 @@ export const DraftsPage = {
                 promptPlaceholder: '输入拒绝原因…',
                 action: async (reason) => {
                     try {
-                        await api.dynamicDrafts.reject(selectedAccount.value, id, reason || '');
+                        await api.dynamicDrafts.reject(soleAccountId.value, id, reason || '');
                         appState.notify('草稿已拒绝', 'success');
                         refresh();
                     } catch (e) {
@@ -145,7 +151,7 @@ export const DraftsPage = {
                 confirmText: '重新发布',
                 action: async () => {
                     try {
-                        const res = await api.dynamicDrafts.retry(selectedAccount.value, id);
+                        const res = await api.dynamicDrafts.retry(soleAccountId.value, id);
                         const taskId = res?.publish_task_id || res?.task_id || '';
                         if (!taskId) {
                             appState.notify(
@@ -180,7 +186,7 @@ export const DraftsPage = {
             editModal.saving = true;
             const id = draftId(editModal.draft);
             try {
-                await api.dynamicDrafts.update(selectedAccount.value, id, {
+                await api.dynamicDrafts.update(soleAccountId.value, id, {
                     content: editModal.content,
                     expected_revision: editModal.revision,
                 });
@@ -220,42 +226,23 @@ export const DraftsPage = {
             if (!appState.accountsLoaded) {
                 await refreshAccounts();
             }
-            if (!selectedAccount.value && appState.accounts.length > 0) {
-                const first = appState.accounts[0];
-                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                // selectedAccount watch 统一 refresh，避免双请求
-                return;
-            }
-            if (selectedAccount.value) refresh();
+            if (resolveSole()) refresh();
         }
 
         onMounted(ensureAccountAndLoad);
 
         watch(() => appState.currentAccountId, (id) => {
-            if (id && id !== selectedAccount.value) {
-                selectedAccount.value = id;
-                page.value = 1;
-                // selectedAccount watch 统一 refresh
-            }
-        });
-
-        watch(() => appState.accountsLoaded, (loaded) => {
-            if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
-                const first = appState.accounts[0];
-                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                // selectedAccount watch 统一 refresh
-            }
-        });
-
-        watch(selectedAccount, (id, prev) => {
-            if (id && id !== prev) {
+            if (id && id !== soleAccountId.value) {
+                soleAccountId.value = id;
                 page.value = 1;
                 drafts.value = [];
                 total.value = 0;
                 refresh();
-            } else if (id && !drafts.value.length) {
-                refresh();
             }
+        });
+
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && resolveSole() && !drafts.value.length) refresh();
         });
 
         onUnmounted(() => {
@@ -265,19 +252,14 @@ export const DraftsPage = {
             }
         });
 
-        const tableGrid = 'minmax(8rem, 0.8fr) 7rem minmax(0, 1.8fr) 7rem 11rem';
-
-        const accName = (id) => {
-            const acc = appState.accounts.find(a => (a.account_id || a.id) === id);
-            return acc?.name || id || '-';
-        };
+        const tableGrid = 'minmax(8rem, 0.8fr) minmax(0, 2.2fr) 7rem 11rem';
 
         return () => loading.value && drafts.value.length === 0
             ? h(Loading)
             : h('div', { class: 'view-frame' }, [
                 h('section', {
                     class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
+                    style: 'grid-template-columns: minmax(0, 1fr);',
                 }, [
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
@@ -294,30 +276,7 @@ export const DraftsPage = {
                             h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '条草稿记录'),
                         ]),
                         h('p', { class: 'muted m-0' }, '审核 AI 生成的动态内容，支持编辑、通过、拒绝与重新发布'),
-                    ]),
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
-                    }, [
-                        h('div', { class: 'card-header' }, [
-                            h('div', { class: 'grid gap-1' }, [
-                                h('span', { class: 'eyebrow' }, '账号'),
-                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '选择账号'),
-                            ]),
-                        ]),
-                        h('div', { class: 'card-body grid gap-2' }, [
-                            h(FormSelect, {
-                                modelValue: selectedAccount.value,
-                                'onUpdate:modelValue': (v) => {
-                                    selectedAccount.value = v;
-                                    appState.currentAccountId = v;
-                                    // selectedAccount watch 会 refresh
-                                },
-                                options: appState.accounts.map(a => ({
-                                    value: a.account_id || a.id,
-                                    label: a.name || a.account_id || a.id,
-                                })),
-                            }),
+                        h('div', { class: 'flex items-center gap-2 flex-wrap', style: 'margin-top: .75rem;' }, [
                             h(Button, {
                                 type: 'primary',
                                 onClick: refresh,
@@ -358,7 +317,6 @@ export const DraftsPage = {
                                 style: `grid-template-columns: ${tableGrid}; column-gap: calc(var(--spacing) * 2); padding-bottom: calc(var(--spacing) * 2); border-bottom: 1px solid hsl(var(--border)); color: hsl(var(--muted-foreground)); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.14em;`,
                             }, [
                                 h('span', { class: 'whitespace-nowrap' }, '时间'),
-                                h('span', { class: 'whitespace-nowrap' }, '账号'),
                                 h('span', { class: 'whitespace-nowrap' }, '内容'),
                                 h('span', { class: 'whitespace-nowrap' }, '状态'),
                                 h('span', { class: 'whitespace-nowrap' }, '操作'),
@@ -374,7 +332,6 @@ export const DraftsPage = {
                                         class: 'whitespace-nowrap',
                                         style: 'color: hsl(var(--muted-foreground)); font-variant-numeric: tabular-nums; font-size:0.85rem;',
                                     }, formatTime(d.created_at)),
-                                    h('span', { class: 'truncate' }, accName(selectedAccount.value)),
                                     h('div', {
                                         class: 'truncate',
                                         style: 'cursor:pointer; min-width:0;',

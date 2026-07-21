@@ -7,7 +7,7 @@ import hashlib
 import time
 from typing import Any, Mapping, Sequence
 
-from .models import Observation, ObservationEnvelope, SourceDocument
+from .models import DEFAULT_JOB_TYPES, Observation, ObservationEnvelope, SourceDocument
 
 
 _MEDIA_KEYS = frozenset(
@@ -40,6 +40,97 @@ def _safe_structured(value: Any) -> Any:
     if isinstance(value, (bytes, bytearray, memoryview)):
         return "[binary omitted]"
     return value
+
+
+def _clip_text(value: Any, limit: int) -> str:
+    text = " ".join(str(value or "").replace("\x00", " ").split())
+    return text[: max(0, int(limit))]
+
+
+def _compact_video_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Keep recall-relevant video facts without archiving multi-megabyte API blobs."""
+    raw = dict(value or {})
+    compact: dict[str, Any] = {}
+    scalar_limits = {
+        "aid": 40,
+        "bvid": 40,
+        "cid": 40,
+        "title": 300,
+        "desc": 3000,
+        "tname": 120,
+        "tname_v2": 120,
+        "copyright": 40,
+        "duration": 40,
+        "pubdate": 40,
+        "ctime": 40,
+        "videos": 20,
+        "pic": 600,
+    }
+    for key, limit in scalar_limits.items():
+        if key in raw and raw.get(key) not in (None, ""):
+            item = raw.get(key)
+            compact[key] = item if isinstance(item, (int, float, bool)) else _clip_text(item, limit)
+    owner = raw.get("owner")
+    if isinstance(owner, Mapping):
+        compact["owner"] = {
+            "mid": _clip_text(owner.get("mid"), 40),
+            "name": _clip_text(owner.get("name"), 120),
+        }
+    stat = raw.get("stat")
+    if isinstance(stat, Mapping):
+        compact["stat"] = {
+            key: stat.get(key)
+            for key in (
+                "view", "danmaku", "reply", "favorite", "coin", "share", "like"
+            )
+            if stat.get(key) is not None
+        }
+    dimension = raw.get("dimension")
+    if isinstance(dimension, Mapping):
+        compact["dimension"] = {
+            key: dimension.get(key)
+            for key in ("width", "height", "rotate")
+            if dimension.get(key) is not None
+        }
+    tags = raw.get("tags") or raw.get("tag")
+    if isinstance(tags, str):
+        tags = [part.strip() for part in tags.split(",") if part.strip()]
+    if isinstance(tags, Sequence) and not isinstance(tags, (str, bytes, bytearray)):
+        compact["tags"] = [_clip_text(item, 80) for item in list(tags)[:30]]
+    pages = raw.get("pages")
+    if isinstance(pages, Sequence) and not isinstance(pages, (str, bytes, bytearray)):
+        compact["pages"] = [
+            {
+                "cid": _clip_text(row.get("cid"), 40),
+                "page": row.get("page"),
+                "part": _clip_text(row.get("part"), 200),
+                "duration": row.get("duration"),
+            }
+            for row in list(pages)[:12]
+            if isinstance(row, Mapping)
+        ]
+    return compact
+
+
+def _compact_web_reference(value: Any) -> Any:
+    if not isinstance(value, Mapping):
+        return _clip_text(value, 4000)
+    result: dict[str, Any] = {}
+    for key in ("query", "answer", "content"):
+        if value.get(key):
+            result[key] = _clip_text(value.get(key), 2000 if key != "query" else 300)
+    rows = value.get("items") or value.get("results") or []
+    if rows and isinstance(rows, Sequence) and not isinstance(rows, (str, bytes, bytearray)):
+        result["items"] = [
+            {
+                "title": _clip_text(row.get("title"), 200),
+                "snippet": _clip_text(row.get("snippet") or row.get("content"), 600),
+                "url": _clip_text(row.get("url"), 600),
+            }
+            for row in list(rows)[:8]
+            if isinstance(row, Mapping)
+        ]
+    return result
 
 
 def _json_text(value: Any) -> str:
@@ -217,7 +308,7 @@ def video_metadata_observation(
     scene: str = "reply_comment",
 ) -> ObservationEnvelope:
     """Archive complete video metadata fetched for a model context."""
-    safe_metadata = _safe_structured(dict(metadata))
+    safe_metadata = _compact_video_metadata(metadata)
     digest = _stable_hash(safe_metadata)
     bvid = str(safe_metadata.get("bvid") or "")
     title = str(safe_metadata.get("title") or "")
@@ -261,6 +352,7 @@ def bot_action_observation(
     metadata: Mapping[str, Any] | None = None,
     importance: float = 0.6,
     state: str = "",
+    job_types: Sequence[str] | None = None,
 ) -> ObservationEnvelope:
     action_state = str(state or ("completed" if published else "intent")).strip().casefold()
     allowed_states = {
@@ -293,6 +385,13 @@ def bot_action_observation(
         or safe_metadata.get("draft_id")
         or action_key
     )
+    effective_job_types = (
+        tuple(job_types)
+        if job_types is not None
+        else DEFAULT_JOB_TYPES
+        if action_state == "completed"
+        else ()
+    )
     return ObservationEnvelope(
         idempotency_key=f"bot_action:{account_id}:{action_key}:{action_state}",
         account_id=str(account_id),
@@ -312,6 +411,7 @@ def bot_action_observation(
         importance=max(0.0, min(1.0, float(importance))),
         occurred_at=time.time(),
         metadata=safe_metadata,
+        job_types=effective_job_types,
         sources=(
             SourceDocument(
                 source_type="bot_action",
@@ -339,11 +439,24 @@ def video_observation(
     persona_id: str = "",
     video_detail: str = "",
 ) -> ObservationEnvelope:
-    safe_context = _safe_structured(context)
-    metadata = safe_context.get("metadata") or {}
-    hot_comments = safe_context.get("hot_comments") or []
-    search_reference = safe_context.get("search_reference") or {}
-    audiovisual = safe_context.get("audiovisual") or {}
+    raw_context = context if isinstance(context, Mapping) else {}
+    metadata = _compact_video_metadata(raw_context.get("metadata") or {})
+    hot_comments_raw = raw_context.get("hot_comments") or []
+    hot_comments = [
+        {
+            "rpid": _clip_text(row.get("rpid") or row.get("id"), 60),
+            "mid": _clip_text(row.get("mid") or row.get("user_id"), 60),
+            "content": _clip_text(
+                row.get("content") or row.get("message") or row.get("text"), 1200
+            ),
+        }
+        for row in list(hot_comments_raw)[:10]
+        if isinstance(row, Mapping)
+    ]
+    search_reference = _compact_web_reference(raw_context.get("search_reference") or {})
+    audiovisual = _safe_structured(raw_context.get("audiovisual") or {})
+    if not isinstance(audiovisual, Mapping):
+        audiovisual = {}
     sources: list[SourceDocument] = []
 
     # Prefer a compact ≤2000-char "video_detail" note as the primary recall surface.
@@ -351,7 +464,7 @@ def video_observation(
     detail_text = str(video_detail or "").strip()
     if not detail_text:
         # Allow callers to stash it on context as well.
-        detail_text = str(safe_context.get("video_detail") or "").strip()
+        detail_text = str(raw_context.get("video_detail") or "").strip()
     if detail_text:
         if len(detail_text) > 2000:
             detail_text = detail_text[:2000].rstrip()
@@ -421,7 +534,16 @@ def video_observation(
             )
         )
 
-    audio_rows = audiovisual.get("audio_observations") or []
+    audio_rows = [
+        {
+            "text": _clip_text(row.get("text"), 1600),
+            "source": _clip_text(row.get("source"), 40),
+            "start": row.get("start"),
+            "end": row.get("end"),
+        }
+        for row in list(audiovisual.get("audio_observations") or [])[:1200]
+        if isinstance(row, Mapping) and row.get("text")
+    ]
     if audio_rows:
         audio_observations = tuple(
             Observation(
@@ -449,7 +571,16 @@ def video_observation(
             )
         )
 
-    visual_rows = audiovisual.get("visual_observations") or []
+    visual_rows = [
+        {
+            "timestamp": row.get("timestamp"),
+            "frame_number": row.get("frame_number"),
+            "description": _clip_text(row.get("description"), 1200),
+            "ocr_text": _clip_text(row.get("ocr_text") or row.get("ocr"), 800),
+        }
+        for row in list(audiovisual.get("visual_observations") or [])[:128]
+        if isinstance(row, Mapping)
+    ]
     if visual_rows:
         visual_observations: list[Observation] = []
         ocr_observations: list[Observation] = []
@@ -508,7 +639,13 @@ def video_observation(
                 source_type="behavior_log",
                 external_id=bvid or oid,
                 full_text=behavior_log,
-                data={"timeline": audiovisual.get("timeline_observations") or []},
+                data={
+                    "timeline": [
+                        _safe_structured(row)
+                        for row in list(audiovisual.get("timeline_observations") or [])[:128]
+                        if isinstance(row, Mapping)
+                    ]
+                },
             )
         )
 
@@ -660,6 +797,7 @@ def text_observation(
     scene: str = "system",
     metadata: Mapping[str, Any] | None = None,
     importance: float = 0.5,
+    job_types: Sequence[str] | None = None,
 ) -> ObservationEnvelope:
     return ObservationEnvelope(
         idempotency_key=f"{source_type}:{account_id}:{idempotency_key}",
@@ -678,6 +816,7 @@ def text_observation(
         importance=max(0.0, min(1.0, float(importance))),
         occurred_at=time.time(),
         metadata=_safe_structured(dict(metadata or {})),
+        job_types=(tuple(job_types) if job_types is not None else DEFAULT_JOB_TYPES),
         sources=(
             SourceDocument(
                 source_type=source_type,

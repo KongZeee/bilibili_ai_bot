@@ -1,8 +1,8 @@
 // pages/proactive.js - 主动行为页（Golden Time 设计稿）
 const { defineComponent, h, ref, onMounted, watch } = window.Vue;
 import { api } from '../api.js';
-import { appState, showToast, refreshAccounts } from '../state.js';
-import { Button, Badge, FormSelect, Loading, EmptyState, Icon } from '../components/common.js';
+import { appState, showToast, refreshAccounts, getSoleAccountId } from '../state.js';
+import { Button, Badge, Loading, EmptyState, Icon } from '../components/common.js';
 import { formatTime, auditSceneLabel, auditStatusLabel, auditStatusBadgeType } from '../utils.js';
 
 export const ProactivePage = defineComponent({
@@ -10,16 +10,22 @@ export const ProactivePage = defineComponent({
     setup() {
         const tasks = ref([]);
         const loading = ref(false);
-        const selectedAccount = ref('');
+        const soleAccountId = ref('');
         const triggering = ref(false);
         let loadSeq = 0;
 
+        function resolveSole() {
+            const id = getSoleAccountId() || appState.currentAccountId || '';
+            soleAccountId.value = id || '';
+            return soleAccountId.value;
+        }
+
         async function loadTasks() {
-            if (!selectedAccount.value) return;
+            if (!resolveSole()) return;
             const seq = ++loadSeq;
             loading.value = true;
             try {
-                const data = await api.accounts.tasks(selectedAccount.value, { page_size: 100 });
+                const data = await api.account.tasks.list({ page_size: 100 });
                 if (seq !== loadSeq) return;
                 tasks.value = data.items || (Array.isArray(data) ? data : []);
             } catch (e) {
@@ -32,10 +38,10 @@ export const ProactivePage = defineComponent({
         }
 
         async function triggerVideo() {
-            if (!selectedAccount.value) return;
+            if (!resolveSole()) return;
             triggering.value = true;
             try {
-                const data = await api.accounts.triggerProactiveVideo(selectedAccount.value);
+                const data = await api.account.tasks.triggerProactiveVideo();
                 // 202 信封：无 task_id 不得报成功（防空响应误 toast）
                 const taskId = data?.task_id || data?.id || '';
                 if (!taskId) {
@@ -54,10 +60,10 @@ export const ProactivePage = defineComponent({
         }
 
         async function triggerDynamic() {
-            if (!selectedAccount.value) return;
+            if (!resolveSole()) return;
             triggering.value = true;
             try {
-                const data = await api.accounts.triggerDynamic(selectedAccount.value);
+                const data = await api.account.tasks.triggerDynamic();
                 const taskId = data?.task_id || data?.id || '';
                 if (!taskId) {
                     showToast('触发未返回任务 ID，请刷新任务列表确认', 'warning');
@@ -75,10 +81,10 @@ export const ProactivePage = defineComponent({
         }
 
         async function triggerBangumi() {
-            if (!selectedAccount.value) return;
+            if (!resolveSole()) return;
             triggering.value = true;
             try {
-                const data = await api.accounts.triggerBangumi(selectedAccount.value);
+                const data = await api.account.tasks.triggerBangumi();
                 const taskId = data?.task_id || data?.id || '';
                 if (!taskId) {
                     showToast('触发未返回任务 ID，请刷新任务列表确认', 'warning');
@@ -106,52 +112,44 @@ export const ProactivePage = defineComponent({
             if (!appState.accountsLoaded) {
                 await refreshAccounts();
             }
-            if (!selectedAccount.value && appState.accounts.length > 0) {
-                const first = appState.accounts[0];
-                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                // selectedAccount watch 统一 loadTasks，避免赋值后再手动 load 双请求
-                return;
-            }
-            if (selectedAccount.value) await loadTasks();
+            if (resolveSole()) await loadTasks();
         }
 
         onMounted(ensureAccountAndLoad);
 
         watch(() => appState.accountsLoaded, (loaded) => {
-            if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
-                const first = appState.accounts[0];
-                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                // selectedAccount watch 会触发 loadTasks
-            }
+            if (loaded && resolveSole() && !tasks.value.length) loadTasks();
         });
 
         watch(() => appState.currentAccountId, (id) => {
-            if (id && id !== selectedAccount.value) {
-                selectedAccount.value = id;
-                // selectedAccount watch 统一 loadTasks
-            }
-        });
-
-        watch(selectedAccount, (id, prev) => {
-            if (id && id !== prev) {
+            if (id && id !== soleAccountId.value) {
+                soleAccountId.value = id;
                 tasks.value = [];
-                loadTasks();
-            } else if (id && !tasks.value.length) {
                 loadTasks();
             }
         });
 
         const tableGrid = 'minmax(0, 1.2fr) 8rem 8rem minmax(0, 1fr) 10rem';
 
-        return () => loading.value && tasks.value.length === 0 && !selectedAccount.value
-            ? h(Loading)
-            : h('div', { class: 'view-frame' }, [
-                // ═══ hero-band：左侧任务统计 + 右侧账号选择 ═══
+        return () => {
+            if (loading.value && tasks.value.length === 0 && !soleAccountId.value) {
+                return h(Loading);
+            }
+            if (appState.accountsLoaded && !soleAccountId.value) {
+                return h('div', { class: 'view-frame' }, [
+                    h(EmptyState, {
+                        icon: 'folder',
+                        title: '尚未接入 B站',
+                        desc: '请先在「B站登录」完成扫码或凭据配置，再管理主动任务。',
+                    }),
+                ]);
+            }
+            return h('div', { class: 'view-frame' }, [
+                // ═══ hero-band：任务统计 + 触发操作 ═══
                 h('section', {
                     class: 'grid gap-3',
-                    style: 'grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);',
+                    style: 'grid-template-columns: minmax(0, 1fr);',
                 }, [
-                    // 左侧：hero-panel 任务统计
                     h('div', { class: 'hero-panel' }, [
                         h('div', { class: 'flex items-start justify-between gap-2 flex-wrap' }, [
                             h('span', { class: 'eyebrow' }, '主动行为'),
@@ -166,42 +164,23 @@ export const ProactivePage = defineComponent({
                             }, String(tasks.value.length || 0)),
                             h('span', { class: 'muted m-0', style: 'font-size:0.9rem;' }, '条任务记录'),
                         ]),
-                        h('p', { class: 'muted m-0' }, '管理主动视频、动态发布与追番检查任务'),
-                    ]),
-                    // 右侧：账号选择 Card
-                    h('article', {
-                        class: 'grid gap-3',
-                        style: 'background: hsl(var(--card)); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.82); padding: calc(var(--spacing) * 4); align-content: start;',
-                    }, [
-                        h('div', { class: 'card-header' }, [
-                            h('div', { class: 'grid gap-1' }, [
-                                h('span', { class: 'eyebrow' }, '账号'),
-                                h('h2', { style: 'margin:0; font-size:1.35rem; line-height:1.1; font-weight:500;' }, '选择账号'),
-                            ]),
-                        ]),
-                        h('div', { class: 'card-body grid gap-2' }, [
-                            h(FormSelect, {
-                                modelValue: selectedAccount.value,
-                                'onUpdate:modelValue': (v) => { selectedAccount.value = v; },
-                                options: appState.accounts.map(a => ({ value: a.account_id || a.id, label: a.name || a.account_id || a.id })),
-                            }),
-                            h('div', { class: 'flex items-center gap-2 flex-wrap' }, [
-                                h(Button, {
-                                    type: 'primary',
-                                    onClick: triggerVideo,
-                                    loading: triggering.value,
-                                }, () => '触发视频'),
-                                h(Button, {
-                                    type: 'ghost',
-                                    onClick: triggerDynamic,
-                                    loading: triggering.value,
-                                }, () => '触发动态'),
-                                h(Button, {
-                                    type: 'ghost',
-                                    onClick: triggerBangumi,
-                                    loading: triggering.value,
-                                }, () => '检查追番'),
-                            ]),
+                        h('p', { class: 'muted m-0' }, '管理本机 Bot 的主动视频、动态发布与追番检查任务'),
+                        h('div', { class: 'flex items-center gap-2 flex-wrap', style: 'margin-top: .75rem;' }, [
+                            h(Button, {
+                                type: 'primary',
+                                onClick: triggerVideo,
+                                loading: triggering.value,
+                            }, () => '触发视频'),
+                            h(Button, {
+                                type: 'ghost',
+                                onClick: triggerDynamic,
+                                loading: triggering.value,
+                            }, () => '触发动态'),
+                            h(Button, {
+                                type: 'ghost',
+                                onClick: triggerBangumi,
+                                loading: triggering.value,
+                            }, () => '检查追番'),
                         ]),
                     ]),
                 ]),
@@ -225,7 +204,7 @@ export const ProactivePage = defineComponent({
                         }, () => '刷新'),
                     ]),
                     tasks.value.length === 0
-                        ? h(EmptyState, { icon: 'folder', title: '暂无任务记录', desc: '当前账号还没有主动行为任务' })
+                        ? h(EmptyState, { icon: 'folder', title: '暂无任务记录', desc: '本机 Bot 还没有主动行为任务' })
                         : h('div', { class: 'grid', style: 'gap:0; min-width:0;' }, [
                             // 表头
                             h('div', {
@@ -277,5 +256,6 @@ export const ProactivePage = defineComponent({
                         ]),
                 ]),
             ]);
+        };
     },
 });

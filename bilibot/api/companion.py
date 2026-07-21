@@ -9,6 +9,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .sole_account import _guard_nested_account_id, _inject_sole_path_params
+
 logger = logging.getLogger("bilibot.api.companion")
 
 
@@ -54,7 +56,24 @@ def create_companion_routes(account_manager) -> list:
         companion = getattr(acc, "companion", None)
         return acc, companion
 
+    def _nested_guard(request: Request):
+        return _guard_nested_account_id(request, account_manager, param="account_id")
+
+    def _as_flat(handler):
+        async def _flat(request: Request) -> JSONResponse:
+            _, err = _inject_sole_path_params(
+                request, account_manager, id_keys=("account_id",)
+            )
+            if err is not None:
+                return err
+            return await handler(request)
+
+        return _flat
+
     async def get_state(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -67,6 +86,9 @@ def create_companion_routes(account_manager) -> list:
             return _err("读取状态失败", "INTERNAL", 500)
 
     async def get_plan(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -76,6 +98,9 @@ def create_companion_routes(account_manager) -> list:
         return _ok({"plan": plan.to_dict(), "story_detail": detail.to_dict()})
 
     async def regenerate_plan(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -90,6 +115,9 @@ def create_companion_routes(account_manager) -> list:
             return _err("生成失败", "INTERNAL", 500)
 
     async def list_diaries(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -98,6 +126,9 @@ def create_companion_routes(account_manager) -> list:
         return _ok({"items": items, "total": len(items)})
 
     async def list_dreams(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -110,6 +141,9 @@ def create_companion_routes(account_manager) -> list:
         })
 
     async def list_notes(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -118,6 +152,9 @@ def create_companion_routes(account_manager) -> list:
         return _ok({"items": items, "total": len(items)})
 
     async def list_bookshelf(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         _, companion = _get_companion(account_id)
         if companion is None:
@@ -133,6 +170,9 @@ def create_companion_routes(account_manager) -> list:
           success: false → error.message 给人读；HTTP 4xx/5xx
         探索失败不得 success:true + 无 produced 误导；未产出时 produced=false。
         """
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         account_id = request.path_params.get("account_id") or ""
         acc, companion = _get_companion(account_id)
         if acc is None:
@@ -232,6 +272,16 @@ def create_companion_routes(account_manager) -> list:
             return _err("触发失败", "INTERNAL", 500)
 
     return [
+        # Flat single-account shell
+        Route("/api/companion/state", _as_flat(get_state), methods=["GET"]),
+        Route("/api/companion/plan", _as_flat(get_plan), methods=["GET"]),
+        Route("/api/companion/plan/regenerate", _as_flat(regenerate_plan), methods=["POST"]),
+        Route("/api/companion/diaries", _as_flat(list_diaries), methods=["GET"]),
+        Route("/api/companion/dreams", _as_flat(list_dreams), methods=["GET"]),
+        Route("/api/companion/notes", _as_flat(list_notes), methods=["GET"]),
+        Route("/api/companion/bookshelf", _as_flat(list_bookshelf), methods=["GET"]),
+        Route("/api/companion/trigger", _as_flat(trigger_tick), methods=["POST"]),
+        # Nested (kept; wrong id → 404 via sole guard)
         Route("/api/accounts/{account_id}/companion/state", get_state, methods=["GET"]),
         Route("/api/accounts/{account_id}/companion/plan", get_plan, methods=["GET"]),
         Route("/api/accounts/{account_id}/companion/plan/regenerate", regenerate_plan, methods=["POST"]),

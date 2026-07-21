@@ -2,7 +2,7 @@
 const { defineComponent, h, ref, computed, onMounted, onUnmounted, watch, nextTick } = window.Vue;
 import { api } from '../../api.js';
 import { Button, Loading, EmptyState, Icon } from '../common.js';
-import { appState, showToast } from '../../state.js';
+import { appState, showToast, refreshAccounts } from '../../state.js';
 
 // 节点类型 → chart 色号映射（与 2D 版一致）
 const TYPE_COLOR_INDEX = {
@@ -794,6 +794,9 @@ export const MemoryGraph3DPage = defineComponent({
         onMounted(async () => {
             mounted = true;
             document.addEventListener('keydown', onEscapeKey);
+            if (!appState.accountsLoaded) {
+                try { await refreshAccounts(); } catch (_) { /* toast */ }
+            }
             await loadData();
         });
 
@@ -829,6 +832,9 @@ export const MemoryGraph3DPage = defineComponent({
 
         watch(() => appState.currentAccountId, (newId, prevId) => {
             if (newId && newId !== prevId) loadData();
+        });
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && !accountId.value) loadData();
         });
 
         function renderNodeDetail(node) {
@@ -1036,8 +1042,8 @@ export const MemoryGraph3DPage = defineComponent({
                 return h('div', { class: 'view-frame' }, [
                     h(EmptyState, {
                         icon: 'folder',
-                        title: '暂无账号',
-                        desc: '请先在账号管理中添加 B站 账号后查看记忆图谱。',
+                    title: '尚未登录 B站',
+                    desc: '请先在「B站登录」完成接入后查看记忆图谱。',
                     }),
                 ]);
             }

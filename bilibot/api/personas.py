@@ -28,10 +28,29 @@ from starlette.requests import Request
 logger = logging.getLogger("bilibot.api.personas")
 
 
-def create_personas_routes(persona_store, orchestrator, llm_manager=None):
-    """创建人格相关路由"""
+def create_personas_routes(persona_store, orchestrator, llm_manager=None, account_manager=None):
+    """创建人格相关路由
+
+    account_manager: 可选；提供时 activate 会同步绑定到唯一 B站账号。
+    """
     from starlette.routing import Route
     from starlette.responses import JSONResponse
+
+    def _sole_account_id() -> str:
+        if account_manager is None:
+            return ""
+        acc_id = ""
+        try:
+            acc_id = account_manager.get_default_id() or ""
+        except Exception:
+            acc_id = ""
+        if not acc_id:
+            try:
+                ids = account_manager.list_account_ids()
+                acc_id = ids[0] if ids else ""
+            except Exception:
+                acc_id = ""
+        return acc_id
 
     async def list_personas(request: Request) -> JSONResponse:
         personas = persona_store.list_personas()
@@ -116,7 +135,27 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None):
 
     async def activate_persona(request: Request) -> JSONResponse:
         persona_id = request.path_params.get("id")
-        success = persona_store.set_current(persona_id)
+        sole_id = _sole_account_id()
+        if sole_id and hasattr(persona_store, "activate_and_bind_account"):
+            success = persona_store.activate_and_bind_account(persona_id, sole_id)
+            # 同步运行时实例 + 配置 registry 的 persona_id
+            if success and account_manager is not None:
+                try:
+                    acc = account_manager.get_account(sole_id)
+                    if acc is not None:
+                        acc.persona_id = persona_id
+                        acc.profile_id = ""
+                        if isinstance(getattr(acc, "account_config", None), dict):
+                            acc.account_config["persona_id"] = persona_id
+                            acc.account_config["profile_id"] = ""
+                    if hasattr(account_manager, "update_account_config"):
+                        account_manager.update_account_config(
+                            sole_id, {"persona_id": persona_id, "profile_id": ""}
+                        )
+                except Exception as e:
+                    logger.warning("激活人格后同步账号配置失败: %s", e)
+        else:
+            success = persona_store.set_current(persona_id)
         if not success:
             return JSONResponse({
                 "success": False,

@@ -211,6 +211,16 @@ def _transcribe_with_api(
     with open(upload_path, "rb") as f:
         audio_base64 = base64.b64encode(f.read()).decode("utf-8")
 
+    duration_seconds = max(0.0, float(_estimate_audio_duration(audio_path) or 0.0))
+    # The observed provider uses an 8192-token context window. Leaving the SDK
+    # default (2048 completion tokens) overflowed on otherwise valid long-audio
+    # requests. Scale the transcript allowance with duration but keep enough
+    # headroom for encoded audio/input tokens.
+    asr_output_tokens = max(
+        384,
+        min(1024, int(duration_seconds * 1.2) + 256),
+    )
+
     cooldown_seconds = max(1.0, float(rate_limit_cooldown_seconds or 30.0))
     # per-key cooldown end (monotonic); module-level not needed — one call retries within itself
     key_cooldown_until = {k: 0.0 for k in keys}
@@ -235,6 +245,7 @@ def _transcribe_with_api(
                     }
                 ],
                 extra_body={"asr_options": {"language": "zh"}},
+                max_tokens=asr_output_tokens,
             )
             return response
         finally:
@@ -297,7 +308,7 @@ def _transcribe_with_api(
         logger.info("ASR API 明确返回无语音: status=no_speech")
         return events
 
-    duration = _estimate_audio_duration(audio_path)
+    duration = duration_seconds
     if duration and duration > 8.0:
         events.extend(_split_segment(0.0, duration, text))
     else:

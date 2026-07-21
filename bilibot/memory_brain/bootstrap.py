@@ -42,6 +42,11 @@ LEGACY_MEMORY_FILENAMES = (
 
 _CUTOVER_AUDIT_FILENAME = "memory_v6_cutover_audit.db"
 
+LAYOUT_VERSION = "flat-bot-v1"
+BOT_DIR_NAME = "bot"
+_MEMORY_BRAIN_DB_NAME = "memory_brain.db"
+_LAYOUT_MARKER_NAME = ".layout_version"
+
 
 def _is_link_or_junction(path: Path) -> bool:
     """Return true for filesystem indirections that cleanup must not traverse."""
@@ -67,19 +72,58 @@ def _validate_account_id(account_id: str) -> str:
     return value
 
 
-def account_db_path(data_root: str | Path, account_id: str) -> Path:
+def _resolved_data_root(data_root: str | Path) -> Path:
     raw_root = Path(data_root)
     if _is_link_or_junction(raw_root):
         raise ValueError("data_root cannot be a symlink or junction")
-    root = raw_root.resolve()
+    return raw_root.resolve()
+
+
+def bot_data_dir(data_root: str | Path) -> Path:
+    """Return the flat sole-account data directory ``{data_root}/bot``."""
+
+    root = _resolved_data_root(data_root)
+    bot_dir = root / BOT_DIR_NAME
+    if _is_link_or_junction(bot_dir):
+        raise ValueError("bot data path cannot traverse a symlink or junction")
+    if bot_dir.parent != root:
+        raise ValueError("bot directory escaped the data root")
+    return bot_dir
+
+
+def account_data_dir(data_root: str | Path, account_id: str = "") -> Path:
+    """Return the account data directory (always ``bot/`` under the flat layout)."""
+
+    if account_id:
+        _validate_account_id(account_id)
+    return bot_data_dir(data_root)
+
+
+def account_db_path(data_root: str | Path, account_id: str) -> Path:
+    """Return the flat memory brain path ``{data_root}/bot/memory_brain.db``."""
+
+    _validate_account_id(account_id)
+    return bot_data_dir(data_root) / _MEMORY_BRAIN_DB_NAME
+
+
+def layout_marker_path(data_root: str | Path) -> Path:
+    """Return the layout version marker path under ``bot/``."""
+
+    return bot_data_dir(data_root) / _LAYOUT_MARKER_NAME
+
+
+def legacy_account_dir(data_root: str | Path, account_id: str) -> Path:
+    """Return the pre-flat account directory ``{data_root}/accounts/{account_id}``."""
+
+    root = _resolved_data_root(data_root)
     value = _validate_account_id(account_id)
     accounts_root = root / "accounts"
     account_dir = accounts_root / value
     if _is_link_or_junction(accounts_root) or _is_link_or_junction(account_dir):
-        raise ValueError("account database path cannot traverse a symlink or junction")
+        raise ValueError("legacy account path cannot traverse a symlink or junction")
     if account_dir.parent != accounts_root:
-        raise ValueError("account database escaped the accounts directory")
-    return account_dir / "memory_brain.db"
+        raise ValueError("legacy account directory escaped the accounts directory")
+    return account_dir
 
 
 class _CutoverAuditLog:
@@ -387,6 +431,9 @@ def cleanup_legacy_memory_files(
     default_store = store_by_account.get(default_id)
 
     directories: list[tuple[Path, str]] = [(root, "")]
+    bot_dir = root / BOT_DIR_NAME
+    if not _is_link_or_junction(bot_dir) and bot_dir.is_dir():
+        directories.append((bot_dir, default_id or BOT_DIR_NAME))
     accounts_root = root / "accounts"
     if not _is_link_or_junction(accounts_root) and accounts_root.is_dir():
         directories.extend(
@@ -458,20 +505,19 @@ def bootstrap_accounts(
     else:
         default_id = unique_ids[0]
 
+    # Flat sole-account layout: every configured id shares bot/memory_brain.db.
+    # brain_info.account_id is the default/sole owner (not encoded in the path).
+    db_path = account_db_path(data_root, default_id)
+    sole_store = MemoryBrainStore(db_path, account_id=default_id)
     stores: dict[str, MemoryBrainStore] = {
-        account_id: MemoryBrainStore(
-            account_db_path(data_root, account_id), account_id=account_id
-        )
-        for account_id in unique_ids
+        account_id: sole_store for account_id in unique_ids
     }
-    health = {
-        account_id: _cutover_health_check(
-            store,
-            expected_db_path=account_db_path(data_root, account_id),
-            expected_account_id=account_id,
-        )
-        for account_id, store in stores.items()
-    }
+    sole_health = _cutover_health_check(
+        sole_store,
+        expected_db_path=db_path,
+        expected_account_id=default_id,
+    )
+    health = {account_id: sole_health for account_id in unique_ids}
     failed = {account_id: report for account_id, report in health.items() if not report.ok}
     if failed:
         details = "; ".join(

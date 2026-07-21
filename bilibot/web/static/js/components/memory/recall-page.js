@@ -2,7 +2,7 @@
 const { defineComponent, h, ref, computed, onMounted, watch } = window.Vue;
 import { api } from '../../api.js';
 import { Button, Badge, EmptyState, Icon, Loading } from '../common.js';
-import { appState, showToast } from '../../state.js';
+import { appState, showToast, refreshAccounts } from '../../state.js';
 import { formatTime } from '../../utils.js';
 
 function score(value) {
@@ -43,7 +43,7 @@ export const MemoryRecallPage = defineComponent({
         const title = ref('');
         const bvid = ref('');
         const oid = ref('');
-        const scene = ref('memory_debug');
+        const scene = ref('reply_comment');
         const recentTurns = ref('');
         const loading = ref(false);
         const historyLoading = ref(false);
@@ -77,7 +77,10 @@ export const MemoryRecallPage = defineComponent({
             try {
                 const data = await api.memory.recallTraces(accountId.value, { limit: 30 });
                 if (accountId.value !== nextId) return;
-                traces.value = data?.items || [];
+                traces.value = (data?.items || []).filter(item => ![
+                    'memory_debug',
+                    'memory_list_quick_test',
+                ].includes(item.scene || ''));
             } catch (e) {
                 showToast('读取召回记录失败: ' + e.message, 'error');
             } finally {
@@ -96,14 +99,14 @@ export const MemoryRecallPage = defineComponent({
                     .map(line => line.trim())
                     .filter(Boolean)
                     .slice(-6);
-                // 仅账号级 API；body 带 account_id 便于后端日志/审计对齐
-                result.value = await api.memory.recall(accountId.value, {
+                // flat /api/memory/recall（sole bot）；body 带 account_id 便于审计
+                result.value = await api.memory.recall({
                     query: query.value.trim(),
                     recent_turns: turns,
                     title: title.value.trim(),
                     bvid: bvid.value.trim(),
                     oid: oid.value.trim(),
-                    scene: scene.value || 'memory_debug',
+                    scene: scene.value || 'reply_comment',
                     account_id: boundAccount,
                 });
                 if (accountId.value !== boundAccount) return;
@@ -145,7 +148,12 @@ export const MemoryRecallPage = defineComponent({
             activeTraceId.value = '';
         }
 
-        onMounted(loadTraces);
+        onMounted(async () => {
+            if (!appState.accountsLoaded) {
+                try { await refreshAccounts(); } catch (_) { /* toast */ }
+            }
+            await loadTraces();
+        });
         watch(() => appState.currentAccountId, (newId, prevId) => {
             if (!newId || newId === prevId) return;
             result.value = null;
@@ -153,11 +161,14 @@ export const MemoryRecallPage = defineComponent({
             activeTraceId.value = '';
             loadTraces();
         });
+        watch(() => appState.accountsLoaded, (loaded) => {
+            if (loaded && !accountId.value) loadTraces();
+        });
 
         return () => {
             if (!accountId.value && !historyLoading.value) {
                 return h('div', { class: 'view-frame' }, [
-                    h(EmptyState, { icon: 'folder', title: '暂无账号', desc: '请先选择账号。' }),
+                    h(EmptyState, { icon: 'folder', title: '尚未登录 B站', desc: '请先在「B站登录」完成接入。' }),
                 ]);
             }
 
@@ -207,10 +218,13 @@ export const MemoryRecallPage = defineComponent({
                             h('label', { class: 'grid gap-1' }, [
                                 h('span', { class: 'form-label' }, '场景'),
                                 h('select', { class: 'form-input', value: scene.value, onChange: event => scene.value = event.target.value }, [
-                                    h('option', { value: 'memory_debug' }, '调试'),
                                     h('option', { value: 'reply_comment' }, '评论回复'),
                                     h('option', { value: 'private_message' }, '私信'),
-                                    h('option', { value: 'proactive' }, '主动行为'),
+                                    h('option', { value: 'proactive_video' }, '主动视频'),
+                                    h('option', { value: 'dynamic_post' }, '动态发布'),
+                                    h('option', { value: 'bangumi' }, '番剧'),
+                                    h('option', { value: 'companion' }, '陪伴生活'),
+                                    h('option', { value: 'memory_debug' }, '纯调试'),
                                 ]),
                             ]),
                         ]),
@@ -311,7 +325,15 @@ export const MemoryRecallPage = defineComponent({
                                             style: `grid-template-columns: ${candidateColumns}; padding: calc(var(--spacing) * 2.4) 0; border-bottom: 1px solid hsl(var(--border)); ${item.injected ? 'background: hsl(var(--accent) / .08);' : ''}`,
                                         }, [
                                             h('div', { class: 'grid gap-1 min-w-0' }, [
+                                                item.title ? h('strong', { class: 'memory-break', style: 'font-size: .86rem;' }, item.title) : null,
                                                 h('code', { class: 'memory-break', style: 'font-size: .8rem;' }, item.candidate_id),
+                                                h('span', { class: 'muted', style: 'font-size: .72rem;' }, [
+                                                    item.event_type || '-',
+                                                    ' · ',
+                                                    item.source_type || '-',
+                                                    ' · ',
+                                                    item.index_status || '-',
+                                                ]),
                                                 item.reason ? h('span', { class: 'muted memory-break', style: 'font-size: .78rem;' }, item.reason) : null,
                                                 item.evidence_ids.length
                                                     ? h('span', { class: 'muted memory-break', style: 'font-size: .72rem;' }, `证据: ${item.evidence_ids.join(', ')}`)

@@ -3,7 +3,7 @@
 
 每个 AccountInstance 拥有独立的：
 - BilibiliAPI（账号凭据）
-- DataStore（data/accounts/{account_id}/）
+- DataStore（data/bot/ — flat sole-account layout）
 - UserStateSystem（画像/好感度/心情，纯 JSON）
 - MemoryBrainService（账号级 SQLite 统一记忆）
 - PersonalitySystem
@@ -61,7 +61,7 @@ class AccountInstance:
             orchestrator: 应用级 Prompt 编排器单例
             context_builder: ACC-502 保留参数（向后兼容），initialize() 会用本账号依赖重建实例
             app_config_loader: 应用级配置加载器（共享 proactive/reply/features 等配置）
-            data_root: 数据根目录（账号目录将创建在 {data_root}/accounts/{account_id}/）
+            data_root: 数据根目录（账号目录为 {data_root}/bot/）
         """
         self.account_id = account_id
         self.account_config = account_config
@@ -85,8 +85,8 @@ class AccountInstance:
         self.persona_id: str = account_config.get("persona_id", "")
         self.llm_id: str = account_config.get("llm_id", "")
 
-        # 账号数据目录
-        self.account_data_dir = os.path.join(data_root, "accounts", account_id)
+        # 账号数据目录（flat layout：始终 data_root/bot）
+        self.account_data_dir = os.path.join(data_root, "bot")
 
         # 运行时组件（initialize 后填充）
         self.data_store = None

@@ -178,10 +178,15 @@ class MemoryConfig:
     recent_promote_days: int = 14  # recent → long_term 升级阈值
     long_term_age_days: int = 180  # MEM-606：长期记忆最大保留天数（过期清理阈值）
     # V6 archive and recall contract
-    recall_candidate_limit: int = 20
+    recall_candidate_limit: int = 12
     recall_inject_limit: int = 5
     recall_association_limit: int = 2
+    rerank_timeout_seconds: float = 8.0
+    recall_total_timeout_seconds: float = 10.0
     rerank_relevance_baseline: float = 0.65
+    enrichment_chat_timeout_seconds: float = 12.0
+    link_candidate_limit: int = 12
+    link_job_max_attempts: int = 3
     prompt_char_budget: int = 5000
     chunk_target_chars: int = 600
     chunk_hard_chars: int = 900
@@ -219,6 +224,21 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
             raise ValueError(f"memory.{name} must be {minimum}{suffix}")
         return result
 
+    def number(name: str, *, minimum: float, maximum: float | None = None) -> float:
+        raw = value(name, getattr(defaults, name))
+        if isinstance(raw, bool):
+            raise ValueError(f"memory.{name} must be a number")
+        try:
+            result = float(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"memory.{name} must be a number") from exc
+        if not math.isfinite(result) or result < minimum or (
+            maximum is not None and result > maximum
+        ):
+            suffix = f"..{maximum:g}" if maximum is not None else " or greater"
+            raise ValueError(f"memory.{name} must be {minimum:g}{suffix}")
+        return result
+
     candidate_limit = integer("recall_candidate_limit", minimum=1, maximum=20)
     inject_limit = integer("recall_inject_limit", minimum=1, maximum=5)
     association_limit = integer("recall_association_limit", minimum=0, maximum=2)
@@ -226,6 +246,15 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
         raise ValueError("memory.recall_inject_limit cannot exceed recall_candidate_limit")
     if association_limit > inject_limit:
         raise ValueError("memory.recall_association_limit cannot exceed recall_inject_limit")
+
+    rerank_timeout = number("rerank_timeout_seconds", minimum=0.5, maximum=60.0)
+    total_timeout = number("recall_total_timeout_seconds", minimum=1.0, maximum=120.0)
+    if rerank_timeout > total_timeout:
+        raise ValueError(
+            "memory.rerank_timeout_seconds cannot exceed recall_total_timeout_seconds"
+        )
+    number("enrichment_chat_timeout_seconds", minimum=1.0, maximum=120.0)
+    integer("link_candidate_limit", minimum=4, maximum=24)
 
     baseline = value("rerank_relevance_baseline", defaults.rerank_relevance_baseline)
     if isinstance(baseline, bool):
@@ -253,6 +282,9 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
         raise ValueError("memory.chunk_overlap_chars cannot exceed 20% of chunk_target_chars")
 
     integer("job_max_attempts", minimum=1)
+    link_attempts = integer("link_job_max_attempts", minimum=1)
+    if link_attempts > integer("job_max_attempts", minimum=1):
+        raise ValueError("memory.link_job_max_attempts cannot exceed job_max_attempts")
     integer("vector_cache_limit", minimum=0)
     integer("vector_batch_size", minimum=1)
 
@@ -285,6 +317,8 @@ class DynamicPublishConfig:
     """动态发布配置（PRD §5.2 / §5.6）"""
     topics: list = field(default_factory=list)       # 主题池
     with_image: bool = False                          # 是否配图
+    image_style: str = "cinematic"                   # 动态配图风格
+    image_style_custom: str = ""                     # 自定义风格描述
     review_before_publish: bool = False               # 发布前审核
 
 
@@ -399,10 +433,17 @@ class ConfigLoader:
             consolidation_discard_threshold=mem.get("consolidation_discard_threshold", consol.get("discard_threshold", 3)),
             recent_promote_days=mem.get("recent_promote_days", consol.get("recent_promote_days", 14)),
             long_term_age_days=mem.get("long_term_age_days", consol.get("long_term_age_days", 180)),
-            recall_candidate_limit=mem.get("recall_candidate_limit", 20),
+            recall_candidate_limit=mem.get("recall_candidate_limit", 12),
             recall_inject_limit=mem.get("recall_inject_limit", 5),
             recall_association_limit=mem.get("recall_association_limit", 2),
+            rerank_timeout_seconds=mem.get("rerank_timeout_seconds", 8.0),
+            recall_total_timeout_seconds=mem.get("recall_total_timeout_seconds", 10.0),
             rerank_relevance_baseline=mem.get("rerank_relevance_baseline", 0.65),
+            enrichment_chat_timeout_seconds=mem.get(
+                "enrichment_chat_timeout_seconds", 12.0
+            ),
+            link_candidate_limit=mem.get("link_candidate_limit", 12),
+            link_job_max_attempts=mem.get("link_job_max_attempts", 3),
             prompt_char_budget=mem.get("prompt_char_budget", 5000),
             chunk_target_chars=mem.get("chunk_target_chars", 600),
             chunk_hard_chars=mem.get("chunk_hard_chars", 900),
@@ -442,6 +483,8 @@ class ConfigLoader:
         self.dynamic_publish = DynamicPublishConfig(
             topics=dyn.get("topics", []),
             with_image=dyn.get("with_image", False),
+            image_style=dyn.get("image_style", "cinematic"),
+            image_style_custom=dyn.get("image_style_custom", ""),
             review_before_publish=dyn.get("review_before_publish", False),
         )
         

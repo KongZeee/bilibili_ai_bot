@@ -61,7 +61,18 @@ class _StagedRestore:
 
     @property
     def is_memory_brain(self) -> bool:
-        return bool(self.account_id)
+        parts = self.relative.parts
+        if (
+            len(parts) == 3
+            and parts[0] == "accounts"
+            and parts[2].casefold() == "memory_brain.db"
+        ):
+            return True
+        return (
+            len(parts) == 2
+            and parts[0] == "bot"
+            and parts[1].casefold() == "memory_brain.db"
+        )
 
 
 def _collect_backup_entries(data_dir: Path) -> list[tuple[Path, Path]]:
@@ -79,26 +90,53 @@ def _collect_backup_entries(data_dir: Path) -> list[tuple[Path, Path]]:
     legacy_names = {name.casefold() for name in LEGACY_MEMORY_FILES}
 
     def add_directory(directory: Path, relative_root: Path) -> None:
+        """Collect .db/.json files under directory (including one level of subdirs).
+
+        Companion stores JSON under ``bot/companion/``; recurse one level so those
+        files are included without walking deep caches.
+        """
         if not directory.is_dir():
             return
-        for source in sorted(directory.iterdir(), key=lambda item: item.name):
+
+        def maybe_add(source: Path, relative: Path) -> None:
             source_name = source.name.casefold()
             if not source.is_file() or source_name in legacy_names:
-                continue
-            # V6 brains exist only below accounts/<account_id>. A stray root brain
-            # is neither backed up nor allowed to become active through restore.
+                return
+            # V6 brains must not live at data root.
             if source_name == "memory_brain.db" and relative_root == Path("root"):
-                continue
-            # SQLite sidecars are represented by an online backup of the main DB.
+                return
             if source_name.endswith((".db-wal", ".db-shm", ".db-journal")):
-                continue
+                return
             if source.suffix.lower() not in {".db", ".json"}:
+                return
+            files.append((source, relative))
+
+        # Skip nested product trees when scanning data root as "root"
+        skip_dirs = set()
+        if relative_root == Path("root"):
+            skip_dirs = {"bot", "accounts", "backups", ".restore_stage", ".restore_rollback"}
+
+        for source in sorted(directory.iterdir(), key=lambda item: item.name):
+            if source.is_file():
+                maybe_add(source, relative_root / source.name)
                 continue
-            files.append((source, relative_root / source.name))
+            if not source.is_dir():
+                continue
+            if source.name.casefold() in skip_dirs:
+                continue
+            # One-level subdirs (e.g. bot/companion/*.json)
+            for child in sorted(source.iterdir(), key=lambda item: item.name):
+                if child.is_file():
+                    maybe_add(child, relative_root / source.name / child.name)
 
     add_directory(data_dir, Path("root"))
+    bot_dir = data_dir / "bot"
+    if bot_dir.is_dir():
+        add_directory(bot_dir, Path("bot"))
+    # Flat layout: if bot/ exists, skip packing legacy accounts/* to avoid dual-tree backups.
+    # Legacy-only installs (no bot/) still pack accounts/{id}/ for restore remap.
     accounts_root = data_dir / "accounts"
-    if accounts_root.is_dir():
+    if accounts_root.is_dir() and not bot_dir.is_dir():
         for account_dir in sorted(accounts_root.iterdir(), key=lambda item: item.name):
             if account_dir.is_dir():
                 add_directory(account_dir, Path("accounts") / account_dir.name)
@@ -133,7 +171,12 @@ def _write_backup(data_dir: Path, backup_dir: Path) -> int:
 
 
 def _collect_restore_entries(backup_dir: Path) -> list[tuple[Path, Path]]:
-    """Return safe V6 restore entries and ignore legacy memory in old backups."""
+    """Return safe V6 restore entries and ignore legacy memory in old backups.
+
+    Returns ``(source, archive_relative)`` pairs. Live targets are resolved later
+    so legacy ``accounts/{id}/memory_brain.db`` archives still carry path identity
+    while landing under flat ``bot/``.
+    """
     entries: list[tuple[Path, Path]] = []
     legacy_names = {name.casefold() for name in LEGACY_MEMORY_FILES}
     for source in sorted(backup_dir.rglob("*")):
@@ -142,15 +185,26 @@ def _collect_restore_entries(backup_dir: Path) -> list[tuple[Path, Path]]:
         relative = source.relative_to(backup_dir)
         parts = relative.parts
         is_canonical_brain = (
-            len(parts) == 3
-            and parts[0] == "accounts"
-            and parts[2].casefold() == "memory_brain.db"
+            (
+                len(parts) == 3
+                and parts[0] == "accounts"
+                and parts[2].casefold() == "memory_brain.db"
+            )
+            or (
+                len(parts) == 2
+                and parts[0] == "bot"
+                and parts[1].casefold() == "memory_brain.db"
+            )
         )
         if source.name.casefold() == "memory_brain.db" and not is_canonical_brain:
             continue
         if parts and parts[0] == "root":
             target_rel = Path(*parts[1:])
-        elif parts and parts[0] == "accounts" and len(parts) == 3:
+        elif parts and parts[0] == "bot" and len(parts) >= 2:
+            # bot/memory_brain.db or bot/companion/*.json etc.
+            target_rel = relative
+        elif parts and parts[0] == "accounts" and len(parts) >= 3:
+            # accounts/{id}/file or accounts/{id}/subdir/file
             target_rel = relative
         elif len(parts) == 1:
             # Backwards-compatible non-memory root backup.
@@ -163,8 +217,34 @@ def _collect_restore_entries(backup_dir: Path) -> list[tuple[Path, Path]]:
     return entries
 
 
+def _live_restore_target(data_dir: Path, relative: Path) -> Path:
+    """Map an archive-relative path to the live flat layout destination.
+
+    Flat product layout: all sole-account runtime files live under ``data/bot/``.
+    Legacy archives under ``accounts/{id}/…`` are remapped into ``bot/…`` so
+    restore does not re-create a nested dual tree.
+    """
+    parts = relative.parts
+    if not parts:
+        return data_dir / relative
+    # Already flat bot/ archive
+    if parts[0] == "bot":
+        return data_dir.joinpath(*parts)
+    # Legacy accounts/{id}/… → bot/… (drop account id segment)
+    if parts[0] == "accounts" and len(parts) >= 2:
+        rest = parts[2:] if len(parts) >= 3 else ()
+        if rest:
+            return data_dir.joinpath("bot", *rest)
+        # accounts/{id} alone (shouldn't happen for files)
+        return data_dir / "bot"
+    # root/… or bare root files
+    if parts[0] == "root":
+        return data_dir.joinpath(*parts[1:]) if len(parts) > 1 else data_dir
+    return data_dir / relative
+
+
 def _memory_brain_account(relative: Path) -> str:
-    """Return the bound account for a canonical V6 brain archive entry."""
+    """Return path-encoded account for legacy archives; empty for flat bot/."""
     parts = relative.parts
     if (
         len(parts) == 3
@@ -189,7 +269,7 @@ def _stage_restore_entries(
         relative = Path(relative)
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             raise RestoreValidationError(f"unsafe restore path: {relative}")
-        target = data_dir / relative
+        target = _live_restore_target(data_dir, relative)
         try:
             target.parent.resolve().relative_to(data_root)
         except ValueError as exc:
@@ -257,34 +337,39 @@ def _validate_staged_memory_brains(
     for entry in staged_entries:
         if not entry.is_memory_brain:
             continue
-        expected_target = account_db_path(data_dir, entry.account_id)
-        if entry.target.resolve() != expected_target.resolve():
-            raise RestoreValidationError(
-                f"memory brain target does not match account {entry.account_id!r}"
-            )
 
         identity = _read_brain_identity(entry.staged)
-        if identity.get("created_by") != "memory_brain_v6":
+        account_id = entry.account_id or str(identity.get("account_id") or "")
+        if not account_id:
+            raise RestoreValidationError("memory brain identity is missing account_id")
+
+        # Live layout is always flat bot/memory_brain.db.
+        expected_target = account_db_path(data_dir, account_id)
+        if entry.target.resolve() != expected_target.resolve():
             raise RestoreValidationError(
-                f"memory brain for account {entry.account_id!r} is not a V6 database"
-            )
-        if identity.get("account_id") != entry.account_id:
-            raise RestoreValidationError(
-                "memory brain account mismatch: "
-                f"archive={identity.get('account_id')!r}, path={entry.account_id!r}"
+                f"memory brain target does not match account {account_id!r}"
             )
 
-        # stage_root/accounts/<id>/memory_brain.db intentionally mirrors the live
-        # shape so health_check enforces both account metadata and path identity.
-        store = MemoryBrainStore(entry.staged, account_id=entry.account_id)
+        if identity.get("created_by") != "memory_brain_v6":
+            raise RestoreValidationError(
+                f"memory brain for account {account_id!r} is not a V6 database"
+            )
+        if identity.get("account_id") != account_id:
+            raise RestoreValidationError(
+                "memory brain account mismatch: "
+                f"archive={identity.get('account_id')!r}, path={account_id!r}"
+            )
+
+        # Health-check the staged file; flat bot/ skips path-encoded account match.
+        store = MemoryBrainStore(entry.staged, account_id=account_id)
         health = store.health_check()
         if not health.ok:
             details = "; ".join(health.errors[:5]) or "unknown health failure"
             raise RestoreValidationError(
-                f"memory brain for account {entry.account_id!r} is unhealthy: {details}"
+                f"memory brain for account {account_id!r} is unhealthy: {details}"
             )
         store.checkpoint("TRUNCATE")
-        account_ids.append(entry.account_id)
+        account_ids.append(account_id)
     return tuple(dict.fromkeys(account_ids))
 
 

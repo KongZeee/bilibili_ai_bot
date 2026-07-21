@@ -1,10 +1,16 @@
 """Account-scoped V6 associative memory brain."""
 
 from .bootstrap import (
+    BOT_DIR_NAME,
+    LAYOUT_VERSION,
     LEGACY_MEMORY_FILENAMES,
+    account_data_dir,
     account_db_path,
+    bot_data_dir,
     bootstrap_accounts,
     cleanup_legacy_memory_files,
+    layout_marker_path,
+    legacy_account_dir,
 )
 from .gateway import EmbeddingBatch, MemoryModelGateway
 from .ingestion import (
@@ -36,6 +42,7 @@ from .store import (
     chunk_text,
     decode_vector,
     encode_vector,
+    normalize_entity_type,
     normalize_search_text,
     normalize_vector,
 )
@@ -54,6 +61,8 @@ __all__ = [
     "EmbeddingBatch",
     "HealthReport",
     "IdempotencyConflictError",
+    "BOT_DIR_NAME",
+    "LAYOUT_VERSION",
     "LEGACY_MEMORY_FILENAMES",
     "MemoryBrainError",
     "MemoryBrainService",
@@ -73,8 +82,10 @@ __all__ = [
     "SourceDocument",
     "VectorDimensionError",
     "WorkerRunReport",
+    "account_data_dir",
     "account_db_path",
     "bangumi_episode_observation",
+    "bot_data_dir",
     "bootstrap_accounts",
     "build_fts_text",
     "bot_action_observation",
@@ -83,6 +94,9 @@ __all__ = [
     "cleanup_legacy_memory_files",
     "decode_vector",
     "encode_vector",
+    "layout_marker_path",
+    "legacy_account_dir",
+    "normalize_entity_type",
     "normalize_search_text",
     "normalize_vector",
     "text_observation",

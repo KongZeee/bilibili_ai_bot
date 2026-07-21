@@ -82,6 +82,28 @@ class AccountManager:
         self._config_registry = AccountConfigRegistry()
         self._memory_brain_bootstrap = None
 
+    def _maybe_migrate_flat_layout(self) -> None:
+        """Best-effort accounts/{id}/ → bot/ migration before brain bootstrap."""
+        account_ids = self._config_registry.list_ids()
+        if not account_ids:
+            return
+        configured_default = str(
+            self.app_config_loader.get_raw_config().get("default_account", "") or ""
+        )
+        sole_id = (
+            configured_default if configured_default in account_ids else account_ids[0]
+        )
+        try:
+            from bilibot.services.layout_migrate import maybe_auto_migrate
+
+            maybe_auto_migrate(self.data_root, sole_id)
+        except Exception as exc:  # noqa: BROAD_EXCEPT_OK — boot must not die on migrate
+            logger.error(
+                "flat layout auto-migrate failed (continuing boot): %s",
+                exc,
+                exc_info=True,
+            )
+
     def _bootstrap_memory_brains(self) -> None:
         """Health-gate every configured account before legacy memory cleanup."""
         account_ids = self._config_registry.list_ids()
@@ -132,6 +154,8 @@ class AccountManager:
         if accounts_list:
             # ACC-501：配置注册表加载 ALL 账号（含 disabled / init-failed）
             self._config_registry.load_from_raw(raw)
+            # Flat layout: migrate accounts/{sole}/ → bot/ before opening brains.
+            self._maybe_migrate_flat_layout()
             # V6: disabled accounts receive a healthy empty brain too. Cleanup is
             # irreversible and therefore happens only after every configured DB passes.
             self._bootstrap_memory_brains()
@@ -178,6 +202,7 @@ class AccountManager:
             }
             # ACC-501：V1 迁移也注册到配置注册表
             self._config_registry.load_from_raw({"accounts": [acc_config]})
+            self._maybe_migrate_flat_layout()
             self._bootstrap_memory_brains()
             try:
                 inst = self._create_instance("default", acc_config)
@@ -227,6 +252,33 @@ class AccountManager:
 
     def get_default_id(self) -> str:
         return self._default_id
+
+    def sole_id(self) -> str:
+        """单账号产品：返回唯一账号 ID（配置注册表优先，否则默认/运行时）。
+
+        不枚举 data/accounts/ 目录，避免孤儿目录污染。
+        """
+        ids = self._config_registry.list_ids()
+        if ids:
+            if self._default_id and self._default_id in ids:
+                return self._default_id
+            return ids[0]
+        if self._default_id:
+            return self._default_id
+        if self._accounts:
+            return next(iter(self._accounts))
+        return ""
+
+    def get_sole(self) -> Optional[AccountInstance]:
+        """单账号产品：返回唯一运行时实例（可能为 None：禁用/未创建实例）。"""
+        acc_id = self.sole_id()
+        if not acc_id:
+            return None
+        return self._accounts.get(acc_id) or self.get_account(acc_id)
+
+    def require_sole_id(self) -> str:
+        """返回 sole_id；无账号时返回空串（调用方映射为 NO_ACCOUNT）。"""
+        return self.sole_id()
 
     def list_accounts(self) -> List[dict]:
         """列出所有账号状态（含禁用账号）
@@ -279,7 +331,7 @@ class AccountManager:
 
     def add_account(self, acc_config: dict) -> str:
         """
-        添加账号
+        添加账号（单账号模式：已有账号时 raise ValueError SINGLE_ACCOUNT）
 
         PRD-V5 ACC-501：同时写入配置注册表和运行时实例。
 
@@ -288,7 +340,14 @@ class AccountManager:
 
         Returns:
             新账号 ID
+
+        Raises:
+            ValueError: 已存在账号时含 SINGLE_ACCOUNT
         """
+        if len(self._config_registry) >= 1:
+            raise ValueError(
+                "SINGLE_ACCOUNT: only one Bilibili account is allowed"
+            )
         # ACC-501：先写入配置注册表（事实来源）
         acc_id = self._config_registry.add(acc_config)
         # A newly configured account must have a healthy brain before it can run.
@@ -308,10 +367,19 @@ class AccountManager:
     def remove_account(self, account_id: str) -> bool:
         """删除账号（停止后移除）
 
+        单账号模式：禁止删除最后一个账号（返回 False）。
+
         PRD-V5 ACC-501：同时从配置注册表和运行时实例删除，写审计。
         """
         existed = self._config_registry.has(account_id) or account_id in self._accounts
         if not existed:
+            return False
+        # 最后一个配置账号不可删
+        if self._config_registry.has(account_id) and len(self._config_registry) <= 1:
+            logger.warning(
+                "LAST_ACCOUNT: refuse to remove the only Bilibili account %s",
+                account_id,
+            )
             return False
         acc = self._accounts.get(account_id)
         if acc:
@@ -353,10 +421,18 @@ class AccountManager:
     async def remove_account_async(self, account_id: str) -> bool:
         """删除账号（含异步关闭 session）
 
+        单账号模式：禁止删除最后一个账号（返回 False）。
+
         PRD-V5 ACC-501：同时从配置注册表和运行时实例删除，写审计。
         """
         existed = self._config_registry.has(account_id) or account_id in self._accounts
         if not existed:
+            return False
+        if self._config_registry.has(account_id) and len(self._config_registry) <= 1:
+            logger.warning(
+                "LAST_ACCOUNT: refuse to remove the only Bilibili account %s",
+                account_id,
+            )
             return False
         acc = self._accounts.get(account_id)
         try:

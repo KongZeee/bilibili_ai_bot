@@ -80,7 +80,7 @@ function unflattenConfig(flat) {
 
 // Task 28 / Task 30：本页渲染的 category 列表
 // 不含 bilibili/llm（V2 遗留，已移除）、web/safety（在 system.js Tab 管理）、
-// profiles（人格管理页）、video_analysis（视频理解页）、accounts（账号管理页）
+// profiles（人格管理页）、video_analysis（视频理解页）、accounts（B站登录页）
 const RENDERED_CATEGORIES = [
     'reply',
     'proactive',
@@ -513,14 +513,14 @@ export const ConfigPage = defineComponent({
                                 h('p', {
                                     class: 'm-0',
                                     style: 'font-size:0.95rem; line-height:1.6;',
-                                }, 'B站账号配置已迁移到「账号管理」页面，请前往该页面管理账号凭证、登录状态与人格绑定。'),
+                                }, 'B站登录已迁移到「B站登录」页面，请前往该页面管理本机凭证、登录状态与人格绑定。'),
                                 h('div', { class: 'flex items-center gap-2' }, [
                                     h(Button, {
                                         type: 'primary',
                                         onClick: () => { window.location.hash = '/accounts'; },
                                     }, () => [
                                         h(Icon, { name: 'arrow-right', size: '1rem' }),
-                                        h('span', '前往账号管理'),
+                                        h('span', '前往 B站登录'),
                                     ]),
                                 ]),
                             ]),

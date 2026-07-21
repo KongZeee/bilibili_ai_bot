@@ -257,6 +257,20 @@ class MemoryModelGateway:
         except json.JSONDecodeError:
             pass
 
+        # Decode the first complete JSON value even when the model appended a
+        # second value or prose (for example ``[...]\n[...]``).  Using
+        # ``rfind`` below would merge both arrays and repeatedly fail with
+        # ``Extra data`` during entity/link enrichment.
+        decoder = json.JSONDecoder()
+        for opener in ("[", "{"):
+            start = cleaned.find(opener)
+            while start != -1:
+                try:
+                    value, _end = decoder.raw_decode(cleaned[start:])
+                    return value
+                except json.JSONDecodeError:
+                    start = cleaned.find(opener, start + 1)
+
         # Prefer full array when present (entity/link jobs expect list payloads).
         # Do not collapse an array to a single object by taking first `{`…last `}`.
         candidates: list[str] = []
@@ -560,6 +574,7 @@ class MemoryModelGateway:
         extra_context: str = "",
         max_chars: int = VIDEO_DETAIL_MAX_CHARS,
         allow_heuristic: bool = True,
+        timeout: float = 120.0,
     ) -> str:
         """Compress a raw audiovisual log into a recall-ready video detail note.
 
@@ -614,7 +629,7 @@ class MemoryModelGateway:
                 system_prompt=system,
                 max_tokens=min(1400, max(400, budget // 1 + 200)),
                 temperature=0.1,
-                timeout=120.0,
+                timeout=max(1.0, float(timeout)),
             )
         except Exception:
             if allow_heuristic:
@@ -677,7 +692,9 @@ class MemoryModelGateway:
             return True
         return False
 
-    async def summarize_event(self, event: Mapping[str, Any]) -> str:
+    async def summarize_event(
+        self, event: Mapping[str, Any], *, timeout: float = 30.0
+    ) -> str:
         sources = event.get("sources") or []
         event_type = str(event.get("event_type") or "")
         source_type = str(event.get("source_type") or "")
@@ -711,6 +728,7 @@ class MemoryModelGateway:
                 owner=str((metadata or {}).get("owner") or ""),
                 behavior_log=behavior_log or self._prefer_audiovisual_source_text(sources),
                 max_chars=self.VIDEO_DETAIL_MAX_CHARS,
+                timeout=timeout,
             )
             return self._sanitize_event_summary(event, detail)
 
@@ -721,7 +739,15 @@ class MemoryModelGateway:
             {
                 "source_type": item.get("source_type"),
                 "external_id": item.get("external_id"),
-                "data": item.get("data") or {},
+                # Never echo raw segments/keyframes/timelines into an enrichment
+                # prompt. The full text lane above is already bounded and more
+                # useful; metadata only carries compact quality/count hints.
+                "data": {
+                    key: (item.get("data") or {}).get(key)
+                    for key in ("count", "quality", "kind", "max_chars")
+                    if isinstance(item.get("data"), Mapping)
+                    and (item.get("data") or {}).get(key) is not None
+                },
             }
             for item in sources
             if isinstance(item, Mapping)
@@ -763,36 +789,55 @@ class MemoryModelGateway:
             + "\n\nRaw sources:\n"
             + source
         )
-        raw = await self.generate(prompt, max_tokens=600, temperature=0.0)
+        raw = await self.generate(
+            prompt, max_tokens=600, temperature=0.0, timeout=timeout
+        )
         return self._sanitize_event_summary(event, raw or "")
 
-    async def extract_entities(self, event: Mapping[str, Any]) -> list[Mapping[str, Any]]:
-        source = "\n\n".join(str(item.get("full_text") or "") for item in event["sources"])
+    async def extract_entities(
+        self, event: Mapping[str, Any], *, timeout: float = 25.0
+    ) -> list[Mapping[str, Any]]:
+        source = self._prefer_audiovisual_source_text(
+            event.get("sources") or [], limit=12000
+        )
+        header = (
+            f"title={str(event.get('title') or '')[:240]}\n"
+            f"summary={str(event.get('summary') or '')[:1200]}\n"
+        )
         payload = await self.generate_json(
             "Return a JSON array of important named entities. Each item has name, type, "
-            "aliases, confidence. Do not invent entities.\n\n" + source,
+            "aliases, confidence. Use a stable broad type such as person, work, organization, "
+            "location, event, product, character, animal, food, time, activity, topic, or concept. "
+            "Do not invent entities.\n\n" + header + source,
             max_tokens=600,
             temperature=0.0,
+            timeout=timeout,
         )
+        if isinstance(payload, Mapping):
+            payload = payload.get("entities") or payload.get("items")
         if not isinstance(payload, list):
             raise ValueError("entity extractor must return a JSON array")
         return [item for item in payload if isinstance(item, Mapping)]
 
     async def suggest_links(
-        self, event: Mapping[str, Any], candidates: Sequence[Mapping[str, Any]]
+        self,
+        event: Mapping[str, Any],
+        candidates: Sequence[Mapping[str, Any]],
+        *,
+        timeout: float = 20.0,
     ) -> list[Mapping[str, Any]]:
         compact = [
             {
                 "event_id": item.get("id"),
-                "title": item.get("title"),
-                "summary": item.get("summary"),
+                "title": str(item.get("title") or "")[:180],
+                "summary": str(item.get("summary") or "")[:420],
                 "allowed_evidence_ids": _compact_link_evidence_ids(item),
             }
-            for item in candidates
+            for item in list(candidates)[:24]
         ]
         source = {
             "id": event.get("id"),
-            "summary": event.get("summary"),
+            "summary": str(event.get("summary") or "")[:800],
             "allowed_evidence_ids": _compact_link_evidence_ids(event),
         }
         payload = await self.generate_json(
@@ -806,7 +851,14 @@ class MemoryModelGateway:
             ),
             max_tokens=600,
             temperature=0.0,
+            timeout=timeout,
         )
+        if isinstance(payload, Mapping):
+            payload = (
+                payload.get("links")
+                or payload.get("associations")
+                or payload.get("items")
+            )
         if not isinstance(payload, list):
             raise ValueError("linker must return a JSON array")
-        return validate_suggested_links(event, candidates, payload)
+        return validate_suggested_links(event, list(candidates)[:24], payload)

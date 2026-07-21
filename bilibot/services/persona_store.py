@@ -307,6 +307,21 @@ class PersonaStore:
         self._save()
         logger.info(f"切换当前人格: {self._personas[persona_id].name}")
         return True
+
+    def activate_and_bind_account(self, persona_id: str, account_id: str) -> bool:
+        """全局激活人格并绑定到指定账号（单账号运行时切换入口）
+
+        1. set_current(persona_id)
+        2. set_account_persona(account_id, persona_id) — 清除 profile 约束，全局切换优先
+
+        Returns:
+            False if persona missing/disabled or account_id empty
+        """
+        if not account_id:
+            return False
+        if not self.set_current(persona_id):
+            return False
+        return self.set_account_persona(account_id, persona_id)
     
     # ===== 导入/导出 =====
     

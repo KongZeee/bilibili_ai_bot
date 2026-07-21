@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 from .gateway import MemoryModelGateway
 from .models import (
     ActivityMemoryError,
+    IdempotencyConflictError,
     Observation,
     ObservationEnvelope,
     SourceDocument,
@@ -215,6 +216,9 @@ class MemoryBrainService:
             "chunk_hard_tokens": int(_config_value(memory_config, "chunk_hard_tokens", 700)),
             "chunk_overlap_chars": int(_config_value(memory_config, "chunk_overlap_chars", 100)),
             "job_max_attempts": int(_config_value(memory_config, "job_max_attempts", 8)),
+            "link_job_max_attempts": int(
+                _config_value(memory_config, "link_job_max_attempts", 3)
+            ),
             "vector_batch_size": int(_config_value(memory_config, "vector_batch_size", 2048)),
             "vector_cache_limit": int(_config_value(memory_config, "vector_cache_limit", 50_000)),
         }
@@ -230,13 +234,28 @@ class MemoryBrainService:
         self.gateway = MemoryModelGateway(
             chat_provider, embedding_provider, account_id=self.account_id
         )
-        self.worker = PersistentMemoryWorker(self.store, self.gateway)
+        self.worker = PersistentMemoryWorker(
+            self.store,
+            self.gateway,
+            enrichment_chat_timeout_seconds=float(
+                _config_value(memory_config, "enrichment_chat_timeout_seconds", 12.0)
+            ),
+            link_candidate_limit=int(
+                _config_value(memory_config, "link_candidate_limit", 12)
+            ),
+        )
         # Ephemeral mid-action working memory: survives across steps of one
         # activity until finish/clear. Not durable — durable truth stays in store.
         self._working_memory: dict[str, dict[str, Any]] = {}
         self.recall_engine = RecallEngine(
             self.store,
             self.gateway,
+            rerank_timeout=float(
+                _config_value(memory_config, "rerank_timeout_seconds", 8.0)
+            ),
+            total_timeout=float(
+                _config_value(memory_config, "recall_total_timeout_seconds", 10.0)
+            ),
             prompt_budget=int(_config_value(memory_config, "prompt_char_budget", 5000)),
             max_candidates=int(_config_value(memory_config, "recall_candidate_limit", 20)),
             max_events=int(_config_value(memory_config, "recall_inject_limit", 5)),
@@ -250,6 +269,7 @@ class MemoryBrainService:
         self.memory_config = memory_config
         self._stop_event: asyncio.Event | None = None
         self._worker_task: asyncio.Task | None = None
+        self._interactive_recall_count = 0
 
     async def start(self) -> None:
         if self._worker_task is not None and not self._worker_task.done():
@@ -260,6 +280,12 @@ class MemoryBrainService:
             name=f"memory-brain-worker:{self.account_id}",
         )
         register_live_brain(self)
+
+    def set_enrichment_throttled(self, enabled: bool, *, reason: str = "") -> None:
+        """Pause expensive entity/link chat jobs while vision owns the model pool."""
+        setter = getattr(self.worker, "set_throttled", None)
+        if callable(setter):
+            setter(bool(enabled), reason=reason)
 
     async def close(self) -> None:
         # 关闭前尽力冲刷 durable jobs（向量/衍生），再 stop worker；
@@ -614,7 +640,17 @@ class MemoryBrainService:
         object.__setattr__(
             query, "scene", RecallQuery.normalize_scene(query.scene)
         )
-        result = await self.recall_engine.recall(query)
+        self._interactive_recall_count += 1
+        if self._interactive_recall_count == 1:
+            self.worker.set_throttled(True, reason="interactive_recall")
+        try:
+            result = await self.recall_engine.recall(query)
+        finally:
+            self._interactive_recall_count = max(
+                0, self._interactive_recall_count - 1
+            )
+            if self._interactive_recall_count == 0:
+                self.worker.set_throttled(False, reason="interactive_recall")
         try:
             await asyncio.to_thread(
                 self.store.record_recall_trace,
@@ -995,15 +1031,39 @@ class MemoryBrainService:
             importance=0.65,
             state="intent",
         )
+        intent_event_id = ""
         try:
             archived = await self.archive_observation_async(envelope)
+        except IdempotencyConflictError as exc:
+            # Same action_key:intent already exists with a different body
+            # (e.g. generation_recall_query / life needles evolved). This is a
+            # data-shape collision, not a storage outage — reuse the existing
+            # intent so callers do not escalate into account risk pause.
+            intent_event_id = self._existing_event_id_for_key(envelope.idempotency_key)
+            if not intent_event_id:
+                raise ActivityMemoryError(
+                    f"activity intent archive failed: {type(exc).__name__}"
+                ) from exc
+            logger.warning(
+                "begin_activity idempotency conflict reused existing intent "
+                "account=%s key=%s event=%s",
+                self.account_id,
+                envelope.idempotency_key,
+                intent_event_id,
+            )
+            archived = None
         except Exception as exc:
             raise ActivityMemoryError(
                 f"activity intent archive failed: {type(exc).__name__}"
             ) from exc
-        if archived is None or getattr(archived, "source_committed", True) is False:
+        if archived is not None:
+            if getattr(archived, "source_committed", True) is False:
+                raise ActivityMemoryError(
+                    "activity intent source commit was not confirmed"
+                )
+            intent_event_id = str(getattr(archived, "event_id", "") or intent_event_id)
+        if not intent_event_id:
             raise ActivityMemoryError("activity intent source commit was not confirmed")
-        intent_event_id = str(getattr(archived, "event_id", "") or "")
         # Seed mid-action working_memory so later steps can replan against it.
         self.update_working_memory(
             str(action_key),
@@ -1077,15 +1137,38 @@ class MemoryBrainService:
             importance=0.65,
             state=terminal,
         )
+        event_id = ""
         try:
             archived = await self.archive_observation_async(envelope)
+        except IdempotencyConflictError as exc:
+            # Terminal outcome for this key already archived (retry / dual-close).
+            # Reuse existing event id; never escalate to account pause.
+            event_id = self._existing_event_id_for_key(envelope.idempotency_key)
+            if not event_id:
+                raise ActivityMemoryError(
+                    f"activity outcome archive failed: {type(exc).__name__}"
+                ) from exc
+            logger.warning(
+                "finish_activity idempotency conflict reused existing outcome "
+                "account=%s key=%s event=%s state=%s",
+                self.account_id,
+                envelope.idempotency_key,
+                event_id,
+                terminal,
+            )
+            archived = None
         except Exception as exc:
             raise ActivityMemoryError(
                 f"activity outcome archive failed: {type(exc).__name__}"
             ) from exc
-        if archived is None or getattr(archived, "source_committed", True) is False:
+        if archived is not None:
+            if getattr(archived, "source_committed", True) is False:
+                raise ActivityMemoryError(
+                    "activity outcome source commit was not confirmed"
+                )
+            event_id = str(getattr(archived, "event_id", "") or event_id)
+        if not event_id:
             raise ActivityMemoryError("activity outcome source commit was not confirmed")
-        event_id = str(getattr(archived, "event_id", "") or "")
         # Write-time light linking (C14/A-MEM-lite): connect completed self acts to
         # recent peer self experiences so dream/creative multi-hop has structure.
         # Ranking only — never deletes. Failures are soft.
@@ -1174,6 +1257,13 @@ class MemoryBrainService:
             "candidates": [
                 {
                     "event_id": item.candidate_id,
+                    "title": item.title,
+                    "summary": item.summary,
+                    "source_type": item.source_type,
+                    "event_type": item.event_type,
+                    "index_status": item.index_status,
+                    "action_state": item.action_state,
+                    "occurred_at": item.occurred_at,
                     "channels": list(item.channels),
                     "channel_ranks": dict(item.channel_ranks),
                     "rrf_score": item.rrf_score,
@@ -1501,6 +1591,20 @@ class MemoryBrainService:
     def find_by_identifiers(self, identifiers: Sequence[str], limit: int = 20):
         return self.store.find_events_by_identifiers(identifiers, limit=limit)
 
+    def _existing_event_id_for_key(self, idempotency_key: str) -> str:
+        """Resolve an already-archived event id for a conflicting idempotency key."""
+        key = str(idempotency_key or "").strip()
+        if not key:
+            return ""
+        try:
+            hits = self.find_by_identifiers([key], limit=1) or []
+        except Exception:
+            return ""
+        if not hits:
+            return ""
+        row = hits[0] if isinstance(hits[0], Mapping) else {}
+        return str(row.get("id") or "").strip()
+
     def list_events(self, **kwargs: Any):
         return self.store.list_events(**kwargs)
 
@@ -1518,6 +1622,15 @@ class MemoryBrainService:
 
     def retry_dead_letter(self, job_id: str) -> bool:
         return self.store.retry_dead_letter(job_id)
+
+    def retry_dead_letters(self, **kwargs: Any) -> int:
+        return self.store.retry_dead_letters(**kwargs)
+
+    def operational_status(self) -> dict[str, Any]:
+        return {
+            "worker": self.worker.runtime_status(),
+            "running": bool(self._worker_task and not self._worker_task.done()),
+        }
 
     def list_recall_traces(self, **kwargs: Any):
         return self.store.list_recall_traces(**kwargs)

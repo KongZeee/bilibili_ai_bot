@@ -2,7 +2,7 @@
 const { defineComponent, h, ref, reactive, computed, onMounted } = window.Vue;
 import { api } from '../api.js';
 import { Card, Button, Badge, Modal, ConfirmModal, createConfirmHelper, FormInput, FormTextarea, FormSelect, Loading, EmptyState, Icon, HeroPanel, ActionList, ProgressBar } from '../components/common.js';
-import { appState, showToast, refreshPersonas, refreshLlm } from '../state.js';
+import { appState, showToast, refreshPersonas, refreshLlm, refreshAccounts } from '../state.js';
 import { navigate } from '../router.js';
 
 export const PersonaListPage = defineComponent({
@@ -100,10 +100,10 @@ export const PersonaListPage = defineComponent({
                 appState.personas = list || [];
                 appState.personasLoaded = true;
 
+                // 必须走 refreshAccounts：同步 sole id + 规范化 id（勿手写 accountsLoaded）
                 if (!appState.accountsLoaded) {
                     try {
-                        appState.accounts = await api.accounts.list();
-                        appState.accountsLoaded = true;
+                        await refreshAccounts();
                     } catch { /* ignore */ }
                 }
 
@@ -420,7 +420,7 @@ export const PersonaListPage = defineComponent({
                                     ]),
                                 h('span', {
                                     style: 'font-size:0.82rem; color:hsl(var(--muted-foreground)); white-space:nowrap;',
-                                }, usage.length > 0 ? `绑定 ${usage.length} 个账号` : '未绑定'),
+                                }, usage.length > 0 ? '当前账号已绑定' : '未绑定'),
                             ]),
                             // 底部按钮：激活/复制/编辑
                             h('div', {

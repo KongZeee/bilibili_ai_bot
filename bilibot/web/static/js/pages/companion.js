@@ -1,8 +1,8 @@
 // pages/companion.js - 陪伴生活页（状态 / 日程 / 日记梦境 / 探索 / 书柜）
 const { defineComponent, h, ref, onMounted, watch, computed } = window.Vue;
 import { api } from '../api.js';
-import { appState, showToast, refreshAccounts } from '../state.js';
-import { Button, Badge, FormSelect, Loading, EmptyState } from '../components/common.js';
+import { appState, showToast, refreshAccounts, getSoleAccountId } from '../state.js';
+import { Button, Badge, Loading, EmptyState } from '../components/common.js';
 
 function panel(eyebrow, title, body, extra) {
     return h('article', {
@@ -101,7 +101,7 @@ function progressBar(cur, max) {
 export const CompanionPage = defineComponent({
     name: 'CompanionPage',
     setup() {
-        const selectedAccount = ref('');
+        const soleAccountId = ref('');
         const loading = ref(false);
         const triggering = ref(false);
         const state = ref(null);
@@ -114,17 +114,24 @@ export const CompanionPage = defineComponent({
         const openNoteId = ref('');
         let loadSeq = 0;
 
+        function resolveSole() {
+            const id = getSoleAccountId() || appState.currentAccountId || '';
+            soleAccountId.value = id || '';
+            return soleAccountId.value;
+        }
+
         async function loadAll() {
-            if (!selectedAccount.value) return;
+            const accId = resolveSole();
+            if (!accId) return;
             const seq = ++loadSeq;
             loading.value = true;
             try {
                 const [st, d, dr, n, b] = await Promise.all([
-                    api.accounts.companion.state(selectedAccount.value),
-                    api.accounts.companion.diaries(selectedAccount.value).catch(() => ({ items: [] })),
-                    api.accounts.companion.dreams(selectedAccount.value).catch(() => ({ latest: null, fragments: [] })),
-                    api.accounts.companion.notes(selectedAccount.value).catch(() => ({ items: [] })),
-                    api.accounts.companion.bookshelf(selectedAccount.value).catch(() => ({ items: [] })),
+                    api.companion.state(accId),
+                    api.companion.diaries(accId).catch(() => ({ items: [] })),
+                    api.companion.dreams(accId).catch(() => ({ latest: null, fragments: [] })),
+                    api.companion.notes(accId).catch(() => ({ items: [] })),
+                    api.companion.bookshelf(accId).catch(() => ({ items: [] })),
                 ]);
                 if (seq !== loadSeq) return;
                 state.value = st;
@@ -144,10 +151,10 @@ export const CompanionPage = defineComponent({
         }
 
         async function trigger(action) {
-            if (!selectedAccount.value) return;
+            if (!resolveSole()) return;
             triggering.value = true;
             try {
-                const res = await api.accounts.companion.trigger(selectedAccount.value, action);
+                const res = await api.companion.trigger(soleAccountId.value, action);
                 // returnEnvelope: { success, data, message }；api.js 已对 success:false 抛错
                 const payload = res && typeof res === 'object' ? res : {};
                 if (payload.success === false) {
@@ -197,32 +204,16 @@ export const CompanionPage = defineComponent({
 
         async function ensureAccountAndLoad() {
             if (!appState.accountsLoaded) await refreshAccounts();
-            if (!selectedAccount.value && appState.accounts.length > 0) {
-                const first = appState.accounts[0];
-                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                // selectedAccount 的 watch 会触发 loadAll
-                return;
-            }
-            if (selectedAccount.value) await loadAll();
+            if (resolveSole()) await loadAll();
         }
 
         onMounted(ensureAccountAndLoad);
         watch(() => appState.accountsLoaded, (loaded) => {
-            if (loaded && !selectedAccount.value && appState.accounts.length > 0) {
-                const first = appState.accounts[0];
-                selectedAccount.value = appState.currentAccountId || first.account_id || first.id;
-                // selectedAccount watch 会触发 loadAll，避免这里再调一次
-            }
+            if (loaded && resolveSole() && !state.value) loadAll();
         });
         watch(() => appState.currentAccountId, (id) => {
-            if (id && id !== selectedAccount.value) {
-                selectedAccount.value = id;
-                // selectedAccount watch 统一 loadAll
-            }
-        });
-        watch(selectedAccount, (id, prev) => {
-            if (id && id !== prev) {
-                // 切换账号：清空旧数据，避免短暂串屏
+            if (id && id !== soleAccountId.value) {
+                soleAccountId.value = id;
                 state.value = null;
                 diaries.value = [];
                 dreams.value = { latest: null, fragments: [] };
@@ -230,8 +221,6 @@ export const CompanionPage = defineComponent({
                 projects.value = [];
                 openBookId.value = '';
                 openNoteId.value = '';
-                loadAll();
-            } else if (id && !state.value) {
                 loadAll();
             }
         });
@@ -242,12 +231,7 @@ export const CompanionPage = defineComponent({
         const cfg = computed(() => (state.value && state.value.config) || {});
 
         return () => {
-            if (loading.value && !state.value && !selectedAccount.value) return h(Loading);
-
-            const accountOptions = (appState.accounts || []).map(a => ({
-                value: a.account_id || a.id,
-                label: a.name || a.account_id || a.id,
-            }));
+            if (loading.value && !state.value && !soleAccountId.value) return h(Loading);
 
             const tabs = [
                 { id: 'overview', label: '总览' },
@@ -279,13 +263,7 @@ export const CompanionPage = defineComponent({
                             h(Button, { type: 'secondary', disabled: triggering.value, onClick: () => trigger('creative') }, () => '续写创作'),
                         ]),
                     ]),
-                    panel('账号与状态', '此刻', [
-                        h(FormSelect, {
-                            modelValue: selectedAccount.value,
-                            'onUpdate:modelValue': (v) => { selectedAccount.value = v; },
-                            options: accountOptions,
-                            placeholder: '选择账号',
-                        }),
+                    panel('生活状态', '此刻', [
                         life.value.energy != null ? energyBar(life.value.energy) : h('span', { class: 'muted' }, '暂无生活状态'),
                         metaRow('心情', life.value.mood_bias),
                         metaRow('当前', life.value.activity),
@@ -307,7 +285,7 @@ export const CompanionPage = defineComponent({
                 loading.value && !state.value
                     ? h(Loading)
                     : !state.value
-                        ? h(EmptyState, { title: '暂无数据', desc: '请选择账号，并在全局配置中启用 companion' })
+                        ? h(EmptyState, { title: '暂无数据', desc: '请先完成 B站登录，并在全局配置中启用 companion' })
                         : renderTab(tab.value),
             ]);
         };

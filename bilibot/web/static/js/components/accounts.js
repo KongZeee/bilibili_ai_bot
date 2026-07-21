@@ -1,4 +1,4 @@
-// components/accounts.js - 账号列表和详情页
+// components/accounts.js - 本机唯一 B站连接（列表 + 详情）
 const { defineComponent, h, ref, reactive, computed, onMounted, watch, onUnmounted } = window.Vue;
 import { api } from '../api.js';
 import { appState, refreshAccounts, showToast } from '../state.js';
@@ -13,7 +13,6 @@ export const AccountListPage = defineComponent({
         const accounts = computed(() => appState.accounts);
         const total = computed(() => accounts.value.length);
         const onlineCount = computed(() => accounts.value.filter(a => a.is_running || a.running).length);
-        const offlineCount = computed(() => total.value - onlineCount.value);
         const firstAccountId = computed(() => accounts.value[0]?.id || null);
 
         // ── 添加账号 Modal ──
@@ -43,9 +42,13 @@ export const AccountListPage = defineComponent({
             }
         }
 
-        // ── 删除账号 ──
+        // ── 删除账号（单账号模式：唯一账号不可删）──
         const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
         function deleteAccount(id) {
+            if (accounts.value.length <= 1) {
+                showToast('不能删除唯一连接', 'warning');
+                return;
+            }
             showConfirm({
                 title: '删除账号',
                 message: '确定删除该账号？此操作不可撤销。',
@@ -61,6 +64,14 @@ export const AccountListPage = defineComponent({
                     }
                 },
             });
+        }
+
+        function openAddModal() {
+            if (accounts.value.length >= 1) {
+                showToast('本机仅支持一个 B站连接', 'warning');
+                return;
+            }
+            showAddModal.value = true;
         }
 
         // ── 编辑账号（跳转详情页）──
@@ -161,17 +172,24 @@ export const AccountListPage = defineComponent({
                     style: 'display:grid;gap:calc(var(--spacing) * 3);padding:calc(var(--spacing) * 5);border:1px solid hsl(var(--accent));background:hsl(var(--accent) / 0.22);border-radius:calc(var(--radius) * 0.82);box-shadow:var(--shadow-xs);align-content:start;',
                 }, [
                     h('div', { style: 'display:grid;gap:calc(var(--spacing) * 1);' }, [
-                        h('span', { class: 'eyebrow' }, '账号管理'),
+                        h('span', { class: 'eyebrow' }, 'B站登录'),
                         h('h2', {
                             style: 'font-size:1.65rem;font-weight:600;line-height:1.18;text-wrap:balance;word-break:keep-all;overflow-wrap:break-word;margin:0;',
-                        }, `${total.value} 个账号已接入`),
+                        }, total.value === 0
+                            ? '尚未登录 B站'
+                            : '本机 Bot 已连接'),
                     ]),
-                    h('div', { style: 'display:flex;align-items:center;gap:calc(var(--spacing) * 3);' }, [
-                        h(Button, { type: 'primary', onClick: () => { showAddModal.value = true; } }, () => [
-                            h(Icon, { name: 'circle-plus', size: '1rem' }),
-                            h('span', '添加账号'),
-                        ]),
-                    ]),
+                    // 单 bot：仅无连接时显示「接入 B站」（onboarding）
+                    total.value === 0
+                        ? h('div', { style: 'display:flex;align-items:center;gap:calc(var(--spacing) * 3);' }, [
+                            h(Button, { type: 'primary', onClick: openAddModal }, () => [
+                                h(Icon, { name: 'circle-plus', size: '1rem' }),
+                                h('span', '接入 B站'),
+                            ]),
+                        ])
+                        : h('p', {
+                            style: 'margin:0;font-size:0.875rem;color:hsl(var(--muted-foreground));',
+                        }, '单 Bot 模式 · 可切换人格与模型'),
                 ]),
                 // 右侧：KPI 面板（Card 样式）
                 h('article', {
@@ -179,11 +197,13 @@ export const AccountListPage = defineComponent({
                 }, [
                     h('div', { style: 'display:grid;gap:calc(var(--spacing) * 1);' }, [
                         h('span', { class: 'eyebrow' }, '运行状态'),
-                        h('h2', { style: 'font-size:1.25rem;font-weight:600;line-height:1.2;margin:0;' }, '在线账号'),
+                        h('h2', { style: 'font-size:1.25rem;font-weight:600;line-height:1.2;margin:0;' }, '运行状态'),
                     ]),
                     h('div', {
                         style: 'font-size:2.25rem;font-weight:600;white-space:nowrap;line-height:1;color:hsl(var(--foreground));font-variant-numeric:tabular-nums;',
-                    }, `${onlineCount.value} / ${total.value}`),
+                    }, total.value === 0
+                        ? '—'
+                        : (onlineCount.value > 0 ? '在线' : '离线')),
                     h(ProgressBar, {
                         value: onlineCount.value,
                         max: total.value || 1,
@@ -194,13 +214,13 @@ export const AccountListPage = defineComponent({
                             style: 'display:inline-flex;align-items:center;gap:0.375rem;font-size:0.75rem;white-space:nowrap;color:hsl(var(--accent-foreground));',
                         }, [
                             h('span', { style: 'display:inline-block;width:0.375rem;height:0.375rem;border-radius:999px;background:hsl(var(--chart-4));' }),
-                            `在线 ${onlineCount.value}`,
+                            onlineCount.value > 0 ? 'Bot 运行中' : 'Bot 未运行',
                         ]),
                         h('span', {
                             style: 'display:inline-flex;align-items:center;gap:0.375rem;font-size:0.75rem;white-space:nowrap;color:hsl(var(--muted-foreground));',
                         }, [
                             h('span', { style: 'display:inline-block;width:0.375rem;height:0.375rem;border-radius:999px;background:hsl(var(--muted-foreground));' }),
-                            `离线 ${offlineCount.value}`,
+                            total.value === 0 ? '未接入' : '单账号',
                         ]),
                     ]),
                 ]),
@@ -215,12 +235,12 @@ export const AccountListPage = defineComponent({
                     style: 'display:flex;align-items:flex-start;justify-content:space-between;gap:calc(var(--spacing) * 4);',
                 }, [
                     h('div', { style: 'display:grid;gap:calc(var(--spacing) * 1);' }, [
-                        h('span', { class: 'eyebrow' }, '账号明细'),
-                        h('h2', { style: 'font-size:1.25rem;font-weight:600;line-height:1.2;margin:0;' }, '接入列表'),
+                        h('span', { class: 'eyebrow' }, '连接明细'),
+                        h('h2', { style: 'font-size:1.25rem;font-weight:600;line-height:1.2;margin:0;' }, '本机连接'),
                     ]),
                     h('span', {
                         style: 'display:inline-flex;align-items:center;gap:0.375rem;padding:0.25rem 0.625rem;font-size:0.75rem;white-space:nowrap;background:hsl(var(--muted));color:hsl(var(--accent-foreground));border-radius:999px;',
-                    }, `共 ${total.value} 个账号`),
+                    }, total.value === 0 ? '未接入' : '已接入'),
                 ]),
                 // 表格内容
                 !appState.accountsLoaded
@@ -229,7 +249,7 @@ export const AccountListPage = defineComponent({
                         ? h(EmptyState, {
                             icon: 'user',
                             title: '暂无账号',
-                            desc: '点击上方"添加账号"按钮创建第一个账号',
+                            desc: '点击上方「接入 B站」完成配置（仅支持一个 B站账号）',
                         })
                         : h('div', { style: 'overflow-x:auto;' }, [
                             h('div', { style: 'min-width:780px;display:grid;gap:0;' }, [
@@ -280,12 +300,15 @@ export const AccountListPage = defineComponent({
                                                 onClick: () => editAccount(acc.id),
                                                 style: iconBtnStyle,
                                             }, [h(Icon, { name: 'pen-line', size: '1rem' })]),
-                                            h('button', {
-                                                type: 'button',
-                                                'aria-label': '删除',
-                                                onClick: () => deleteAccount(acc.id),
-                                                style: iconBtnStyle + 'color:hsl(var(--destructive));',
-                                            }, [h(Icon, { name: 'trash-2', size: '1rem' })]),
+                                            // 单账号模式：唯一账号不提供删除入口
+                                            total.value > 1
+                                                ? h('button', {
+                                                    type: 'button',
+                                                    'aria-label': '删除',
+                                                    onClick: () => deleteAccount(acc.id),
+                                                    style: iconBtnStyle + 'color:hsl(var(--destructive));',
+                                                }, [h(Icon, { name: 'trash-2', size: '1rem' })])
+                                                : null,
                                         ]),
                                     ]);
                                 }),
@@ -355,7 +378,9 @@ export const AccountListPage = defineComponent({
                     ]),
                     h(ActionList, {
                         items: [
-                            { iconName: 'user', label: '添加账号', onClick: () => { showAddModal.value = true; } },
+                            ...(total.value === 0
+                                ? [{ iconName: 'user', label: '添加账号', onClick: openAddModal }]
+                                : []),
                             {
                                 iconName: 'pen-line',
                                 label: '编辑账号',
@@ -464,81 +489,80 @@ function ghostBtn(label, opts = {}) {
     ].filter(Boolean));
 }
 
-// ── 1. AccountInfoTab ──
-const AccountInfoTab = defineComponent({
-    name: 'AccountInfoTab',
-    props: { account: Object },
-    emits: ['save', 'delete'],
-    setup(props, { emit }) {
-        // 兼容后端 uid / name 与表单 dede_user_id / nickname 字段
-        const form = ref({
-            ...props.account,
-            dede_user_id: props.account?.dede_user_id || props.account?.uid || '',
-            nickname: props.account?.nickname || props.account?.name || '',
-            note: props.account?.note || '',
-        });
-        const saving = ref(false);
+// ── 1. AccountInfoTab（单账号：不展示删除入口）──
+	const AccountInfoTab = defineComponent({
+	    name: 'AccountInfoTab',
+	    props: { account: Object },
+	    emits: ['save'],
+	    setup(props, { emit }) {
+	        // 兼容后端 uid / name 与表单 dede_user_id / nickname 字段
+	        const form = ref({
+	            ...props.account,
+	            dede_user_id: props.account?.dede_user_id || props.account?.uid || '',
+	            nickname: props.account?.nickname || props.account?.name || '',
+	            note: props.account?.note || '',
+	        });
+	        const saving = ref(false);
 
-        async function handleSave() {
-            saving.value = true;
-            try {
-                emit('save', {
-                    ...form.value,
-                    // 写回后端识别的字段
-                    name: form.value.nickname || form.value.name,
-                    dede_user_id: form.value.dede_user_id,
-                    note: form.value.note,
-                });
-            } finally {
-                saving.value = false;
-            }
-        }
+	        async function handleSave() {
+	            saving.value = true;
+	            try {
+	                emit('save', {
+	                    ...form.value,
+	                    // 写回后端识别的字段
+	                    name: form.value.nickname || form.value.name,
+	                    dede_user_id: form.value.dede_user_id,
+	                    note: form.value.note,
+	                });
+	            } finally {
+	                saving.value = false;
+	            }
+	        }
 
-        return () => h('article', {
-            class: 'grid gap-3',
-            style: detailCardStyle,
-        }, [
-            h('div', { class: 'card-header' }, [
-                h('div', { class: 'grid gap-1' }, [
-                    h('span', { class: 'eyebrow' }, '账号信息'),
-                    h('h2', { style: detailHeadingStyle }, '基本资料'),
-                ]),
-            ]),
-            h('div', { class: 'card-body', style: detailCardBodyStyle }, [
-                h(FormInput, {
-                    label: '账号 UID',
-                    modelValue: form.value.dede_user_id,
-                    'onUpdate:modelValue': (v) => form.value.dede_user_id = v,
-                    id: 'info-uid', name: 'info-uid',
-                    autocomplete: 'off', spellcheck: false,
-                    placeholder: 'B站用户 UID',
-                }),
-                h(FormInput, {
-                    label: '昵称',
-                    modelValue: form.value.nickname || form.value.name || '',
-                    'onUpdate:modelValue': (v) => form.value.nickname = v,
-                    id: 'info-nickname', name: 'info-nickname',
-                    autocomplete: 'off', spellcheck: false,
-                    placeholder: '账号显示名称',
-                }),
-                h(FormInput, {
-                    label: '备注',
-                    modelValue: form.value.note || '',
-                    'onUpdate:modelValue': (v) => form.value.note = v,
-                    id: 'info-note', name: 'info-note',
-                    autocomplete: 'off', spellcheck: false,
-                    placeholder: '可选备注',
-                }),
-                h('div', {
-                    style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 2); flex-wrap:wrap;',
-                }, [
-                    primaryBtn('保存', { loading: saving.value, onClick: handleSave }),
-                    ghostBtn('删除', { onClick: () => emit('delete') }),
-                ]),
-            ]),
-        ]);
-    },
-});
+	        return () => h('article', {
+	            class: 'grid gap-3',
+	            style: detailCardStyle,
+	        }, [
+	            h('div', { class: 'card-header' }, [
+	                h('div', { class: 'grid gap-1' }, [
+	                    h('span', { class: 'eyebrow' }, '账号信息'),
+	                    h('h2', { style: detailHeadingStyle }, '基本资料'),
+	                ]),
+	            ]),
+	            h('div', { class: 'card-body', style: detailCardBodyStyle }, [
+	                h(FormInput, {
+	                    label: '账号 UID',
+	                    modelValue: form.value.dede_user_id,
+	                    'onUpdate:modelValue': (v) => form.value.dede_user_id = v,
+	                    id: 'info-uid', name: 'info-uid',
+	                    autocomplete: 'off', spellcheck: false,
+	                    placeholder: 'B站用户 UID',
+	                }),
+	                h(FormInput, {
+	                    label: '昵称',
+	                    modelValue: form.value.nickname || form.value.name || '',
+	                    'onUpdate:modelValue': (v) => form.value.nickname = v,
+	                    id: 'info-nickname', name: 'info-nickname',
+	                    autocomplete: 'off', spellcheck: false,
+	                    placeholder: '账号显示名称',
+	                }),
+	                h(FormInput, {
+	                    label: '备注',
+	                    modelValue: form.value.note || '',
+	                    'onUpdate:modelValue': (v) => form.value.note = v,
+	                    id: 'info-note', name: 'info-note',
+	                    autocomplete: 'off', spellcheck: false,
+	                    placeholder: '可选备注',
+	                }),
+	                h('div', {
+	                    style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 2); flex-wrap:wrap;',
+	                }, [
+	                    primaryBtn('保存', { loading: saving.value, onClick: handleSave }),
+	                ]),
+	            ]),
+	        ]);
+	    },
+	});
 
 // ── 2. AccountLoginTab ──
 const AccountLoginTab = defineComponent({
@@ -866,13 +890,12 @@ const AccountPersonaTab = defineComponent({
     },
 });
 
-// ── 5. AccountStatusTab ──
+// ── 5. AccountStatusTab（单账号：无「设为默认」）──
 const AccountStatusTab = defineComponent({
     name: 'AccountStatusTab',
     props: { account: Object },
     setup(props) {
         const operating = ref(false);
-        const settingDefault = ref(false);
 
         async function start() {
             operating.value = true;
@@ -896,70 +919,33 @@ const AccountStatusTab = defineComponent({
             } finally { operating.value = false; }
         }
 
-        async function setDefault() {
-            settingDefault.value = true;
-            try {
-                await api.accounts.setDefault(props.account.id);
-                showToast('已设为默认账号', 'success');
-                await refreshAccounts();
-            } catch (e) {
-                showToast('设置失败: ' + e.message, 'error');
-            } finally { settingDefault.value = false; }
-        }
-
         return () => h('div', { style: 'display:grid; gap:calc(var(--spacing) * 4);' }, [
-            // 两个 Card 并排
-            h('div', {
-                style: 'display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:calc(var(--spacing) * 4);',
+            // 运行状态 Card
+            h('article', {
+                class: 'grid gap-3',
+                style: detailCardStyle,
             }, [
-                // Card A: 运行状态
-                h('article', {
-                    class: 'grid gap-3',
-                    style: detailCardStyle,
-                }, [
-                    h('div', { class: 'card-header' }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '运行状态'),
-                            h('h2', { style: detailHeadingStyle }, '账号运行'),
-                        ]),
-                    ]),
-                    h('div', { class: 'card-body', style: detailCardBodyStyle }, [
-                        h('div', {
-                            style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 2);',
-                        }, [
-                            h(StatusDot, {
-                                status: (props.account.running || props.account.is_running) ? 'online' : 'offline',
-                                label: (props.account.running || props.account.is_running) ? '运行中' : '已停止',
-                            }),
-                        ]),
-                        props.account.last_error
-                            ? h('div', { class: 'form-error' }, '最后错误: ' + props.account.last_error)
-                            : null,
+                h('div', { class: 'card-header' }, [
+                    h('div', { class: 'grid gap-1' }, [
+                        h('span', { class: 'eyebrow' }, '运行状态'),
+                        h('h2', { style: detailHeadingStyle }, '账号运行'),
                     ]),
                 ]),
-                // Card B: 默认账号状态
-                h('article', {
-                    class: 'grid gap-3',
-                    style: detailCardStyle,
-                }, [
-                    h('div', { class: 'card-header' }, [
-                        h('div', { class: 'grid gap-1' }, [
-                            h('span', { class: 'eyebrow' }, '默认账号'),
-                            h('h2', { style: detailHeadingStyle }, '默认状态'),
-                        ]),
+                h('div', { class: 'card-body', style: detailCardBodyStyle }, [
+                    h('div', {
+                        style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 2);',
+                    }, [
+                        h(StatusDot, {
+                            status: (props.account.running || props.account.is_running) ? 'online' : 'offline',
+                            label: (props.account.running || props.account.is_running) ? '运行中' : '已停止',
+                        }),
                     ]),
-                    h('div', { class: 'card-body', style: detailCardBodyStyle }, [
-                        h('div', {
-                            style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 2);',
-                        }, [
-                            props.account.is_default
-                                ? h(Badge, { type: 'success' }, () => '默认账号')
-                                : h(Badge, { type: 'info' }, () => '非默认'),
-                        ]),
-                    ]),
+                    props.account.last_error
+                        ? h('div', { class: 'form-error' }, '最后错误: ' + props.account.last_error)
+                        : null,
                 ]),
             ]),
-            // 底部按钮区
+            // 底部按钮区：启动 / 停止（单账号无「设为默认」）
             h('div', {
                 style: 'display:flex; align-items:center; gap:calc(var(--spacing) * 2); flex-wrap:wrap;',
             }, [
@@ -973,12 +959,6 @@ const AccountStatusTab = defineComponent({
                     disabled: !(props.account.running || props.account.is_running),
                     onClick: stop,
                 }),
-                !props.account.is_default
-                    ? ghostBtn('设为默认', {
-                        loading: settingDefault.value,
-                        onClick: setDefault,
-                    })
-                    : null,
             ]),
         ]);
     },
@@ -1010,26 +990,6 @@ export const AccountDetailPage = defineComponent({
             } catch (e) {
                 showToast('保存失败: ' + e.message, 'error');
             }
-        }
-
-        const { state: confirmState, showConfirm, handleConfirm } = createConfirmHelper();
-        function deleteAccount() {
-            showConfirm({
-                title: '删除账号',
-                message: `确定删除账号 ${accountId.value}？此操作不可撤销。`,
-                confirmText: '删除',
-                danger: true,
-                action: async () => {
-                    try {
-                        await api.accounts.delete(accountId.value);
-                        showToast('账号已删除', 'success');
-                        navigate('/accounts');
-                        await refreshAccounts();
-                    } catch (e) {
-                        showToast('删除失败: ' + e.message, 'error');
-                    }
-                },
-            });
         }
 
         onMounted(() => { if (!appState.accountsLoaded) refreshAccounts(); });
@@ -1083,7 +1043,6 @@ export const AccountDetailPage = defineComponent({
                         h('h2', {
                             style: 'margin:0; font-size:1.5rem; font-weight:600; line-height:1.2; text-wrap:balance; word-break:keep-all; overflow-wrap:break-word;',
                         }, account.value.nickname || account.value.name || account.value.id),
-                        account.value.is_default ? h(Badge, { type: 'info' }, () => '默认') : null,
                     ]),
                 ]),
                 // Tab 切换
@@ -1096,26 +1055,12 @@ export const AccountDetailPage = defineComponent({
                         onClick: () => activeTab.value = t.id,
                     }, t.label))
                 ),
-                // Tab 内容
-                activeTab.value === 'info' ? h(AccountInfoTab, { account: account.value, onSave: saveInfo, onDelete: deleteAccount }) : null,
+                // Tab 内容（单账号：无删除入口）
+                activeTab.value === 'info' ? h(AccountInfoTab, { account: account.value, onSave: saveInfo }) : null,
                 activeTab.value === 'login' ? h(AccountLoginTab, { account: account.value }) : null,
                 activeTab.value === 'llm' ? h(AccountLlmTab, { account: account.value }) : null,
                 activeTab.value === 'persona' ? h(AccountPersonaTab, { account: account.value }) : null,
                 activeTab.value === 'status' ? h(AccountStatusTab, { account: account.value }) : null,
-
-                // ═══ 统一确认对话框 ═══
-                h(ConfirmModal, {
-                    modelValue: confirmState.visible,
-                    title: confirmState.title,
-                    message: confirmState.message,
-                    confirmText: confirmState.confirmText,
-                    cancelText: confirmState.cancelText,
-                    danger: confirmState.danger,
-                    prompt: confirmState.prompt,
-                    promptPlaceholder: confirmState.promptPlaceholder,
-                    'onUpdate:modelValue': (v) => confirmState.visible = v,
-                    onConfirm: handleConfirm,
-                }),
             ]);
         };
     },

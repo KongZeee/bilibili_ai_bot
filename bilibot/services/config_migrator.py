@@ -95,10 +95,15 @@ def migrate_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     # 旧容量/遗忘字段保留，便于配置回滚和审计，但 V6 运行时不再消费。
     memory_cfg = migrated.setdefault("memory", {})
     v6_memory_defaults = {
-        "recall_candidate_limit": 20,
+        "recall_candidate_limit": 12,
         "recall_inject_limit": 5,
         "recall_association_limit": 2,
+        "rerank_timeout_seconds": 8.0,
+        "recall_total_timeout_seconds": 10.0,
         "rerank_relevance_baseline": 0.65,
+        "enrichment_chat_timeout_seconds": 12.0,
+        "link_candidate_limit": 12,
+        "link_job_max_attempts": 3,
         "prompt_char_budget": 5000,
         "chunk_target_chars": 600,
         "chunk_hard_chars": 900,

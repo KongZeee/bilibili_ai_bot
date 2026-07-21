@@ -61,6 +61,7 @@ _JOB_TYPES = {
     "link_associations",
 }
 _EVENT_EMBEDDING_TITLE_LIMIT = 256
+_ENTITY_TYPE_TAXONOMY_VERSION = "1"
 _HEALTH_REQUIRED_TABLES = frozenset(
     {
         "brain_info",
@@ -85,6 +86,163 @@ _HEALTH_REQUIRED_TABLES = frozenset(
         "bangumi_watch_state",
     }
 )
+
+
+def normalize_entity_type(value: Any) -> str:
+    """Collapse free-form model labels into a stable entity taxonomy."""
+
+    raw = unicodedata.normalize("NFKC", str(value or "")).strip().casefold()
+    compact = re.sub(r"[\s_\-]+", " ", raw)
+    if not compact:
+        return "topic"
+    rules = (
+        ("character", ("character", "fictional", "角色")),
+        (
+            "person",
+            (
+                "person",
+                "creator",
+                "author",
+                "up主",
+                "up host",
+                "historical figure",
+                "handle",
+                "user id",
+                "user_id",
+                "人物",
+                "人名",
+            ),
+        ),
+        (
+            "organization",
+            (
+                "organization",
+                "organisation",
+                "company",
+                "brand",
+                "platform",
+                "server",
+                "group",
+                "组织",
+                "机构",
+            ),
+        ),
+        (
+            "location",
+            (
+                "location",
+                "country",
+                "city",
+                "place",
+                "geographic",
+                "faction",
+                "world",
+                "地点",
+                "地区",
+                "国家",
+            ),
+        ),
+        (
+            "work",
+            (
+                "work",
+                "video",
+                "game",
+                "song",
+                "tv series",
+                "media franchise",
+                "channel/series",
+                "title",
+                "作品",
+                "视频",
+                "游戏",
+                "歌曲",
+            ),
+        ),
+        ("event", ("event", "challenge", "exam", "crime", "事件", "活动")),
+        (
+            "animal",
+            (
+                "animal",
+                "organism",
+                "species",
+                "creature",
+                "pet",
+                "plant",
+                "taxonomic",
+                "动物",
+                "生物",
+                "植物",
+            ),
+        ),
+        (
+            "food",
+            (
+                "food",
+                "dish",
+                "cuisine",
+                "ingredient",
+                "condiment",
+                "drink",
+                "菜",
+                "食物",
+                "饮料",
+                "原料",
+            ),
+        ),
+        (
+            "product",
+            (
+                "product",
+                "object",
+                "item",
+                "prop",
+                "artifact",
+                "vehicle",
+                "material",
+                "outfit",
+                "产品",
+                "物品",
+                "道具",
+            ),
+        ),
+        (
+            "activity",
+            ("activity", "action", "dance", "行为", "动作"),
+        ),
+        (
+            "time",
+            ("date", "timeperiod", "geologicalperiod", "time period", "日期", "时间"),
+        ),
+        (
+            "concept",
+            (
+                "concept",
+                "subject",
+                "ability",
+                "skill",
+                "technique",
+                "law",
+                "principle",
+                "language",
+                "meme",
+                "phenomenon",
+                "role",
+                "class",
+                "feature",
+                "version",
+                "hashtag",
+                "slang",
+                "概念",
+                "技能",
+                "话题",
+            ),
+        ),
+    )
+    for canonical, needles in rules:
+        if any(needle in compact for needle in needles):
+            return canonical
+    return "topic"
 
 
 SCHEMA_SQL = r"""
@@ -750,6 +908,7 @@ class MemoryBrainStore:
         chunk_hard_tokens: int = 700,
         chunk_overlap_chars: int = 100,
         job_max_attempts: int = 8,
+        link_job_max_attempts: int = 3,
         vector_batch_size: int = 2048,
         vector_cache_limit: int = 50_000,
     ) -> None:
@@ -765,6 +924,7 @@ class MemoryBrainStore:
             chunk_hard_tokens=chunk_hard_tokens,
             chunk_overlap_chars=chunk_overlap_chars,
             job_max_attempts=job_max_attempts,
+            link_job_max_attempts=link_job_max_attempts,
             vector_batch_size=vector_batch_size,
             vector_cache_limit=vector_cache_limit,
         )
@@ -780,6 +940,7 @@ class MemoryBrainStore:
         chunk_hard_tokens: int = 700,
         chunk_overlap_chars: int = 100,
         job_max_attempts: int = 8,
+        link_job_max_attempts: int = 3,
         vector_batch_size: int = 2048,
         vector_cache_limit: int = 50_000,
     ) -> None:
@@ -789,6 +950,9 @@ class MemoryBrainStore:
         self.chunk_hard_tokens = max(self.chunk_target_tokens, int(chunk_hard_tokens))
         self.chunk_overlap_chars = max(0, int(chunk_overlap_chars))
         self.job_max_attempts = max(1, int(job_max_attempts))
+        self.link_job_max_attempts = max(
+            1, min(self.job_max_attempts, int(link_job_max_attempts))
+        )
         with self._vector_cache_lock:
             self.vector_batch_size = max(1, int(vector_batch_size))
             self.vector_cache_limit = max(0, int(vector_cache_limit))
@@ -840,6 +1004,31 @@ class MemoryBrainStore:
                     "INSERT OR IGNORE INTO schema_migrations(version,name,applied_at) VALUES(?,?,?)",
                     (2, "recall_trace_and_observation_metadata", now),
                 )
+                taxonomy = conn.execute(
+                    "SELECT value FROM brain_info WHERE key='entity_type_taxonomy_version'"
+                ).fetchone()
+                if not taxonomy or str(taxonomy["value"] or "") != _ENTITY_TYPE_TAXONOMY_VERSION:
+                    entity_rows = conn.execute(
+                        "SELECT id,entity_type FROM memory_entities"
+                    ).fetchall()
+                    updates = []
+                    for row in entity_rows:
+                        normalized_type = normalize_entity_type(row["entity_type"])
+                        if normalized_type != str(row["entity_type"] or ""):
+                            updates.append((normalized_type, row["id"]))
+                    if updates:
+                        conn.executemany(
+                            "UPDATE memory_entities SET entity_type=?,updated_at=? WHERE id=?",
+                            [
+                                (entity_type, now, entity_id)
+                                for entity_type, entity_id in updates
+                            ],
+                        )
+                    conn.execute(
+                        "INSERT INTO brain_info(key,value,updated_at) VALUES(?,?,?) "
+                        "ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at",
+                        ("entity_type_taxonomy_version", _ENTITY_TYPE_TAXONOMY_VERSION, now),
+                    )
                 existing_account = conn.execute(
                     "SELECT value FROM brain_info WHERE key='account_id'"
                 ).fetchone()
@@ -1218,11 +1407,23 @@ class MemoryBrainStore:
                             job_type,
                             event_id,
                             _json_dumps({"event_id": event_id}),
-                            self.job_max_attempts,
+                            (
+                                self.link_job_max_attempts
+                                if job_type == "link_associations"
+                                else self.job_max_attempts
+                            ),
                             now,
                             now,
                             now,
                         ),
+                    )
+                if not job_ids:
+                    # Raw source, observations, chunks and FTS are committed in
+                    # this transaction. Events with no derived work are ready
+                    # immediately instead of remaining permanently "pending".
+                    conn.execute(
+                        "UPDATE memory_events SET index_status='ready',updated_at=? WHERE id=?",
+                        (now, event_id),
                     )
                 conn.commit()
                 return ArchiveResult(
@@ -1289,6 +1490,7 @@ class MemoryBrainStore:
         offset: int = 0,
         source_type: str | None = None,
         status: str | None = None,
+        exclude_intents: bool = False,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1298,6 +1500,10 @@ class MemoryBrainStore:
         if status:
             clauses.append("index_status=?")
             params.append(status)
+        if exclude_intents:
+            clauses.append(
+                "coalesce(json_extract(metadata_json,'$.action_state'),'')!='intent'"
+            )
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         params.extend((max(1, min(int(limit), 500)), max(0, int(offset))))
         conn = self._connect()
@@ -1307,6 +1513,37 @@ class MemoryBrainStore:
                 params,
             ).fetchall()
             return [self._event_row(row) for row in rows]
+        finally:
+            conn.close()
+
+    def count_events(
+        self,
+        *,
+        source_type: str | None = None,
+        status: str | None = None,
+        exclude_intents: bool = False,
+    ) -> int:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source_type:
+            clauses.append("source_type=?")
+            params.append(source_type)
+        if status:
+            clauses.append("index_status=?")
+            params.append(status)
+        if exclude_intents:
+            clauses.append(
+                "coalesce(json_extract(metadata_json,'$.action_state'),'')!='intent'"
+            )
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        conn = self._connect()
+        try:
+            return int(
+                conn.execute(
+                    f"SELECT count(*) FROM memory_events {where}", params
+                ).fetchone()[0]
+                or 0
+            )
         finally:
             conn.close()
 
@@ -1404,6 +1641,7 @@ class MemoryBrainStore:
     def stats(self) -> dict[str, Any]:
         conn = self._connect()
         try:
+            now = time.time()
             table_counts = {}
             for table in (
                 "memory_events",
@@ -1440,6 +1678,136 @@ class MemoryBrainStore:
                     "SELECT index_status,count(*) AS count FROM memory_events GROUP BY index_status"
                 ).fetchall()
             }
+            newest_event_at = float(
+                conn.execute("SELECT coalesce(max(created_at),0) FROM memory_events").fetchone()[0]
+                or 0.0
+            )
+            events_last_30m = int(
+                conn.execute(
+                    "SELECT count(*) FROM memory_events WHERE created_at>=?", (now - 1800.0,)
+                ).fetchone()[0]
+                or 0
+            )
+            active_job_row = conn.execute(
+                """SELECT min(created_at) AS oldest_created_at,
+                          min(available_at) AS oldest_available_at
+                   FROM brain_jobs
+                   WHERE status IN ('pending','processing','retry','blocked')"""
+            ).fetchone()
+            recall_rows = conn.execute(
+                """SELECT used_fallback,rerank_status,channel_errors_json,
+                          latency_ms,prompt_chars
+                   FROM recall_traces WHERE created_at>=?
+                   ORDER BY created_at""",
+                (now - 1800.0,),
+            ).fetchall()
+            job_detail_rows = conn.execute(
+                """SELECT job_type,status,last_error,created_at,updated_at
+                   FROM brain_jobs"""
+            ).fetchall()
+            canonical_rows = conn.execute(
+                """SELECT e.id,e.event_type,e.created_at,e.metadata_json,s.full_text
+                   FROM memory_events e
+                   LEFT JOIN memory_sources s ON s.event_id=e.id AND s.ordinal=0
+                   WHERE e.event_type IN ('daily_plan','life_detail','diary','dream')
+                   ORDER BY e.created_at DESC"""
+            ).fetchall()
+
+            def _median(values: Sequence[float]) -> float:
+                ordered = sorted(float(value or 0.0) for value in values)
+                count = len(ordered)
+                if not count:
+                    return 0.0
+                middle = count // 2
+                if count % 2:
+                    return ordered[middle]
+                return (ordered[middle - 1] + ordered[middle]) / 2.0
+
+            def _percentile(values: Sequence[float], percentile: float) -> float:
+                ordered = sorted(float(value or 0.0) for value in values)
+                if not ordered:
+                    return 0.0
+                rank = max(0, math.ceil((len(ordered) * percentile) - 1))
+                return ordered[min(rank, len(ordered) - 1)]
+
+            def _error_kind(value: Any) -> str:
+                text = str(value or "").strip()
+                if not text:
+                    return "none"
+                head = text.split(":", 1)[0].strip()
+                return head[:80] or "unknown"
+
+            fallback_count = sum(int(row["used_fallback"] or 0) for row in recall_rows)
+            recall_latencies = [float(row["latency_ms"] or 0.0) for row in recall_rows]
+            timeout_count = 0
+            error_count = 0
+            rerank_statuses: dict[str, int] = {}
+            for row in recall_rows:
+                rerank_status = str(row["rerank_status"] or "unknown")
+                rerank_statuses[rerank_status] = rerank_statuses.get(rerank_status, 0) + 1
+                channel_errors = str(row["channel_errors_json"] or "{}")
+                if "timeout" in rerank_status.casefold() or "timeout" in channel_errors.casefold():
+                    timeout_count += 1
+                if (
+                    rerank_status.startswith("error:")
+                    or channel_errors not in {"", "{}", "null"}
+                ):
+                    error_count += 1
+            active_jobs_by_type: dict[str, int] = {}
+            dead_jobs_by_type: dict[str, int] = {}
+            failures_by_type: dict[str, dict[str, int]] = {}
+            for row in job_detail_rows:
+                job_type = str(row["job_type"] or "unknown")
+                status = str(row["status"] or "unknown")
+                if status in {"pending", "processing", "retry", "blocked"}:
+                    active_jobs_by_type[job_type] = active_jobs_by_type.get(job_type, 0) + 1
+                if status == "dead":
+                    dead_jobs_by_type[job_type] = dead_jobs_by_type.get(job_type, 0) + 1
+                if status in {"retry", "blocked", "dead"}:
+                    kind = _error_kind(row["last_error"])
+                    bucket = failures_by_type.setdefault(job_type, {})
+                    bucket[kind] = bucket.get(kind, 0) + 1
+            oldest_created_at = float(active_job_row["oldest_created_at"] or 0.0)
+            latest_canonical: dict[str, dict[str, Any]] = {}
+            for row in canonical_rows:
+                kind = str(row["event_type"] or "")
+                if not kind or kind in latest_canonical:
+                    continue
+                try:
+                    metadata = json.loads(row["metadata_json"] or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    metadata = {}
+                body = str(row["full_text"] or "")
+                expected_hash = str(metadata.get("canonical_sha256") or "")
+                expected_chars_raw = metadata.get("canonical_chars")
+                try:
+                    expected_chars = int(expected_chars_raw)
+                except (TypeError, ValueError):
+                    expected_chars = None
+                actual_hash = hashlib.sha256(
+                    body.encode("utf-8", errors="ignore")
+                ).hexdigest()
+                metadata_present = bool(expected_hash) and expected_chars is not None
+                verified = bool(
+                    metadata_present
+                    and expected_hash == actual_hash
+                    and expected_chars == len(body)
+                )
+                latest_canonical[kind] = {
+                    "event_id": str(row["id"] or ""),
+                    "created_at": float(row["created_at"] or 0.0),
+                    "metadata_present": metadata_present,
+                    "verified": verified,
+                    "expected_chars": expected_chars,
+                    "actual_chars": len(body),
+                }
+            canonical_checked = len(latest_canonical)
+            canonical_verified = sum(
+                1 for item in latest_canonical.values() if item["verified"]
+            )
+            canonical_missing_metadata = sum(
+                1 for item in latest_canonical.values() if not item["metadata_present"]
+            )
             return {
                 "account_id": self.account_id,
                 "db_path": str(self.db_path),
@@ -1449,6 +1817,56 @@ class MemoryBrainStore:
                 "event_types": event_type_counts,
                 "index_statuses": index_status_counts,
                 "schema_version": SCHEMA_VERSION,
+                "operations": {
+                    "events_last_30m": events_last_30m,
+                    "newest_event_at": newest_event_at,
+                    "event_freshness_seconds": (
+                        max(0.0, now - newest_event_at) if newest_event_at else None
+                    ),
+                    "active_jobs": sum(
+                        int(job_counts.get(status) or 0)
+                        for status in ("pending", "processing", "retry", "blocked")
+                    ),
+                    "active_jobs_by_type": active_jobs_by_type,
+                    "dead_jobs_by_type": dead_jobs_by_type,
+                    "job_failures_by_type": failures_by_type,
+                    "oldest_active_job_at": oldest_created_at or None,
+                    "oldest_active_job_age_seconds": (
+                        max(0.0, now - oldest_created_at) if oldest_created_at else None
+                    ),
+                    "recall_last_30m": {
+                        "count": len(recall_rows),
+                        "fallback_count": fallback_count,
+                        "fallback_rate": (
+                            fallback_count / len(recall_rows) if recall_rows else 0.0
+                        ),
+                        "latency_ms_p50": _median(
+                            recall_latencies
+                        ),
+                        "latency_ms_p95": _percentile(recall_latencies, 0.95),
+                        "latency_ms_max": max(recall_latencies, default=0.0),
+                        "timeout_count": timeout_count,
+                        "timeout_rate": (
+                            timeout_count / len(recall_rows) if recall_rows else 0.0
+                        ),
+                        "error_count": error_count,
+                        "rerank_statuses": rerank_statuses,
+                        "prompt_chars_p50": int(
+                            round(
+                                _median(
+                                    [float(row["prompt_chars"] or 0.0) for row in recall_rows]
+                                )
+                            )
+                        ),
+                    },
+                    "canonical_documents": {
+                        "checked": canonical_checked,
+                        "verified": canonical_verified,
+                        "mismatch": canonical_checked - canonical_verified,
+                        "missing_metadata": canonical_missing_metadata,
+                        "latest": latest_canonical,
+                    },
+                },
             }
         finally:
             conn.close()
@@ -2183,7 +2601,9 @@ class MemoryBrainStore:
                             entity_id,
                             name,
                             normalized,
-                            str(item.get("type") or item.get("entity_type") or "topic"),
+                            normalize_entity_type(
+                                item.get("type") or item.get("entity_type") or "topic"
+                            ),
                             _json_dumps(item.get("metadata") or {}),
                             now,
                             now,
@@ -2442,7 +2862,11 @@ class MemoryBrainStore:
                 conn.execute("BEGIN IMMEDIATE")
                 rows = conn.execute(
                     f"SELECT * FROM brain_jobs WHERE {' AND '.join(clauses)} "
-                    "ORDER BY available_at,created_at,id LIMIT ?",
+                    "ORDER BY CASE job_type "
+                    "WHEN 'embed_event' THEN 0 WHEN 'embed_chunks' THEN 1 "
+                    "WHEN 'summarize_event' THEN 2 WHEN 'extract_entities' THEN 3 "
+                    "WHEN 'link_associations' THEN 4 ELSE 5 END,"
+                    "available_at,created_at,id LIMIT ?",
                     params,
                 ).fetchall()
                 jobs: list[ClaimedJob] = []
@@ -2538,13 +2962,14 @@ class MemoryBrainStore:
         with self._write_lock:
             conn = self._connect()
             try:
-                # 重新激活除 processing/blocked 外的所有状态（包括 dead/retry/pending/completed），
-                # 确保上游 job 完成后下游 job 能被重新调度，避免死信永久卡住。
+                # Re-open ordinary downstream states after upstream enrichment.
+                # Dead letters require an explicit operator retry; silently
+                # resetting them here creates endless job generations/storms.
                 changed = conn.execute(
                     """UPDATE brain_jobs SET status='pending',attempts=0,available_at=?,
                         lease_owner=NULL,leased_until=NULL,last_error='',completed_at=NULL,
                         updated_at=? WHERE event_id=? AND job_type=?
-                        AND status NOT IN ('processing', 'blocked')""",
+                        AND status NOT IN ('processing', 'blocked', 'dead')""",
                     (now, now, event_id, job_type),
                 ).rowcount
                 return bool(changed)
@@ -2653,6 +3078,116 @@ class MemoryBrainStore:
                 return bool(changed)
             finally:
                 conn.close()
+
+    def retry_dead_letters(
+        self,
+        *,
+        job_type: str | None = None,
+        event_id: str | None = None,
+        limit: int = 100,
+    ) -> int:
+        """Explicitly requeue a bounded dead-letter batch for operator recovery."""
+
+        selected_type = str(job_type or "").strip()
+        selected_event = str(event_id or "").strip()
+        bounded_limit = max(1, min(int(limit), 500))
+        now = time.time()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                clauses = ["status='dead'"]
+                params: list[Any] = []
+                if selected_type:
+                    clauses.append("job_type=?")
+                    params.append(selected_type)
+                if selected_event:
+                    clauses.append("event_id=?")
+                    params.append(selected_event)
+                params.append(bounded_limit)
+                rows = conn.execute(
+                    f"SELECT id FROM brain_jobs WHERE {' AND '.join(clauses)} "
+                    "ORDER BY updated_at,id LIMIT ?",
+                    params,
+                ).fetchall()
+                ids = [str(row["id"]) for row in rows]
+                if ids:
+                    placeholders = ",".join("?" for _ in ids)
+                    conn.execute(
+                        f"""UPDATE brain_jobs SET status='pending',attempts=0,available_at=?,
+                            lease_owner=NULL,leased_until=NULL,last_error='',completed_at=NULL,
+                            updated_at=? WHERE id IN ({placeholders}) AND status='dead'""",
+                        [now, now, *ids],
+                    )
+                conn.commit()
+                return len(ids)
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def dead_letter_report(self, *, limit: int = 20) -> dict[str, Any]:
+        """Summarize durable enrichment failures without replaying them.
+
+        Operators can first inspect common causes, then replay a bounded job type
+        or one event instead of waking every historical dead letter at once.
+        """
+
+        bounded = max(1, min(int(limit), 100))
+        conn = self._connect()
+        try:
+            where = "status IN ('dead','blocked','retry')"
+            total_row = conn.execute(
+                f"SELECT count(*) AS total,count(DISTINCT event_id) AS affected FROM brain_jobs WHERE {where}"
+            ).fetchone()
+            status_rows = conn.execute(
+                f"SELECT status,count(*) AS count FROM brain_jobs WHERE {where} GROUP BY status"
+            ).fetchall()
+            type_rows = conn.execute(
+                f"SELECT job_type,count(*) AS count FROM brain_jobs WHERE {where} GROUP BY job_type"
+            ).fetchall()
+            error_expression = (
+                "CASE WHEN trim(coalesce(last_error,''))='' THEN 'unknown' "
+                "WHEN instr(last_error,':')>0 THEN substr(last_error,1,instr(last_error,':')-1) "
+                "ELSE last_error END"
+            )
+            error_rows = conn.execute(
+                f"SELECT {error_expression} AS error_kind,count(*) AS count "
+                f"FROM brain_jobs WHERE {where} GROUP BY {error_expression} "
+                "ORDER BY count DESC,error_kind LIMIT 50"
+            ).fetchall()
+            sample_rows = conn.execute(
+                f"""SELECT id,event_id,job_type,status,attempts,max_attempts,
+                            last_error,created_at,updated_at
+                     FROM brain_jobs WHERE {where}
+                     ORDER BY CASE status WHEN 'dead' THEN 0 WHEN 'blocked' THEN 1 ELSE 2 END,
+                              updated_at,id LIMIT ?""",
+                (bounded,),
+            ).fetchall()
+            by_status = {
+                str(row["status"] or "unknown"): int(row["count"] or 0)
+                for row in status_rows
+            }
+            by_job_type = {
+                str(row["job_type"] or "unknown"): int(row["count"] or 0)
+                for row in type_rows
+            }
+            by_error = {
+                str(row["error_kind"] or "unknown")[:80]: int(row["count"] or 0)
+                for row in error_rows
+            }
+            return {
+                "total": int(total_row["total"] or 0),
+                "by_status": by_status,
+                "by_job_type": by_job_type,
+                "by_error": by_error,
+                "affected_event_count": int(total_row["affected"] or 0),
+                "samples": [dict(row) for row in sample_rows],
+            }
+        finally:
+            conn.close()
 
     def list_jobs(
         self, status: str | None = None, limit: int = 100, offset: int = 0
@@ -2957,7 +3492,11 @@ class MemoryBrainStore:
                                 job_type,
                                 event_id,
                                 _json_dumps({"event_id": event_id}),
-                                self.job_max_attempts,
+                                (
+                                    self.link_job_max_attempts
+                                    if job_type == "link_associations"
+                                    else self.job_max_attempts
+                                ),
                                 now,
                                 now,
                                 now,
@@ -3156,7 +3695,16 @@ class MemoryBrainStore:
             )
             candidates = []
             for candidate in conn.execute(
-                "SELECT * FROM recall_candidates WHERE trace_id=? ORDER BY final_score DESC,id",
+                """SELECT c.*,coalesce(e.title,'') AS title,
+                          coalesce(e.summary,'') AS summary,
+                          coalesce(e.source_type,'') AS source_type,
+                          coalesce(e.event_type,'') AS event_type,
+                          coalesce(e.index_status,'') AS index_status,
+                          coalesce(json_extract(e.metadata_json,'$.action_state'),'') AS action_state,
+                          coalesce(e.occurred_at,e.created_at,0) AS occurred_at
+                   FROM recall_candidates c
+                   LEFT JOIN memory_events e ON e.id=c.event_id
+                   WHERE c.trace_id=? ORDER BY c.final_score DESC,c.id""",
                 (trace_id,),
             ).fetchall():
                 item = dict(candidate)
@@ -3396,11 +3944,14 @@ class MemoryBrainStore:
 
                         resolved_path = self.db_path.resolve()
                         path_account: str | None = None
-                        if (
-                            resolved_path.name.casefold() == "memory_brain.db"
-                            and resolved_path.parent.parent.name.casefold() == "accounts"
-                        ):
-                            path_account = resolved_path.parent.name
+                        parent = resolved_path.parent
+                        grandparent = parent.parent
+                        if resolved_path.name.casefold() == "memory_brain.db":
+                            if parent.name.casefold() == "bot":
+                                # Flat sole-account layout: path does not encode account_id.
+                                path_account = None
+                            elif grandparent.name.casefold() == "accounts":
+                                path_account = parent.name
                         if path_account is not None:
                             if stored_account != path_account:
                                 errors.append(

@@ -1,7 +1,7 @@
 // pages/token-usage.js - Token 用量统计页
 const { defineComponent, h, ref, onMounted, watch, computed } = window.Vue;
 import { api } from '../api.js';
-import { appState, showToast, refreshAccounts } from '../state.js';
+import { showToast } from '../state.js';
 import { Button, Badge, FormSelect, Loading, EmptyState, KpiCard } from '../components/common.js';
 import { formatTime, auditSceneLabel } from '../utils.js';
 
@@ -74,14 +74,12 @@ export const TokenUsagePage = defineComponent({
     setup() {
         const loading = ref(true);
         const days = ref(7);
-        const accountId = ref('');
         const data = ref(null);
 
         async function load() {
             loading.value = true;
             try {
                 const params = { days: days.value };
-                if (accountId.value) params.account_id = accountId.value;
                 // 统一走 api.tokenUsage，避免硬编码路径与契约漂移
                 data.value = await (api.tokenUsage?.summary
                     ? api.tokenUsage.summary(params)
@@ -94,25 +92,13 @@ export const TokenUsagePage = defineComponent({
             }
         }
 
-        onMounted(async () => {
-            if (!appState.accountsLoaded) {
-                try { await refreshAccounts(); } catch (_) {}
-            }
-            await load();
-        });
-        watch([days, accountId], () => { load(); });
+        onMounted(() => { load(); });
+        watch(days, () => { load(); });
 
         const today = computed(() => data.value?.today || {});
         const totals = computed(() => data.value?.totals || {});
 
         return () => {
-            const accountOptions = [
-                { value: '', label: '全部账号' },
-                ...((appState.accounts || []).map(a => ({
-                    value: a.account_id || a.id,
-                    label: a.name || a.account_id || a.id,
-                }))),
-            ];
             const dayOptions = [
                 { value: '1', label: '今天' },
                 { value: '7', label: '近 7 天' },
@@ -137,11 +123,6 @@ export const TokenUsagePage = defineComponent({
                                 modelValue: String(days.value),
                                 'onUpdate:modelValue': (v) => { days.value = Number(v) || 7; },
                                 options: dayOptions,
-                            }),
-                            h(FormSelect, {
-                                modelValue: accountId.value,
-                                'onUpdate:modelValue': (v) => { accountId.value = v; },
-                                options: accountOptions,
                             }),
                             h(Button, { type: 'secondary', onClick: load }, () => '刷新'),
                         ]),

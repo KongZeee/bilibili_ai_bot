@@ -270,7 +270,7 @@ class PlanItem:
 class DailyPlan:
     date: str = ""
     generated_at: str = ""
-    source: str = "fallback"  # llm | fallback
+    source: str = "fallback"  # llm | fallback | fallback_merged | fallback_bridge
     items: List[PlanItem] = field(default_factory=list)
     quality_score: int = 0
     raw: str = ""

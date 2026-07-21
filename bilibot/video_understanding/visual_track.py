@@ -116,14 +116,14 @@ def _select_timeline_frames(frame_numbers: List[int], limit: int) -> List[int]:
     return sorted(selected)
 
 
-def _clamp_max_keyframes(value: int, *, default: int = 150) -> int:
+def _clamp_max_keyframes(value: int, *, default: int = 32) -> int:
     """抽帧上限：镜头未超上限则全抽，超过则等距下采样。"""
     try:
         n = int(value)
     except (TypeError, ValueError):
         n = default
-    # 硬夹紧：1～500，防止误配导致 Vision 调用爆炸
-    return max(1, min(n, 500))
+    # 64 is the explicit high-detail ceiling; default active browsing uses 32.
+    return max(1, min(n, 64))
 
 
 def _resize_image(image_path: str, max_size: int) -> str:
@@ -380,11 +380,11 @@ def _prepare_visual_frames(
     frame_extractor: str = "katna",
     scenedetect_threshold: float = 27.0,
     image_max_size: int = 768,
-    max_keyframes: int = 150,
+    max_keyframes: int = 32,
 ) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], int]:
     """CPU/ffmpeg-heavy keyframe extraction + resize (must not run on event loop).
 
-    max_keyframes：抽帧上限（可配置，默认 150）。
+    max_keyframes：抽帧上限（可配置，默认 32，硬顶 64）。
     - scenedetect：镜头数 ≤ 上限则全抽，否则在镜头中点上等距抽上限张
     - katna/ffmpeg：直接以该上限为抽帧目标（无镜头列表时）
     """
@@ -480,7 +480,7 @@ async def describe_visual_track(
     frame_max_retries: int = 2,
     frame_retry_backoff_seconds: float = 1.5,
     min_success_ratio: float = 0.5,
-    max_keyframes: int = 150,
+    max_keyframes: int = 32,
     executor=None,
 ) -> Tuple[List[VisualEvent], bool]:
     """

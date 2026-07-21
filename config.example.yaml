@@ -96,23 +96,23 @@ model_request_limits:
   rate_limit_cooldown_seconds: 30
   vision_max_concurrency_hard_cap: 8
 
-# ── V2: 多账号 ──
-
-# 人格配置组（profile）：一组人格的集合，账号可引用一个 profile
-# 参考 AstrBot 的多配置文件设计：一个 profile 类似一个 abconf_，含默认人格 + 可用人格池
-# 账号可通过 profile_id 引用 profile，运行时可在 profile.personas 中切换激活人格
+# ── B站账号与人格 ──
+# 仅支持一个 B站账号；人格库可切换多个人格
+# 人格配置组（profile）：一组人格的集合，唯一账号可通过 profile_id 引用
+# 运行时可在 profile.personas / Web 人格库中切换激活人格（非多 B站账号）
 profiles:
   - id: default
     name: 默认人格组
     default_persona: default       # 主人格 ID（账号激活时默认使用）
     personas:                       # 该 profile 可用的所有人格 ID 列表
       - default
-    # 可添加更多人格组：
+    # 可选：更多人格组（仍挂在同一 B站账号下，用于切换人格池）
     # - id: multi_style
     #   name: 多风格切换
     #   default_persona: tech_persona
     #   personas: [tech_persona, casual_persona, gamer_persona]
 
+# 仅配置一个 B站账号条目；请勿添加第二个
 accounts:
   - id: main
     name: 主账号
@@ -126,15 +126,6 @@ accounts:
     persona_id: default            # 向后兼容：未配 profile_id 时使用单个人格
     chat_provider_id: ""           # 绑定的对话 Provider ID（留空用 model_routing.chat）
     enabled: true
-  # 可添加更多账号：
-  # - id: sub
-  #   name: 小号
-  #   sessdata: ""
-  #   bili_jct: ""
-  #   dede_user_id: ""
-  #   profile_id: multi_style      # 引用多风格 profile，运行时可切换人格
-  #   llm_id: openai
-  #   enabled: true
 
 default_account: main
 
@@ -215,7 +206,7 @@ bangumi:
 
 # ── 陪伴生活层（人格化日程/梦境/日记/探索/创作；默认关闭）──
 # enabled=false 时不写脏、不注入 prompt；热重载会 rebind memory_brain。
-# 灵感来自 astrbot_plugin_private_companion 概念，按 B 站多账号架构重写
+# 灵感来自 astrbot_plugin_private_companion 概念，按单 B 站账号 + 人格库架构重写
 companion:
   enabled: false             # 总开关
   life_state:
@@ -261,6 +252,11 @@ dynamic_publish:
   topics: []
   # 是否配图（需要 image_generation.enabled 同时开启）
   with_image: false
+  # 动态配图风格：cinematic / anime / photorealistic / digital_illustration /
+  # watercolor / cyberpunk / pixel_art / minimalist / custom
+  image_style: cinematic
+  # image_style=custom 时生效，建议用简短视觉描述（最多 300 字符）
+  image_style_custom: ""
   # 发布前是否需要 Web 审核（审核通过后独立 TaskRun 发布并写脑）
   review_before_publish: false
   # 草稿过期时间（秒），过期后自动标记 expired，永不发布
@@ -392,7 +388,8 @@ video_analysis:
   scenedetect_threshold: 27.0
   image_max_size: 768
   # 抽帧上限：镜头数 ≤ 本值则按镜头全抽；超过则在镜头中点上等距抽本值张（默认 150）
-  max_keyframes: 150
+  # 主动视频默认 32 帧；高细节场景可调到 48-64，运行时硬顶 64
+  max_keyframes: 32
   # 视觉并发窗口（期望值）；实际并发 = min(本值, 视觉硬顶, 密钥数×每密钥并发)
   vision_window_size: 2
   # 视觉请求起步速率（每分钟）；多 key 时运行时按密钥数线性放大
@@ -412,10 +409,17 @@ video_analysis:
 # 修复可写后 resume_account 恢复主动行为。
 memory:
   # V6 账号级统一联想记忆大脑
-  recall_candidate_limit: 20
+  recall_candidate_limit: 12
   recall_inject_limit: 5
   recall_association_limit: 2
+  # 单次 LLM rerank 与整条召回链的硬预算；超时会保留 FTS/vector 确定性结果
+  rerank_timeout_seconds: 8
+  recall_total_timeout_seconds: 10
   rerank_relevance_baseline: 0.65
+  # 后台富化不得长期占用在线回复/召回配额
+  enrichment_chat_timeout_seconds: 12
+  link_candidate_limit: 12
+  link_job_max_attempts: 3
   prompt_char_budget: 5000
   chunk_target_chars: 600
   chunk_hard_chars: 900

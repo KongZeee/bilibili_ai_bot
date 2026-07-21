@@ -58,6 +58,21 @@ VISION_SYSTEM_PROMPT = (
     "不要添加任何主观推测或修辞手法。"
 )
 
+
+def _partial_audio_behavior_log(
+    result: Optional[ASRTranscriptionResult], duration: float
+) -> str:
+    """Render completed ASR as explicitly partial evidence after visual failure."""
+
+    events = list(getattr(result, "events", None) or [])
+    if not events:
+        return ""
+    return build_behavior_log(
+        align_events(events, [], max(0.0, float(duration or 0.0)), is_static=False),
+        is_static=False,
+        no_audio=False,
+    )
+
 # 问答 Prompt（从 demo orchestrator.py 迁移）
 _QA_SYSTEM_PROMPT = "你是一个高精度的视频内容深度分析专家。你需要结合视频的「视听对齐日志」来回答用户的问题。"
 
@@ -93,12 +108,13 @@ class VideoUnderstandingConfig:
         self.frame_extractor: str = va.get("frame_extractor", "katna")
         self.scenedetect_threshold: float = float(va.get("scenedetect_threshold", 27.0))
         self.image_max_size: int = int(va.get("image_max_size", 768))
-        # 抽帧上限：镜头未超则全抽，超过则等距下采样（配置页可改，默认 150）
+        # Active-video profile: enough temporal coverage without 100+ serial
+        # vision calls competing with memory enrichment.
         try:
-            max_kf = int(va.get("max_keyframes", 150))
+            max_kf = int(va.get("max_keyframes", 32))
         except (TypeError, ValueError):
-            max_kf = 150
-        self.max_keyframes: int = max(1, min(max_kf, 500))
+            max_kf = 32
+        self.max_keyframes: int = max(1, min(max_kf, 64))
         # Soft request from video_analysis; absolute clamp applied later via router hard cap.
         try:
             requested_vision_window = int(va.get("vision_window_size", 2))
@@ -596,9 +612,12 @@ class VideoUnderstandingService:
                         if (seg.get("content") or "").strip()
                     ]
 
+                partial_audio_result: Optional[ASRTranscriptionResult] = None
+
                 async def _dual_track():
                     # VID-605：audio 异常 / 外层超时 cancel 时必须取消 visual，
                     # 避免 Vision LLM 孤儿任务继续占满全局 semaphore。
+                    nonlocal partial_audio_result
                     visual_future = asyncio.create_task(_visual_task())
                     try:
                         if subtitle_events or read_subtitles:
@@ -607,6 +626,7 @@ class VideoUnderstandingService:
                                 audio_events_local,
                                 "subtitle" if subtitle_events else "visual_subtitle",
                             )
+                            partial_audio_result = audio_result_local
                             if read_subtitles and not subtitle_events:
                                 logger.info(
                                     "番剧字幕识别模式：跳过音频 ASR，由 Vision LLM 从画面帧转写硬字幕"
@@ -620,6 +640,7 @@ class VideoUnderstandingService:
                             audio_result_local = await loop.run_in_executor(
                                 executor, _audio_task
                             )
+                            partial_audio_result = audio_result_local
                             audio_events_local = audio_result_local.events
                             visual_events_local, is_static_local = await visual_future
                         return (
@@ -662,11 +683,33 @@ class VideoUnderstandingService:
                         shutil.rmtree(prep.work_dir, ignore_errors=True)
                     except Exception:
                         pass
+                    partial_events = list(
+                        getattr(partial_audio_result, "events", None) or []
+                    )
+                    partial_behavior_log = _partial_audio_behavior_log(
+                        partial_audio_result, prep.duration
+                    )
+                    if partial_behavior_log:
+                        logger.info(
+                            "视频视觉轨超时，保留已完成 ASR 作为部分失败证据: segments=%s chars=%s",
+                            len(partial_events),
+                            len(partial_behavior_log),
+                        )
                     return {
-                        "behavior_log": "",
+                        "behavior_log": partial_behavior_log,
                         "answer": None,
                         "work_dir": "",
                         "degradation_reason": "analysis_timeout",
+                        "audio_status": {
+                            "status": str(
+                                getattr(partial_audio_result, "status", "") or ""
+                            ),
+                            "error_code": str(
+                                getattr(partial_audio_result, "error_code", "") or ""
+                            ),
+                            "partial_evidence": bool(partial_behavior_log),
+                            "segment_count": len(partial_events),
+                        },
                     }
 
                 # 3. 时序缝合

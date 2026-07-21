@@ -12,9 +12,42 @@ export const appState = reactive({
     llmLoaded: false,
     personas: [],
     personasLoaded: false,
+    /** 单 bot：始终指向唯一账号 id（无切换器） */
     currentAccountId: null,
     toasts: [],
 });
+
+// 供 api.js 解析 sole account（避免 api↔state 循环 import）
+try { window.appState = appState; } catch (_) { /* ignore */ }
+
+/**
+ * 返回唯一 bot 账号 id（accounts[0]）。
+ * 列表未加载或为空时返回 null。
+ */
+export function getSoleAccountId() {
+    const list = appState.accounts || [];
+    if (!list.length) return null;
+    const a0 = list[0];
+    return a0.account_id || a0.id || null;
+}
+
+/** 将 currentAccountId 固定为唯一账号（导出：页面勿手写 accountsLoaded） */
+export function syncSoleAccountId() {
+    const sole = getSoleAccountId();
+    appState.currentAccountId = sole;
+    return sole;
+}
+
+/** 规范化 accounts 列表并同步 sole id */
+export function applyAccountsList(list) {
+    const rows = Array.isArray(list) ? list : [];
+    rows.forEach((acc) => {
+        if (acc && !acc.id && acc.account_id) acc.id = acc.account_id;
+    });
+    appState.accounts = rows;
+    appState.accountsLoaded = true;
+    return syncSoleAccountId();
+}
 
 export function showToast(message, type = 'info') {
     const id = Date.now() + Math.random();
@@ -32,14 +65,11 @@ export async function refreshAccounts() {
     try {
         const { api } = window;
         const list = await api.accounts.list();
-        // 规范化：后端返回 account_id，统一映射为 id 供前端使用
-        list.forEach(acc => { if (!acc.id) acc.id = acc.account_id; });
-        appState.accounts = list;
-        appState.accountsLoaded = true;
-        if (!appState.currentAccountId && appState.accounts.length > 0) {
-            const _a0 = appState.accounts[0]; appState.currentAccountId = _a0.account_id || _a0.id;
-        }
+        applyAccountsList(list);
     } catch (e) {
+        // 仍标记 loaded，避免各页永久等待 accountsLoaded
+        appState.accountsLoaded = true;
+        appState.accounts = appState.accounts || [];
         showToast('加载账号列表失败: ' + e.message, 'error');
     }
 }

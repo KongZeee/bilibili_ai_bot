@@ -20,6 +20,7 @@ from starlette.responses import JSONResponse
 from starlette.requests import Request
 
 from .responses import ok, fail, fail_internal
+from .sole_account import _guard_nested_account_id, _inject_sole_path_params
 
 logger = logging.getLogger("bilibot.api.dynamic_drafts")
 
@@ -54,12 +55,29 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
         store = acc.scheduler.get_draft_store()
         return acc, store, None
 
+    def _nested_guard(request: Request):
+        return _guard_nested_account_id(request, account_manager, param="account_id")
+
+    def _as_flat(handler):
+        async def _flat(request: Request) -> JSONResponse:
+            _, err = _inject_sole_path_params(
+                request, account_manager, id_keys=("account_id",)
+            )
+            if err is not None:
+                return err
+            return await handler(request)
+
+        return _flat
+
     async def list_drafts(request: Request) -> JSONResponse:
         """GET /api/accounts/{account_id}/dynamic-drafts
 
         Query: status, page, page_size
         """
         try:
+            guard = _nested_guard(request)
+            if guard is not None:
+                return guard
             acc_id = request.path_params.get("account_id")
             acc, store, err = _resolve_account(acc_id)
             if err is not None:
@@ -92,6 +110,9 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
     async def get_draft(request: Request) -> JSONResponse:
         """GET /api/accounts/{account_id}/dynamic-drafts/{draft_id}"""
         try:
+            guard = _nested_guard(request)
+            if guard is not None:
+                return guard
             acc_id = request.path_params.get("account_id")
             draft_id = request.path_params.get("draft_id")
             _, store, err = _resolve_account(acc_id)
@@ -115,6 +136,9 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
         编辑草稿 → 自增 revision（乐观锁）。可重新安全检查并更新快照。
         """
         try:
+            guard = _nested_guard(request)
+            if guard is not None:
+                return guard
             acc_id = request.path_params.get("account_id")
             draft_id = request.path_params.get("draft_id")
             acc, store, err = _resolve_account(acc_id)
@@ -215,6 +239,9 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
         同一 revision 只能通过一次（乐观锁）。
         """
         try:
+            guard = _nested_guard(request)
+            if guard is not None:
+                return guard
             acc_id = request.path_params.get("account_id")
             draft_id = request.path_params.get("draft_id")
             acc, store, err = _resolve_account(acc_id)
@@ -294,6 +321,9 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
         审核拒绝 → 永不发布。
         """
         try:
+            guard = _nested_guard(request)
+            if guard is not None:
+                return guard
             acc_id = request.path_params.get("account_id")
             draft_id = request.path_params.get("draft_id")
             _, store, err = _resolve_account(acc_id)
@@ -347,6 +377,9 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
         approved 表示审核通过但 publish task 创建失败（DYN-601），直接重新创建任务。
         """
         try:
+            guard = _nested_guard(request)
+            if guard is not None:
+                return guard
             acc_id = request.path_params.get("account_id")
             draft_id = request.path_params.get("draft_id")
             acc, store, err = _resolve_account(acc_id)
@@ -395,6 +428,14 @@ def create_dynamic_drafts_routes(account_manager, config_loader=None):
             return fail_internal()
 
     return [
+        # Flat single-account shell
+        Route("/api/dynamic-drafts", _as_flat(list_drafts), methods=["GET"]),
+        Route("/api/dynamic-drafts/{draft_id}", _as_flat(get_draft), methods=["GET"]),
+        Route("/api/dynamic-drafts/{draft_id}", _as_flat(patch_draft), methods=["PATCH"]),
+        Route("/api/dynamic-drafts/{draft_id}/approve", _as_flat(approve_draft), methods=["POST"]),
+        Route("/api/dynamic-drafts/{draft_id}/reject", _as_flat(reject_draft), methods=["POST"]),
+        Route("/api/dynamic-drafts/{draft_id}/retry", _as_flat(retry_draft), methods=["POST"]),
+        # Nested (kept; wrong id → 404 via sole guard)
         Route("/api/accounts/{account_id}/dynamic-drafts", list_drafts, methods=["GET"]),
         Route("/api/accounts/{account_id}/dynamic-drafts/{draft_id}", get_draft, methods=["GET"]),
         Route("/api/accounts/{account_id}/dynamic-drafts/{draft_id}", patch_draft, methods=["PATCH"]),

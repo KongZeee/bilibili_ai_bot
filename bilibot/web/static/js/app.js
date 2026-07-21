@@ -43,8 +43,8 @@ const pages = [
     { path: '/', title: '总览' },
     { path: '/comments', title: '评论' },
     { path: '/logs', title: '日志' },
-    { path: '/accounts', title: '账号管理' },
-    { path: '/accounts/:id', title: '账号详情' },
+    { path: '/accounts', title: 'B站登录' },
+    { path: '/accounts/:id', title: '连接详情' },
     { path: '/personas', title: '人格管理' },
     { path: '/companion', title: '陪伴生活' },
     { path: '/llm', title: '模型管理' },
@@ -72,10 +72,10 @@ import { LlmListPage } from './components/llm.js';
 registerRoute('/llm', LlmListPage, '模型管理');
 registerRoute('/llm/:id', createRedirect('/llm'), '模型编辑');
 import { ModelRoutingPage } from './pages/model-routing.js';
-registerRoute('/model-routing', ModelRoutingPage, '模型分配', '账号与身份');
-import { AccountListPage, AccountDetailPage } from './components/accounts.js';
-registerRoute('/accounts', AccountListPage, '账号管理');
-registerRoute('/accounts/:id', AccountDetailPage, '账号详情');
+    registerRoute('/model-routing', ModelRoutingPage, '模型分配', 'Bot 与身份');
+    import { AccountListPage, AccountDetailPage } from './components/accounts.js';
+    registerRoute('/accounts', AccountListPage, 'B站登录');
+    registerRoute('/accounts/:id', AccountDetailPage, '连接详情');
 import { MemoryRecallPage } from './components/memory/recall-page.js';
 registerRoute('/memory/recall', MemoryRecallPage, '召回测试');
 import { MemoryListPage } from './components/memory/list-page.js';

@@ -78,7 +78,7 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
                           "temp_disk_quota_bytes", "vision_frame_max_retries"):
                 val = int(val)
                 if key == "max_keyframes":
-                    val = max(1, min(val, 500))
+                    val = max(1, min(val, 64))
                 if key == "vision_frame_max_retries":
                     val = max(0, min(val, 5))
             va[key] = val

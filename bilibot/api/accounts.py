@@ -27,6 +27,7 @@ from starlette.responses import JSONResponse
 from starlette.requests import Request
 
 from .responses import ok, fail, fail_internal
+from .sole_account import _guard_nested_account_id, _inject_sole_path_params
 
 logger = logging.getLogger("bilibot.api.accounts")
 
@@ -188,6 +189,22 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
     # PRD-V5 §5.3 LLM-501：从 account_manager 获取 llm_manager 用于 Provider 校验
     llm_manager = account_manager.llm_manager
 
+    def _nested_guard(request: Request):
+        return _guard_nested_account_id(request, account_manager, param="id")
+
+    def _as_flat(handler, id_keys=("id",)):
+        """Flat /api/account* wrapper: inject sole id then reuse nested handler."""
+
+        async def _flat(request: Request) -> JSONResponse:
+            _, err = _inject_sole_path_params(
+                request, account_manager, id_keys=id_keys
+            )
+            if err is not None:
+                return err
+            return await handler(request)
+
+        return _flat
+
     async def list_accounts(request: Request) -> JSONResponse:
         statuses = account_manager.list_accounts()
         for s in statuses:
@@ -195,6 +212,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         return ok(statuses)
 
     async def get_account(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         acc_id = request.path_params.get("id")
         if not account_manager.has_account(acc_id):
             return fail("NOT_FOUND", f"账号不存在: {acc_id}", status_code=404)
@@ -216,7 +236,14 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                 body["id"] = acc_id
             except ValueError as ve:
                 return fail("VALIDATION_ERROR", str(ve))
-            if acc_id in account_manager:
+            # 单账号模式：已有任意账号则拒绝第二个
+            if len(account_manager.list_account_ids()) >= 1:
+                return fail(
+                    "SINGLE_ACCOUNT",
+                    "仅支持一个 B站账号，不能再添加",
+                    status_code=409,
+                )
+            if account_manager.has_account(acc_id) or acc_id in account_manager:
                 return fail("DUPLICATE_ID", f"账号 ID 已存在: {acc_id}")
             # PRD-V5 §5.3 LLM-501：校验 llm_id 指向已存在且 enabled 的 Provider
             llm_id = body.get("llm_id", "")
@@ -230,6 +257,13 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             _enrich_llm_status(status, llm_manager)
             return ok(status, "账号添加成功")
         except ValueError as e:
+            msg = str(e)
+            if "SINGLE_ACCOUNT" in msg:
+                return fail(
+                    "SINGLE_ACCOUNT",
+                    "仅支持一个 B站账号，不能再添加",
+                    status_code=409,
+                )
             logger.warning("添加账号校验失败: %s", e)
             return fail("VALIDATION_ERROR", "账号参数不合法")
         except Exception as e:
@@ -237,18 +271,27 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             return fail_internal()
 
     async def delete_account(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         acc_id = request.path_params.get("id")
-        if acc_id == account_manager.get_default_id() and len(account_manager) <= 1:
-            return fail("LAST_ACCOUNT", "不能删除最后一个默认账号")
+        # 单账号模式：禁止删除最后一个（唯一）账号
+        if len(account_manager.list_account_ids()) <= 1:
+            return fail("LAST_ACCOUNT", "不能删除最后一个 B站账号")
         # ACC-501：显式 DELETE 操作，从配置注册表 + 运行时实例删除，写审计
         removed = await account_manager.remove_account_async(acc_id)
         if not removed:
+            if account_manager.has_account(acc_id):
+                return fail("LAST_ACCOUNT", "不能删除最后一个 B站账号")
             return fail("NOT_FOUND", f"账号不存在: {acc_id}")
         await _save_accounts_to_config(config_loader, account_manager, config_path)
         return ok(message="账号已删除")
 
     async def update_account(request: Request) -> JSONResponse:
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             # ACC-501：同步配置注册表（拾取 qrlogin 等外部写入）
             account_manager.sync_registry_from_config()
@@ -273,11 +316,12 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             return fail_internal()
 
     async def set_default(request: Request) -> JSONResponse:
-        acc_id = request.path_params.get("id")
-        if not account_manager.set_default(acc_id):
-            return fail("NOT_FOUND", f"账号不存在: {acc_id}")
-        await _save_accounts_to_config(config_loader, account_manager, config_path)
-        return ok(message=f"默认账号已设置为: {acc_id}")
+        # 单账号模式：不再提供多账号切换默认
+        return fail(
+            "SINGLE_ACCOUNT",
+            "单账号模式下无需设置默认账号",
+            status_code=410,
+        )
 
     async def bind_persona(request: Request) -> JSONResponse:
         """绑定账号到人格或 profile
@@ -289,6 +333,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         - {"persona_id": ""}              解绑
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             acc = account_manager.get_account(acc_id)
             if not acc:
@@ -346,6 +393,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         请求体：{"persona_id": "xxx"}
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             acc = account_manager.get_account(acc_id)
             if not acc:
@@ -372,6 +422,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
 
     async def list_account_personas(request: Request) -> JSONResponse:
         """列出账号可用的人格（含当前激活人格）"""
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         acc_id = request.path_params.get("id")
         acc = account_manager.get_account(acc_id)
         if not acc:
@@ -396,6 +449,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
 
     async def bind_llm(request: Request) -> JSONResponse:
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             acc = account_manager.get_account(acc_id)
             if not acc:
@@ -418,6 +474,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
 
     async def start_account(request: Request) -> JSONResponse:
         """PRD V4 BOOT-002：后台启动，立即返回 task_id 和状态，不等待调度循环"""
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         acc_id = request.path_params.get("id")
         acc = account_manager.get_account(acc_id)
         if not acc:
@@ -454,6 +513,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             return fail_internal()
 
     async def stop_account(request: Request) -> JSONResponse:
+        err = _nested_guard(request)
+        if err is not None:
+            return err
         acc_id = request.path_params.get("id")
         acc = account_manager.get_account(acc_id)
         if not acc:
@@ -485,6 +547,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         - 账号不存在时不回退 V1
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             # ACC-503：账号不存在 → 不回退 V1 配置
             if not account_manager.has_account(acc_id):
@@ -573,6 +638,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         - 仅重载目标账号
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             session_id = request.path_params.get("session_id")
 
@@ -714,6 +782,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         - 标记为 cancelled，立即失效
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             session_id = request.path_params.get("session_id")
 
@@ -785,6 +856,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         信封：{ success, data: { task_id, status, scene, account_id }, message }
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             scheduler, err = _get_account_scheduler(acc_id)
             if err is not None:
@@ -823,6 +897,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         与调度内部/列表展示对齐：scene 使用 ``dynamic_post``（非短名 dynamic）。
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             scheduler, err = _get_account_scheduler(acc_id)
             if err is not None:
@@ -858,6 +935,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
     async def trigger_bangumi_task(request: Request) -> JSONResponse:
         """POST /api/accounts/{id}/tasks/bangumi → observable async check."""
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             scheduler, err = _get_account_scheduler(acc_id)
             if err is not None:
@@ -906,6 +986,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         status（可选，按任务状态过滤）。不要求调度器运行。
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             task_store, err = _get_account_task_store(acc_id)
             if err is not None:
@@ -939,6 +1022,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
     async def get_account_task(request: Request) -> JSONResponse:
         """GET /api/accounts/{id}/tasks/{task_id} → status + desensitized result"""
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             task_id = request.path_params.get("task_id")
             task_store, err = _get_account_task_store(acc_id)
@@ -964,6 +1050,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         running/succeeded 状态不可取消（可能已发布）。
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             task_id = request.path_params.get("task_id")
             scheduler, err = _get_account_scheduler(acc_id)
@@ -992,6 +1081,9 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
         重置为 scheduled 后立即 claim + 按 scene 分发（不依赖下一次主循环）。
         """
         try:
+            err = _nested_guard(request)
+            if err is not None:
+                return err
             acc_id = request.path_params.get("id")
             task_id = request.path_params.get("task_id")
             scheduler, err = _get_account_scheduler(acc_id)
@@ -1037,10 +1129,50 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             logger.error(f"重试账号任务失败: {e}", exc_info=True)
             return fail_internal()
 
+    # Flat /api/account* wrappers (single-account product shell)
+    flat_get = _as_flat(get_account)
+    flat_update = _as_flat(update_account)
+    flat_start = _as_flat(start_account)
+    flat_stop = _as_flat(stop_account)
+    flat_persona = _as_flat(bind_persona)
+    flat_switch_persona = _as_flat(switch_persona)
+    flat_personas = _as_flat(list_account_personas)
+    flat_llm = _as_flat(bind_llm)
+    flat_qr_init = _as_flat(qr_login_init)
+    flat_qr_poll = _as_flat(qr_login_poll)
+    flat_qr_cancel = _as_flat(qr_login_cancel)
+    flat_tasks = _as_flat(list_account_tasks)
+    flat_task_proactive = _as_flat(trigger_proactive_video_task)
+    flat_task_dynamic = _as_flat(trigger_dynamic_task)
+    flat_task_bangumi = _as_flat(trigger_bangumi_task)
+    flat_task_get = _as_flat(get_account_task)
+    flat_task_cancel = _as_flat(cancel_account_task)
+    flat_task_retry = _as_flat(retry_account_task)
+
     return [
         Route("/api/accounts", list_accounts, methods=["GET"]),
         Route("/api/accounts", add_account, methods=["POST"]),
         Route("/api/accounts/profiles", list_profiles, methods=["GET"]),  # BEFORE {id}
+        # Flat single-account shell (no id in path)
+        Route("/api/account", flat_get, methods=["GET"]),
+        Route("/api/account", flat_update, methods=["PATCH"]),
+        Route("/api/account/start", flat_start, methods=["POST"]),
+        Route("/api/account/stop", flat_stop, methods=["POST"]),
+        Route("/api/account/persona", flat_persona, methods=["POST"]),
+        Route("/api/account/switch-persona", flat_switch_persona, methods=["POST"]),
+        Route("/api/account/personas", flat_personas, methods=["GET"]),
+        Route("/api/account/llm", flat_llm, methods=["POST"]),
+        Route("/api/account/qr-login", flat_qr_init, methods=["POST"]),
+        Route("/api/account/qr-login/{session_id}", flat_qr_poll, methods=["GET"]),
+        Route("/api/account/qr-login/{session_id}/cancel", flat_qr_cancel, methods=["POST"]),
+        Route("/api/account/tasks", flat_tasks, methods=["GET"]),
+        Route("/api/account/tasks/proactive-video", flat_task_proactive, methods=["POST"]),
+        Route("/api/account/tasks/dynamic", flat_task_dynamic, methods=["POST"]),
+        Route("/api/account/tasks/bangumi", flat_task_bangumi, methods=["POST"]),
+        Route("/api/account/tasks/{task_id}", flat_task_get, methods=["GET"]),
+        Route("/api/account/tasks/{task_id}/cancel", flat_task_cancel, methods=["POST"]),
+        Route("/api/account/tasks/{task_id}/retry", flat_task_retry, methods=["POST"]),
+        # Nested (kept; wrong id → 404 via sole guard)
         Route("/api/accounts/{id}", get_account, methods=["GET"]),
         Route("/api/accounts/{id}", delete_account, methods=["DELETE"]),
         Route("/api/accounts/{id}", update_account, methods=["PATCH"]),

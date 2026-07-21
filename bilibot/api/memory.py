@@ -11,6 +11,7 @@ import inspect
 import logging
 import time
 from dataclasses import asdict, is_dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -24,6 +25,7 @@ from bilibot.memory_brain.recall import RecallEngine, RecallQuery
 from bilibot.memory_brain.store import content_hash
 
 from .responses import fail, fail_internal, ok
+from .sole_account import _guard_nested_account_id, _inject_sole_path_params
 
 logger = logging.getLogger("bilibot.api.memory")
 
@@ -110,6 +112,7 @@ def _recall_engine_options(runtime_engine: Any = None) -> dict[str, Any]:
 
     return {
         "rerank_timeout": float(getattr(runtime_engine, "rerank_timeout", 8.0)),
+        "total_timeout": float(getattr(runtime_engine, "total_timeout", 10.0)),
         "prompt_budget": int(getattr(runtime_engine, "prompt_budget", 5000)),
         "max_candidates": int(getattr(runtime_engine, "max_candidates", 20)),
         "max_events": int(getattr(runtime_engine, "max_events", 5)),
@@ -239,6 +242,13 @@ class _MemoryApi:
 
     def default_account_id(self) -> str:
         if self.account_manager:
+            sole = ""
+            try:
+                sole = str(self.account_manager.sole_id() or "").strip()
+            except Exception:
+                sole = ""
+            if sole:
+                return sole
             account_id = str(self.account_manager.get_default_id() or "").strip()
             if account_id:
                 return account_id
@@ -269,9 +279,25 @@ class _MemoryApi:
         return self._stores[account_id]
 
     def resolve(self, request: Request, *, root: bool = False) -> tuple[str, MemoryBrainStore] | JSONResponse:
-        account_id = self.default_account_id() if root else str(request.path_params.get("account_id") or "")
-        if not root and not self.account_exists(account_id):
-            return fail("NOT_FOUND", f"账号不存在: {account_id}", status_code=404)
+        if root:
+            account_id = self.default_account_id()
+            # Product single-account manager: prefer sole_id when available
+            if self.account_manager is not None and hasattr(self.account_manager, "sole_id"):
+                try:
+                    sole = str(self.account_manager.sole_id() or "").strip()
+                except Exception:
+                    sole = ""
+                if sole:
+                    account_id = sole
+        else:
+            guard = _guard_nested_account_id(
+                request, self.account_manager, param="account_id"
+            )
+            if guard is not None:
+                return guard
+            account_id = str(request.path_params.get("account_id") or "")
+            if not self.account_exists(account_id):
+                return fail("NOT_FOUND", f"账号不存在: {account_id}", status_code=404)
         try:
             return account_id, self.store(account_id)
         except ValueError as exc:
@@ -351,6 +377,69 @@ class _MemoryApi:
         events = store.list_events(limit=500, offset=0)
         now = time.time()
         health = _jsonable(store.health_check())
+        runtime_status: dict[str, Any] = {}
+        runtime = self.runtime_account(account_id)
+        brain = getattr(runtime, "memory_brain", None) if runtime is not None else None
+        status_method = getattr(brain, "operational_status", None)
+        if callable(status_method):
+            try:
+                runtime_status = _jsonable(status_method())
+            except Exception:
+                logger.debug(
+                    "failed to read live memory worker status",
+                    exc_info=True,
+                    extra={"account_id": account_id},
+                )
+        companion = getattr(runtime, "companion", None) if runtime is not None else None
+        snapshot_method = getattr(companion, "get_self_snapshot", None)
+        if callable(snapshot_method):
+            try:
+                snapshot = snapshot_method()
+                payload = _jsonable(
+                    snapshot.to_dict() if callable(getattr(snapshot, "to_dict", None)) else snapshot
+                )
+                salient = [
+                    str(item)
+                    for item in (payload.get("salient_recent") or [])
+                    if str(item or "").strip()
+                ]
+                threads = [
+                    str(item)
+                    for item in (payload.get("ongoing_threads") or [])
+                    if str(item or "").strip()
+                ]
+                updated_at = str(payload.get("updated_at") or "")
+                freshness_seconds = None
+                if updated_at:
+                    try:
+                        freshness_seconds = max(
+                            0.0, time.time() - datetime.fromisoformat(updated_at).timestamp()
+                        )
+                    except (TypeError, ValueError):
+                        freshness_seconds = None
+                plan = companion.store.get_daily_plan()
+                state = companion.store.get_life_state()
+                evidence_bound = sum("|eid=" in item for item in salient)
+                runtime_status["companion"] = {
+                    "enabled": bool(getattr(companion, "enabled", False)),
+                    "life_date": str(getattr(state, "date", "") or ""),
+                    "updated_at": updated_at,
+                    "freshness_seconds": freshness_seconds,
+                    "salient_count": len(salient),
+                    "salient_evidence_bound": evidence_bound,
+                    "salient_evidence_rate": (
+                        evidence_bound / len(salient) if salient else 0.0
+                    ),
+                    "ongoing_threads_count": len(threads),
+                    "daily_plan_date": str(getattr(plan, "date", "") or ""),
+                    "daily_plan_source": str(getattr(plan, "source", "") or ""),
+                }
+            except Exception:
+                logger.debug(
+                    "failed to read live companion status",
+                    exc_info=True,
+                    extra={"account_id": account_id},
+                )
         total = int(counts.get("memory_events") or 0)
         return {
             "account_id": account_id,
@@ -365,6 +454,8 @@ class _MemoryApi:
             "jobs": dict(raw.get("jobs") or {}),
             "index_statuses": index_statuses,
             "health": health,
+            "operations": dict(raw.get("operations") or {}),
+            "runtime": runtime_status,
             "schema_version": raw.get("schema_version"),
             "graph_nodes": int(counts.get("memory_events") or 0) + int(counts.get("memory_entities") or 0),
             "graph_edges": int(counts.get("memory_links") or 0),
@@ -378,6 +469,8 @@ class _MemoryApi:
         category = str(request.query_params.get("category") or request.query_params.get("type") or "").strip()
         status = str(request.query_params.get("status") or "").strip()
         keyword = str(request.query_params.get("keyword") or "").strip()
+        include_intents = str(request.query_params.get("include_intents") or "true").lower()
+        exclude_intents = include_intents in {"0", "false", "no"}
         active = str(request.query_params.get("active") or "").lower()
         if active in {"0", "false"}:
             return {"items": [], "page": page, "page_size": page_size, "total": 0}
@@ -386,13 +479,28 @@ class _MemoryApi:
             matched = self.search(store, keyword, limit=500)["items"]
             rows = [item["_event"] for item in matched]
         elif category or status:
-            rows = store.list_events(limit=500, offset=0, source_type=source_type or None, status=status or None)
+            rows = store.list_events(
+                limit=500,
+                offset=0,
+                source_type=source_type or None,
+                status=status or None,
+                exclude_intents=exclude_intents,
+            )
         else:
             rows = store.list_events(
                 limit=page_size,
                 offset=(page - 1) * page_size,
                 source_type=source_type or None,
+                exclude_intents=exclude_intents,
             )
+
+        if exclude_intents and keyword:
+            rows = [
+                row
+                for row in rows
+                if str((row.get("metadata") or {}).get("action_state") or "").casefold()
+                != "intent"
+            ]
 
         if category:
             rows = [
@@ -406,9 +514,11 @@ class _MemoryApi:
             total = len(rows)
             rows = rows[(page - 1) * page_size : page * page_size]
         elif source_type:
-            total = int(store.stats().get("sources", {}).get(source_type, 0))
+            total = store.count_events(
+                source_type=source_type, exclude_intents=exclude_intents
+            )
         else:
-            total = int(store.stats().get("counts", {}).get("memory_events", 0))
+            total = store.count_events(exclude_intents=exclude_intents)
 
         event_ids = [str(row.get("id") or "") for row in rows]
         detailed = store.get_events(event_ids, chunks_per_event=None)
@@ -1003,6 +1113,68 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
             logger.exception("重试记忆任务失败", extra={"account_id": account_id, "job_id": job_id})
             return fail_internal("重试记忆任务失败")
 
+    async def retry_dead_jobs(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        rejected = api.reject_mutation(account_id)
+        if rejected:
+            return rejected
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, Mapping):
+            return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+        job_type = str(body.get("job_type") or "").strip() or None
+        event_id = str(body.get("event_id") or "").strip() or None
+        if job_type and job_type not in _JOB_TYPES:
+            return fail("INVALID_INPUT", "不支持的任务类型", status_code=400)
+        if event_id and len(event_id) > 160:
+            return fail("INVALID_INPUT", "event_id 过长", status_code=400)
+        limit = _bounded_int(body.get("limit"), 100, 1, 500)
+        try:
+            count = await asyncio.to_thread(
+                store.retry_dead_letters,
+                job_type=job_type,
+                event_id=event_id,
+                limit=limit,
+            )
+            await api.audit_mutation(
+                "retry_dead_letters",
+                account_id,
+                details={
+                    "job_type": job_type,
+                    "event_id": event_id,
+                    "limit": limit,
+                    "count": count,
+                },
+            )
+            return ok(
+                {
+                    "count": count,
+                    "job_type": job_type,
+                    "event_id": event_id,
+                    "status": "pending",
+                }
+            )
+        except Exception:
+            logger.exception("批量重试记忆死信失败", extra={"account_id": account_id})
+            return fail_internal("批量重试失败")
+
+    async def dead_job_report(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        _account_id, store = value
+        limit = _bounded_int(request.query_params.get("limit"), 20, 1, 100)
+        try:
+            return ok(await asyncio.to_thread(store.dead_letter_report, limit=limit))
+        except Exception:
+            logger.exception("读取记忆死信报告失败")
+            return fail_internal("读取死信报告失败")
+
     async def reindex(request: Request) -> JSONResponse:
         value = await resolved(request)
         if isinstance(value, JSONResponse):
@@ -1068,6 +1240,8 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
         "trace_detail": trace_detail,
         "jobs": jobs,
         "retry_job": retry_job,
+        "retry_dead_jobs": retry_dead_jobs,
+        "dead_job_report": dead_job_report,
         "reindex": reindex,
     }
 
@@ -1081,7 +1255,18 @@ def create_account_memory_routes(account_manager: Any) -> list[Route]:
     async def migrate(_request: Request) -> JSONResponse:
         return _gone_response()
 
-    return [
+    def _as_flat(handler):
+        async def _flat(request: Request) -> JSONResponse:
+            _, err = _inject_sole_path_params(
+                request, account_manager, id_keys=("account_id",)
+            )
+            if err is not None:
+                return err
+            return await handler(request)
+
+        return _flat
+
+    nested = [
         Route("/api/accounts/{account_id}/memory/stats", handlers["stats"], methods=["GET"]),
         Route("/api/accounts/{account_id}/memory/search", handlers["search"], methods=["GET", "POST"]),
         Route("/api/accounts/{account_id}/memory/recall", handlers["traces"], methods=["GET"]),
@@ -1093,12 +1278,35 @@ def create_account_memory_routes(account_manager: Any) -> list[Route]:
         Route("/api/accounts/{account_id}/memory/graph/query", handlers["graph_query"], methods=["POST"]),
         Route("/api/accounts/{account_id}/memory/reindex", handlers["reindex"], methods=["POST"]),
         Route("/api/accounts/{account_id}/memory/jobs", handlers["jobs"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/jobs/dead-report", handlers["dead_job_report"], methods=["GET"]),
+        Route("/api/accounts/{account_id}/memory/jobs/retry-dead", handlers["retry_dead_jobs"], methods=["POST"]),
         Route("/api/accounts/{account_id}/memory/jobs/{job_id}/retry", handlers["retry_job"], methods=["POST"]),
         Route("/api/accounts/{account_id}/memory/migrate", migrate, methods=["POST"]),
         Route("/api/accounts/{account_id}/memory", handlers["listing"], methods=["GET"]),
         Route("/api/accounts/{account_id}/memory/{mem_id}", handlers["detail"], methods=["GET"]),
         Route("/api/accounts/{account_id}/memory/{mem_id}", handlers["delete"], methods=["DELETE"]),
     ]
+    # Flat primary shell: /api/memory/* (writes + full surface via sole inject)
+    flat = [
+        Route("/api/memory/stats", _as_flat(handlers["stats"]), methods=["GET"]),
+        Route("/api/memory/search", _as_flat(handlers["search"]), methods=["GET", "POST"]),
+        Route("/api/memory/recall", _as_flat(handlers["traces"]), methods=["GET"]),
+        Route("/api/memory/recall", _as_flat(handlers["recall"]), methods=["POST"]),
+        Route("/api/memory/recall/{trace_id}", _as_flat(handlers["trace_detail"]), methods=["GET"]),
+        Route("/api/memory/recall-traces", _as_flat(handlers["traces"]), methods=["GET"]),
+        Route("/api/memory/recall-traces/{trace_id}", _as_flat(handlers["trace_detail"]), methods=["GET"]),
+        Route("/api/memory/graph", _as_flat(handlers["graph"]), methods=["GET"]),
+        Route("/api/memory/graph/query", _as_flat(handlers["graph_query"]), methods=["POST"]),
+        Route("/api/memory/reindex", _as_flat(handlers["reindex"]), methods=["POST"]),
+        Route("/api/memory/jobs", _as_flat(handlers["jobs"]), methods=["GET"]),
+        Route("/api/memory/jobs/dead-report", _as_flat(handlers["dead_job_report"]), methods=["GET"]),
+        Route("/api/memory/jobs/retry-dead", _as_flat(handlers["retry_dead_jobs"]), methods=["POST"]),
+        Route("/api/memory/jobs/{job_id}/retry", _as_flat(handlers["retry_job"]), methods=["POST"]),
+        Route("/api/memory", _as_flat(handlers["listing"]), methods=["GET"]),
+        Route("/api/memory/{mem_id}", _as_flat(handlers["detail"]), methods=["GET"]),
+        Route("/api/memory/{mem_id}", _as_flat(handlers["delete"]), methods=["DELETE"]),
+    ]
+    return flat + nested
 
 
 def create_memory_routes(
@@ -1107,20 +1315,23 @@ def create_memory_routes(
     data_dir: str = "./data",
     account_manager: Any = None,
 ) -> list[Route]:
-    """Create deprecated root reads mapped to the default account's V6 brain.
+    """Create flat primary V6 memory routes via sole-id resolution.
 
-    Writes remain permanently gone (410). Frontend must use account-scoped
-    routes under ``/api/accounts/{account_id}/memory`` only.
+    When ``account_manager`` is present, delegates to
+    ``create_account_memory_routes`` (flat + nested). Otherwise keeps a
+    minimal deprecated root-read surface for legacy callers without manager.
     """
 
     del persona_store, scheduler
+    # Product AccountManager (has sole_id): flat primary + nested aliases
+    if account_manager is not None and hasattr(account_manager, "sole_id"):
+        return create_account_memory_routes(account_manager)
+
+    # Legacy / test doubles: deprecated root reads + optional nested registered separately
     api = _MemoryApi(account_manager, data_dir)
 
-    def root_request(request: Request) -> Request:
-        return request
-
     async def root_call(request: Request, operation: str) -> JSONResponse:
-        value = api.resolve(root_request(request), root=True)
+        value = api.resolve(request, root=True)
         if isinstance(value, JSONResponse):
             return _with_deprecation(value)
         account_id, store = value

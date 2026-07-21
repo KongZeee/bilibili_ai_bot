@@ -13,6 +13,17 @@ from starlette.routing import Route
 from starlette.responses import JSONResponse
 from starlette.requests import Request
 
+from bilibot.image.styles import (
+    CUSTOM_IMAGE_STYLE,
+    DEFAULT_IMAGE_STYLE,
+    MAX_CUSTOM_STYLE_CHARS,
+    apply_image_style,
+    image_style_options,
+    is_supported_image_style,
+    normalize_custom_style,
+    normalize_image_style,
+)
+
 from .responses import ok, fail, fail_internal
 
 logger = logging.getLogger("bilibot.api.image_generation")
@@ -31,6 +42,21 @@ def _mask_config(cfg: dict) -> dict:
     return masked
 
 
+def _dynamic_image_settings(raw: dict) -> dict:
+    dp = raw.get("dynamic_publish", {}) if isinstance(raw, dict) else {}
+    if not isinstance(dp, dict):
+        dp = {}
+    style = normalize_image_style(dp.get("image_style", DEFAULT_IMAGE_STYLE))
+    return {
+        "with_image": bool(dp.get("with_image", False)),
+        "image_style": style,
+        "image_style_custom": normalize_custom_style(
+            dp.get("image_style_custom", "")
+        ),
+        "image_style_options": image_style_options(),
+    }
+
+
 def create_image_generation_routes(config_loader, config_path: str):
     """创建文生图配置路由"""
 
@@ -41,9 +67,10 @@ def create_image_generation_routes(config_loader, config_path: str):
             ig = raw.get("image_generation", {})
             if not isinstance(ig, dict):
                 ig = {}
-            dp = raw.get("dynamic_publish", {})
-            with_image = dp.get("with_image", False) if isinstance(dp, dict) else False
-            return ok({"image_generation": _mask_config(ig), "with_image": with_image})
+            return ok({
+                "image_generation": _mask_config(ig),
+                **_dynamic_image_settings(raw),
+            })
         except Exception as e:
             logger.error(f"获取文生图配置失败: {e}", exc_info=True)
             return fail_internal()
@@ -72,6 +99,44 @@ def create_image_generation_routes(config_loader, config_path: str):
                     if not isinstance(val, str) or not _SIZE_RE.match(val):
                         return fail("INVALID_INPUT", "default_size 格式必须为 WIDTHxHEIGHT（如 1024x768）", status_code=400)
 
+            if "image_style" in body and not is_supported_image_style(
+                body.get("image_style")
+            ):
+                return fail(
+                    "INVALID_INPUT",
+                    "image_style 不是受支持的配图风格",
+                    status_code=400,
+                )
+            if "image_style_custom" in body:
+                raw_custom = body.get("image_style_custom")
+                if not isinstance(raw_custom, str):
+                    return fail(
+                        "INVALID_INPUT",
+                        "image_style_custom 必须是字符串",
+                        status_code=400,
+                    )
+                if len(raw_custom) > MAX_CUSTOM_STYLE_CHARS:
+                    return fail(
+                        "INVALID_INPUT",
+                        f"image_style_custom 最多 {MAX_CUSTOM_STYLE_CHARS} 个字符",
+                        status_code=400,
+                    )
+
+            if normalize_image_style(body.get("image_style")) == CUSTOM_IMAGE_STYLE:
+                current = _dynamic_image_settings(config_loader.get_raw_config())
+                custom = normalize_custom_style(
+                    body.get(
+                        "image_style_custom",
+                        current.get("image_style_custom", ""),
+                    )
+                )
+                if not custom:
+                    return fail(
+                        "INVALID_INPUT",
+                        "选择自定义风格时必须填写风格描述",
+                        status_code=400,
+                    )
+
             def _mutate(raw: dict) -> None:
                 ig = raw.get("image_generation", {})
                 if not isinstance(ig, dict):
@@ -93,7 +158,17 @@ def create_image_generation_routes(config_loader, config_path: str):
                     if not isinstance(dp, dict):
                         dp = {}
                     dp["with_image"] = bool(body["with_image"])
-                    raw["dynamic_publish"] = dp
+                else:
+                    dp = raw.get("dynamic_publish", {})
+                    if not isinstance(dp, dict):
+                        dp = {}
+                if "image_style" in body:
+                    dp["image_style"] = normalize_image_style(body["image_style"])
+                if "image_style_custom" in body:
+                    dp["image_style_custom"] = normalize_custom_style(
+                        body["image_style_custom"]
+                    )
+                raw["dynamic_publish"] = dp
                 raw["config_revision"] = int(raw.get("config_revision", 0) or 0) + 1
 
             if hasattr(config_loader, "atomic_update"):
@@ -107,8 +182,7 @@ def create_image_generation_routes(config_loader, config_path: str):
             logger.info(f"文生图配置已更新: enabled={ig.get('enabled')}, model={ig.get('model')}")
             return ok({
                 "image_generation": _mask_config(ig if isinstance(ig, dict) else {}),
-                "with_image": (raw.get("dynamic_publish") or {}).get("with_image", False)
-                if isinstance(raw, dict) else False,
+                **_dynamic_image_settings(raw),
             })
         except Exception as e:
             logger.error(f"更新文生图配置失败: {e}", exc_info=True)
@@ -127,6 +201,42 @@ def create_image_generation_routes(config_loader, config_path: str):
                 return fail("INVALID_INPUT", "请输入 prompt 提示词", status_code=400)
 
             raw = config_loader.get_raw_config()
+            settings = _dynamic_image_settings(raw)
+            requested_style = body.get("style", settings["image_style"])
+            if not is_supported_image_style(requested_style):
+                return fail(
+                    "INVALID_INPUT",
+                    "style 不是受支持的配图风格",
+                    status_code=400,
+                )
+            requested_custom = body.get(
+                "custom_style",
+                settings["image_style_custom"],
+            )
+            if not isinstance(requested_custom, str):
+                return fail(
+                    "INVALID_INPUT",
+                    "custom_style 必须是字符串",
+                    status_code=400,
+                )
+            if len(requested_custom) > MAX_CUSTOM_STYLE_CHARS:
+                return fail(
+                    "INVALID_INPUT",
+                    f"custom_style 最多 {MAX_CUSTOM_STYLE_CHARS} 个字符",
+                    status_code=400,
+                )
+            requested_custom = normalize_custom_style(requested_custom)
+            if normalize_image_style(requested_style) == CUSTOM_IMAGE_STYLE and not requested_custom:
+                return fail(
+                    "INVALID_INPUT",
+                    "选择自定义风格时必须填写风格描述",
+                    status_code=400,
+                )
+            effective_prompt = apply_image_style(
+                prompt,
+                style=requested_style,
+                custom_style=requested_custom,
+            )
 
             # 从 model_routing + image_providers 获取当前路由的 provider 配置
             routing = raw.get("model_routing", {}) or {}
@@ -146,15 +256,18 @@ def create_image_generation_routes(config_loader, config_path: str):
             from bilibot.image.provider import ImageProvider
             provider = ImageProvider(provider_cfg)
             size = body.get("size") or provider_cfg.get("default_size", "1024x768")
-            image_bytes = await provider.generate(prompt, size=size)
-            await provider.close()
+            try:
+                image_bytes = await provider.generate(effective_prompt, size=size)
+            finally:
+                await provider.close()
             if image_bytes:
                 b64 = base64.b64encode(image_bytes).decode("utf-8")
                 return ok({
                     "success": True,
                     "image_b64": b64,
                     "size": len(image_bytes),
-                    "prompt": prompt,
+                    "prompt": effective_prompt,
+                    "style": normalize_image_style(requested_style),
                     "model": provider_cfg.get("model", ""),
                 }, "图片生成成功")
             return fail("IMAGE_GENERATION_FAILED", "文生图返回空结果", status_code=500)

@@ -82,7 +82,7 @@ export const OverviewPage = defineComponent({
                             ]),
                         ]),
                         h('p', { class: 'muted m-0' },
-                            status.value?.bilibili?.authenticated ? '已登录' : '未登录 · 请前往账号管理'),
+                            status.value?.bilibili?.authenticated ? '已登录' : '未登录 · 请前往 B站登录'),
                     ]),
                     // Card B: LLM 服务状态
                     h('article', {
@@ -224,7 +224,7 @@ export const OverviewPage = defineComponent({
                         ]),
                         h(ActionList, {
                             items: [
-                                { iconName: 'user', label: '添加账号', onClick: () => navigate('/accounts') },
+                                { iconName: 'user', label: 'B站登录', onClick: () => navigate('/accounts') },
                                 { iconName: 'star', label: '创建人格', onClick: () => navigate('/personas') },
                                 { iconName: 'circle-check', label: '测试召回', onClick: () => navigate('/memory/recall') },
                                 { iconName: 'tag', label: '保存配置', onClick: () => navigate('/config') },
@@ -234,7 +234,7 @@ export const OverviewPage = defineComponent({
                         h(Button, {
                             type: 'primary',
                             onClick: () => navigate('/accounts'),
-                        }, () => ['管理账号']),
+                        }, () => ['账号与登录']),
                     ]),
                 ]),
             ]);

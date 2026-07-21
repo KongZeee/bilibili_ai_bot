@@ -76,7 +76,10 @@ class AccountConfigRegistry:
         self._order: List[str] = []
 
     def load_from_raw(self, raw_config: dict):
-        """从原始配置字典加载所有账号（含 disabled / init-failed）
+        """从原始配置字典加载账号（单账号模式：最多保留 1 个）
+
+        若配置中有多个账号：优先保留 default_account（若在列表中），否则保留第一个；
+        其余账号丢弃并打 warning 日志。
 
         Args:
             raw_config: config.yaml 的原始字典（含 accounts 列表）
@@ -84,12 +87,35 @@ class AccountConfigRegistry:
         self._configs.clear()
         self._order.clear()
         accounts_list = raw_config.get("accounts", []) or []
+        parsed: List[dict] = []
         for i, acc_config in enumerate(accounts_list):
             if not isinstance(acc_config, dict):
                 continue
             acc_id = acc_config.get("id") or f"account_{i}"
             cfg = copy.deepcopy(acc_config)
             cfg.setdefault("id", acc_id)
+            parsed.append(cfg)
+
+        if len(parsed) > 1:
+            preferred = str(raw_config.get("default_account", "") or "")
+            winner = None
+            for cfg in parsed:
+                if cfg.get("id") == preferred:
+                    winner = cfg
+                    break
+            if winner is None:
+                winner = parsed[0]
+            dropped = [c.get("id") for c in parsed if c.get("id") != winner.get("id")]
+            logger.warning(
+                "SINGLE_ACCOUNT: config has %d accounts; keeping %s, dropping %s",
+                len(parsed),
+                winner.get("id"),
+                dropped,
+            )
+            parsed = [winner]
+
+        for cfg in parsed:
+            acc_id = cfg.get("id")
             self._configs[acc_id] = cfg
             self._order.append(acc_id)
         logger.info(f"配置注册表已加载 {len(self._configs)} 个账号: {self._order}")
@@ -97,20 +123,48 @@ class AccountConfigRegistry:
     def sync_from_raw(self, raw_config: dict):
         """从原始配置同步（拾取外部写入如 qrlogin）
 
-        - raw 中已有的账号：更新注册表中的配置（保留外部写入的敏感值）
-        - raw 中新增的账号：添加到注册表
-        - 注册表中已有但 raw 中没有的账号：保留不删除（避免丢失未保存的添加）
+        单账号模式：若 raw 含多个账号，只同步 winner（default_account 或第一个）。
+        - raw 中已有账号：更新注册表配置
+        - raw 中新账号：仅当注册表为空时才添加；已有账号时拒绝扩容
+        - 注册表中已有但 raw 中没有的账号：保留不删除
 
         Args:
             raw_config: config.yaml 的原始字典
         """
         accounts_list = raw_config.get("accounts", []) or []
+        parsed: List[dict] = []
         for i, acc_config in enumerate(accounts_list):
             if not isinstance(acc_config, dict):
                 continue
             acc_id = acc_config.get("id") or f"account_{i}"
             cfg = copy.deepcopy(acc_config)
             cfg.setdefault("id", acc_id)
+            parsed.append(cfg)
+
+        if len(parsed) > 1:
+            preferred = str(raw_config.get("default_account", "") or "")
+            winner = next((c for c in parsed if c.get("id") == preferred), None)
+            if winner is None:
+                winner = parsed[0]
+            dropped = [c.get("id") for c in parsed if c.get("id") != winner.get("id")]
+            logger.warning(
+                "SINGLE_ACCOUNT: sync keeping %s, ignoring %s",
+                winner.get("id"),
+                dropped,
+            )
+            parsed = [winner]
+
+        for cfg in parsed:
+            acc_id = cfg.get("id")
+            if acc_id in self._configs:
+                self._configs[acc_id] = cfg
+                continue
+            # 新 ID：仅空注册表可添加
+            if len(self._configs) >= 1:
+                logger.warning(
+                    "SINGLE_ACCOUNT: refuse adding account on sync: %s", acc_id
+                )
+                continue
             self._configs[acc_id] = cfg
             if acc_id not in self._order:
                 self._order.append(acc_id)
@@ -140,14 +194,18 @@ class AccountConfigRegistry:
         return acc_id in self._configs
 
     def add(self, acc_config: dict) -> str:
-        """添加账号配置
+        """添加账号配置（单账号模式：已有账号时拒绝）
 
         Returns:
             新账号 ID
 
         Raises:
-            ValueError: 账号 ID 已存在或路径不合法
+            ValueError: 账号 ID 已存在、路径不合法、或已达单账号上限（SINGLE_ACCOUNT）
         """
+        if len(self._configs) >= 1:
+            raise ValueError(
+                "SINGLE_ACCOUNT: only one Bilibili account is allowed"
+            )
         raw_id = acc_config.get("id") or f"account_{uuid.uuid4().hex[:8]}"
         acc_id = validate_account_id(raw_id)
         if acc_id in self._configs:
