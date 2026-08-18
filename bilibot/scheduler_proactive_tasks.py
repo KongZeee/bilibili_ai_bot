@@ -114,9 +114,11 @@ async def check_proactive_tasks(self, current_time: str):
                 break
 
     # 发布动态（H1：范围匹配，对齐 proactive_video，避免主循环跳分钟漏槽）
+    # Scheduled dynamics are time-bound TaskRuns.  A companion rest motive may
+    # defer expensive video work, but must not let a due dynamic expire before
+    # the scheduler can claim it.
     if (
         features.get("dynamic_post", True)
-        and not motive_rest
         and not prefer_video_now
     ):
         for trigger_time in self._dynamic_times:
