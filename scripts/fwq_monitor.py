@@ -26,8 +26,16 @@ try:
     )
     from bilibot.services.clock import now_cn
 except ModuleNotFoundError:
-    # Support direct execution from a systemd unit whose cwd is not the app root.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    # Support both <repo>/scripts/fwq_monitor.py and /root/monitor.py.
+    script_path = Path(__file__).resolve()
+    candidates = (
+        script_path.parent / "bilibot",
+        script_path.parents[1],
+    )
+    for candidate in candidates:
+        if (candidate / "bilibot").is_dir():
+            sys.path.insert(0, str(candidate))
+            break
     from bilibot.runtime_health import (
         CONSOLIDATION_DEFAULT_HOUR,
         CONSOLIDATION_DEFAULT_MINUTE,
