@@ -9,6 +9,8 @@ from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Optional
 
+from ..video_links import canonical_video_url
+
 
 # ═══════════════════════════════════════════════
 # 枚举
@@ -289,6 +291,9 @@ class VideoContext:
             parts.append(f"【观看情绪】{self.emotion}")
         if self.watched_at:
             parts.append(f"【观看时间】{self.watched_at}")
+        video_url = canonical_video_url(bvid=self.bvid, aid=self.oid)
+        if video_url:
+            parts.append(f"【视频链接】{video_url}")
         return "\n".join(parts)
 
 

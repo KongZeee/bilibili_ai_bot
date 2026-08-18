@@ -20,6 +20,11 @@ import logging
 from typing import Any, Dict, Optional, Tuple
 
 from .models import SceneType, ReplyContext
+from .video_links import (
+    ensure_video_link,
+    first_video_bvid,
+    normalize_bvid,
+)
 from .models.generation import (
     GenerationOutcome,
     LLM_CLIENT_UNAVAILABLE,
@@ -278,6 +283,24 @@ class ReplyGenerator:
                 type(exc).__name__,
             )
 
+    @staticmethod
+    def _trusted_video_link_target(reply_context: Optional[ReplyContext]) -> tuple[str, str]:
+        """Get a video identifier from structured context or rendered trusted evidence."""
+
+        if reply_context is None:
+            return "", ""
+        video = getattr(reply_context, "video", None)
+        bvid = normalize_bvid(getattr(video, "bvid", "") if video else "")
+        if bvid:
+            return bvid, ""
+        evidence_bvid = first_video_bvid(
+            getattr(reply_context, "memory_evidence", "")
+        )
+        if evidence_bvid:
+            return evidence_bvid, ""
+        aid = str(getattr(video, "oid", "") or "").strip() if video else ""
+        return "", aid
+
     async def _generate_reply_impl(
         self,
         user_id: str,
@@ -526,6 +549,17 @@ class ReplyGenerator:
                         state="skipped",
                     )
                     return GenerationOutcome.skip(MODEL_EMPTY_REPLY)
+
+            # A requested video link must come from validated context, never from
+            # a model-invented identifier. Preserve the Bilibili comment limit.
+            trusted_bvid, trusted_aid = self._trusted_video_link_target(reply_context)
+            reply_text = ensure_video_link(
+                reply_text,
+                query=comment,
+                bvid=trusted_bvid,
+                aid=trusted_aid,
+                max_chars=233,
+            )
 
             # 3. 写入 audit（含 persona_id / context_summary，PRD V3 §8.6 / V4 §4.5.3）
             audit_id = await self._record_audit(

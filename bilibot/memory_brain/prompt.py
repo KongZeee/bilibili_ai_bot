@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping, Sequence
 
+from bilibot.video_links import video_url_from_event
+
 
 DEFAULT_MEMORY_PROMPT_BUDGET = 5000
 MAX_EVENTS = 5
@@ -291,6 +293,9 @@ def _render_event(event: Mapping[str, Any], ordinal: int, limit: int) -> tuple[s
         lines.append(f"来源: {_escaped(source_type, 80)}")
     if title:
         lines.append(f"标题: {_escaped(title, 160)}")
+    video_url = video_url_from_event(event)
+    if video_url:
+        lines.append(f"视频链接（如需分享请原样使用）: {_escaped(video_url, 120)}")
     if raw_source_type in _USER_SOURCES and not bool(event.get("verified", False)):
         lines.append("事实边界: 这是某人当时说过的话，不是已验证事实。")
     if summary:
