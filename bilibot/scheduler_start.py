@@ -8,6 +8,7 @@ import logging
 from datetime import date
 from typing import Any, Dict
 
+from bilibot.runtime_health import consolidation_schedule_reached
 from bilibot.scheduler_motive import prepare_tick_motive
 from bilibot.services.clock import now_cn
 
@@ -307,17 +308,25 @@ async def scheduler_start(self):
 
             # 日终记忆清算（PRD 3.4，默认 03:00）
             consolidation_hour = 3
+            consolidation_minute = 0
             try:
-                consolidation_hour = int(
+                consolidation_config = (
                     self.config_loader.get_raw_config()
                     .get("memory", {})
                     .get("consolidation", {})
-                    .get("hour", 3)
                 )
+                consolidation_hour = int(consolidation_config.get("hour", 3))
+                consolidation_minute = int(consolidation_config.get("minute", 0))
             except Exception:
                 pass
+            # Run once after today's scheduled time, including a late process
+            # start or a loop that was paused during the exact hour.
             if (
-                now.hour == consolidation_hour
+                consolidation_schedule_reached(
+                    now,
+                    hour=consolidation_hour,
+                    minute=consolidation_minute,
+                )
                 and now.date() != self._last_consolidation_date
             ):
                 self._last_consolidation_date = now.date()

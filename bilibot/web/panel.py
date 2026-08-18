@@ -27,7 +27,16 @@ from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.staticfiles import StaticFiles
 
+from ..runtime_health import (
+    CONSOLIDATION_DEFAULT_HOUR,
+    CONSOLIDATION_DEFAULT_MINUTE,
+    ENRICHMENT_MAX_PENDING_AGE_SECONDS,
+    ENRICHMENT_MAX_PENDING_JOBS,
+    evaluate_consolidation_state,
+    memory_enrichment_is_clear,
+)
 from ..services import PersonaStore
+from ..services.clock import now_cn
 from ..prompts import PromptOrchestrator
 
 logger = logging.getLogger("bilibot.web")
@@ -100,6 +109,66 @@ def _memory_readiness_ok(memory_brain: Any, runtime_scheduler: Any) -> bool:
     return ok
 
 
+def _memory_enrichment_readiness_ok(memory_brain: Any, runtime_scheduler: Any) -> bool:
+    """Use the same queue/dead-letter contract as the external monitor."""
+    stats_reader = getattr(memory_brain, "stats", None)
+    if not callable(stats_reader):
+        return False
+    now = time.monotonic()
+    cached = getattr(runtime_scheduler, "_readiness_memory_operational_cache", None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        cached_at, cached_ok = cached
+        if now - float(cached_at) < _MEMORY_HEALTH_CACHE_TTL_SECONDS:
+            return bool(cached_ok)
+    try:
+        report = stats_reader()
+        ok = isinstance(report, dict) and memory_enrichment_is_clear(
+            report,
+            max_jobs=ENRICHMENT_MAX_PENDING_JOBS,
+            max_age_seconds=ENRICHMENT_MAX_PENDING_AGE_SECONDS,
+        )
+    except Exception:
+        ok = False
+    setattr(runtime_scheduler, "_readiness_memory_operational_cache", (now, ok))
+    return ok
+
+
+def _consolidation_readiness_ok(runtime_scheduler: Any) -> bool:
+    """Treat a missed today's scheduled run as not ready until recorded."""
+    data_store = getattr(runtime_scheduler, "ds", None)
+    load_json = getattr(data_store, "load_json", None)
+    if not callable(load_json):
+        return False
+    sentinel = object()
+    try:
+        state = load_json("consolidation_state.json", sentinel)
+        data_dir = getattr(data_store, "data_dir", None)
+        state_exists = state is not sentinel
+        if data_dir:
+            state_exists = (Path(data_dir) / "consolidation_state.json").exists()
+        raw_config = getattr(
+            getattr(runtime_scheduler, "config_loader", None),
+            "get_raw_config",
+            lambda: {},
+        )()
+        memory_config = raw_config.get("memory", {}) if isinstance(raw_config, dict) else {}
+        consolidation_config = (
+            memory_config.get("consolidation", {})
+            if isinstance(memory_config, dict)
+            else {}
+        )
+        report = evaluate_consolidation_state(
+            {} if state is sentinel else state,
+            now=now_cn(),
+            state_exists=state_exists and state is not sentinel,
+            hour=int(consolidation_config.get("hour", CONSOLIDATION_DEFAULT_HOUR)),
+            minute=int(consolidation_config.get("minute", CONSOLIDATION_DEFAULT_MINUTE)),
+        )
+        return bool(report.get("clear"))
+    except Exception:
+        return False
+
+
 def build_public_readiness(
     *,
     scheduler: Any = None,
@@ -117,6 +186,8 @@ def build_public_readiness(
         "task_runs_clear": False,
         "pm_states_clear": False,
         "memory_available": False,
+        "memory_enrichment_clear": False,
+        "consolidation_clear": False,
     }
     try:
         # A scheduler object alone is insufficient: it can remain allocated after
@@ -179,6 +250,10 @@ def build_public_readiness(
         checks["memory_available"] = _memory_readiness_ok(
             memory_brain, runtime_scheduler
         )
+        checks["memory_enrichment_clear"] = _memory_enrichment_readiness_ok(
+            memory_brain, runtime_scheduler
+        )
+        checks["consolidation_clear"] = _consolidation_readiness_ok(runtime_scheduler)
     except Exception:
         logger.debug("public readiness check failed closed", exc_info=True)
     return {"ready": all(checks.values()), "checks": checks}

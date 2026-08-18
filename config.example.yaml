@@ -452,6 +452,10 @@ memory:
   # 后台富化（摘要/实体/关联）单次调用预算。推理型模型常把输出预算
   # 花在 reasoning_content 上，12s 会频繁超时；实测建议 300。
   enrichment_chat_timeout_seconds: 300
+  # 关联是可选富化，单独限制模型等待，避免队列被一次 link 重试拖住。
+  link_enrichment_timeout_seconds: 60
+  # 小批量并发处理 durable jobs；不要超过模型端点的并发上限。
+  enrichment_worker_concurrency: 2
   link_candidate_limit: 12
   link_job_max_attempts: 3
   prompt_char_budget: 5000

@@ -52,15 +52,37 @@ class PersistentMemoryWorker:
         enrichment_chat_timeout_seconds: float = 12.0,
         link_candidate_limit: int = 12,
         unblock_grace_seconds: float = 30.0,
+        worker_concurrency: int = 2,
+        link_enrichment_timeout_seconds: float | None = None,
     ) -> None:
         self.store = store
         self.gateway = gateway
         self.worker_id = worker_id or f"memory-{uuid.uuid4().hex}"
-        self.lease_seconds = max(5.0, float(lease_seconds))
+        configured_lease_seconds = max(5.0, float(lease_seconds))
         self.embedding_batch_size = max(1, min(int(embedding_batch_size), 256))
         self.enrichment_chat_timeout_seconds = max(
             1.0, float(enrichment_chat_timeout_seconds)
         )
+        # Link suggestions are optional enrichment. Keep their worst-case retry
+        # bounded even when the general reasoning timeout is deliberately large.
+        self.link_enrichment_timeout_seconds = max(
+            1.0,
+            min(
+                self.enrichment_chat_timeout_seconds,
+                float(
+                    link_enrichment_timeout_seconds
+                    if link_enrichment_timeout_seconds is not None
+                    else 60.0
+                ),
+            ),
+        )
+        # A lease must outlive one provider call, otherwise a slow request can
+        # be reclaimed by another worker while the original task is still live.
+        self.lease_seconds = max(
+            configured_lease_seconds,
+            self.enrichment_chat_timeout_seconds + 30.0,
+        )
+        self.worker_concurrency = max(1, min(int(worker_concurrency), 4))
         self.link_candidate_limit = max(4, min(int(link_candidate_limit), 24))
         # A blocked job may reopen only after this many seconds. Without a
         # grace period, ProviderNotConfigured failures (including empty LLM
@@ -78,6 +100,9 @@ class PersistentMemoryWorker:
         self._last_job_type = ""
         self._completed_total = 0
         self._failed_total = 0
+        self._active_job_ids: set[str] = set()
+        self._active_job_types: set[str] = set()
+        self._active_job_type_by_id: dict[str, str] = {}
 
     def set_throttled(self, enabled: bool, *, reason: str = "") -> None:
         key = str(reason or "manual").strip() or "manual"
@@ -106,6 +131,10 @@ class PersistentMemoryWorker:
             "last_job_type": self._last_job_type,
             "completed_total": self._completed_total,
             "failed_total": self._failed_total,
+            "worker_concurrency": self.worker_concurrency,
+            "active_jobs": len(self._active_job_ids),
+            "active_job_types": sorted(self._active_job_types),
+            "link_enrichment_timeout_seconds": self.link_enrichment_timeout_seconds,
         }
 
     def _claimable_job_types(self) -> tuple[str, ...]:
@@ -162,17 +191,36 @@ class PersistentMemoryWorker:
         claimable = self._claimable_job_types()
         if not claimable:
             return WorkerRunReport()
+        batch_limit = max(1, min(int(limit), self.worker_concurrency))
         jobs = await asyncio.to_thread(
             self.store.claim_jobs,
             self.worker_id,
-            limit,
+            batch_limit,
             self.lease_seconds,
             job_types=claimable,
         )
+        if not jobs:
+            return WorkerRunReport()
+        reports = await asyncio.gather(
+            *(self._process_claimed_job(job) for job in jobs)
+        )
+        return WorkerRunReport(
+            claimed=len(jobs),
+            completed=sum(report.completed for report in reports),
+            blocked=sum(report.blocked for report in reports),
+            retried=sum(report.retried for report in reports),
+            dead=sum(report.dead for report in reports),
+        )
+
+    async def _process_claimed_job(self, job: ClaimedJob) -> WorkerRunReport:
+        """Execute one lease; independent jobs may run concurrently."""
+        self._active_job_ids.add(job.id)
+        self._active_job_types.add(job.job_type)
+        self._active_job_type_by_id[job.id] = job.job_type
+        self._last_job_started_at = time.time()
+        self._last_job_type = job.job_type
         completed = blocked = retried = dead = 0
-        for job in jobs:
-            self._last_job_started_at = time.time()
-            self._last_job_type = job.job_type
+        try:
             try:
                 result_counts = await self._execute(job)
             except asyncio.CancelledError:
@@ -218,24 +266,28 @@ class PersistentMemoryWorker:
                 ):
                     completed += 1
                     self._completed_total += 1
-            finally:
-                self._last_job_finished_at = time.time()
-                if job.event_id:
-                    try:
-                        await asyncio.to_thread(
-                            self.store.refresh_event_index_status, job.event_id
-                        )
-                    except Exception as exc:
-                        # The event may have been hard-deleted mid-job. A
-                        # missing row must never kill the durable worker.
-                        logger.debug(
-                            "memory job cleanup skipped for deleted event: job_id=%s event=%s error=%s",
-                            job.id,
-                            job.event_id,
-                            exc,
-                        )
+        finally:
+            self._last_job_finished_at = time.time()
+            self._active_job_ids.discard(job.id)
+            self._active_job_type_by_id.pop(job.id, None)
+            if job.job_type not in self._active_job_type_by_id.values():
+                self._active_job_types.discard(job.job_type)
+            if job.event_id:
+                try:
+                    await asyncio.to_thread(
+                        self.store.refresh_event_index_status, job.event_id
+                    )
+                except Exception as exc:
+                    # The event may have been hard-deleted mid-job. A missing
+                    # row must never kill the durable worker.
+                    logger.debug(
+                        "memory job cleanup skipped for deleted event: job_id=%s event=%s error=%s",
+                        job.id,
+                        job.event_id,
+                        exc,
+                    )
         return WorkerRunReport(
-            claimed=len(jobs),
+            claimed=1,
             completed=completed,
             blocked=blocked,
             retried=retried,
@@ -258,11 +310,11 @@ class PersistentMemoryWorker:
         self, stop_event: asyncio.Event, *, poll_interval: float = 1.0
     ) -> None:
         while not stop_event.is_set():
-            # Claim exactly one durable job so a newly-arrived online request can
-            # throttle expensive enrichment before the next chat call. Claiming
-            # eight jobs gave no throughput benefit because execution is serial.
+            # Keep a small bounded batch in flight. SQLite leases preserve
+            # ownership, while two independent enrichment calls prevent one
+            # slow optional link suggestion from serializing the whole queue.
             try:
-                report = await self.run_once(limit=1)
+                report = await self.run_once(limit=self.worker_concurrency)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -351,7 +403,7 @@ class PersistentMemoryWorker:
                         links = await self.gateway.suggest_links(
                             event,
                             candidates,
-                            timeout=self.enrichment_chat_timeout_seconds,
+                            timeout=self.link_enrichment_timeout_seconds,
                         )
                     except Exception as exc:
                         # Reasoning endpoints can exhaust even a 16k budget on

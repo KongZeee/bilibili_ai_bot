@@ -102,6 +102,8 @@ def migrate_config(config: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
         "recall_total_timeout_seconds": 10.0,
         "rerank_relevance_baseline": 0.65,
         "enrichment_chat_timeout_seconds": 12.0,
+        "link_enrichment_timeout_seconds": 60.0,
+        "enrichment_worker_concurrency": 2,
         "link_candidate_limit": 12,
         "link_job_max_attempts": 3,
         "prompt_char_budget": 5000,

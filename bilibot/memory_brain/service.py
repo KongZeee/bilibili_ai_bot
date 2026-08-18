@@ -254,6 +254,12 @@ class MemoryBrainService:
             link_candidate_limit=int(
                 _config_value(memory_config, "link_candidate_limit", 12)
             ),
+            worker_concurrency=int(
+                _config_value(memory_config, "enrichment_worker_concurrency", 2)
+            ),
+            link_enrichment_timeout_seconds=float(
+                _config_value(memory_config, "link_enrichment_timeout_seconds", 60.0)
+            ),
         )
         # Ephemeral mid-action working memory: survives across steps of one
         # activity until finish/clear. Not durable — durable truth stays in store.

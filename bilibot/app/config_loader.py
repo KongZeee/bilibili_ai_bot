@@ -194,6 +194,8 @@ class MemoryConfig:
     # softer than the chat-JSON 0..100-normalized scores, so it gets its own knob.
     rerank_model_relevance_baseline: float = 0.20
     enrichment_chat_timeout_seconds: float = 12.0
+    link_enrichment_timeout_seconds: float = 60.0
+    enrichment_worker_concurrency: int = 2
     link_candidate_limit: int = 12
     link_job_max_attempts: int = 3
     prompt_char_budget: int = 5000
@@ -267,6 +269,8 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
             "memory.rerank_timeout_seconds cannot exceed recall_total_timeout_seconds"
         )
     number("enrichment_chat_timeout_seconds", minimum=1.0, maximum=600.0)
+    number("link_enrichment_timeout_seconds", minimum=1.0, maximum=600.0)
+    integer("enrichment_worker_concurrency", minimum=1, maximum=4)
     integer("link_candidate_limit", minimum=4, maximum=24)
 
     baseline = value("rerank_relevance_baseline", defaults.rerank_relevance_baseline)
@@ -496,6 +500,12 @@ class ConfigLoader:
             ),
             enrichment_chat_timeout_seconds=mem.get(
                 "enrichment_chat_timeout_seconds", 12.0
+            ),
+            link_enrichment_timeout_seconds=mem.get(
+                "link_enrichment_timeout_seconds", 60.0
+            ),
+            enrichment_worker_concurrency=mem.get(
+                "enrichment_worker_concurrency", 2
             ),
             link_candidate_limit=mem.get("link_candidate_limit", 12),
             link_job_max_attempts=mem.get("link_job_max_attempts", 3),
