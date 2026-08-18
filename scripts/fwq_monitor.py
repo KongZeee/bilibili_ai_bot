@@ -14,6 +14,16 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+_SCRIPT_PATH = Path(__file__).resolve()
+_APP_ROOT_CANDIDATES = (
+    _SCRIPT_PATH.parent / "bilibot",
+    _SCRIPT_PATH.parents[1],
+)
+for _candidate in _APP_ROOT_CANDIDATES:
+    if (_candidate / "bilibot").is_dir():
+        sys.path.insert(0, str(_candidate))
+        break
+
 try:
     from bilibot.runtime_health import (
         CONSOLIDATION_DEFAULT_HOUR,
