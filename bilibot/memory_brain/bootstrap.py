@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import logging
 import math
 from pathlib import Path
 import sqlite3
@@ -21,6 +22,8 @@ from .store import (
     normalize_search_text,
     normalize_vector,
 )
+
+logger = logging.getLogger("bilibot.memory_brain.bootstrap")
 
 
 LEGACY_MEMORY_FILENAMES = (
@@ -461,17 +464,37 @@ def cleanup_legacy_memory_files(
                 )
             else:
                 try:
-                    candidate.unlink()
-                except FileNotFoundError:
-                    record = CleanupRecord(normalized_path, "missing", "")
+                    # Snapshot the file before deletion; if it changes between
+                    # health-gate and unlink (a concurrent writer replaced it),
+                    # refuse to delete instead of silently removing fresh data.
+                    try:
+                        before = candidate.lstat()
+                    except FileNotFoundError:
+                        before = None
+                    if before is None:
+                        record = CleanupRecord(normalized_path, "missing", "")
+                    else:
+                        try:
+                            after = candidate.lstat()
+                        except FileNotFoundError:
+                            after = None
+                        if after is None or (
+                            before.st_mtime_ns, before.st_size
+                        ) != (after.st_mtime_ns, after.st_size):
+                            record = CleanupRecord(
+                                normalized_path,
+                                "failed",
+                                "file changed during cleanup snapshot",
+                            )
+                        else:
+                            candidate.unlink()
+                            record = CleanupRecord(normalized_path, "deleted", "")
                 except OSError as exc:
                     record = CleanupRecord(
                         normalized_path,
                         "failed",
                         f"{type(exc).__name__}: {exc}",
                     )
-                else:
-                    record = CleanupRecord(normalized_path, "deleted", "")
             records.append(record)
             if owner is not None:
                 owner.log_legacy_cleanup(record.path, record.status, record.error)
@@ -507,6 +530,16 @@ def bootstrap_accounts(
 
     # Flat sole-account layout: every configured id shares bot/memory_brain.db.
     # brain_info.account_id is the default/sole owner (not encoded in the path).
+    # Extra configured ids (historical / disabled) are aliases for health-gate
+    # compatibility only; only the default account may boot a runtime service.
+    if len(unique_ids) > 1:
+        logger.warning(
+            "memory bootstrap: %s account ids configured; flat layout aliases "
+            "all of them to the sole brain owned by %r. Only that account can "
+            "instantiate a runtime MemoryBrainService.",
+            len(unique_ids),
+            default_id,
+        )
     db_path = account_db_path(data_root, default_id)
     sole_store = MemoryBrainStore(db_path, account_id=default_id)
     stores: dict[str, MemoryBrainStore] = {
@@ -524,6 +557,15 @@ def bootstrap_accounts(
             f"{account_id}: {', '.join(report.errors)}" for account_id, report in failed.items()
         )
         raise RuntimeError(f"memory brain health gate failed; legacy files were preserved: {details}")
+    try:
+        pruned_jobs = sole_store.prune_finished_jobs()
+        if pruned_jobs:
+            logger.info("memory bootstrap pruned %s finished outbox jobs", pruned_jobs)
+        pruned_traces = sole_store.prune_recall_traces()
+        if pruned_traces:
+            logger.info("memory bootstrap pruned %s old recall traces", pruned_traces)
+    except Exception as exc:
+        logger.warning("memory bootstrap prune failed: %s", exc)
     cleanup = (
         cleanup_legacy_memory_files(
             data_root,

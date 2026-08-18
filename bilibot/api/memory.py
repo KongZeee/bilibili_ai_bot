@@ -120,7 +120,13 @@ def _recall_engine_options(runtime_engine: Any = None) -> dict[str, Any]:
         "relevance_baseline": float(
             getattr(runtime_engine, "relevance_baseline", 0.65)
         ),
+        "dedicated_rerank_baseline": float(
+            getattr(runtime_engine, "dedicated_rerank_baseline", 0.20)
+        ),
         "vector_batch_size": int(getattr(runtime_engine, "vector_batch_size", 2048)),
+        "vector_candidate_prefilter": bool(
+            getattr(runtime_engine, "vector_candidate_prefilter", False)
+        ),
     }
 
 
@@ -274,6 +280,15 @@ class _MemoryApi:
         return self.account_exists(account_id) and self.runtime_account(account_id) is None
 
     def store(self, account_id: str) -> MemoryBrainStore:
+        # Prefer the running account's live store so API mutations share the
+        # worker's write lock. A second MemoryBrainStore instance for the same
+        # memory_brain.db would carry its own _write_lock and let concurrent
+        # SQLite write transactions contend at the database level.
+        runtime = self.runtime_account(account_id)
+        brain = getattr(runtime, "memory_brain", None)
+        live_store = getattr(brain, "store", None)
+        if live_store is not None:
+            return live_store
         if account_id not in self._stores:
             self._stores[account_id] = MemoryBrainStore.for_account(self.data_root, account_id)
         return self._stores[account_id]
@@ -1227,6 +1242,40 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
             logger.exception("重建记忆索引失败", extra={"account_id": account_id})
             return fail_internal("重建记忆索引失败")
 
+    async def derivation_repair(request: Request) -> JSONResponse:
+        value = await resolved(request)
+        if isinstance(value, JSONResponse):
+            return value
+        account_id, store = value
+        rejected = api.reject_mutation(account_id)
+        if rejected:
+            return rejected
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, Mapping):
+            return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
+        try:
+            dry_run = bool(body.get("dry_run", False))
+            limit = max(1, min(int(body.get("limit", 100)), 2000))
+            report = await asyncio.to_thread(
+                store.scan_derivation_repairs, limit=limit, dry_run=dry_run
+            )
+            await api.audit_mutation(
+                "derivation_repair",
+                account_id,
+                details={
+                    "dry_run": dry_run,
+                    "scanned": int(report.get("scanned") or 0),
+                    "repaired_events": int(report.get("repaired_events") or 0),
+                },
+            )
+            return ok(report)
+        except Exception:
+            logger.exception("记忆派生行修复失败", extra={"account_id": account_id})
+            return fail_internal("记忆派生行修复失败")
+
     return {
         "stats": stats,
         "listing": listing,
@@ -1243,6 +1292,7 @@ def _account_handlers(api: _MemoryApi) -> dict[str, Any]:
         "retry_dead_jobs": retry_dead_jobs,
         "dead_job_report": dead_job_report,
         "reindex": reindex,
+        "derivation_repair": derivation_repair,
     }
 
 
@@ -1277,6 +1327,7 @@ def create_account_memory_routes(account_manager: Any) -> list[Route]:
         Route("/api/accounts/{account_id}/memory/graph", handlers["graph"], methods=["GET"]),
         Route("/api/accounts/{account_id}/memory/graph/query", handlers["graph_query"], methods=["POST"]),
         Route("/api/accounts/{account_id}/memory/reindex", handlers["reindex"], methods=["POST"]),
+        Route("/api/accounts/{account_id}/memory/derivation-repair", handlers["derivation_repair"], methods=["POST"]),
         Route("/api/accounts/{account_id}/memory/jobs", handlers["jobs"], methods=["GET"]),
         Route("/api/accounts/{account_id}/memory/jobs/dead-report", handlers["dead_job_report"], methods=["GET"]),
         Route("/api/accounts/{account_id}/memory/jobs/retry-dead", handlers["retry_dead_jobs"], methods=["POST"]),
@@ -1298,6 +1349,7 @@ def create_account_memory_routes(account_manager: Any) -> list[Route]:
         Route("/api/memory/graph", _as_flat(handlers["graph"]), methods=["GET"]),
         Route("/api/memory/graph/query", _as_flat(handlers["graph_query"]), methods=["POST"]),
         Route("/api/memory/reindex", _as_flat(handlers["reindex"]), methods=["POST"]),
+        Route("/api/memory/derivation-repair", _as_flat(handlers["derivation_repair"]), methods=["POST"]),
         Route("/api/memory/jobs", _as_flat(handlers["jobs"]), methods=["GET"]),
         Route("/api/memory/jobs/dead-report", _as_flat(handlers["dead_job_report"]), methods=["GET"]),
         Route("/api/memory/jobs/retry-dead", _as_flat(handlers["retry_dead_jobs"]), methods=["POST"]),

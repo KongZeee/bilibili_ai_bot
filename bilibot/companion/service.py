@@ -10,8 +10,10 @@ import random
 import re
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any, Dict, List, Mapping, Optional, Tuple
+
+from bilibot.services.clock import now_cn, today_cn
 
 from .config import CompanionConfig, load_companion_config
 from .models import (
@@ -43,11 +45,11 @@ _THREAD_CATEGORY_PREFIXES = ("兴趣：", "最近在看：", "小说：")
 
 
 def _today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return today_cn().isoformat()
 
 
 def _now_iso() -> str:
-    return datetime.now().isoformat(timespec="seconds")
+    return now_cn().isoformat(timespec="seconds")
 
 
 def _parse_hhmm(s: str) -> Optional[int]:
@@ -212,10 +214,16 @@ def _merge_partial_plan_items(
         if match_index is None:
             continue
         base = merged[match_index]
+        sleep_tokens = ("睡", "睡眠", "就寝", "休息")
+        base_is_sleep = any(t in str(base.activity or "") for t in sleep_tokens)
+        # The fallback sleep slot is a safety anchor: never let a partial LLM
+        # row replace it with an all-night activity, even one that merely
+        # mentions "不睡觉/睡不着".
+        activity = base.activity if base_is_sleep else (candidate.activity or base.activity)
         merged[match_index] = PlanItem(
             time=base.time,
             end=base.end,
-            activity=str(candidate.activity or base.activity).strip()[:180],
+            activity=str(activity).strip()[:180],
             mood=str(candidate.mood or base.mood).strip()[:30],
             message_seed=str(candidate.message_seed or base.message_seed).strip()[:160],
             basis="llm_partial",
@@ -299,6 +307,9 @@ class CompanionLifeService:
         # 异步可重入保护：bool 在 await 间隙会误判；用 asyncio.Lock
         self._tick_lock: Optional[asyncio.Lock] = None
         self._tick_busy = False  # sync fallback if lock not yet bound to loop
+        # 本进程内 begin_activity 已打开、尚未 finish 的活动。
+        # tick 结束时仍残留的项会被强制关闭，避免 LLM/搜索异常泄漏 intent。
+        self._open_companion_activities: dict[str, dict[str, Any]] = {}
         # 最近一次入脑失败（可观测，不阻断主链路）
         self._last_archive_error: str = ""
         self._last_archive_ok_at: str = ""
@@ -541,7 +552,9 @@ class CompanionLifeService:
             # 日记/梦境/日程等同日可重写：键带内容指纹，避免 IdempotencyConflict 刷警告
             base_key = idempotency_key or f"{source_type}:{_today()}:{uuid.uuid4().hex[:8]}"
             if source_type in {"diary", "dream", "life_plan", "creative", "web_reference"}:
-                digest = hashlib.sha1(str(text).encode("utf-8", errors="ignore")).hexdigest()[:10]
+                digest = hashlib.sha1(
+                    str(text).encode("utf-8", errors="ignore"), usedforsecurity=False
+                ).hexdigest()[:10]
                 base_key = f"{base_key}:{digest}"
 
             meta = dict(metadata or {})
@@ -925,6 +938,14 @@ class CompanionLifeService:
                     exc_info=True,
                 )
                 raise
+            # Track the opened intent so tick's finally can close it even when
+            # a later LLM/search step raises before the generator can finish.
+            self._open_companion_activities[str(action_key)] = {
+                "action_type": action_type or scene,
+                "scene": scene,
+                "title": title or action_type or scene,
+                "metadata": dict(metadata or {}),
+            }
             evidence = str(getattr(activity, "prompt_text", "") or "").strip()
             event_ids = list(getattr(activity, "event_ids", ()) or ())
             snippets = list(getattr(activity, "recent_self_actions", ()) or ())
@@ -1252,6 +1273,7 @@ class CompanionLifeService:
                     close_thread_prefix=close_thread_prefix,
                     event_id=str(finished_event_id or ""),
                 )
+            self._open_companion_activities.pop(str(action_key), None)
             return True
         except Exception as exc:
             # Domain output may already be committed; do not regenerate a
@@ -1283,6 +1305,80 @@ class CompanionLifeService:
             )
             return False
 
+    async def _fail_open_activity(
+        self,
+        *,
+        action_key: str,
+        action_type: str,
+        scene: str,
+        title: str,
+        result_text: str = "",
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Close an activity intent opened by _recall_life_evidence as failed.
+
+        Called on archive failure so memory's recent-self lane never keeps a
+        permanently open "准备中" intent.
+        """
+        if not action_key:
+            return
+        try:
+            await self._finish_activity_memory(
+                action_key=action_key,
+                action_type=action_type,
+                result_text=result_text or f"{scene} 记忆归档失败",
+                scene=scene,
+                title=title,
+                metadata=metadata,
+                state="failed",
+                pause_on_error=False,
+            )
+        except Exception as exc:  # never mask the original archive error
+            logger.warning(
+                "[%s] failed-activity close failed action=%s: %s",
+                self.account_id,
+                action_key,
+                exc,
+            )
+
+    async def _close_stale_open_activities(self) -> int:
+        """Fail any begin_activity intent that a generator did not finish.
+
+        Generators close their intents on every normal path; this is the tick
+        finally-belt for LLM/search/timeout exceptions that propagate before
+        the generator reaches its own close.
+        """
+        registry = getattr(self, "_open_companion_activities", None) or {}
+        if not registry:
+            return 0
+        stale = list(registry.items())
+        remaining: dict[str, dict[str, Any]] = {}
+        for key, meta in stale:
+            try:
+                closed = await self._finish_activity_memory(
+                    action_key=key,
+                    action_type=str(meta.get("action_type") or "companion"),
+                    result_text="companion 生成中断，未产生可归档的终态输出",
+                    scene=str(meta.get("scene") or "companion"),
+                    title=str(meta.get("title") or "companion"),
+                    metadata=dict(meta.get("metadata") or {}),
+                    state="failed",
+                    pause_on_error=False,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "[%s] stale-activity close failed action=%s: %s",
+                    self.account_id,
+                    key,
+                    exc,
+                )
+                closed = False
+            if not closed:
+                remaining[key] = meta
+        if remaining:
+            registry.update(remaining)
+        return len(stale) - len(remaining)
+
     def _offer_draft(self, content: str, created_by: str) -> Optional[str]:
         if not content or not content.strip():
             return None
@@ -1311,7 +1407,7 @@ class CompanionLifeService:
         Higher score ⇒ more urgent. Callers (scheduler tick / proactive checks)
         should prefer the top motive's ``suggested_action`` over blind cron slots.
         """
-        now = now or datetime.now()
+        now = now or now_cn()
         snap = self.get_self_snapshot() if self.enabled else SelfSnapshot()
         energy = int(getattr(snap, "energy", 70) or 70)
         threads = list(getattr(snap, "ongoing_threads", None) or [])
@@ -1336,6 +1432,21 @@ class CompanionLifeService:
         try:
             browse_session_count = max(0, int(runtime.get("browse_session_count") or 0))
         except (TypeError, ValueError):
+            browse_session_count = 0
+        try:
+            last_proactive_video_ts = float(
+                runtime.get("last_proactive_video_ts") or 0
+            )
+        except (TypeError, ValueError):
+            last_proactive_video_ts = 0.0
+        # Session count is a rolling 2h window. Without this decay a crash /
+        # restart between the 4th watch and a reset hook keeps rest>=7.0
+        # forever and the MotiveQueue gate blocks every future video/dynamic.
+        if (
+            browse_session_count > 0
+            and last_proactive_video_ts > 0
+            and now_ts - last_proactive_video_ts >= 2 * 3600
+        ):
             browse_session_count = 0
         try:
             last_feed_exhaustion_ts = float(runtime.get("last_feed_exhaustion_ts") or 0)
@@ -1606,7 +1717,7 @@ class CompanionLifeService:
         try:
             plan = self.store.get_daily_plan()
             if plan and getattr(plan, "items", None):
-                now_m = datetime.now().hour * 60 + datetime.now().minute
+                now_m = now_cn().hour * 60 + now_cn().minute
                 for it in plan.items:
                     s = _parse_hhmm(it.time)
                     e = _parse_hhmm(it.end)
@@ -1638,7 +1749,7 @@ class CompanionLifeService:
         current = snap.activity or state.activity or ""
         seed = snap.message_seed or state.message_seed or ""
         if plan.items:
-            now_m = datetime.now().hour * 60 + datetime.now().minute
+            now_m = now_cn().hour * 60 + now_cn().minute
             for it in plan.items:
                 s = _parse_hhmm(it.time)
                 e = _parse_hhmm(it.end)
@@ -1756,7 +1867,7 @@ class CompanionLifeService:
         """True if current companion plan activity looks like browsing Bilibili."""
         if not self.enabled:
             return False
-        now = now or datetime.now()
+        now = now or now_cn()
         plan = self.store.get_daily_plan()
         if plan.date != _today() or not plan.items:
             state = self.store.get_life_state()
@@ -2087,7 +2198,7 @@ class CompanionLifeService:
         failures = runtime.get("video_failure_cooldowns") or {}
         item = failures.get(str(bvid)) if isinstance(failures, dict) else None
         try:
-            return bool(item) and float(item.get("until") or 0) > (now or datetime.now()).timestamp()
+            return bool(item) and float(item.get("until") or 0) > (now or now_cn()).timestamp()
         except (TypeError, ValueError, AttributeError):
             return False
 
@@ -2140,7 +2251,6 @@ class CompanionLifeService:
             return
         try:
             self.ensure_life_state()
-            seed = str(topic or content or "")[:60]
             preview = (content or topic or "").strip().replace("\n", " ")
 
             def _mutate_dyn(state: LifeState) -> None:
@@ -2216,9 +2326,10 @@ class CompanionLifeService:
                 state = self.store.get_life_state()
                 _mutate_pm(state)
                 self.store.save_life_state(state)
+            # Actor pseudonym is PM-specific and must not enter the public
+            # prompt surface (message_seed / salient_recent). Keep it only in
+            # the non-injected runtime debug trail.
             line = "回了私信"
-            if who:
-                line += f"（{who}）"
             self._push_salient_self(line=line[:120])
             runtime_patch: Dict[str, Any] = {"last_private_message_at": _now_iso()}
             if safe_preview:
@@ -2303,105 +2414,124 @@ class CompanionLifeService:
 
     # ── life state ──
 
-    def ensure_life_state(self) -> LifeState:
-        state = self.store.get_life_state()
-        today = _today()
-        if state.date != today:
-            # day roll — keep continuous self so overnight threads/recent acts
-            # still ground generation; only reset daily energy/mood shell.
-            dream = self.store.get_latest_dream()
-            energy = self._cfg.life_state.energy_default
-            mood = "平稳"
-            afterglow = ""
-            sleep = "正常"
-            now = datetime.now()
-            previous_energy = int(getattr(state, "energy", energy) or energy)
-            late_roll = now.hour < 5
-            if late_roll:
-                # Crossing midnight while still active is not a full recharge.
-                energy = min(previous_energy, max(0, energy - 12))
-                mood = "困倦"
-                sleep = "晚睡/通宵"
-            dream_is_recent = False
-            if dream and dream.date:
-                try:
-                    dream_date = datetime.strptime(dream.date, "%Y-%m-%d").date()
-                    dream_age_days = (now.date() - dream_date).days
-                    dream_is_recent = 0 <= dream_age_days <= 1
-                except (TypeError, ValueError):
-                    dream_is_recent = False
-            if dream_is_recent:
-                # A dream may color the following day, but must not become a
-                # permanent afterglow when diary/dream generation missed days.
-                energy = max(0, min(100, energy + int(dream.energy_delta or 0)))
-                mood = dream.mood or mood
-                afterglow = dream.afterglow or ""
-            prev_salient = [
-                str(x).strip()
-                for x in (getattr(state, "salient_recent", None) or [])
-                if str(x or "").strip()
-            ][:5]
-            prior_threads = [
-                str(x).strip()
-                for x in (getattr(state, "ongoing_threads", None) or [])
-                if str(x or "").strip() and "已完成" not in str(x)
-            ]
-            # Day roll is the decay boundary for transient thoughts. Keep a
-            # recently watched item into tomorrow, but expire it after 36h so
-            # the same old topic cannot pollute every future plan/recall. Older
-            # installations lack per-thread timestamps; keep each legacy row
-            # once and stamp it now for the next roll.
-            runtime = self.store.get_runtime() or {}
-            raw_thread_stamps = runtime.get("ongoing_thread_timestamps") or {}
-            thread_stamps = (
-                dict(raw_thread_stamps) if isinstance(raw_thread_stamps, dict) else {}
-            )
-            now_ts = now.timestamp()
-            prev_threads: List[str] = []
-            kept_stamps: Dict[str, float] = {}
-            for item in prior_threads:
-                persistent = item.startswith(("小说：", "追番："))
-                try:
-                    stamped_at = float(thread_stamps.get(item) or 0)
-                except (TypeError, ValueError):
-                    stamped_at = 0.0
-                if not stamped_at:
-                    stamped_at = now_ts
-                if persistent or now_ts - stamped_at <= 36 * 3600:
-                    prev_threads.append(item)
-                    kept_stamps[item] = stamped_at
-                if len(prev_threads) >= 4:
-                    break
+    def _roll_life_state_if_needed(
+        self,
+        state: LifeState,
+        *,
+        now: Optional[datetime] = None,
+    ) -> None:
+        """Mutate ``state`` in place when its date is stale (day roll).
+
+        Called inside ``store.update_life_state``'s lock so the roll and any
+        concurrent energy/salient update cannot clobber each other.
+        """
+        now = now or now_cn()
+        today = now.strftime("%Y-%m-%d")
+        if state.date == today:
+            return
+
+        # day roll — keep continuous self so overnight threads/recent acts
+        # still ground generation; only reset daily energy/mood shell.
+        dream = self.store.get_latest_dream()
+        energy = self._cfg.life_state.energy_default
+        mood = "平稳"
+        afterglow = ""
+        sleep = "正常"
+        previous_energy = int(getattr(state, "energy", energy) or energy)
+        late_roll = now.hour < 6
+        if late_roll:
+            # Crossing midnight while still active is not a full recharge.
+            energy = min(previous_energy, max(0, energy - 12))
+            mood = "困倦"
+            sleep = "晚睡/通宵"
+        dream_is_recent = False
+        if dream and dream.date:
             try:
-                self.store.patch_runtime(ongoing_thread_timestamps=kept_stamps)
-            except Exception:
-                pass
-            state = LifeState(
-                date=today,
-                energy=energy,
-                sleep=sleep,
-                mood_bias=mood,
-                activity="夜深了，正在收尾准备休息" if late_roll else "",
-                message_seed="先休息，醒来再继续" if late_roll else "",
-                conditions=[],
-                dream_afterglow=afterglow,
-                salient_recent=prev_salient,
-                ongoing_threads=prev_threads,
-                updated_at=_now_iso(),
-            )
-            self.store.save_life_state(state)
-        return state
+                dream_date = datetime.strptime(dream.date, "%Y-%m-%d").date()
+                dream_age_days = (now.date() - dream_date).days
+                dream_is_recent = 0 <= dream_age_days <= 1
+            except (TypeError, ValueError):
+                dream_is_recent = False
+        if dream_is_recent:
+            # A dream may color the following day, but must not become a
+            # permanent afterglow when diary/dream generation missed days.
+            energy = max(0, min(100, energy + int(dream.energy_delta or 0)))
+            mood = dream.mood or mood
+            afterglow = dream.afterglow or ""
+        prev_salient = [
+            str(x).strip()
+            for x in (getattr(state, "salient_recent", None) or [])
+            if str(x or "").strip()
+        ][:5]
+        prior_threads = [
+            str(x).strip()
+            for x in (getattr(state, "ongoing_threads", None) or [])
+            if str(x or "").strip() and "已完成" not in str(x)
+        ]
+        # Day roll is the decay boundary for transient thoughts. Keep a
+        # recently watched item into tomorrow, but expire it after 36h so
+        # the same old topic cannot pollute every future plan/recall. Older
+        # installations lack per-thread timestamps; keep each legacy row
+        # once and stamp it now for the next roll.
+        runtime = self.store.get_runtime() or {}
+        raw_thread_stamps = runtime.get("ongoing_thread_timestamps") or {}
+        thread_stamps = (
+            dict(raw_thread_stamps) if isinstance(raw_thread_stamps, dict) else {}
+        )
+        now_ts = now.timestamp()
+        prev_threads: List[str] = []
+        kept_stamps: Dict[str, float] = {}
+        for item in prior_threads:
+            persistent = item.startswith(("小说：", "追番："))
+            try:
+                stamped_at = float(thread_stamps.get(item) or 0)
+            except (TypeError, ValueError):
+                stamped_at = 0.0
+            if not stamped_at:
+                stamped_at = now_ts
+            if persistent or now_ts - stamped_at <= 36 * 3600:
+                prev_threads.append(item)
+                kept_stamps[item] = stamped_at
+            if len(prev_threads) >= 4:
+                break
+        try:
+            self.store.patch_runtime(ongoing_thread_timestamps=kept_stamps)
+        except Exception:
+            pass
+        state.date = today
+        state.energy = energy
+        state.sleep = sleep
+        state.mood_bias = mood
+        state.activity = "夜深了，正在收尾准备休息" if late_roll else ""
+        state.message_seed = "先休息，醒来再继续" if late_roll else ""
+        state.conditions = []
+        state.dream_afterglow = afterglow
+        state.salient_recent = prev_salient
+        state.ongoing_threads = prev_threads
+        state.updated_at = _now_iso()
+
+    def ensure_life_state(self) -> LifeState:
+        """Load LifeState and apply day roll atomically under the store lock."""
+        def _mutate(state: LifeState) -> None:
+            self._roll_life_state_if_needed(state)
+
+        return self.store.update_life_state(_mutate)
 
     def _refresh_life_rhythm(self, now: Optional[datetime] = None) -> LifeState:
         """Apply bounded time-of-day energy drift at most once per 30 minutes."""
-        now = now or datetime.now()
+        now = now or now_cn()
         state = self.ensure_life_state()
         runtime = self.store.get_runtime() or {}
         now_ts = now.timestamp()
         try:
-            last_ts = float(runtime.get("last_life_rhythm_ts") or now_ts)
+            last_ts = float(runtime.get("last_life_rhythm_ts") or 0.0)
         except (TypeError, ValueError):
-            last_ts = now_ts
+            last_ts = 0.0
+        if last_ts <= 0.0:
+            # First run: establish the baseline instead of silently returning
+            # forever (the missing key previously made elapsed always 0).
+            self.store.patch_runtime(last_life_rhythm_ts=now_ts)
+            return state
         elapsed = max(0.0, min(8 * 3600.0, now_ts - last_ts))
         if elapsed < 30 * 60:
             return state
@@ -2418,9 +2548,19 @@ class CompanionLifeService:
                 delta = -min(8, steps)
                 mood = "困倦" if state.energy >= 25 else "疲惫"
         else:
-            # Natural awake drain is intentionally slower than activity costs.
-            delta = -max(1, steps // 4)
-            mood = state.mood_bias
+            resting = any(
+                token in str(state.activity or "")
+                for token in ("休息", "午睡", "小憩", "放松")
+            )
+            if resting:
+                # Daytime rest recovers a little energy so a drained bot is
+                # not locked at 0 until the next day roll.
+                delta = min(3, steps)
+                mood = state.mood_bias
+            else:
+                # Natural awake drain is intentionally slower than activity costs.
+                delta = -max(1, steps // 4)
+                mood = state.mood_bias
 
         def _mutate(current: LifeState) -> None:
             current.energy = max(0, min(100, int(current.energy) + delta))
@@ -2435,8 +2575,8 @@ class CompanionLifeService:
         return state
 
     def _sync_state_from_plan(self, plan: DailyPlan, state: Optional[LifeState] = None) -> LifeState:
-        state = state or self.ensure_life_state()
-        now_m = datetime.now().hour * 60 + datetime.now().minute
+        del state  # kept for call-site compatibility; always operate atomically
+        now_m = now_cn().hour * 60 + now_cn().minute
         current = None
         for it in plan.items:
             s = _parse_hhmm(it.time)
@@ -2453,22 +2593,35 @@ class CompanionLifeService:
             if in_seg:
                 current = it
                 break
-        if current:
-            state.activity = current.activity
-            state.message_seed = current.message_seed
-            if current.mood:
-                state.mood_bias = current.mood
-        state.updated_at = _now_iso()
-        self.store.save_life_state(state)
-        return state
+
+        def _mutate(cur: LifeState) -> None:
+            self._roll_life_state_if_needed(cur)
+            if current:
+                cur.activity = current.activity
+                cur.message_seed = current.message_seed
+                if current.mood:
+                    cur.mood_bias = current.mood
+            cur.updated_at = _now_iso()
+
+        return self.store.update_life_state(_mutate)
 
     def apply_activity_energy_delta(self, delta: int, reason: str = "") -> LifeState:
-        state = self.ensure_life_state()
-        state.energy = max(0, min(100, int(state.energy) + int(delta)))
-        state.updated_at = _now_iso()
-        self.store.save_life_state(state)
+        energy_delta = int(delta)
+
+        def _mutate(state: LifeState) -> None:
+            self._roll_life_state_if_needed(state)
+            state.energy = max(0, min(100, int(state.energy) + energy_delta))
+            state.updated_at = _now_iso()
+
+        state = self.store.update_life_state(_mutate)
         if reason:
-            logger.debug("[%s] energy %+d (%s) -> %s", self.account_id, delta, reason, state.energy)
+            logger.debug(
+                "[%s] energy %+d (%s) -> %s",
+                self.account_id,
+                energy_delta,
+                reason,
+                state.energy,
+            )
         return state
 
     # ── schedule ──
@@ -2486,7 +2639,7 @@ class CompanionLifeService:
         bits = self._persona_bits()
         state = self.store.get_life_state()
         snapshot = self.get_self_snapshot()
-        now = datetime.now()
+        now = now_cn()
         if not self._cfg.schedule.enabled or fallback_only:
             plan = DailyPlan(
                 date=today,
@@ -2536,6 +2689,13 @@ class CompanionLifeService:
                     pause_on_error=False,
                 )
                 if not archived:
+                    await self._fail_open_activity(
+                        action_key=bridge_key,
+                        action_type="create_daily_plan",
+                        scene="life_plan",
+                        title=f"凌晨日程衔接 {today}",
+                        metadata={"date": today, "provisional": True},
+                    )
                     raise RuntimeError("companion bridge plan memory archive failed")
                 await self._finish_activity_memory(
                     action_key=bridge_key,
@@ -2663,6 +2823,13 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         if not archived:
+            await self._fail_open_activity(
+                action_key=f"companion_plan:{today}",
+                action_type="create_daily_plan",
+                scene="life_plan",
+                title=f"日程 {today}",
+                metadata={"date": today},
+            )
             raise RuntimeError("companion daily plan memory archive failed")
         await self._finish_activity_memory(
             action_key=f"companion_plan:{today}",
@@ -2711,7 +2878,7 @@ class CompanionLifeService:
         if plan.date != _today() or not plan.items:
             return None
         lead = self._cfg.schedule.detail_lead_minutes
-        now_m = datetime.now().hour * 60 + datetime.now().minute
+        now_m = now_cn().hour * 60 + now_cn().minute
         target: Optional[PlanItem] = None
         for it in plan.items:
             s = _parse_hhmm(it.time)
@@ -2823,6 +2990,13 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         if not archived:
+            await self._fail_open_activity(
+                action_key=f"companion_life_detail:{seg_key}",
+                action_type="expand_life_detail",
+                scene="life_plan",
+                title=f"生活时段 {window}",
+                metadata={"segment_key": seg_key, "date": plan.date},
+            )
             raise RuntimeError("companion life detail memory archive failed")
         await self._finish_activity_memory(
             action_key=f"companion_life_detail:{seg_key}",
@@ -2835,10 +3009,14 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         self.store.save_story_detail(detail)
-        state.activity = target.activity
-        state.message_seed = hooks[0] if hooks else target.message_seed
-        state.updated_at = _now_iso()
-        self.store.save_life_state(state)
+
+        def _mutate_life(cur: LifeState) -> None:
+            self._roll_life_state_if_needed(cur)
+            cur.activity = target.activity
+            cur.message_seed = hooks[0] if hooks else target.message_seed
+            cur.updated_at = _now_iso()
+
+        self.store.update_life_state(_mutate_life)
         return detail
 
     # ── dream + diary ──
@@ -2869,7 +3047,9 @@ class CompanionLifeService:
             return None
         today = _today()
         existing = self.store.get_latest_dream()
-        if not force and existing and existing.date == today and existing.content:
+        # Same-day idempotency applies to force=True too: force means "run now",
+        # not "archive a second dream for the same date into the brain".
+        if existing and existing.date == today and existing.content:
             return existing
         bits = self._persona_bits()
         frags = self._normalize_fragments(self.store.get_dream_fragments())
@@ -2954,6 +3134,13 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         if not archived:
+            await self._fail_open_activity(
+                action_key=f"companion_dream:{today}",
+                action_type="write_dream",
+                scene="dream",
+                title=f"梦境 {today}",
+                metadata={"date": today},
+            )
             raise RuntimeError("companion dream memory archive failed")
         await self._finish_activity_memory(
             action_key=f"companion_dream:{today}",
@@ -2977,14 +3164,20 @@ class CompanionLifeService:
                 DreamFragment(text=fac, weight=1.2, created_ts=now, source="dream", date=today)
             )
         self.store.save_dream_fragments(self._normalize_fragments(pool))
-        # update life afterglow
-        state = self.ensure_life_state()
-        state.dream_afterglow = dream.afterglow
-        if dream.mood:
-            state.mood_bias = dream.mood
-        state.energy = max(0, min(100, state.energy + int(dream.energy_delta or 0)))
-        state.updated_at = _now_iso()
-        self.store.save_life_state(state)
+        # update life afterglow atomically
+        dream_afterglow = dream.afterglow
+        dream_mood = dream.mood or ""
+        dream_energy_delta = int(dream.energy_delta or 0)
+
+        def _mutate_life(cur: LifeState) -> None:
+            self._roll_life_state_if_needed(cur)
+            cur.dream_afterglow = dream_afterglow
+            if dream_mood:
+                cur.mood_bias = dream_mood
+            cur.energy = max(0, min(100, cur.energy + dream_energy_delta))
+            cur.updated_at = _now_iso()
+
+        self.store.update_life_state(_mutate_life)
         self.store.patch_runtime(last_dream_at=_now_iso())
         return dream
 
@@ -2993,7 +3186,9 @@ class CompanionLifeService:
             return None
         today = _today()
         diaries = self.store.get_diaries()
-        if not force and any(d.date == today for d in diaries):
+        # Same-day idempotency applies to force=True too: force means "run
+        # now", not "archive a second diary for the same date".
+        if any(d.date == today for d in diaries):
             return next(d for d in diaries if d.date == today)
 
         # optional dream first
@@ -3080,6 +3275,13 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         if not archived:
+            await self._fail_open_activity(
+                action_key=f"companion_diary:{today}",
+                action_type="write_diary",
+                scene="diary",
+                title=f"日记 {today}",
+                metadata={"date": today},
+            )
             raise RuntimeError("companion diary memory archive failed")
         await self._finish_activity_memory(
             action_key=f"companion_diary:{today}",
@@ -3209,17 +3411,20 @@ class CompanionLifeService:
         if not self.web_search or not getattr(self.web_search, "is_available", lambda: False)():
             logger.debug("[%s] exploration skipped: web_search unavailable", self.account_id)
             return None
-        # scene gate：未配置 companion_exploration 时回落到 DEFAULT（True）或 proactive_video
+        # scene gate：优先 companion_exploration，回落到 proactive_video；
+        # 实际调用必须使用与 gate 相同的 scene，否则 search() 内部二次
+        # gate 会静默返回空结果，白白烧一次探索 LLM。
+        search_scene = "companion_exploration"
         if hasattr(self.web_search, "is_scene_enabled"):
-            if not (
-                self.web_search.is_scene_enabled("companion_exploration")
-                or self.web_search.is_scene_enabled("proactive_video")
-            ):
-                logger.debug(
-                    "[%s] exploration skipped: web_search scene companion_exploration disabled",
-                    self.account_id,
-                )
-                return None
+            if not self.web_search.is_scene_enabled(search_scene):
+                if self.web_search.is_scene_enabled("proactive_video"):
+                    search_scene = "proactive_video"
+                else:
+                    logger.debug(
+                        "[%s] exploration skipped: web_search scene companion_exploration disabled",
+                        self.account_id,
+                    )
+                    return None
 
         # One activity key represents one exploration attempt.  A date-only key
         # collides on the second exploration because the generation recall query
@@ -3293,7 +3498,7 @@ class CompanionLifeService:
         try:
             result = await self.web_search.search(
                 query,
-                scene="companion_exploration",
+                scene=search_scene,
             )
         except TypeError:
             try:
@@ -3413,6 +3618,13 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         if not archived:
+            await self._fail_open_activity(
+                action_key=explore_action_key,
+                action_type="explore_topic",
+                scene="exploration",
+                title=f"主动探索 {_today()}",
+                metadata={"date": _today()},
+            )
             raise RuntimeError("companion exploration memory archive failed")
         await self._finish_activity_memory(
             action_key=explore_action_key,
@@ -3446,7 +3658,7 @@ class CompanionLifeService:
     # ── creative ──
 
     def _creative_idle_ok(self) -> bool:
-        if datetime.now().hour < 7:
+        if now_cn().hour < 7:
             return False
         if not self._looks_idle():
             return False
@@ -3555,6 +3767,16 @@ class CompanionLifeService:
                         pause_on_error=False,
                     )
                     if not archived:
+                        await self._fail_open_activity(
+                            action_key=project_action_key,
+                            action_type="create_creative_project",
+                            scene="creative",
+                            title=f"新创作项目 {_today()}",
+                            metadata={
+                                "date": _today(),
+                                "project_slot": len(projects),
+                            },
+                        )
                         raise RuntimeError(
                             "companion creative project memory archive failed"
                         )
@@ -3700,6 +3922,13 @@ class CompanionLifeService:
             pause_on_error=False,
         )
         if not archived:
+            await self._fail_open_activity(
+                action_key=f"companion_creative_chunk:{proj.id}:{creative_chunk_index}",
+                action_type="write_creative_chunk",
+                scene="creative",
+                title=proj.title,
+                metadata={"project_id": proj.id, "chunk_index": creative_chunk_index},
+            )
             raise RuntimeError("companion creative chunk memory archive failed")
         await self._finish_activity_memory(
             action_key=f"companion_creative_chunk:{proj.id}:{creative_chunk_index}",
@@ -3738,7 +3967,7 @@ class CompanionLifeService:
     # ── main tick ──
 
     def _past_time(self, hhmm: str, now: Optional[datetime] = None) -> bool:
-        now = now or datetime.now()
+        now = now or now_cn()
         m = _parse_hhmm(hhmm)
         if m is None:
             return False
@@ -3746,7 +3975,7 @@ class CompanionLifeService:
 
     async def tick(self, now: Optional[datetime] = None) -> Dict[str, Any]:
         """Called by scheduler roughly once per minute. Lightweight orchestration."""
-        now = now or datetime.now()
+        now = now or now_cn()
         result: Dict[str, Any] = {"enabled": self.enabled, "actions": []}
         if not self.enabled:
             return result
@@ -3968,6 +4197,14 @@ class CompanionLifeService:
             result["error"] = type(e).__name__
             return result
         finally:
+            try:
+                await self._close_stale_open_activities()
+            except Exception as exc:
+                logger.debug(
+                    "[%s] stale companion activity sweep failed: %s",
+                    self.account_id,
+                    type(exc).__name__,
+                )
             if lock is not None:
                 try:
                     lock.release()

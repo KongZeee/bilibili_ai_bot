@@ -11,6 +11,7 @@ const FEATURE_META = [
     { type: 'chat',      label: '对话',       icon: 'message-circle-more', desc: '主动回复 / 动态 / 记忆提取' },
     { type: 'vision',    label: '视觉',       icon: 'circle-check',        desc: '视频画面理解' },
     { type: 'embedding', label: '向量检索',   icon: 'star',                desc: '记忆向量检索' },
+    { type: 'rerank',    label: '记忆重排',   icon: 'list-ordered',        desc: '记忆召回精排（专用模型）' },
     { type: 'asr',       label: '语音识别',   icon: 'file',                desc: '视频音频转写' },
     { type: 'image',     label: '文生图',     icon: 'folder-open',         desc: '动态配图生成' },
 ];

@@ -20,7 +20,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 from ..models import (
-    ReplyContext, VideoContext, CommentThread, CommentItem, UserProfile, SceneType,
+    ReplyContext, VideoContext, CommentThread, CommentItem, UserProfile,
 )
 
 logger = logging.getLogger("bilibot.comment_context")
@@ -183,6 +183,13 @@ class CommentContextService:
             if self._memory_archive_required:
                 from bilibot.memory_brain.ingestion import video_metadata_observation
 
+                pseudonymize_actor = None
+                redactor = getattr(self.memory_brain, "redactor", None)
+                pseudo_method = getattr(redactor, "pseudonymize_identifier", None)
+                if callable(pseudo_method):
+                    pseudonymize_actor = lambda value: pseudo_method(
+                        str(value), namespace="uid"
+                    )
                 try:
                     await self._archive_context_required(
                         video_metadata_observation(
@@ -190,6 +197,7 @@ class CommentContextService:
                             oid=str(oid),
                             metadata=info,
                             persona_id=persona_id,
+                            pseudonymize_actor=pseudonymize_actor,
                         )
                     )
                 except ContextArchiveError as archive_exc:

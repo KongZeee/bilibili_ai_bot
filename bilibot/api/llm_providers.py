@@ -148,7 +148,12 @@ def create_llm_providers_routes(
 
     async def add_provider(request: Request) -> JSONResponse:
         try:
-            body = await request.json()
+            try:
+                body = await request.json()
+            except Exception:
+                return fail("INVALID_INPUT", "请求体必须是合法 JSON 对象", status_code=400)
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             has_keys = bool(body.get("api_key")) or bool(body.get("api_keys"))
             if not has_keys:
                 return fail("VALIDATION_ERROR", "api_key / api_keys 不能为空")
@@ -209,6 +214,8 @@ def create_llm_providers_routes(
         try:
             llm_id = request.path_params.get("id")
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             if not llm_manager.update_provider(llm_id, body):
                 return fail("NOT_FOUND", f"Provider 不存在: {llm_id}")
             _save_llm_to_config(config_loader, llm_manager, config_path)

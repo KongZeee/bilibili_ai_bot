@@ -109,6 +109,39 @@ class ImageProvider:
             timeout=aiohttp.ClientTimeout(total=self.timeout),
         )
 
+    async def _download_generated_image(
+        self, img_url: str, api_key: str = ""
+    ) -> Optional[bytes]:
+        """下载文生图 API 返回的 URL。
+
+        agnes-ai 等平台的输出对象存储是公开/预签名的，带 Authorization
+        头反而会触发 401（AuthenticationRequired）。这里先无鉴权下载；
+        若平台要求鉴权（401/403），再退回带 Bearer 头重试一次。
+        """
+        attempts: list = [dict()]
+        if api_key:
+            attempts.append({"Authorization": f"Bearer {api_key}"})
+        last_status = 0
+        last_err: Optional[Exception] = None
+        timeout = aiohttp.ClientTimeout(total=max(10.0, float(self.timeout)))
+        for headers in attempts:
+            try:
+                async with aiohttp.ClientSession(
+                    headers=headers, timeout=timeout,
+                ) as dl_session:
+                    async with dl_session.get(img_url) as img_resp:
+                        if img_resp.status == 200:
+                            return await img_resp.read()
+                        last_status = img_resp.status
+                        if img_resp.status not in (401, 403):
+                            break
+            except Exception as e:
+                last_err = e
+        logger.error(
+            f"下载生成的图片失败: HTTP {last_status or last_err}"
+        )
+        return None
+
     async def generate(self, prompt: str, size: str = "") -> Optional[bytes]:
         """
         生成图片
@@ -124,21 +157,22 @@ class ImageProvider:
             logger.warning("文生图 Provider 未配置 api_key")
             return None
 
-        # 文生图通常不返回 chat-style token usage；记 1 次调用便于面板统计
-        try:
-            from bilibot.services.token_usage import record_usage_safe
-            record_usage_safe(
-                provider_id=getattr(self, "provider_id", "") or getattr(self, "name", "") or "image",
-                model=getattr(self, "model", "") or "",
-                kind="image",
-                scene="image_generation",
-                prompt_tokens=0,
-                completion_tokens=0,
-                total_tokens=0,
-                meta={"size": size or getattr(self, "default_size", "")},
-            )
-        except Exception:
-            pass
+        def _record_success() -> None:
+            # 文生图通常不返回 chat-style token usage；成功时记 1 次调用便于面板统计
+            try:
+                from bilibot.services.token_usage import record_usage_safe
+                record_usage_safe(
+                    provider_id=getattr(self, "provider_id", "") or getattr(self, "name", "") or "image",
+                    model=getattr(self, "model", "") or "",
+                    kind="image",
+                    scene="image_generation",
+                    prompt_tokens=0,
+                    completion_tokens=0,
+                    total_tokens=0,
+                    meta={"size": size or getattr(self, "default_size", "")},
+                )
+            except Exception:
+                pass
 
         url = f"{self.base_url.rstrip('/')}/images/generations"
         body = {
@@ -185,17 +219,18 @@ class ImageProvider:
                 b64 = item.get("b64_json")
                 if b64:
                     logger.info(f"文生图成功 (b64): prompt={prompt[:50]}...")
+                    _record_success()
                     return base64.b64decode(b64)
 
-                # 回退 URL 下载
+                # 回退 URL 下载（不带 Authorization 优先，鉴权失败再带 Bearer 重试）
                 img_url = item.get("url")
                 if img_url:
                     logger.info(f"文生图成功 (url): {img_url}")
-                    async with session.get(img_url) as img_resp:
-                        if img_resp.status == 200:
-                            return await img_resp.read()
-                        logger.error(f"下载生成的图片失败: HTTP {img_resp.status}")
-                        return None
+                    data = await self._download_generated_image(img_url, key)
+                    if data:
+                        _record_success()
+                        return data
+                    return None
 
                 logger.error("文生图 API 返回无 b64_json 也无 url")
                 return None

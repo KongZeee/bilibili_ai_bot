@@ -15,15 +15,13 @@ PRD V4 §8.7 VID-006 / §10.2 COM-002：
 """
 import asyncio
 import hashlib
-import json
 import logging
 import math
 import sqlite3
 import threading
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 from bilibot.models.interaction import InteractionSuggestion
 

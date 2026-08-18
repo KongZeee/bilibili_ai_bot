@@ -51,6 +51,7 @@ class PersistentMemoryWorker:
         embedding_batch_size: int = 64,
         enrichment_chat_timeout_seconds: float = 12.0,
         link_candidate_limit: int = 12,
+        unblock_grace_seconds: float = 30.0,
     ) -> None:
         self.store = store
         self.gateway = gateway
@@ -61,6 +62,12 @@ class PersistentMemoryWorker:
             1.0, float(enrichment_chat_timeout_seconds)
         )
         self.link_candidate_limit = max(4, min(int(link_candidate_limit), 24))
+        # A blocked job may reopen only after this many seconds. Without a
+        # grace period, ProviderNotConfigured failures (including empty LLM
+        # content) become a claim→block→unblock hot loop that burns one HTTP
+        # call per second and resets attempts to 0 forever.
+        self.unblock_grace_seconds = max(0.0, float(unblock_grace_seconds))
+        self._last_unblock_at = 0.0
         self._throttle_reasons: set[str] = set()
         self._failure_streaks: dict[str, int] = {}
         self._circuit_until: dict[str, float] = {}
@@ -134,15 +141,32 @@ class PersistentMemoryWorker:
     async def run_once(self, limit: int = 1) -> WorkerRunReport:
         self._last_poll_at = time.time()
         available = self.gateway.available_job_types()
+        # SQLite I/O must never run on the event loop: a 284MB brain + WAL
+        # checkpoint can stall the scheduler and web console for tens of
+        # seconds. Every store call is dispatched to a worker thread.
         if available:
-            self.store.unblock_blocked_jobs(available)
+            now = time.time()
+            if now - self._last_unblock_at >= self.unblock_grace_seconds:
+                reopened = await asyncio.to_thread(
+                    self.store.unblock_blocked_jobs,
+                    available,
+                    min_blocked_age_seconds=self.unblock_grace_seconds,
+                )
+                if reopened:
+                    logger.info(
+                        "memory worker reopened %s blocked jobs after grace=%ss",
+                        reopened,
+                        self.unblock_grace_seconds,
+                    )
+                self._last_unblock_at = now
         claimable = self._claimable_job_types()
         if not claimable:
             return WorkerRunReport()
-        jobs = self.store.claim_jobs(
+        jobs = await asyncio.to_thread(
+            self.store.claim_jobs,
             self.worker_id,
-            limit=limit,
-            lease_seconds=self.lease_seconds,
+            limit,
+            self.lease_seconds,
             job_types=claimable,
         )
         completed = blocked = retried = dead = 0
@@ -150,19 +174,28 @@ class PersistentMemoryWorker:
             self._last_job_started_at = time.time()
             self._last_job_type = job.job_type
             try:
-                await self._execute(job)
+                result_counts = await self._execute(job)
             except asyncio.CancelledError:
                 raise
             except ProviderNotConfigured as exc:
                 self._last_job_error_at = time.time()
                 self._failed_total += 1
-                if self.store.block_job(job.id, self.worker_id, str(exc)):
+                logger.warning(
+                    "memory job blocked: job_id=%s type=%s error=%s",
+                    job.id,
+                    job.job_type,
+                    exc,
+                )
+                if await asyncio.to_thread(
+                    self.store.block_job, job.id, self.worker_id, str(exc)
+                ):
                     blocked += 1
             except Exception as exc:
                 self._last_job_error_at = time.time()
                 self._failed_total += 1
                 self._record_job_failure(job.job_type)
-                status = self.store.fail_job(
+                status = await asyncio.to_thread(
+                    self.store.fail_job,
                     job.id,
                     self.worker_id,
                     f"{type(exc).__name__}: {exc}",
@@ -180,13 +213,27 @@ class PersistentMemoryWorker:
                 )
             else:
                 self._record_job_success(job.job_type)
-                if self.store.complete_job(job.id, self.worker_id):
+                if await asyncio.to_thread(
+                    self.store.complete_job, job.id, self.worker_id, result_counts
+                ):
                     completed += 1
                     self._completed_total += 1
             finally:
                 self._last_job_finished_at = time.time()
                 if job.event_id:
-                    self.store.refresh_event_index_status(job.event_id)
+                    try:
+                        await asyncio.to_thread(
+                            self.store.refresh_event_index_status, job.event_id
+                        )
+                    except Exception as exc:
+                        # The event may have been hard-deleted mid-job. A
+                        # missing row must never kill the durable worker.
+                        logger.debug(
+                            "memory job cleanup skipped for deleted event: job_id=%s event=%s error=%s",
+                            job.id,
+                            job.event_id,
+                            exc,
+                        )
         return WorkerRunReport(
             claimed=len(jobs),
             completed=completed,
@@ -214,7 +261,19 @@ class PersistentMemoryWorker:
             # Claim exactly one durable job so a newly-arrived online request can
             # throttle expensive enrichment before the next chat call. Claiming
             # eight jobs gave no throughput benefit because execution is serial.
-            report = await self.run_once(limit=1)
+            try:
+                report = await self.run_once(limit=1)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("memory worker run_once crashed; continuing loop")
+                try:
+                    await asyncio.wait_for(
+                        stop_event.wait(), timeout=max(0.05, float(poll_interval))
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                continue
             if report.claimed:
                 continue
             try:
@@ -224,61 +283,138 @@ class PersistentMemoryWorker:
             except asyncio.TimeoutError:
                 pass
 
-    def _renew_or_lose(self, job: ClaimedJob) -> None:
+    async def _renew_or_lose(self, job: ClaimedJob) -> None:
         """Renew lease around long LLM awaits; raise if ownership was lost."""
-        if not self.store.renew_job_lease(job.id, self.worker_id, self.lease_seconds):
+        if not await asyncio.to_thread(
+            self.store.renew_job_lease, job.id, self.worker_id, self.lease_seconds
+        ):
             raise RuntimeError(f"memory job lease was lost: {job.job_type}:{job.id}")
 
-    async def _execute(self, job: ClaimedJob) -> None:
+    async def _execute(self, job: ClaimedJob) -> dict[str, int]:
         if not job.event_id:
             raise ValueError("memory enrichment job has no event_id")
-        event = self.store.get_event_index_input(job.event_id)
+        event = await asyncio.to_thread(self.store.get_event_index_input, job.event_id)
         if job.job_type == "summarize_event":
-            self._renew_or_lose(job)
+            await self._renew_or_lose(job)
             summary = await self.gateway.summarize_event(
                 event, timeout=self.enrichment_chat_timeout_seconds
             )
-            self._renew_or_lose(job)
-            self.store.update_event_summary(job.event_id, summary)
+            await self._renew_or_lose(job)
+            await asyncio.to_thread(
+                self.store.update_event_summary, job.event_id, summary
+            )
             # These jobs may have completed before the summary was available.
-            self.store.requeue_event_job(job.event_id, "embed_event")
-            self.store.requeue_event_job(job.event_id, "link_associations")
-            return
+            await asyncio.to_thread(
+                self.store.requeue_event_job, job.event_id, "embed_event"
+            )
+            await asyncio.to_thread(
+                self.store.requeue_event_job, job.event_id, "link_associations"
+            )
+            return {"summary_chars": len(str(summary or ""))}
         if job.job_type == "embed_event":
             await self._embed_event(job, event)
-            return
+            return {"event_embeddings": 1}
         if job.job_type == "embed_chunks":
             await self._embed_chunks(job, event)
-            return
+            return {"chunk_embeddings": len(event["chunks"])}
         if job.job_type == "extract_entities":
-            self._renew_or_lose(job)
+            await self._renew_or_lose(job)
             entities = await self.gateway.extract_entities(
                 event, timeout=self.enrichment_chat_timeout_seconds
             )
-            self._renew_or_lose(job)
-            self.store.upsert_entities(job.event_id, entities)
-            self.store.requeue_event_job(job.event_id, "link_associations")
-            return
+            await self._renew_or_lose(job)
+            entity_ids = await asyncio.to_thread(
+                self.store.upsert_entities, job.event_id, entities
+            )
+            await asyncio.to_thread(
+                self.store.requeue_event_job, job.event_id, "link_associations"
+            )
+            return {"entity_mentions": len(entity_ids)}
         if job.job_type == "link_associations":
             recent = [
                 item
-                for item in self.store.recent_events(limit=50)
+                for item in await asyncio.to_thread(
+                    self.store.recent_events, 50
+                )
                 if item["id"] != job.event_id
             ]
             candidates = self._rank_link_candidates(event, recent)
             if candidates:
-                self._renew_or_lose(job)
-                links = await self.gateway.suggest_links(
-                    event,
-                    candidates,
-                    timeout=self.enrichment_chat_timeout_seconds,
+                fallback_reason = ""
+                cooling = (
+                    callable(getattr(self.gateway, "link_model_cooling", None))
+                    and self.gateway.link_model_cooling()
                 )
-                self._renew_or_lose(job)
-                self.store.upsert_links(
+                if not cooling:
+                    await self._renew_or_lose(job)
+                    try:
+                        links = await self.gateway.suggest_links(
+                            event,
+                            candidates,
+                            timeout=self.enrichment_chat_timeout_seconds,
+                        )
+                    except Exception as exc:
+                        # Reasoning endpoints can exhaust even a 16k budget on
+                        # chain-of-thought, return malformed JSON, or hit transport
+                        # timeouts. Shared extracted entities are an
+                        # evidence-backed fallback that lets the event converge
+                        # instead of dead-lettering; the fallback never invents a
+                        # target the brain has not already seen.
+                        fallback_reason = type(exc).__name__
+                        note = getattr(
+                            self.gateway, "note_link_model_failure", None
+                        )
+                        entered_cooldown = bool(
+                            note and note(fallback_reason)
+                        )
+                        if entered_cooldown:
+                            logger.info(
+                                "memory link model entered cooldown %.0fs "
+                                "after consecutive failures; using entity "
+                                "overlap fallback for link_associations",
+                                float(
+                                    getattr(
+                                        self.gateway,
+                                        "link_model_cooldown_seconds",
+                                        600,
+                                    )
+                                ),
+                            )
+                        else:
+                            logger.warning(
+                                "memory link model unusable, using entity "
+                                "overlap fallback: job_id=%s error=%s",
+                                job.id,
+                                fallback_reason,
+                            )
+                        links = await asyncio.to_thread(
+                            self.store.suggest_entity_links,
+                            job.event_id,
+                            [str(item["id"]) for item in candidates],
+                        )
+                else:
+                    fallback_reason = "link_model_cooldown"
+                    logger.debug(
+                        "memory link model cooling; entity overlap fallback "
+                        "for job_id=%s",
+                        job.id,
+                    )
+                    links = await asyncio.to_thread(
+                        self.store.suggest_entity_links,
+                        job.event_id,
+                        [str(item["id"]) for item in candidates],
+                    )
+                await self._renew_or_lose(job)
+                link_ids = await asyncio.to_thread(
+                    self.store.upsert_links,
                     job.event_id,
                     validate_suggested_links(event, candidates, links),
                 )
-            return
+                result_counts = {"links": len(link_ids)}
+                if fallback_reason:
+                    result_counts["link_fallback"] = 1
+                return result_counts
+            return {"links": 0}
         raise ValueError(f"unsupported memory job type: {job.job_type}")
 
     @staticmethod
@@ -330,10 +466,11 @@ class PersistentMemoryWorker:
             # Do not complete-as-success with a missing vector; leave a diagnosable failure
             # so reindex/retry can pick it up after summary/title becomes available.
             raise ValueError("EMPTY_EMBEDDING_TEXT: event has no embedding_text")
-        self._renew_or_lose(job)
+        await self._renew_or_lose(job)
         batch = await self.gateway.embed_texts([text])
-        self._renew_or_lose(job)
-        self.store.upsert_embedding(
+        await self._renew_or_lose(job)
+        await asyncio.to_thread(
+            self.store.upsert_embedding,
             "event",
             event["id"],
             batch.vectors[0],
@@ -345,12 +482,18 @@ class PersistentMemoryWorker:
     async def _embed_chunks(self, job: ClaimedJob, event: dict[str, Any]) -> None:
         chunks = event["chunks"]
         for start in range(0, len(chunks), self.embedding_batch_size):
-            if not self.store.renew_job_lease(job.id, self.worker_id, self.lease_seconds):
+            if not await asyncio.to_thread(
+                self.store.renew_job_lease,
+                job.id,
+                self.worker_id,
+                self.lease_seconds,
+            ):
                 raise RuntimeError("embedding job lease was lost")
             current = chunks[start : start + self.embedding_batch_size]
             batch = await self.gateway.embed_texts([item["text"] for item in current])
             for item, vector in zip(current, batch.vectors):
-                self.store.upsert_embedding(
+                await asyncio.to_thread(
+                    self.store.upsert_embedding,
                     "chunk",
                     item["id"],
                     vector,

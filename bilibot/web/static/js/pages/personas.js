@@ -13,7 +13,18 @@ export const PersonaListPage = defineComponent({
         const activePersonaId = ref(null);
         const showCreateModal = ref(false);
         const editingId = ref(null);
-        const createForm = reactive({ name: '', description: '', system_prompt: '', personality: '', appearance: '' });
+        const createForm = reactive({
+            name: '',
+            description: '',
+            system_prompt: '',
+            lore_prompt: '',
+            personality: '',
+            appearance: '',
+            // 公开回复精简（通用：任意人格可开；默认关）
+            social_public_guard_enabled: false,
+            social_guard_names: '',
+            social_base_prompt_cap: 5000,
+        });
         const testInput = ref('');
         const testReply = ref('');
         const testing = ref(false);
@@ -175,13 +186,26 @@ export const PersonaListPage = defineComponent({
         }
 
         // ── 创建/编辑 Modal ──
+        function parseGuardNames(text) {
+            if (!text) return [];
+            if (Array.isArray(text)) return text.map(s => String(s).trim()).filter(Boolean);
+            return String(text)
+                .split(/[,，\n]/)
+                .map(s => s.trim())
+                .filter(Boolean);
+        }
+
         function openCreateModal() {
             editingId.value = null;
             createForm.name = '';
             createForm.description = '';
             createForm.system_prompt = '';
+            createForm.lore_prompt = '';
             createForm.personality = '';
             createForm.appearance = '';
+            createForm.social_public_guard_enabled = false;
+            createForm.social_guard_names = '';
+            createForm.social_base_prompt_cap = 5000;
             showCreateModal.value = true;
         }
 
@@ -190,9 +214,25 @@ export const PersonaListPage = defineComponent({
             createForm.name = persona.name || '';
             createForm.description = persona.description || '';
             createForm.system_prompt = persona.system_prompt || persona.base_prompt || '';
+            createForm.lore_prompt = persona.lore_prompt || '';
             const tags = getTags(persona);
             createForm.personality = persona.personality || (tags.length > 0 ? tags.join('，') : '');
             createForm.appearance = persona.appearance || '';
+            const names = persona.social_guard_names;
+            createForm.social_guard_names = Array.isArray(names)
+                ? names.join('，')
+                : (names || '');
+            const cap = Number(persona.social_base_prompt_cap);
+            createForm.social_base_prompt_cap = Number.isFinite(cap) && cap > 0 ? cap : 5000;
+            // 开关：显式字段优先；旧数据有名单/cap 则视为开
+            if (typeof persona.social_public_guard_enabled === 'boolean') {
+                createForm.social_public_guard_enabled = persona.social_public_guard_enabled;
+            } else {
+                createForm.social_public_guard_enabled = !!(
+                    (Array.isArray(names) && names.length) ||
+                    (Number.isFinite(cap) && cap > 0)
+                );
+            }
             showCreateModal.value = true;
         }
 
@@ -202,13 +242,22 @@ export const PersonaListPage = defineComponent({
                 return;
             }
             try {
+                let cap = parseInt(String(createForm.social_base_prompt_cap || '0'), 10);
+                if (!Number.isFinite(cap) || cap < 0) cap = 0;
+                if (cap > 200000) cap = 200000;
                 // 后端 persona_store 只持久化 base_prompt，不认 system_prompt
                 const payload = {
                     name: createForm.name,
                     description: createForm.description,
                     base_prompt: createForm.system_prompt,
+                    lore_prompt: createForm.lore_prompt || '',
                     personality: createForm.personality,
                     appearance: createForm.appearance,
+                    social_public_guard_enabled: !!createForm.social_public_guard_enabled,
+                    social_guard_names: createForm.social_public_guard_enabled
+                        ? parseGuardNames(createForm.social_guard_names)
+                        : [],
+                    social_base_prompt_cap: createForm.social_public_guard_enabled ? cap : 0,
                 };
                 if (editingId.value) {
                     await api.personas.update(editingId.value, payload);
@@ -538,10 +587,10 @@ export const PersonaListPage = defineComponent({
                     modelValue: showCreateModal.value,
                     'onUpdate:modelValue': (v) => showCreateModal.value = v,
                     title: editingId.value ? '编辑人格' : '创建人格',
-                    width: '640px',
+                    width: '720px',
                 }, {
                     default: () => h('div', {
-                        style: 'display:grid; gap: calc(var(--spacing) * 3);',
+                        style: 'display:grid; gap: calc(var(--spacing) * 3); max-height: min(70vh, 720px); overflow:auto; padding-right: 4px;',
                     }, [
                         // FormInput（名称）— 使用正确的 type
                         h(FormInput, {
@@ -559,13 +608,23 @@ export const PersonaListPage = defineComponent({
                             modelValue: createForm.description,
                             'onUpdate:modelValue': (v) => createForm.description = v,
                         }),
-                        // FormTextarea（系统提示词）
+                        // 回复用简单提示词（base_prompt）— 公开评论/私信注入
                         h(FormTextarea, {
-                            label: '系统提示词',
-                            placeholder: '定义人格的系统提示词',
-                            rows: 4,
+                            label: '回复用简单提示词',
+                            placeholder: '压缩后的身份、口吻、禁止事项。公开评论/私信/主动评/动态注入此段（建议几千字内，勿贴整本剧本）。',
+                            rows: 8,
                             modelValue: createForm.system_prompt,
                             'onUpdate:modelValue': (v) => createForm.system_prompt = v,
+                            hint: '对应 base_prompt。请写「给人看的短人设」，不要粘贴完整游戏剧本。',
+                        }),
+                        // 完整设定/剧本（lore_prompt）— 仅内部场景注入
+                        h(FormTextarea, {
+                            label: '完整设定 / 剧本（保留全文）',
+                            placeholder: '完整原作剧本、长背景等放这里。公开回复默认不注入；日记/梦/日程等内部场景会带上。',
+                            rows: 6,
+                            modelValue: createForm.lore_prompt,
+                            'onUpdate:modelValue': (v) => createForm.lore_prompt = v,
+                            hint: '对应 lore_prompt。长内容完整保留在此，不占用公开回复上下文。',
                         }),
                         // FormTextarea（性格特征）
                         h(FormTextarea, {
@@ -583,6 +642,52 @@ export const PersonaListPage = defineComponent({
                             modelValue: createForm.appearance,
                             'onUpdate:modelValue': (v) => createForm.appearance = v,
                         }),
+                        // ── 公开回复精简（开关 + 配置）──
+                        h('div', {
+                            style: 'display:grid; gap: calc(var(--spacing) * 2); padding: calc(var(--spacing) * 3); border: 1px solid hsl(var(--border)); border-radius: calc(var(--radius) * 0.7); background: hsl(var(--muted) / 0.25);',
+                        }, [
+                            h('label', {
+                                style: 'display:flex; align-items:flex-start; gap: 0.65rem; cursor:pointer; user-select:none;',
+                            }, [
+                                h('input', {
+                                    type: 'checkbox',
+                                    checked: !!createForm.social_public_guard_enabled,
+                                    style: 'margin-top: 0.25rem; width: 1rem; height: 1rem;',
+                                    onChange: (e) => {
+                                        createForm.social_public_guard_enabled = !!e.target.checked;
+                                    },
+                                }),
+                                h('div', { style: 'display:grid; gap: 0.25rem;' }, [
+                                    h('span', { style: 'font-weight: 600; font-size: 0.95rem;' }, '公开回复约束（可选）'),
+                                    h('span', {
+                                        class: 'muted',
+                                        style: 'font-size: 0.82rem; line-height: 1.45;',
+                                    }, '开启后：可对「回复用简单提示词」设长度安全上限，并禁止未提及的名字。请先把完整剧本放在「完整设定/剧本」，把压缩后的短人设放在「回复用简单提示词」。其它人格保持关闭即可。'),
+                                ]),
+                            ]),
+                            createForm.social_public_guard_enabled
+                                ? h('div', {
+                                    style: 'display:grid; gap: calc(var(--spacing) * 2.5); padding-top: 0.25rem;',
+                                }, [
+                                    h(FormInput, {
+                                        label: '回复提示词长度上限（字符，安全网）',
+                                        type: 'number',
+                                        placeholder: '5000',
+                                        modelValue: createForm.social_base_prompt_cap,
+                                        'onUpdate:modelValue': (v) => createForm.social_base_prompt_cap = v,
+                                        hint: '建议 5000。内容请事先压缩进「回复用简单提示词」；此项只是超长时的保护截断，不是自动摘要。',
+                                    }),
+                                    h(FormTextarea, {
+                                        label: '勿主动点名的名字（可选）',
+                                        placeholder: '如：夏生，水菜萌（逗号或换行分隔）。用户未提及时禁止主动提起。',
+                                        rows: 2,
+                                        modelValue: createForm.social_guard_names,
+                                        'onUpdate:modelValue': (v) => createForm.social_guard_names = v,
+                                        hint: '仅对该人格生效；留空则只做长度保护、不做点名过滤。',
+                                    }),
+                                ])
+                                : null,
+                        ]),
                     ]),
                     footer: () => [
                         h(Button, { onClick: () => showCreateModal.value = false }, () => '取消'),

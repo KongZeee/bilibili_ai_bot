@@ -14,7 +14,7 @@ import copy
 import logging
 import threading
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any, Mapping
+from typing import Dict, Any, Mapping
 
 logger = logging.getLogger("bilibot.config")
 
@@ -114,7 +114,7 @@ class LLMConfig:
 class WebConfig:
     """Web面板配置"""
     enabled: bool = True
-    host: str = "0.0.0.0"
+    host: str = "127.0.0.1"
     port: int = 8080
     secret_key: str = "change-this-to-a-random-string"
     admin_username: str = "admin"
@@ -184,6 +184,15 @@ class MemoryConfig:
     rerank_timeout_seconds: float = 8.0
     recall_total_timeout_seconds: float = 10.0
     rerank_relevance_baseline: float = 0.65
+    # Fallback-only deterministic gates. Conversational Chinese queries with
+    # multiple distinctive terms often land ~0.43 lexical_coverage, so the
+    # default is intentionally lower than PRD-V6's illustrative 0.80/0.88;
+    # operators can raise them back through these explicit knobs.
+    fallback_direct_threshold: float = 0.40
+    fallback_association_threshold: float = 0.55
+    # Dedicated cross-encoder (BGE-style) baseline. Its 0..1 score scale is
+    # softer than the chat-JSON 0..100-normalized scores, so it gets its own knob.
+    rerank_model_relevance_baseline: float = 0.20
     enrichment_chat_timeout_seconds: float = 12.0
     link_candidate_limit: int = 12
     link_job_max_attempts: int = 3
@@ -195,7 +204,11 @@ class MemoryConfig:
     chunk_overlap_chars: int = 100
     job_max_attempts: int = 8
     vector_cache_limit: int = 50000
+    # 向量全表扫描行数预算：超过时向量通道报错降级 FTS，避免 100GB 级库拖死在线回复
+    vector_full_scan_row_limit: int = 50_000
     vector_batch_size: int = 2048
+    # 大库召回策略：只对 FTS/标识符/图扩展先命中的事件做向量精排（默认关闭）
+    vector_candidate_prefilter: bool = False
 
 
 def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> None:
@@ -239,7 +252,7 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
             raise ValueError(f"memory.{name} must be {minimum:g}{suffix}")
         return result
 
-    candidate_limit = integer("recall_candidate_limit", minimum=1, maximum=20)
+    candidate_limit = integer("recall_candidate_limit", minimum=1, maximum=12)
     inject_limit = integer("recall_inject_limit", minimum=1, maximum=5)
     association_limit = integer("recall_association_limit", minimum=0, maximum=2)
     if inject_limit > candidate_limit:
@@ -253,7 +266,7 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
         raise ValueError(
             "memory.rerank_timeout_seconds cannot exceed recall_total_timeout_seconds"
         )
-    number("enrichment_chat_timeout_seconds", minimum=1.0, maximum=120.0)
+    number("enrichment_chat_timeout_seconds", minimum=1.0, maximum=600.0)
     integer("link_candidate_limit", minimum=4, maximum=24)
 
     baseline = value("rerank_relevance_baseline", defaults.rerank_relevance_baseline)
@@ -267,6 +280,37 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
         ) from exc
     if not math.isfinite(baseline) or not 0 <= baseline <= 1:
         raise ValueError("memory.rerank_relevance_baseline must be a number from 0 to 1")
+
+    model_baseline = value(
+        "rerank_model_relevance_baseline",
+        defaults.rerank_model_relevance_baseline,
+    )
+    if isinstance(model_baseline, bool):
+        raise ValueError(
+            "memory.rerank_model_relevance_baseline must be a number from 0 to 1"
+        )
+    try:
+        model_baseline = float(model_baseline)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "memory.rerank_model_relevance_baseline must be a number from 0 to 1"
+        ) from exc
+    if not math.isfinite(model_baseline) or not 0 <= model_baseline <= 1:
+        raise ValueError(
+            "memory.rerank_model_relevance_baseline must be a number from 0 to 1"
+        )
+
+    fallback_direct = number(
+        "fallback_direct_threshold", minimum=0.0, maximum=1.0
+    )
+    fallback_association = number(
+        "fallback_association_threshold", minimum=0.0, maximum=1.0
+    )
+    if fallback_association < fallback_direct:
+        raise ValueError(
+            "memory.fallback_association_threshold cannot be smaller than "
+            "memory.fallback_direct_threshold"
+        )
 
     integer("prompt_char_budget", minimum=512, maximum=5000)
     target_chars = integer("chunk_target_chars", minimum=1)
@@ -286,7 +330,11 @@ def validate_memory_config_values(config: MemoryConfig | Mapping[str, Any]) -> N
     if link_attempts > integer("job_max_attempts", minimum=1):
         raise ValueError("memory.link_job_max_attempts cannot exceed job_max_attempts")
     integer("vector_cache_limit", minimum=0)
+    integer("vector_full_scan_row_limit", minimum=0)
     integer("vector_batch_size", minimum=1)
+    prefilter = value("vector_candidate_prefilter", defaults.vector_candidate_prefilter)
+    if not isinstance(prefilter, bool):
+        raise ValueError("memory.vector_candidate_prefilter must be a boolean")
 
 
 @dataclass
@@ -381,7 +429,7 @@ class ConfigLoader:
         web = self._raw_config.get("web", {})
         self.web = WebConfig(
             enabled=web.get("enabled", True),
-            host=web.get("host", "0.0.0.0"),
+            host=web.get("host", "127.0.0.1"),
             port=web.get("port", 8080),
             secret_key=web.get("secret_key", "change-this-to-a-random-string"),
             admin_username=web.get("admin_username", "admin"),
@@ -439,6 +487,13 @@ class ConfigLoader:
             rerank_timeout_seconds=mem.get("rerank_timeout_seconds", 8.0),
             recall_total_timeout_seconds=mem.get("recall_total_timeout_seconds", 10.0),
             rerank_relevance_baseline=mem.get("rerank_relevance_baseline", 0.65),
+            fallback_direct_threshold=mem.get("fallback_direct_threshold", 0.40),
+            fallback_association_threshold=mem.get(
+                "fallback_association_threshold", 0.55
+            ),
+            rerank_model_relevance_baseline=mem.get(
+                "rerank_model_relevance_baseline", 0.20
+            ),
             enrichment_chat_timeout_seconds=mem.get(
                 "enrichment_chat_timeout_seconds", 12.0
             ),
@@ -452,7 +507,9 @@ class ConfigLoader:
             chunk_overlap_chars=mem.get("chunk_overlap_chars", 100),
             job_max_attempts=mem.get("job_max_attempts", 8),
             vector_cache_limit=mem.get("vector_cache_limit", 50000),
+            vector_full_scan_row_limit=mem.get("vector_full_scan_row_limit", 50_000),
             vector_batch_size=mem.get("vector_batch_size", 2048),
+            vector_candidate_prefilter=mem.get("vector_candidate_prefilter", False),
         )
         validate_memory_config_values(self.memory)
 

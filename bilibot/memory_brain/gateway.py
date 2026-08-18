@@ -5,12 +5,16 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import logging
 import re
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
 from .models import ProviderNotConfigured, VectorDimensionError
 
+
+logger = logging.getLogger("bilibot.memory_brain.gateway")
 
 _FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 
@@ -29,6 +33,15 @@ class EmbeddingBatch:
     provider: str
     model: str
     vectors: tuple[tuple[float, ...], ...]
+
+
+class EmptyModelResultError(RuntimeError):
+    """A configured provider returned an empty/None result for one request.
+
+    This is a job-specific failure (retry with backoff → dead letter), not a
+    configuration gap. Treating it as ProviderNotConfigured would block and
+    immediately reopen the same job forever, resetting its attempt budget.
+    """
 
 
 async def _resolve(value: Any) -> Any:
@@ -133,27 +146,41 @@ class MemoryModelGateway:
         embedding_provider: Any = None,
         *,
         account_id: str = "",
+        rerank_provider: Any = None,
     ) -> None:
         self.chat_provider = chat_provider
         self.embedding_provider = embedding_provider
+        self.rerank_provider = rerank_provider
         # 用于 token usage_context 归因（未传则为空，兼容旧调用）
         self.account_id = str(account_id or "")
+        # Link-LLM 熔断：推理模型对 link prompt 频繁返回空内容时，短暂跳过
+        # 模型建议，直接走实体共现回退，避免每个 job 烧两次长推理预算。
+        self._link_llm_failure_streak = 0
+        self._link_llm_cooldown_until = 0.0
+        self.link_model_cooldown_seconds: float = 600.0
+        self.link_model_failure_threshold: int = 2
 
     def rebind_providers(
         self,
         *,
         chat_provider: Any = _UNSET,
         embedding_provider: Any = _UNSET,
+        rerank_provider: Any = _UNSET,
     ) -> None:
-        """热重载：替换 chat/embedding provider（不重建 worker/store）。
+        """热重载：替换 chat/embedding/rerank provider（不重建 worker/store）。
 
         未传的侧保持不变；显式传 None 清空该侧。
         例：rebind_providers(embedding_provider=ep)
         """
         if chat_provider is not _UNSET:
             self.chat_provider = chat_provider
+            # 换模型后熔断状态失效，给新模型一次重新尝试的机会
+            self._link_llm_failure_streak = 0
+            self._link_llm_cooldown_until = 0.0
         if embedding_provider is not _UNSET:
             self.embedding_provider = embedding_provider
+        if rerank_provider is not _UNSET:
+            self.rerank_provider = rerank_provider
 
     @staticmethod
     def _enabled(provider: Any) -> bool:
@@ -173,6 +200,40 @@ class MemoryModelGateway:
             for name in ("embed_many", "embed", "get_embeddings", "get_embedding")
         )
 
+    @property
+    def rerank_configured(self) -> bool:
+        return self._enabled(self.rerank_provider) and callable(
+            getattr(self.rerank_provider, "rerank", None)
+        )
+
+    async def rerank_texts(
+        self,
+        query: str,
+        documents: Sequence[str],
+        *,
+        top_n: int | None = None,
+        timeout: float | None = 30.0,
+    ) -> list[dict]:
+        """Dedicated rerank model call; raises if not configured.
+
+        ``timeout=None`` skips the internal wait_for so callers that already
+        enforce a shared deadline (e.g. RecallEngine total budget) don't pay a
+        second, redundant timeout layer.
+        """
+        if not self.rerank_configured:
+            raise ProviderNotConfigured("rerank provider is not configured")
+        method = getattr(self.rerank_provider, "rerank", None)
+        if not callable(method):
+            raise ProviderNotConfigured("rerank provider has no rerank()")
+
+        async def _invoke() -> Any:
+            result = method(query, documents, top_n=top_n)
+            return await result if inspect.isawaitable(result) else result
+
+        if timeout is None:
+            return await _invoke()
+        return await asyncio.wait_for(_invoke(), timeout=timeout)
+
     def available_job_types(self) -> tuple[str, ...]:
         result: list[str] = []
         if self.chat_configured:
@@ -180,6 +241,24 @@ class MemoryModelGateway:
         if self.embedding_configured:
             result.extend(("embed_event", "embed_chunks"))
         return tuple(result)
+
+    def link_model_cooling(self, now: Optional[float] = None) -> bool:
+        """Link-LLM 是否处于熔断冷却期（持续空结果时跳过模型建议）。"""
+        return time.monotonic() < self._link_llm_cooldown_until
+
+    def note_link_model_failure(self, error_type: str = "") -> bool:
+        """记录一次 link 模型失败；达到阈值后进入冷却期并返回 True。"""
+        self._link_llm_failure_streak += 1
+        if self._link_llm_failure_streak < self.link_model_failure_threshold:
+            return False
+        self._link_llm_cooldown_until = (
+            time.monotonic() + self.link_model_cooldown_seconds
+        )
+        return True
+
+    def note_link_model_success(self) -> None:
+        """一次成功的 link 模型建议清除失败连击计数。"""
+        self._link_llm_failure_streak = 0
 
     async def generate(
         self,
@@ -231,7 +310,7 @@ class MemoryModelGateway:
                 _resolve(_invoke()), timeout=max(0.1, float(timeout))
             )
         if result is None or not str(result).strip():
-            raise ProviderNotConfigured("chat provider returned no result")
+            raise EmptyModelResultError("chat provider returned an empty result")
         return str(result).strip()
 
     async def generate_json(
@@ -790,7 +869,7 @@ class MemoryModelGateway:
             + source
         )
         raw = await self.generate(
-            prompt, max_tokens=600, temperature=0.0, timeout=timeout
+            prompt, max_tokens=2048, temperature=0.0, timeout=timeout
         )
         return self._sanitize_event_summary(event, raw or "")
 
@@ -809,7 +888,7 @@ class MemoryModelGateway:
             "aliases, confidence. Use a stable broad type such as person, work, organization, "
             "location, event, product, character, animal, food, time, activity, topic, or concept. "
             "Do not invent entities.\n\n" + header + source,
-            max_tokens=600,
+            max_tokens=2048,
             temperature=0.0,
             timeout=timeout,
         )
@@ -840,7 +919,7 @@ class MemoryModelGateway:
             "summary": str(event.get("summary") or "")[:800],
             "allowed_evidence_ids": _compact_link_evidence_ids(event),
         }
-        payload = await self.generate_json(
+        prompt = (
             "Choose supported associations for the source event from the candidate IDs only. "
             "relation_type must be one of related_to, is_about, supports. "
             "Return a JSON array with target_event_id, relation_type, weight, and a non-empty "
@@ -848,11 +927,32 @@ class MemoryModelGateway:
             + json.dumps(
                 {"source": source, "candidates": compact},
                 ensure_ascii=False,
-            ),
-            max_tokens=600,
-            temperature=0.0,
-            timeout=timeout,
+            )
         )
+        try:
+            payload = await self.generate_json(
+                prompt,
+                # Reasoning models can spend most of the budget on hidden
+                # reasoning and return an empty or truncated body.
+                max_tokens=2048,
+                temperature=0.0,
+                timeout=timeout,
+            )
+        except (EmptyModelResultError, json.JSONDecodeError, ValueError) as exc:
+            # Link suggestions are optional enrichment. Give a malformed/empty
+            # response one stricter, larger-budget retry before the worker's
+            # circuit breaker records the failure and uses verified overlap.
+            logger.debug(
+                "memory link model output retry error_kind=%s",
+                type(exc).__name__,
+            )
+            payload = await self.generate_json(
+                prompt
+                + "\n\nOutput contract: return only one JSON array; no markdown, prose, or empty response.",
+                max_tokens=4096,
+                temperature=0.0,
+                timeout=timeout,
+            )
         if isinstance(payload, Mapping):
             payload = (
                 payload.get("links")
@@ -861,4 +961,6 @@ class MemoryModelGateway:
             )
         if not isinstance(payload, list):
             raise ValueError("linker must return a JSON array")
-        return validate_suggested_links(event, list(candidates)[:24], payload)
+        links = validate_suggested_links(event, list(candidates)[:24], payload)
+        self.note_link_model_success()
+        return links

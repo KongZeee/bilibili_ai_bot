@@ -9,7 +9,7 @@ import json
 import math
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from .prompt import DEFAULT_MEMORY_PROMPT_BUDGET, RenderedMemoryEvidence, render_memory_evidence
@@ -43,6 +43,7 @@ _RECALL_DEADLINE: contextvars.ContextVar[float | None] = contextvars.ContextVar(
 CHANNEL_WEIGHTS: Mapping[str, float] = {
     "explicit_id": 3.0,
     "title_entity": 2.2,
+    "source_genre": 6.0,
     "chunk_fts": 1.6,
     "chunk_vector": 1.6,
     "event_fts": 1.2,
@@ -1109,6 +1110,7 @@ class RecallEngine:
         *,
         chat_provider: Any = None,
         embedding_provider: Any = None,
+        rerank_provider: Any = None,
         rerank_timeout: float = RERANK_TIMEOUT_SECONDS,
         total_timeout: float = RECALL_TOTAL_TIMEOUT_SECONDS,
         prompt_budget: int = DEFAULT_MEMORY_PROMPT_BUDGET,
@@ -1116,12 +1118,17 @@ class RecallEngine:
         max_events: int = 5,
         max_associations: int = 2,
         relevance_baseline: float = RERANK_RELEVANCE_BASELINE,
+        dedicated_rerank_baseline: float = 0.20,
+        fallback_direct_threshold: float = FALLBACK_DIRECT_THRESHOLD,
+        fallback_association_threshold: float = FALLBACK_ASSOCIATION_THRESHOLD,
         vector_batch_size: int = 2048,
+        vector_candidate_prefilter: bool = False,
     ):
         self.store = store
         self.model_gateway = model_gateway
         self.chat_provider = chat_provider
         self.embedding_provider = embedding_provider
+        self.rerank_provider = rerank_provider
         self.rerank_timeout = float(rerank_timeout)
         self.total_timeout = max(float(total_timeout), self.rerank_timeout)
         self.prompt_budget = min(DEFAULT_MEMORY_PROMPT_BUDGET, max(1, int(prompt_budget)))
@@ -1129,7 +1136,22 @@ class RecallEngine:
         self.max_events = min(5, max(1, int(max_events)))
         self.max_associations = min(2, max(0, int(max_associations)))
         self.relevance_baseline = max(0.0, min(1.0, float(relevance_baseline)))
+        # Dedicated cross-encoder baselines (BGE-style 0..1 scores) are a
+        # separate config knob from the chat-JSON baseline (0..100-normalized).
+        self.dedicated_rerank_baseline = max(
+            0.0, min(1.0, float(dedicated_rerank_baseline))
+        )
+        self.fallback_direct_threshold = max(
+            0.0, min(1.0, float(fallback_direct_threshold))
+        )
+        self.fallback_association_threshold = max(
+            0.0, min(1.0, float(fallback_association_threshold))
+        )
         self.vector_batch_size = max(1, int(vector_batch_size))
+        # Candidate prefilter trades purely-semantic recall for bounded vector
+        # I/O at very large scales: rank only events already surfaced by
+        # FTS / identifiers / graph expansion.
+        self.vector_candidate_prefilter = bool(vector_candidate_prefilter)
 
     async def recall(self, query: RecallQuery | Mapping[str, Any]) -> RecallResult:
         deadline = time.perf_counter() + self.total_timeout
@@ -1152,6 +1174,10 @@ class RecallEngine:
         if not isinstance(query, RecallQuery):
             query = RecallQuery.from_mapping(query)
         else:
+            # Callers may reuse the same frozen RecallQuery (retries, loops,
+            # audits). All seed/normalization mutations below must touch a
+            # private copy so the original message and trace stay intact.
+            query = replace(query)
             # Infer mode from raw scene BEFORE normalize collapses dream→companion.
             if not str(getattr(query, "mode", "") or "").strip():
                 raw_scene = str(query.scene or "").strip().casefold()
@@ -1177,7 +1203,20 @@ class RecallEngine:
             )
         self._validate_account(query)
         policy = query.resolved_policy()
+        # Configurable fallback gates only replace the scene recipe when that
+        # recipe is still on the global defaults. Scene-specific recipes
+        # (dream/creative explicitly lower their fallback gates) keep theirs.
+        if (
+            policy.fallback_direct_threshold == FALLBACK_DIRECT_THRESHOLD
+            and policy.fallback_association_threshold == FALLBACK_ASSOCIATION_THRESHOLD
+        ):
+            policy = replace(
+                policy,
+                fallback_direct_threshold=self.fallback_direct_threshold,
+                fallback_association_threshold=self.fallback_association_threshold,
+            )
         self._active_policy = policy
+        self._private_message_scene_allowed = self._scene_allows_private_message(query)
         # Per-call association budget may exceed engine default for high-entropy modes.
         self._active_max_associations = max(
             0, min(4, int(policy.max_associations or self.max_associations))
@@ -1233,7 +1272,7 @@ class RecallEngine:
             object.__setattr__(
                 query,
                 "current_message",
-                f"{message_for_flags} ATRI 亚托莉 视觉小说 夏生 番剧",
+                f"{message_for_flags} 视觉小说 番剧",
             )
         # Open dream questions often only contain stopwordy shells ("什么/做过");
         # seed the archival verb used by dream rows. Avoid bare "梦/做梦" —
@@ -1364,6 +1403,24 @@ class RecallEngine:
                     limit=40,
                 )
 
+        # Open dream questions have almost no distinctive tokens ("什么/做过")
+        # and the seeded rewrite still lets generic action_intent rows drown
+        # the actual dream events under the 12-candidate rerank cap. Source
+        # genre is the high-precision lane those queries are allowed to use.
+        if getattr(self, "_dream_query_active", False):
+            await self._collect_store_channel(
+                candidates,
+                errors,
+                "source_genre",
+                "list_events",
+                limit=10,
+                source_type="dream",
+            )
+
+        candidate_event_ids: list[str] | None = None
+        if self.vector_candidate_prefilter and candidates:
+            candidate_event_ids = sorted(candidates.keys())[:500]
+
         embedding = await self._embedding(message, errors, "main_embedding") if message else None
         if embedding:
             model_kwargs = self._embedding_model_kwargs(embedding)
@@ -1376,6 +1433,7 @@ class RecallEngine:
                 target_type="event",
                 limit=30,
                 batch_size=self.vector_batch_size,
+                event_ids=candidate_event_ids,
                 **model_kwargs,
             )
             await self._collect_store_channel(
@@ -1387,6 +1445,7 @@ class RecallEngine:
                 target_type="chunk",
                 limit=40,
                 batch_size=self.vector_batch_size,
+                event_ids=candidate_event_ids,
                 **model_kwargs,
             )
 
@@ -1414,6 +1473,7 @@ class RecallEngine:
                     target_type="chunk",
                     limit=30,
                     batch_size=self.vector_batch_size,
+                    event_ids=candidate_event_ids,
                     **self._embedding_model_kwargs(context_embedding),
                 )
 
@@ -1783,7 +1843,38 @@ class RecallEngine:
                     for c in selected
                 ):
                     need_self_rescue = True
-            if need_self_rescue:
+            # Dedicated model returned ranked rows but none passed score gates.
+            # Only fall back when the model still saw a mild positive signal —
+            # otherwise empty inject is safer (avoids polluting unrelated queries).
+            if (
+                not selected
+                and not need_self_rescue
+                and str(rerank_status or "").startswith("ok_rerank_model")
+            ):
+                floor = max(0.15, self.dedicated_rerank_baseline)
+                model_scores: dict[str, float] = {}
+                max_model_rel = 0.0
+                for decision in decisions or ():
+                    try:
+                        rel = float(getattr(decision, "relevance", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        continue
+                    model_scores[decision.candidate_id] = rel
+                    max_model_rel = max(max_model_rel, rel)
+                if max_model_rel >= floor:
+                    # The deterministic fallback must not smuggle back in a
+                    # candidate the dedicated model already rejected.
+                    fallback = [
+                        c
+                        for c in self._select_fallback(rough, query=query)
+                        if model_scores.get(c.event_id, 0.0) >= floor
+                    ]
+                    for cand in fallback:
+                        cand.llm_score = model_scores.get(cand.event_id)
+                    mode = "fallback"
+                    rerank_status = f"{rerank_status}+threshold_fallback"
+                    selected = fallback
+            elif need_self_rescue:
                 mode = "fallback"
                 rerank_status = f"{rerank_status}+self_genre_postfilter_rescue"
                 selected = self._select_fallback(rough, query=query)
@@ -1836,6 +1927,21 @@ class RecallEngine:
             raise ValueError("RecallQuery account_id does not match the bound memory store")
 
     @staticmethod
+    def _scene_allows_private_message(query: RecallQuery) -> bool:
+        """Only PM self-recall and private-reply scenes may see PM bodies."""
+        scene = str(getattr(query, "scene", "") or "").strip().casefold()
+        mode = str(getattr(query, "mode", "") or "").strip().casefold()
+        return scene in {"private_reply", "private_message", "pm", "private_msg"} or mode == "pm"
+
+    def _private_message_hit_allowed(self, hit: Mapping[str, Any]) -> bool:
+        source = str(hit.get("source_type") or "").strip().casefold()
+        if source != "private_message":
+            return True
+        if getattr(self, "_pm_query_active", False):
+            return True
+        return bool(getattr(self, "_private_message_scene_allowed", False))
+
+    @staticmethod
     def _explicit_identifiers(query: RecallQuery) -> list[str]:
         values = [str(item).strip() for item in query.explicit_ids if str(item).strip()]
         values.extend(_BVID_RE.findall(str(query.current_message or "")))
@@ -1865,15 +1971,32 @@ class RecallEngine:
             values.append(message)
         return list(dict.fromkeys(values))
 
-    async def _store_call(self, method_name: str, *args: Any, **kwargs: Any) -> Any:
+    async def _store_call(
+        self,
+        method_name: str,
+        *args: Any,
+        enforce_budget: bool = True,
+        **kwargs: Any,
+    ) -> Any:
         method = getattr(self.store, method_name, None)
         if not callable(method):
             raise AttributeError(f"store does not implement {method_name}")
-        if inspect.iscoroutinefunction(method):
-            return await method(*args, **kwargs)
         # SQLite FTS/vector scans can approach the one-second local budget;
-        # keep them off the account scheduler's event loop.
-        result = await asyncio.to_thread(method, *args, **kwargs)
+        # keep them off the account scheduler's event loop. When a shared
+        # recall deadline exists, enforce it here too so a slow disk cannot
+        # silently exceed recall_total_timeout_seconds. Bounded point lookups
+        # (candidate reread) opt out so fallback still has its row data.
+        remaining = self._remaining_budget()
+        if enforce_budget and remaining <= 0:
+            raise asyncio.TimeoutError("recall total_timeout exhausted")
+        if inspect.iscoroutinefunction(method):
+            coro = method(*args, **kwargs)
+        else:
+            coro = asyncio.to_thread(method, *args, **kwargs)
+        if enforce_budget and math.isfinite(remaining):
+            result = await asyncio.wait_for(coro, timeout=remaining)
+        else:
+            result = await coro
         return await result if inspect.isawaitable(result) else result
 
     async def _collect_store_channel(
@@ -1897,7 +2020,7 @@ class RecallEngine:
         for raw_rank, hit in enumerate(hits, start=1):
             if not isinstance(hit, Mapping):
                 continue
-            if channel in {"event_vector", "chunk_vector"} and "score" in hit:
+            if channel in {"event_vector", "chunk_vector", "context"} and "score" in hit:
                 try:
                     vector_score = float(hit["score"])
                 except (TypeError, ValueError):
@@ -1908,6 +2031,11 @@ class RecallEngine:
                 vector_score = None
             event_id = _event_id(hit)
             if not event_id:
+                continue
+            # Privacy boundary: private-message bodies may only surface in PM
+            # self-recall / private-reply scenes. Gate before any candidate is
+            # created so no downstream path (fallback or LLM) can re-add them.
+            if not self._private_message_hit_allowed(hit):
                 continue
             candidate = candidates.setdefault(event_id, RecallCandidate(event_id=event_id))
             if channel in {"event_fts", "chunk_fts", "context"} and "lexical_coverage" in hit:
@@ -1933,6 +2061,11 @@ class RecallEngine:
                 )
             chunk_id = _chunk_id(hit)
             link_id = _link_id(hit)
+            # Real graph rows use "id" for the link primary key; the older
+            # "link_id" alias only exists in some tests. Without this the
+            # reinforce_recall link lane silently never fires.
+            if channel == "graph" and not link_id and hit.get("id"):
+                link_id = str(hit.get("id") or "")
             candidate.evidence_ids.add(event_id)
             if chunk_id:
                 candidate.evidence_ids.add(chunk_id)
@@ -1973,7 +2106,7 @@ class RecallEngine:
         for candidate in candidates.values():
             candidate.rrf_score = sum(candidate.rrf_contributions.values())
             candidate.deterministic_score = _calibrate_rrf(candidate.rrf_score)
-            strong_identifier = {"explicit_id", "title_entity"}.intersection(
+            strong_identifier = {"explicit_id", "title_entity", "source_genre"}.intersection(
                 candidate.channel_ranks
             )
             measured_evidence = [
@@ -2050,10 +2183,15 @@ class RecallEngine:
                     or "观看了" in summary
                 ):
                     recent_watch = 1
+            # Source-genre lanes (dream self-queries) are authoritative when
+            # present; OR-FTS noise rows with more stopword terms must not push
+            # them out of the 12-candidate rerank cap.
+            genre_pin = -1 if "source_genre" in (item.channel_ranks or {}) else 0
             # Prefer multi-term + title hits so distinctive self events survive
             # the top-k cut before fallback ranking. For watch self-questions,
             # also pin recent watch rows into the head of the rough list.
             return (
+                genre_pin,
                 -recent_watch,
                 -len(content_terms),
                 -title_hits,
@@ -2070,7 +2208,10 @@ class RecallEngine:
             return []
         try:
             rows = await self._store_call(
-                "get_events", [item.event_id for item in candidates], chunks_per_event=None
+                "get_events",
+                [item.event_id for item in candidates],
+                chunks_per_event=None,
+                enforce_budget=False,
             )
         except Exception as exc:
             errors.setdefault("candidate_reread", type(exc).__name__)
@@ -2319,23 +2460,128 @@ class RecallEngine:
         )
         return json.dumps(request, ensure_ascii=False, separators=(",", ":")), system
 
-    async def _rerank(
-        self, query: RecallQuery, candidates: Sequence[RecallCandidate]
+    def _resolve_rerank_provider(self) -> Any:
+        if self.rerank_provider is not None:
+            provider = self.rerank_provider
+        elif self.model_gateway is not None and getattr(
+            self.model_gateway, "rerank_provider", None
+        ) is not None:
+            provider = self.model_gateway.rerank_provider
+        else:
+            return None
+        if provider is None:
+            return None
+        if getattr(provider, "enabled", True) is False:
+            return None
+        if not callable(getattr(provider, "rerank", None)):
+            return None
+        return provider
+
+    def _decisions_from_rerank_scores(
+        self,
+        ranked: Sequence[RecallCandidate],
+        rows: Sequence[Mapping[str, Any]],
+    ) -> list[_RerankDecision] | None:
+        """Map dedicated-model results[] into _RerankDecision list."""
+        if not rows:
+            return []
+        decisions: list[_RerankDecision] = []
+        seen: set[int] = set()
+        for row in rows:
+            if not isinstance(row, Mapping):
+                continue
+            idx = row.get("index")
+            score = row.get("relevance_score")
+            if (
+                not isinstance(idx, int)
+                or isinstance(idx, bool)
+                or idx in seen
+                or not 0 <= idx < len(ranked)
+            ):
+                continue
+            if isinstance(score, bool) or not isinstance(score, (int, float)):
+                continue
+            relevance = float(score)
+            if not math.isfinite(relevance):
+                continue
+            if relevance > 1.0 and relevance <= 100.0:
+                relevance = relevance / 100.0
+            relevance = max(0.0, min(1.0, relevance))
+            cand = ranked[idx]
+            evidence = tuple(cand.evidence_ids) or (cand.event_id,)
+            seen.add(idx)
+            decisions.append(
+                _RerankDecision(
+                    cand.event_id,
+                    relevance,
+                    "association" if cand.relation_only else "direct",
+                    evidence,
+                    "rerank_model",
+                )
+            )
+        return decisions if decisions else None
+
+    async def _rerank_with_model(
+        self, query: RecallQuery, ranked: Sequence[RecallCandidate]
     ) -> tuple[list[_RerankDecision] | None, str, int]:
-        # Contract: empty / single-trivial candidate sets never pay for LLM rerank.
-        if not candidates:
-            return None, "skipped_empty", 0
+        """Dedicated SiliconFlow-style rerank model path."""
+        provider = self._resolve_rerank_provider()
+        if provider is None:
+            return None, "no_dedicated", 0
+
+        documents: list[str] = []
+        for cand in ranked:
+            parts = [str(cand.summary or "").strip()]
+            for _eid, text in (cand.evidence_snippets or ())[:2]:
+                t = str(text or "").strip()
+                if t:
+                    parts.append(t)
+            documents.append("\n".join(p for p in parts if p) or cand.event_id)
+
+        qtext = str(getattr(query, "current_message", "") or query or "")
+
+        async def invoke_once() -> Any:
+            gateway = self.model_gateway
+            if gateway is not None and callable(getattr(gateway, "rerank_texts", None)):
+                # Single timeout layer: the outer asyncio.wait_for below already
+                # enforces min(rerank_timeout, remaining total budget).
+                result = gateway.rerank_texts(
+                    qtext,
+                    documents,
+                    top_n=len(documents),
+                    timeout=None,
+                )
+            else:
+                result = provider.rerank(qtext, documents, top_n=len(documents))
+            return await result if inspect.isawaitable(result) else result
+
+        try:
+            remaining = self._remaining_budget()
+            if remaining <= 0:
+                return None, "total_timeout", 0
+            raw = await asyncio.wait_for(
+                invoke_once(), timeout=min(self.rerank_timeout, remaining)
+            )
+        except asyncio.TimeoutError:
+            status = "total_timeout" if self._remaining_budget() <= 0 else "timeout"
+            return None, status, 1
+        except Exception as exc:
+            return None, f"error:{type(exc).__name__}", 1
+
+        if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes, bytearray)):
+            return None, "invalid_response", 1
+        decisions = self._decisions_from_rerank_scores(ranked, raw)
+        if decisions is None:
+            return None, "invalid_response", 1
+        return decisions, "ok_rerank_model", 1
+
+    async def _rerank_with_chat(
+        self, query: RecallQuery, ranked: Sequence[RecallCandidate]
+    ) -> tuple[list[_RerankDecision] | None, str, int]:
+        """Legacy chat-JSON rerank path."""
         method = self._resolve_chat_callable()
         if method is None:
             return None, "provider_unavailable", 0
-        # Reasoning models pay a large fixed CoT cost per call. Ranking more than
-        # ~12 candidates mostly adds noise and token pressure; keep the top slice.
-        ranked = list(candidates)
-        if len(ranked) > 12:
-            ranked = sorted(
-                ranked,
-                key=lambda item: (-item.deterministic_score, item.event_id),
-            )[:12]
         prompt, system = self._rerank_prompt(query, ranked)
 
         async def invoke_once() -> Any:
@@ -2364,6 +2610,59 @@ class RecallEngine:
             return None, "invalid_json", 1
         return decisions, "ok", 1
 
+    async def _rerank(
+        self, query: RecallQuery, candidates: Sequence[RecallCandidate]
+    ) -> tuple[list[_RerankDecision] | None, str, int]:
+        # Contract: empty / single-trivial candidate sets never pay for LLM rerank.
+        if not candidates:
+            return None, "skipped_empty", 0
+        # Reasoning models pay a large fixed CoT cost per call. Ranking more than
+        # ~12 candidates mostly adds noise and token pressure; keep the top slice.
+        ranked = list(candidates)
+        if len(ranked) > 12:
+            ranked = sorted(
+                ranked,
+                key=lambda item: (-item.deterministic_score, item.event_id),
+            )[:12]
+        # Note: single-candidate sets intentionally still pay for the LLM
+        # rerank. Several contract tests and the frozen-empty-results contract
+        # depend on the model's verdict, and skipping it here changes public
+        # trace semantics for explicit-id recall.
+
+        # Cascade: dedicated rerank model → chat JSON → caller deterministic fallback.
+        # If the shared total budget is already exhausted (e.g. slow embedding), do not
+        # pay for either path — preserve total_timeout for deterministic fallback.
+        if self._remaining_budget() <= 0:
+            return None, "total_timeout", 0
+
+        model_decisions, model_status, model_calls = await self._rerank_with_model(
+            query, ranked
+        )
+        if model_decisions is not None:
+            return model_decisions, model_status, model_calls
+
+        # Dedicated already hit the total deadline — do not cascade into chat
+        # (chat would only burn a tiny residual budget and pollute status as invalid_json).
+        if model_status == "total_timeout" or self._remaining_budget() <= 0:
+            return None, "total_timeout", model_calls
+
+        # PRD-V6 11.4：只要产生候选，恰好调用一次 LLM 重排。dedicated 模型
+        # 失败后不得再级联 chat（那会变成两次 LLM 调用）；直接进入调用方
+        # 的确定性 fallback。chat JSON 仅在未配置 dedicated 模型时使用。
+        if model_status != "no_dedicated":
+            return None, f"rerank_model_failed:{model_status}", model_calls
+
+        chat_decisions, chat_status, chat_calls = await self._rerank_with_chat(
+            query, ranked
+        )
+        total_calls = model_calls + chat_calls
+        if chat_decisions is not None:
+            return chat_decisions, chat_status, total_calls
+
+        # Neither path produced decisions. No-dedicated keeps the chat path's
+        # own status for legacy trace semantics (timeout/invalid_json/...).
+        return None, chat_status, total_calls
+
     @staticmethod
     def _parse_rerank(
         raw: Any, candidates: Sequence[RecallCandidate]
@@ -2387,15 +2686,20 @@ class RecallEngine:
         if isinstance(payload, list):
             rows = payload
         elif isinstance(payload, dict):
-            if "results" in payload and isinstance(payload["results"], list):
-                rows = payload["results"]
-            elif "candidates" in payload and isinstance(payload["candidates"], list):
-                rows = payload["candidates"]
-            else:
+            # PRD 11.4：严格返回结构。多个容器键或额外顶级字段都使
+            # 整次结果无效，不得修补后二次调用模型。
+            containers = {
+                key
+                for key in ("items", "results", "candidates")
+                if isinstance(payload.get(key), list)
+            }
+            if len(containers) != 1 or set(payload.keys()) != containers:
                 return None
+            rows = payload[next(iter(containers))]
         else:
             return None
         if len(rows) > len(candidates):
+            # 未知/超量候选：整批无效，不保留“合法前缀”。
             return None
         if not rows:
             # A syntactically valid empty result is an explicit "nothing is
@@ -2408,58 +2712,48 @@ class RecallEngine:
         required = {"candidate_id", "relevance", "kind", "evidence_ids", "reason"}
         kind_aliases = {
             "direct": "direct",
-            "direct_reference": "direct",
-            "reference": "direct",
-            "exact": "direct",
             "association": "association",
-            "related": "association",
-            "associative": "association",
         }
         for row in rows:
-            # 单 candidate 违规只跳过该条，不废整批（避免 LLM 输出抖动导致全量降级）
+            # 单条违规废掉整批，而不是跳过保留其余（PRD 11.4）。
             if not isinstance(row, dict):
-                continue
-            # Accept common key aliases from smaller/weaker models.
-            if "candidate_id" not in row and "id" in row:
-                row = {**row, "candidate_id": row["id"]}
-            if "evidence_ids" not in row and "evidence" in row:
-                row = {**row, "evidence_ids": row["evidence"]}
+                return None
             if not required.issubset(row):
-                continue
+                return None
             candidate_id = row["candidate_id"]
             if not isinstance(candidate_id, str) or candidate_id not in by_id or candidate_id in seen:
-                continue
+                return None
             relevance = row["relevance"]
             if isinstance(relevance, bool) or not isinstance(relevance, (int, float)):
-                continue
+                return None
             relevance = float(relevance)
             if not math.isfinite(relevance):
-                continue
+                return None
             # Models sometimes emit 0..1 floats instead of 0..100.
             if 0.0 <= relevance <= 1.0:
                 relevance_norm = relevance
             elif 0.0 <= relevance <= 100.0:
                 relevance_norm = relevance / 100.0
             else:
-                continue
+                return None
             kind_raw = str(row["kind"] or "").strip().casefold()
             kind = kind_aliases.get(kind_raw)
             if kind is None:
-                continue
+                return None
             evidence_ids = row["evidence_ids"]
             if not isinstance(evidence_ids, list) or not evidence_ids or len(evidence_ids) > 12:
-                continue
+                return None
             if any(not isinstance(item, str) for item in evidence_ids):
-                continue
+                return None
             if len(set(evidence_ids)) != len(evidence_ids):
-                continue
+                return None
             allowed = set(by_id[candidate_id].evidence_ids)
             # If the model only echoed the event id, accept it as evidence.
             if not set(evidence_ids).issubset(allowed):
                 if set(evidence_ids) == {candidate_id}:
                     evidence_ids = [candidate_id]
                 else:
-                    continue
+                    return None
             snippet_ids = {
                 evidence_id
                 for evidence_id, _text in by_id[candidate_id].evidence_snippets
@@ -2467,10 +2761,10 @@ class RecallEngine:
             if kind == "direct" and snippet_ids and not snippet_ids.intersection(evidence_ids):
                 # Allow event-id-only evidence when the model did not quote chunks.
                 if set(evidence_ids) != {candidate_id} and candidate_id not in evidence_ids:
-                    continue
+                    return None
             reason = row["reason"]
             if not isinstance(reason, str) or not reason.strip() or len(reason) > 240:
-                continue
+                return None
             seen.add(candidate_id)
             decisions.append(
                 _RerankDecision(
@@ -2489,6 +2783,16 @@ class RecallEngine:
         decisions: Sequence[_RerankDecision],
     ) -> list[RecallCandidate]:
         by_id = {candidate.event_id: candidate for candidate in candidates}
+        # Dedicated cross-encoders (e.g. BGE/bge-reranker-v2-m3) typically emit
+        # softer 0..1 scores than chat-JSON 0..100-normalized relevance. Using the
+        # chat baseline (0.65) + direct gate (0.72) wipes legitimate life_plan /
+        # schedule hits even when the model ranked them first.
+        dedicated = any(
+            str(getattr(d, "reason", "") or "") == "rerank_model" for d in decisions
+        )
+        score_baseline = (
+            self.dedicated_rerank_baseline if dedicated else self.relevance_baseline
+        )
         for decision in decisions:
             candidate = by_id[decision.candidate_id]
             candidate.llm_score = decision.relevance
@@ -2499,10 +2803,13 @@ class RecallEngine:
 
         eligible: list[RecallCandidate] = []
         for candidate in candidates:
-            if candidate.llm_score is None or candidate.llm_score < self.relevance_baseline:
+            if candidate.llm_score is None or candidate.llm_score < score_baseline:
                 continue
             policy = getattr(self, "_active_policy", None)
-            if isinstance(policy, RetrievalPolicy):
+            if dedicated:
+                # Keep fusion weights; only lower absolute gates for model scores.
+                threshold = 0.50 if candidate.kind == "association" else 0.42
+            elif isinstance(policy, RetrievalPolicy):
                 threshold = (
                     policy.association_threshold
                     if candidate.kind == "association"
@@ -2545,6 +2852,47 @@ class RecallEngine:
 
         if getattr(self, "_dream_query_active", False):
             kept = [c for c in rows if src(c) == "dream"]
+            return kept
+        if getattr(self, "_watch_query_active", False):
+            kept = []
+            for c in rows:
+                s = src(c)
+                if s in {"video_experience", "video"}:
+                    title = str(c.title or "")
+                    if "番剧" in title or re.search(r"第\s*\d+\s*话", title):
+                        continue
+                    kept.append(c)
+                elif s == "bot_action":
+                    text = blob(c)
+                    if (
+                        "evaluate_proactive_video" in text
+                        or (
+                            ("看完" in text or "观看了" in text)
+                            and "话" not in text
+                            and "番剧" not in text
+                        )
+                    ):
+                        kept.append(c)
+            return kept
+        if getattr(self, "_bangumi_query_active", False):
+            kept = []
+            for c in rows:
+                s = src(c)
+                text = blob(c)
+                is_bangumiish = any(
+                    k in text
+                    for k in (
+                        "ATRI",
+                        "亚托莉",
+                        "视觉小说",
+                        "番剧",
+                        "追番",
+                        "夏生",
+                        "动漫",
+                    )
+                ) or s in {"bangumi"}
+                if is_bangumiish:
+                    kept.append(c)
             return kept
         if getattr(self, "_pm_query_active", False):
             kept = [
@@ -3152,7 +3500,7 @@ class RecallEngine:
     @staticmethod
     def _fallback_has_content_evidence(candidate: RecallCandidate) -> bool:
         channels = set(candidate.channel_ranks or {})
-        if {"explicit_id", "title_entity"}.intersection(channels):
+        if {"explicit_id", "title_entity", "source_genre"}.intersection(channels):
             return True
         content_lex = [
             cov
@@ -3274,7 +3622,10 @@ class RecallEngine:
             return []
         try:
             rows = await self._store_call(
-                "get_events", [item.event_id for item in selected], chunks_per_event=None
+                "get_events",
+                [item.event_id for item in selected],
+                chunks_per_event=None,
+                enforce_budget=False,
             )
         except Exception as exc:
             errors.setdefault("final_reread", type(exc).__name__)
@@ -3426,8 +3777,16 @@ class RecallEngine:
                 try:
                     from datetime import datetime
 
-                    dt = datetime.fromisoformat(raw_t.replace("Z", "+00:00"))
-                    age_h = max(0.0, (time.time() - dt.timestamp()) / 3600.0)
+                    if re.fullmatch(r"\d+(\.\d+)?", raw_t):
+                        # Store timestamps are Unix floats; candidates carry the
+                        # numeric value as a string for prompt rendering.
+                        age_h = max(
+                            0.0,
+                            (time.time() - float(raw_t)) / 3600.0,
+                        )
+                    else:
+                        dt = datetime.fromisoformat(raw_t.replace("Z", "+00:00"))
+                        age_h = max(0.0, (time.time() - dt.timestamp()) / 3600.0)
                 except Exception:
                     age_h = 0.0
             age_d = age_h / 24.0 if age_h else 0.0

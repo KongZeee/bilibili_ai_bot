@@ -23,6 +23,8 @@ from starlette.requests import Request
 
 from .responses import ok, fail, fail_internal, fail_invalid_input
 
+from bilibot.app.config_loader import is_sensitive_placeholder
+
 logger = logging.getLogger("bilibot.api.video_analysis")
 
 
@@ -46,6 +48,13 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
         va = {}
 
     # 顶层标量字段
+    # 帧拼接开关会影响 max_keyframes 的合法上限，先取本次更新的值（未提交则用现值）。
+    _pack_enabled = bool(updates.get("frame_pack_enabled", va.get("frame_pack_enabled", False)))
+    try:
+        _per_tile = int(updates.get("frames_per_tile", va.get("frames_per_tile", 4)))
+    except (TypeError, ValueError):
+        _per_tile = 4
+    _per_tile = max(1, min(_per_tile, 9))
     for key in ("enabled", "frame_extractor", "scenedetect_threshold",
                 "image_max_size", "max_keyframes", "vision_window_size",
                 "vision_requests_per_minute", "temp_dir",
@@ -57,10 +66,12 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
                 "max_local_whisper_workers", "temp_disk_quota_bytes",
                 # 视觉轨重试 / 成功率（运行时 VideoUnderstandingConfig 读取）
                 "vision_frame_max_retries", "vision_frame_retry_backoff_seconds",
-                "vision_min_success_ratio"):
+                "vision_min_success_ratio",
+                # 帧拼接（九宫格连续帧）
+                "frame_pack_enabled", "frames_per_tile", "frame_pack_tile_size"):
         if key in updates:
             val = updates[key]
-            if key in ("enabled", "local_whisper_enabled"):
+            if key in ("enabled", "local_whisper_enabled", "frame_pack_enabled"):
                 val = bool(val)
             elif key in ("scenedetect_threshold", "vision_frame_retry_backoff_seconds",
                          "vision_min_success_ratio"):
@@ -75,12 +86,17 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
                           "max_concurrent_global", "max_concurrent_per_account",
                           "download_timeout_seconds", "preprocess_timeout_seconds",
                           "analysis_timeout_seconds", "max_local_whisper_workers",
-                          "temp_disk_quota_bytes", "vision_frame_max_retries"):
+                          "temp_disk_quota_bytes", "vision_frame_max_retries",
+                          "frames_per_tile", "frame_pack_tile_size"):
                 val = int(val)
                 if key == "max_keyframes":
-                    val = max(1, min(val, 64))
+                    val = max(1, min(val, 64 * (_per_tile if _pack_enabled else 1)))
                 if key == "vision_frame_max_retries":
                     val = max(0, min(val, 5))
+                if key == "frames_per_tile":
+                    val = max(1, min(val, 9))
+                if key == "frame_pack_tile_size":
+                    val = max(256, min(val, 1024))
             va[key] = val
 
     # ASR 子段
@@ -94,7 +110,7 @@ def _merge_video_analysis(raw: dict, updates: dict) -> dict:
             if key in updates["asr"]:
                 val = updates["asr"][key]
                 # api_key 为占位符时不覆盖
-                if key == "api_key" and val == "***已配置***":
+                if key == "api_key" and is_sensitive_placeholder(val):
                     continue
                 asr[key] = val
         va["asr"] = asr
@@ -155,11 +171,45 @@ def _extract_bvid(text: str) -> str:
     if not text:
         return ""
     text = text.strip()
-    # 直接匹配 BV 开头的号
-    m = re.search(r"(BV[0-9A-Za-z]{10})", text)
+    # BV + 10 位字符；要求前后不是同类字符，避免从 12 位以上的字符串中截出假 BV
+    m = re.search(r"(?<![0-9A-Za-z])BV[0-9A-Za-z]{10}(?![0-9A-Za-z])", text)
     if m:
-        return m.group(1)
+        return m.group(1) if m.lastindex else m.group(0)
     return ""
+
+
+_SHORTLINK_PATTERN = re.compile(r"((?:https?://)?b23\.tv/[0-9A-Za-z]+)")
+
+
+def _extract_shortlink_url(text: str) -> str:
+    """从用户输入提取 b23.tv 短链接，并补全 https scheme。"""
+    if not text:
+        return ""
+    m = _SHORTLINK_PATTERN.search(text.strip())
+    if not m:
+        return ""
+    url = m.group(1)
+    if not url.lower().startswith(("http://", "https://")):
+        url = "https://" + url
+    return url
+
+
+async def _resolve_video_bvid(text: str, bili) -> str:
+    """提取 BV 号；短链接通过 BilibiliAPI.resolve_shortlink 解析后二次提取。"""
+    bvid = _extract_bvid(text)
+    if bvid:
+        return bvid
+    shortlink = _extract_shortlink_url(text)
+    if not shortlink:
+        return ""
+    resolver = getattr(bili, "resolve_shortlink", None)
+    if not callable(resolver):
+        return ""
+    try:
+        location, _err = await resolver(shortlink)
+    except Exception:
+        return ""
+    return _extract_bvid(location or "")
 
 
 async def _archive_test_analysis(acc, *, bvid: str, vinfo: dict, result: dict) -> None:
@@ -210,6 +260,17 @@ async def _archive_test_analysis(acc, *, bvid: str, vinfo: dict, result: dict) -
                 behavior_log=behavior_log,
                 max_chars=2000,
             )
+    redactor = getattr(getattr(acc, "memory_brain", None), "redactor", None)
+
+    def _pseudo_actor(value) -> str:
+        if redactor is not None and callable(
+            getattr(redactor, "pseudonymize_identifier", None)
+        ):
+            return str(
+                redactor.pseudonymize_identifier(value, namespace="uid")
+            )
+        return str(value or "")
+
     envelope = video_observation(
         account_id=account_id,
         observation_key=f"manual-test:{bvid}:draft",
@@ -221,6 +282,7 @@ async def _archive_test_analysis(acc, *, bvid: str, vinfo: dict, result: dict) -
         tags=tags,
         persona_id=str(getattr(acc, "persona_id", "") or ""),
         video_detail=video_detail,
+        pseudonymize_actor=_pseudo_actor,
     )
     canonical = {
         "metadata": envelope.metadata,
@@ -353,11 +415,14 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
         """
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail_invalid_input("请求体必须是 JSON 对象")
             if isinstance(body, dict) and body.get("config"):
                 logger.info("[test] 忽略未保存的 config 覆盖，请先保存视频理解配置")
             video_url = body.get("video_url") or body.get("url") or ""
             bvid = _extract_bvid(video_url)
-            if not bvid:
+            shortlink = _extract_shortlink_url(video_url)
+            if not bvid and not shortlink:
                 return fail_invalid_input("无法识别视频 BV 号，请输入 BV 开头的 12 位代码或 B站视频链接")
 
             if account_manager is None:
@@ -377,6 +442,12 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             bili = getattr(acc, "bili", None)
             if bili is None:
                 return fail("NO_BILI_CLIENT", "B站客户端未初始化")
+
+            # b23.tv 短链接需要先解析出真实视频 URL 再提取 BV 号
+            if not bvid and shortlink:
+                bvid = await _resolve_video_bvid(video_url, bili)
+            if not bvid:
+                return fail_invalid_input("无法解析该 B站短链接，请直接粘贴 BV 开头的 12 位代码")
 
             # 1. 获取视频信息（cid）
             data, _ = await bili._http_get(
@@ -401,11 +472,47 @@ def create_video_analysis_routes(config_loader, config_path: str, account_manage
             duration = vinfo.get("duration", 0)
             owner = vinfo.get("owner", {}).get("name", "")
 
-            # 2. 下载视频到临时目录
+            # 下载前资源预检：超长视频直接返回元数据降级，不下载。
+            try:
+                max_duration = int(
+                    getattr(getattr(vu, "cfg", None), "max_duration_seconds", 0) or 0
+                )
+            except (TypeError, ValueError):
+                max_duration = 0
+            if max_duration > 0:
+                try:
+                    duration_f = float(duration or 0)
+                except (TypeError, ValueError):
+                    duration_f = 0.0
+                if duration_f > max_duration:
+                    return ok({
+                        "title": title,
+                        "owner": owner,
+                        "duration": duration,
+                        "bvid": bvid,
+                        "degradation_reason": "duration_exceeds_limit",
+                        "description": "视频时长超过配置上限，已跳过下载，返回元数据分析",
+                        "frames": [],
+                    })
+
+            # 2. 下载视频到临时目录（带字节上限与超时）
             data_dir = getattr(acc, "account_data_dir", "") or os.path.join(os.getcwd(), "data")
             video_temp_dir = os.path.join(data_dir, "video_temp")
             save_path = os.path.join(video_temp_dir, f"test_{bvid}")
-            video_file = await bili.download_video(bvid, cid, save_path, quality=32)
+            try:
+                max_bytes = max(
+                    0,
+                    int(getattr(getattr(vu, "cfg", None), "max_download_bytes", 0) or 0),
+                )
+                timeout = max(
+                    30,
+                    int(getattr(getattr(vu, "cfg", None), "download_timeout_seconds", 0) or 90),
+                )
+            except (TypeError, ValueError):
+                max_bytes, timeout = 0, 600
+            video_file = await bili.download_video(
+                bvid, cid, save_path, quality=32, max_bytes=max_bytes, timeout=timeout
+            )
 
             if not video_file or not os.path.exists(video_file):
                 return fail("DOWNLOAD_FAILED", f"视频下载失败: {bvid}")

@@ -30,6 +30,7 @@ FEATURE_LABELS = {
     "embedding": "记忆向量检索",
     "asr": "视频音频轨",
     "image": "动态配图",
+    "rerank": "记忆重排序",
 }
 
 
@@ -136,6 +137,70 @@ def _rebind_memory_brains_for_embedding(router, account_manager=None) -> int:
     return rebound
 
 
+def _rebind_memory_brains_for_rerank(router, account_manager=None) -> int:
+    """rerank 路由/Provider 变更后，热重绑存活 MemoryBrain 的 rerank 侧。"""
+    rr = None
+    try:
+        resolve = getattr(router, "resolve_rerank", None)
+        rr = resolve() if callable(resolve) else None
+    except Exception as e:
+        logger.warning("resolve_rerank 失败，跳过记忆重绑: %s", e)
+        return 0
+
+    rebound = 0
+    already_rebound: set[int] = set()
+    try:
+        from bilibot.memory_brain.service import (
+            iter_live_brains,
+            rebind_all_live_brains,
+        )
+
+        rebound = rebind_all_live_brains(
+            rerank_provider=rr,
+            rebind_rerank=True,
+        )
+        # The account loop below is only a fallback for brains that are not
+        # registered as live (e.g. constructed but never started). Skip the
+        # ones the global pass just rebound so the count isn't inflated.
+        already_rebound = {id(brain) for brain in iter_live_brains()}
+    except Exception as e:
+        logger.warning("rebind_all_live_brains(rerank) 失败: %s", e)
+
+    am = _resolve_account_manager(account_manager)
+    if am is not None:
+        try:
+            accounts = getattr(am, "_accounts", None) or {}
+            seen_ids: set[str] = set()
+            for acc in list(accounts.values()):
+                brain = getattr(acc, "memory_brain", None)
+                if brain is None or not hasattr(brain, "rebind_providers"):
+                    continue
+                if id(brain) in already_rebound:
+                    continue
+                aid = str(getattr(acc, "account_id", "") or id(brain))
+                if aid in seen_ids:
+                    continue
+                seen_ids.add(aid)
+                try:
+                    brain.rebind_providers(
+                        rerank_provider=rr,
+                        rebind_rerank=True,
+                    )
+                    rebound += 1
+                except Exception as e:
+                    logger.warning(
+                        "记忆大脑 rerank 重绑失败 account=%s: %s",
+                        getattr(acc, "account_id", "?"),
+                        e,
+                    )
+        except Exception as e:
+            logger.warning("遍历账号重绑记忆大脑 rerank 失败: %s", e)
+
+    if rebound:
+        logger.info("已热重绑记忆 rerank provider（%s 次）", rebound)
+    return rebound
+
+
 def create_model_routing_routes(
     router,
     config_loader,
@@ -185,6 +250,8 @@ def create_model_routing_routes(
         """更新功能路由"""
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail_invalid_input("请求体必须是 JSON 对象")
             updated = {}
             for ptype in PROVIDER_TYPES:
                 if ptype in body:
@@ -197,6 +264,8 @@ def create_model_routing_routes(
             _save_to_config(config_loader, router, config_path)
             if "embedding" in updated:
                 _rebind_memory_brains_for_embedding(router, account_manager)
+            if "rerank" in updated:
+                _rebind_memory_brains_for_rerank(router, account_manager)
             return ok(router.get_routing(), "路由已更新")
         except Exception as e:
             logger.error(f"更新模型路由失败: {e}", exc_info=True)
@@ -216,6 +285,8 @@ def create_model_routing_routes(
             return fail_invalid_input(f"未知 Provider 类型: {ptype}")
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail_invalid_input("请求体必须是 JSON 对象")
             if not body.get("model"):
                 return fail("VALIDATION_ERROR", "model 不能为空")
             # local-whisper ASR 可不填 key；其余类型至少需要一个密钥
@@ -227,6 +298,8 @@ def create_model_routing_routes(
             _save_to_config(config_loader, router, config_path)
             if ptype == "embedding":
                 _rebind_memory_brains_for_embedding(router, account_manager)
+            if ptype == "rerank":
+                _rebind_memory_brains_for_rerank(router, account_manager)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 添加成功")
         except ValueError as e:
             logger.warning("模型路由校验失败: %s", e)
@@ -249,6 +322,8 @@ def create_model_routing_routes(
         _save_to_config(config_loader, router, config_path)
         if ptype == "embedding":
             _rebind_memory_brains_for_embedding(router, account_manager)
+        if ptype == "rerank":
+            _rebind_memory_brains_for_rerank(router, account_manager)
         return ok(message="Provider 已删除")
 
     async def update_by_type(request: Request) -> JSONResponse:
@@ -259,11 +334,15 @@ def create_model_routing_routes(
             return fail_invalid_input(f"未知 Provider 类型: {ptype}")
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail_invalid_input("请求体必须是 JSON 对象")
             if not router.update_provider(ptype, pid, body):
                 return fail("NOT_FOUND", f"Provider 不存在: {pid}")
             _save_to_config(config_loader, router, config_path)
             if ptype == "embedding":
                 _rebind_memory_brains_for_embedding(router, account_manager)
+            if ptype == "rerank":
+                _rebind_memory_brains_for_rerank(router, account_manager)
             return ok(router.get_provider_by_type(ptype, pid).get_info(), "Provider 已更新")
         except Exception as e:
             logger.error(f"更新 Provider 失败: {e}", exc_info=True)
@@ -290,6 +369,8 @@ def create_model_routing_routes(
                 success, err_msg = await provider.test_asr()
             elif ptype == "image":
                 success, err_msg = await provider.test_image()
+            elif ptype == "rerank":
+                success, err_msg = await provider.test_rerank()
             else:
                 success, err_msg = await provider.test()
 

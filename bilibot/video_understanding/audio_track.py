@@ -126,6 +126,10 @@ def _split_segment(start: float, end: float, text: str, max_span: float = 8.0) -
         return [AudioEvent(start=start, end=end, text=text)]
 
     n_parts = max(2, int((end - start) / max_span) + 1)
+    # 文本过短时不要切成每片 1 个字符甚至空片：那会把一句短台词
+    # 错位铺满几十秒，污染视觉对齐与行为日志。
+    if len(chars) < n_parts * 2:
+        return [AudioEvent(start=start, end=end, text=text)]
     part_size = len(chars) // n_parts
     events = []
     total_duration = end - start
@@ -135,6 +139,10 @@ def _split_segment(start: float, end: float, text: str, max_span: float = 8.0) -
         sub_text = "".join(chars[c_start:c_end]).strip()
         sub_start = start + total_duration * i / n_parts
         sub_end = start + total_duration * (i + 1) / n_parts if i < n_parts - 1 else end
+        if not sub_text:
+            # Empty spans are noise for the alignment log and downstream
+            # memory sources; keep only spans that carry transcript text.
+            continue
         events.append(AudioEvent(start=round(sub_start, 2), end=round(sub_end, 2), text=sub_text))
     return events
 
@@ -188,8 +196,14 @@ def _transcribe_with_api(
     asr_base_url: str,
     asr_api_keys: Optional[Sequence[str]] = None,
     rate_limit_cooldown_seconds: float = 30.0,
+    api_timeout_seconds: float = 120.0,
 ) -> List[AudioEvent]:
-    """通过 OpenAI 兼容 ASR API 转写音频（多 key 轮转 + 429 冷却）。"""
+    """通过 OpenAI 兼容 ASR API 转写音频（多 key 轮转 + 429 冷却）。
+
+    ``api_timeout_seconds`` is applied at the SDK level so a hung request
+    actually aborts inside the worker thread; an outer asyncio timeout cannot
+    cancel a thread running its own event loop.
+    """
     try:
         from openai import AsyncOpenAI
     except ImportError as e:
@@ -226,7 +240,11 @@ def _transcribe_with_api(
     key_cooldown_until = {k: 0.0 for k in keys}
 
     async def _request_with_key(api_key: str):
-        client = AsyncOpenAI(api_key=api_key, base_url=asr_base_url)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=asr_base_url,
+            timeout=max(1.0, float(api_timeout_seconds or 120.0)),
+        )
         # PRD 4.2：确保 AsyncOpenAI 客户端在请求结束后被关闭，避免资源泄漏
         try:
             response = await client.chat.completions.create(
@@ -360,14 +378,18 @@ def _get_whisper_executor(max_workers: int = 1) -> ThreadPoolExecutor:
     return _whisper_executor
 
 
-def shutdown_whisper_executor() -> None:
-    """关闭本地 Whisper 工作池（优雅关闭时调用）"""
+def shutdown_whisper_executor(wait: bool = True) -> None:
+    """关闭本地 Whisper 工作池（优雅关闭时调用）。
+
+    wait=True 时等待在途转写任务结束（受 whisper_timeout 上限约束），避免
+    进程退出后线程仍持有音频文件句柄；内部工作池扩容的替换场景不等待。
+    """
     global _whisper_executor, _whisper_executor_workers
     if _whisper_executor is not None:
-        _whisper_executor.shutdown(wait=False)
+        _whisper_executor.shutdown(wait=wait)
         _whisper_executor = None
         _whisper_executor_workers = 0
-        logger.info("本地 Whisper 工作池已关闭")
+        logger.info(f"本地 Whisper 工作池已关闭（wait={wait}）")
 
 
 def transcribe_audio(
@@ -383,6 +405,7 @@ def transcribe_audio(
     local_whisper_enabled: bool = False,
     max_local_whisper_workers: int = 1,
     whisper_timeout: int = 600,
+    api_timeout_seconds: float = 120.0,
     return_result: bool = False,
     raise_on_error: bool = False,
 ) -> Union[List[AudioEvent], ASRTranscriptionResult]:
@@ -396,6 +419,7 @@ def transcribe_audio(
         local_whisper_enabled: 是否启用本地 faster-whisper（默认 False）
         max_local_whisper_workers: 本地 Whisper 工作池大小
         whisper_timeout: 本地 Whisper 超时秒数
+        api_timeout_seconds: API ASR SDK 级超时秒数（在 worker 线程内生效）
 
     Returns:
         音频事件列表，识别失败或无对白返回空列表
@@ -437,6 +461,7 @@ def transcribe_audio(
                     asr_base_url,
                     asr_api_keys=asr_api_keys,
                     rate_limit_cooldown_seconds=rate_limit_cooldown_seconds,
+                    api_timeout_seconds=api_timeout_seconds,
                 )
             except Exception as api_error:
                 if not local_whisper_enabled:

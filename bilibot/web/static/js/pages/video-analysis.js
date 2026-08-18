@@ -16,6 +16,9 @@ export const VideoAnalysisPage = {
             scenedetect_threshold: 27.0,
             image_max_size: 768,
             max_keyframes: 32,
+            frame_pack_enabled: false,
+            frames_per_tile: 4,
+            frame_pack_tile_size: 512,
             vision_window_size: 5,
             vision_requests_per_minute: 10,
             vision_frame_max_retries: 2,
@@ -85,6 +88,9 @@ export const VideoAnalysisPage = {
                 config.scenedetect_threshold = data.scenedetect_threshold ?? 27.0;
                 config.image_max_size = data.image_max_size ?? 768;
                 config.max_keyframes = data.max_keyframes ?? 32;
+                config.frame_pack_enabled = data.frame_pack_enabled ?? false;
+                config.frames_per_tile = data.frames_per_tile ?? 4;
+                config.frame_pack_tile_size = data.frame_pack_tile_size ?? 512;
                 config.vision_window_size = data.vision_window_size ?? 5;
                 config.vision_requests_per_minute = data.vision_requests_per_minute ?? 10;
                 config.vision_frame_max_retries = data.vision_frame_max_retries ?? 2;
@@ -279,14 +285,62 @@ export const VideoAnalysisPage = {
                                     modelValue: String(config.max_keyframes),
                                     'onUpdate:modelValue': (v) => {
                                         const n = parseInt(v, 10);
+                                        const ceiling = config.frame_pack_enabled
+                                            ? 64 * Math.max(1, Math.min(config.frames_per_tile || 4, 9))
+                                            : 64;
                                         config.max_keyframes = Number.isFinite(n)
-                                            ? Math.max(1, Math.min(n, 64))
+                                            ? Math.max(1, Math.min(n, ceiling))
                                             : 150;
                                     },
                                     type: 'number',
                                 }),
-                                h(FormHint, '镜头数 ≤ 本值则按镜头全抽；超过则等距抽样（默认 32，高细节可用 48-64）'),
+                                h(FormHint, config.frame_pack_enabled
+                                    ? '帧拼接开启时上限为 64 × 每图帧数；超过则等距抽样'
+                                    : '镜头数 ≤ 本值则按镜头全抽；超过则等距抽样（默认 32，高细节可用 48-64）'),
                             ]),
+                            h('div', { class: 'form-group' }, [
+                                h('label', { class: 'form-label' }, '帧拼接（九宫格）'),
+                                h('div', { class: 'flex items-center gap-2' }, [
+                                    h(Toggle, {
+                                        modelValue: config.frame_pack_enabled,
+                                        'onUpdate:modelValue': (v) => config.frame_pack_enabled = v,
+                                    }),
+                                    h('span', { class: 'form-hint' }, config.frame_pack_enabled ? '已开启' : '已关闭'),
+                                ]),
+                                h(FormHint, '把连续帧拼成一张带编号大图，一次 Vision 请求描述多帧；开启后抽帧上限按每图帧数放大'),
+                            ]),
+                            config.frame_pack_enabled
+                                ? h('div', { class: 'form-group' }, [
+                                    h('label', { class: 'form-label' }, '每张拼接图帧数'),
+                                    h(FormInput, {
+                                        modelValue: String(config.frames_per_tile),
+                                        'onUpdate:modelValue': (v) => {
+                                            const n = parseInt(v, 10);
+                                            config.frames_per_tile = Number.isFinite(n)
+                                                ? Math.max(1, Math.min(n, 9))
+                                                : 4;
+                                        },
+                                        type: 'number',
+                                    }),
+                                    h(FormHint, '1–9，建议 4（2×2）'),
+                                ])
+                                : null,
+                            config.frame_pack_enabled
+                                ? h('div', { class: 'form-group' }, [
+                                    h('label', { class: 'form-label' }, '拼接图每格最大边长（px）'),
+                                    h(FormInput, {
+                                        modelValue: String(config.frame_pack_tile_size),
+                                        'onUpdate:modelValue': (v) => {
+                                            const n = parseInt(v, 10);
+                                            config.frame_pack_tile_size = Number.isFinite(n)
+                                                ? Math.max(256, Math.min(n, 1024))
+                                                : 512;
+                                        },
+                                        type: 'number',
+                                    }),
+                                    h(FormHint, '256–1024，控制拼接图总分辨率与 Vision 输入大小'),
+                                ])
+                                : null,
                             h('div', { class: 'form-group' }, [
                                 h('label', { class: 'form-label' }, '视觉窗口大小（帧数）'),
                                 h(FormInput, {

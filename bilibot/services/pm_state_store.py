@@ -23,6 +23,7 @@
     - 本状态库按账号隔离（每账号独立 DB 文件），不写入他账号数据目录。
 """
 import hashlib
+import json
 import logging
 import sqlite3
 import time
@@ -55,7 +56,8 @@ _BACKOFF_CAP_SECONDS = 1800  # 30 分钟
 # 合法状态转移
 _VALID_TRANSITIONS: Dict[str, frozenset] = {
     "discovered": frozenset({
-        "ignored", "context_building", "generation_pending",
+        # 归档失败或进程中断时，已发现但尚未进入生成的消息必须可恢复。
+        "ignored", "context_building", "generation_pending", "deferred",
     }),
     "context_building": frozenset({
         "generation_pending", "deferred", "ignored",
@@ -382,24 +384,14 @@ class PrivateMessageStateStore:
         new_status: str,
         **fields,
     ) -> PrivateMessageState:
-        """状态转移（带校验）
+        """状态转移（带校验 + 事务内状态前置条件）
 
         可选字段：last_error, last_error_code, persona_id, next_retry_at,
                  attempt, published_at, metadata
         """
-        existing = self.get_by_id(state_id)
-        if existing is None:
-            raise ValueError(f"状态记录不存在: id={state_id}")
-
         # result_unknown 不自动重发（PRD-V5 §6.3 / PM-501）：
         # 仅当调用方显式传入 force=True 才允许从 result_unknown 转出。
         force = bool(fields.pop("force", False))
-        self._validate_transition(existing.status, new_status)
-        if existing.status == "result_unknown" and not force:
-            raise ValueError(
-                f"result_unknown 状态不自动重发（PM-501），"
-                f"如需转 {new_status!r} 请显式传入 force=True"
-            )
 
         now = time.time()
         allowed_cols = {
@@ -422,14 +414,33 @@ class PrivateMessageStateStore:
             sets.append("published_at=?")
             params.append(now)
 
-        params.append(int(state_id))
         conn = self._get_conn()
         try:
-            conn.execute(
-                f"UPDATE pm_states SET {', '.join(sets)} WHERE id=?",
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT status FROM pm_states WHERE id=?", (int(state_id),)
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"状态记录不存在: id={state_id}")
+            old_status = row["status"]
+            self._validate_transition(old_status, new_status)
+            if old_status == "result_unknown" and not force:
+                raise ValueError(
+                    f"result_unknown 状态不自动重发（PM-501），"
+                    f"如需转 {new_status!r} 请显式传入 force=True"
+                )
+            params.extend([int(state_id), old_status])
+            cur = conn.execute(
+                f"UPDATE pm_states SET {', '.join(sets)} WHERE id=? AND status=?",
                 params,
             )
+            if cur.rowcount == 0:
+                raise ValueError(f"状态已并发变化，无法从 {old_status!r} 转移: id={state_id}")
             conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
         finally:
             conn.close()
         return self.get_by_id(state_id)
@@ -480,12 +491,121 @@ class PrivateMessageStateStore:
             conn.close()
         return self.get_by_id(state_id)
 
+    def update_metadata(
+        self,
+        state_id: int,
+        updates: Optional[Dict[str, Any]] = None,
+        *,
+        last_error_code: Optional[str] = None,
+        last_error: Optional[str] = None,
+    ) -> PrivateMessageState:
+        """Merge operational metadata without changing the PM state.
+
+        Used for durable memory-archive repair markers on already published
+        messages. It must not reopen a terminal publish state or trigger a
+        platform resend.
+        """
+        existing = self.get_by_id(state_id)
+        if existing is None:
+            raise ValueError(f"状态记录不存在: id={state_id}")
+        metadata = dict(existing.metadata or {})
+        if updates:
+            metadata.update(updates)
+        now = time.time()
+        sets = ["metadata=?", "updated_at=?"]
+        params: list = [json.dumps(metadata, ensure_ascii=False), now]
+        if last_error_code is not None:
+            sets.append("last_error_code=?")
+            params.append(str(last_error_code))
+        if last_error is not None:
+            sets.append("last_error=?")
+            params.append(str(last_error))
+        params.append(int(state_id))
+        conn = self._get_conn()
+        try:
+            conn.execute(
+                f"UPDATE pm_states SET {', '.join(sets)} WHERE id=?",
+                params,
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        return self.get_by_id(state_id)
+
+    def mark_memory_archive_pending(
+        self,
+        state_id: int,
+        *,
+        stage: str,
+        error_type: str,
+    ) -> PrivateMessageState:
+        """Persist an outgoing-memory repair marker without reopening a PM."""
+        return self.update_metadata(
+            state_id,
+            {
+                "memory_archive_pending": True,
+                "memory_archive_stage": str(stage or "outgoing"),
+                "memory_archive_error": str(error_type or "Exception"),
+            },
+            last_error_code="MEMORY_ARCHIVE_PENDING",
+            last_error=f"{stage}:{error_type}",
+        )
+
+    def clear_memory_archive_pending(self, state_id: int) -> PrivateMessageState:
+        """Clear a repaired memory marker; never changes publish status."""
+        return self.update_metadata(
+            state_id,
+            {
+                "memory_archive_pending": False,
+                "memory_archive_stage": "",
+                "memory_archive_error": "",
+            },
+            last_error_code="",
+            last_error="",
+        )
+
+    def list_memory_archive_pending(
+        self, account_id: str = ""
+    ) -> List[PrivateMessageState]:
+        """List PMs whose durable outgoing memory archive still needs repair."""
+        acc = str(account_id or self.account_id)
+        conn = self._get_conn()
+        try:
+            if acc:
+                rows = conn.execute(
+                    "SELECT * FROM pm_states WHERE account_id=? "
+                    "AND status='published' AND metadata LIKE ? "
+                    "ORDER BY updated_at ASC LIMIT 50",
+                    (acc, '%"memory_archive_pending": true%'),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM pm_states WHERE status='published' "
+                    "AND metadata LIKE ? ORDER BY updated_at ASC LIMIT 50",
+                    ('%"memory_archive_pending": true%',),
+                ).fetchall()
+            result = []
+            for row in rows:
+                state = self._row_to_state(row)
+                if state and (state.metadata or {}).get("memory_archive_pending") is True:
+                    result.append(state)
+            return result
+        finally:
+            conn.close()
+
     # ───────────────────────────────────────────────────────
     # 终态 / 重试 标记
     # ───────────────────────────────────────────────────────
 
     def mark_published(self, state_id: int) -> PrivateMessageState:
-        return self.update_status(state_id, "published")
+        """Commit platform success and clear stale transient retry diagnostics."""
+        return self.update_status(
+            state_id,
+            "published",
+            next_retry_at=None,
+            last_error_code="",
+            last_error="",
+        )
 
     def mark_ignored(self, state_id: int, rule: str = "") -> PrivateMessageState:
         return self.update_status(
@@ -632,10 +752,12 @@ class PrivateMessageStateStore:
         timeout_minutes: int = 10,
         now: float = None,
     ) -> int:
-        """Recover PMs stuck in intermediate states after crash.
+        """Recover PMs stuck in intermediate states after crash or archive failure.
 
-        publish_pending with generation_text → retry_wait (reuse text).
-        other intermediate → deferred (regenerate).
+        stale publish_pending → result_unknown (manual platform reconciliation).
+        discovered and other intermediate states → deferred (regenerate).
+        A stale discovered row is recoverable because incoming_text is kept in
+        metadata before the archive/generation pipeline begins.
         """
         now = now or time.time()
         threshold = now - max(1, int(timeout_minutes)) * 60
@@ -647,7 +769,7 @@ class PrivateMessageStateStore:
                 rows = conn.execute(
                     "SELECT id, status, generation_text FROM pm_states "
                     "WHERE account_id=? AND status IN "
-                    "('context_building','generation_pending','safety_pending','publish_pending') "
+                    "('discovered','context_building','generation_pending','safety_pending','publish_pending') "
                     "AND updated_at < ?",
                     (acc, threshold),
                 ).fetchall()
@@ -655,28 +777,95 @@ class PrivateMessageStateStore:
                 rows = conn.execute(
                     "SELECT id, status, generation_text FROM pm_states "
                     "WHERE status IN "
-                    "('context_building','generation_pending','safety_pending','publish_pending') "
+                    "('discovered','context_building','generation_pending','safety_pending','publish_pending') "
                     "AND updated_at < ?",
                     (threshold,),
                 ).fetchall()
             for row in rows:
                 sid = row["id"]
                 status = row["status"]
-                gen = (row["generation_text"] or "").strip()
-                if status == "publish_pending" and gen:
-                    new_status = "retry_wait"
+                if status == "publish_pending":
+                    # The platform may have accepted the send before a crash;
+                    # never auto-resend a stale publish_pending row.
+                    new_status = "result_unknown"
                     err_code = "STUCK_PUBLISH_PENDING"
+                elif status == "discovered":
+                    new_status = "deferred"
+                    err_code = "STUCK_DISCOVERED"
                 else:
                     new_status = "deferred"
                     err_code = "STUCK_RECOVERY"
+                self._validate_transition(status, new_status)
+                next_retry_at = now if new_status == "deferred" else None
                 cur = conn.execute(
                     "UPDATE pm_states SET status=?, next_retry_at=?, updated_at=?, "
                     "last_error_code=?, last_error=? WHERE id=? AND status=?",
-                    (new_status, now, now, err_code, f"stuck recovery from {status}", sid, status),
+                    (
+                        new_status,
+                        next_retry_at,
+                        now,
+                        err_code,
+                        f"stuck recovery from {status}",
+                        sid,
+                        status,
+                    ),
                 )
                 recovered += cur.rowcount
             conn.commit()
             return recovered
+        finally:
+            conn.close()
+
+    def count_stale_intermediate(
+        self,
+        account_id: str = "",
+        *,
+        stale_after: float = 900.0,
+        now: Optional[float] = None,
+    ) -> int:
+        """Count PM pipeline states that exceeded the recovery grace period."""
+        acc = str(account_id or self.account_id)
+        now = time.time() if now is None else float(now)
+        cutoff = now - max(0.0, float(stale_after))
+        statuses = (
+            "discovered",
+            "context_building",
+            "generation_pending",
+            "safety_pending",
+            "publish_pending",
+        )
+        placeholders = ",".join("?" for _ in statuses)
+        conn = self._get_conn()
+        try:
+            params: list[Any] = [*statuses, cutoff]
+            query = (
+                "SELECT COUNT(*) FROM pm_states "
+                f"WHERE status IN ({placeholders}) AND updated_at <= ?"
+            )
+            if acc:
+                query += " AND account_id=?"
+                params.append(acc)
+            row = conn.execute(query, params).fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            conn.close()
+
+    def count_result_unknown(self, account_id: str = "") -> int:
+        """Count manual-reconciliation PMs without loading message state."""
+        acc = str(account_id or self.account_id)
+        conn = self._get_conn()
+        try:
+            if acc:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM pm_states "
+                    "WHERE account_id=? AND status='result_unknown'",
+                    (acc,),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM pm_states WHERE status='result_unknown'"
+                ).fetchone()
+            return int(row[0] if row else 0)
         finally:
             conn.close()
 

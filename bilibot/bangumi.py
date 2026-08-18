@@ -25,7 +25,6 @@ from typing import Any, Dict, List, Mapping, Optional, Sequence
 from bilibot.memory_brain.ingestion import (
     bangumi_episode_observation,
     bot_action_observation,
-    text_observation,
 )
 from bilibot.memory_brain.models import Observation, SourceDocument
 
@@ -720,7 +719,6 @@ class BangumiService:
         evaluation["score"] = score
         comment = evaluation.get("comment", "")
         mood = evaluation.get("mood", "平静")
-        review = evaluation.get("review", "")
         logger.info(f"评分：{score}/10 | 心情：{mood} | 短评：{(comment or '')[:30]}")
 
         # 4. 原始提取内容与评价必须先持久提交；失败时不允许主动互动 / 不推进 completed。

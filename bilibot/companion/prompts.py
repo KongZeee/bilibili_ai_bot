@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 def _clip(text: str, n: int = 800) -> str:
@@ -203,8 +203,8 @@ def build_explore_query_prompt(
 5. motive 用角色第一人称写「为什么想了解」（可带人设口吻），但 query 本身要可搜
 
 示例（仅示范风格，勿照抄）：
-- query:「ATRI 亚托莉 世界观设定 百科」 motive:「想再确认一下和夏生有关的背景」
-- query:「B站 2025 AI 区 热门话题」 motive:「看看最近大家在聊什么」
+	- query:「ATRI 亚托莉 世界观设定 百科」 motive:「想再确认一下角色背景设定」
+	- query:「B站 2025 AI 区 热门话题」 motive:「看看最近大家在聊什么」
 
 输出：
 {{"query":"...","motive":"..."}}

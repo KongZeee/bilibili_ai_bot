@@ -5,7 +5,6 @@ BiliBot 数据模型
 """
 from __future__ import annotations
 
-import uuid
 from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Any, Optional
@@ -70,6 +69,9 @@ class Persona:
     name: str = ""
     description: str = ""
     base_prompt: str = ""
+    # 长设定/原作剧本等扩展正文（可选）。公开社交场景默认不注入；
+    # 日记/梦/日程/探索/创作等内部场景可与 base_prompt 一并注入。
+    lore_prompt: str = ""
     speaking_style: str = ""
     boundaries: str = ""
     relationship_rules: str = ""
@@ -90,6 +92,13 @@ class Persona:
     life_background: str = ""
     diary_rules: str = ""
     creative_rules: str = ""
+    # 公开互动精简总开关（Web 可配）。False 时忽略下方 guard/cap，其它人格默认关闭。
+    social_public_guard_enabled: bool = False
+    # 公开互动：勿主动点名的角色/人名（人格自配；空=不启用）。
+    # 例：原作向人格可填配角名，避免未提及时强行带入。通用人格保持 []。
+    social_guard_names: list[str] = field(default_factory=list)
+    # 社交场景 base_prompt 软截断上限（字符）；0=不截断。长 base 时可设 5000。
+    social_base_prompt_cap: int = 0
     # P3: 市场元数据
     version: str = "1.0.0"
     author: str = ""
@@ -109,11 +118,29 @@ class Persona:
         interests = d.get("interests") or []
         if isinstance(interests, str):
             interests = [x.strip() for x in interests.replace("\n", ",").split(",") if x.strip()]
+        guard_names = d.get("social_guard_names") or d.get("name_drop_guard") or []
+        if isinstance(guard_names, str):
+            guard_names = [
+                x.strip()
+                for x in guard_names.replace("\n", ",").split(",")
+                if x.strip()
+            ]
+        try:
+            base_cap = int(d.get("social_base_prompt_cap") or 0)
+        except (TypeError, ValueError):
+            base_cap = 0
+        guard_enabled = d.get("social_public_guard_enabled")
+        if guard_enabled is None:
+            # Backward compat: treat non-empty names or cap>0 as enabled
+            guard_enabled = bool(guard_names) or base_cap > 0
+        else:
+            guard_enabled = bool(guard_enabled)
         return cls(
             id=d.get("id", ""),
             name=d.get("name", ""),
             description=d.get("description", ""),
             base_prompt=d.get("base_prompt", ""),
+            lore_prompt=d.get("lore_prompt", "") or d.get("script_prompt", "") or "",
             speaking_style=d.get("speaking_style", ""),
             boundaries=d.get("boundaries", ""),
             relationship_rules=d.get("relationship_rules", ""),
@@ -131,6 +158,9 @@ class Persona:
             life_background=d.get("life_background", "") or "",
             diary_rules=d.get("diary_rules", "") or "",
             creative_rules=d.get("creative_rules", "") or "",
+            social_public_guard_enabled=guard_enabled,
+            social_guard_names=list(guard_names) if isinstance(guard_names, list) else [],
+            social_base_prompt_cap=max(0, base_cap),
             version=d.get("version", "1.0.0"),
             author=d.get("author", ""),
             tags=d.get("tags", []),

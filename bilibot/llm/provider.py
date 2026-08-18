@@ -9,13 +9,14 @@ import asyncio
 import hashlib
 import inspect
 import logging
+import math
 import re
 import json
 import threading
 import time
 import weakref
 from contextlib import asynccontextmanager
-from typing import Optional, List, Any, Tuple, Sequence, Callable
+from typing import Optional, List, Any, Tuple, Sequence, Callable, Dict
 
 # 可选依赖：openai 未安装或环境异常时仍允许模块被导入
 try:
@@ -408,8 +409,17 @@ class LLMProvider:
     """单个 LLM 提供商 — 封装 OpenAI 兼容 API"""
 
     # base_url 末尾冗余路径后缀（OpenAI SDK 会自动追加）
-    _URL_SUFFIX_TRIM = ("/embeddings", "/embedding", "/audio/transcriptions",
-                        "/audio", "/images/generations", "/images", "/chat/completions", "/chat")
+    _URL_SUFFIX_TRIM = (
+        "/embeddings",
+        "/embedding",
+        "/rerank",
+        "/audio/transcriptions",
+        "/audio",
+        "/images/generations",
+        "/images",
+        "/chat/completions",
+        "/chat",
+    )
 
     @classmethod
     def _normalize_base_url(cls, url: str) -> str:
@@ -463,7 +473,7 @@ class LLMProvider:
         )
         self.vision_api_keys: List[str] = vision_keys if self.vision_enabled else []
         self.vision_api_key: str = _vision_key
-        self.vision_base_url: str = self._normalize_base_url(vision.get("base_url", self.base_url))
+        self.vision_base_url: str = self._normalize_base_url(vision.get("base_url") or self.base_url)
         self.vision_model: str = vision.get("model", "")
 
         # Embedding 配置（可选）——同样修复遗漏 enabled 的问题
@@ -475,8 +485,11 @@ class LLMProvider:
         )
         self.embedding_api_keys: List[str] = emb_keys if self.embedding_enabled else []
         self.embedding_api_key: str = _emb_key
-        self.embedding_base_url: str = self._normalize_base_url(embedding.get("base_url", self.base_url))
+        self.embedding_base_url: str = self._normalize_base_url(embedding.get("base_url") or self.base_url)
         self.embedding_model: str = embedding.get("model", "BAAI/bge-m3")
+
+        # Rerank 429 冷却（独立小表，避免同 key 风暴）
+        self._rerank_key_cooldown_until: Dict[str, float] = {}
 
         # OpenAI 客户端 / 密钥池（客户端按 key 懒创建，避免多实例初始化卡死）
         self._chat_completion_gate: Optional[CompletionConcurrencyGate] = None
@@ -707,15 +720,63 @@ class LLMProvider:
                 messages.append({"role": "system", "content": system_prompt})
             messages.append({"role": "user", "content": prompt})
 
-            async def _call(client):
+            async def _call(client, budget: int):
                 return await client.chat.completions.create(
                     model=model or self.model,
                     messages=messages,
-                    max_tokens=max_tokens or self.max_tokens,
+                    max_tokens=budget,
                     temperature=temperature if temperature is not None else self.temperature,
                 )
 
-            response = await self._chat_with_pool(_call)
+            requested_budget = max_tokens or self.max_tokens
+            response = await self._chat_with_pool(lambda client: _call(client, requested_budget))
+
+            def _extract(resp):
+                if resp and resp.choices:
+                    message = resp.choices[0].message
+                    result = message.content
+                    # Reasoning-style models may return the answer only in
+                    # reasoning_content when the API does not populate content.
+                    if not result and getattr(resp.choices[0], "finish_reason", "stop") != "length":
+                        result = getattr(message, "reasoning_content", None)
+                    if result:
+                        return str(result).strip()
+                return None
+
+            result = _extract(response)
+            # Reasoning models can spend the whole budget on reasoning tokens
+            # and leave content empty. Small classification callers (80-120
+            # tokens), medium JSON callers (linker/entities use 2048) and the
+            # most stubborn link prompts (verified up to 16k reasoning tokens)
+            # all hit this in production. Retry with an escalating budget
+            # instead of returning None — which the memory worker would treat
+            # as a job failure and eventually dead-letter.
+            finish = getattr(response.choices[0], "finish_reason", "stop") if response and response.choices else ""
+            reasoning = getattr(response.choices[0].message, "reasoning_content", None) if response and response.choices else None
+            # Small callers get one intermediate step; medium/large JSON callers
+            # (linker/entities at 2048) skip straight to 16k. Three escalating
+            # calls take 100s+ on a reasoning endpoint and outrun the caller's
+            # asyncio timeout even though the final answer is reachable.
+            if requested_budget < 1024:
+                ladder = (max(1024, requested_budget * 2), 16384)
+            else:
+                ladder = (16384,)
+            previous_budget = requested_budget
+            for retry_budget in ladder:
+                if retry_budget <= previous_budget:
+                    continue
+                if result is not None or finish != "length":
+                    break
+                if not reasoning and requested_budget >= 512:
+                    break
+                response = await self._chat_with_pool(
+                    lambda client: _call(client, retry_budget)
+                )
+                previous_budget = retry_budget
+                result = _extract(response)
+                finish = getattr(response.choices[0], "finish_reason", "stop") if response and response.choices else ""
+                reasoning = getattr(response.choices[0].message, "reasoning_content", None) if response and response.choices else None
+
             try:
                 from bilibot.services.token_usage import record_response_safe
                 record_response_safe(
@@ -727,12 +788,9 @@ class LLMProvider:
                 )
             except Exception:
                 pass
-            if response and response.choices:
-                result = response.choices[0].message.content
-                if result:
-                    logger.debug(f"[{self.llm_id}] LLM 生成成功: {len(result)} 字符")
-                    return result.strip()
-                return None
+            if result:
+                logger.debug(f"[{self.llm_id}] LLM 生成成功: {len(result)} 字符")
+                return result
             return None
 
         except Exception as e:
@@ -750,6 +808,9 @@ class LLMProvider:
         if not self._chat_pool.slots:
             return
 
+        stream_completed = False
+        usage = None
+        chars = 0
         try:
             messages = []
             if system_prompt:
@@ -769,14 +830,38 @@ class LLMProvider:
                     max_tokens=max_tokens or self.max_tokens,
                     temperature=temperature if temperature is not None else self.temperature,
                     stream=True,
+                    stream_options={"include_usage": True},
                 )
                 async for chunk in stream:
                     if chunk.choices and chunk.choices[0].delta.content:
-                        yield chunk.choices[0].delta.content
-
+                        content = chunk.choices[0].delta.content
+                        chars += len(content)
+                        yield content
+                    if getattr(chunk, "usage", None):
+                        usage = chunk.usage
+            stream_completed = True
         except Exception as e:
             logger.error(f"[{self.llm_id}] LLM 流式生成失败: {e}")
             raise
+        finally:
+            # 仅在完整消费成功后记账；usage 不可得时至少记一次调用
+            if stream_completed:
+                try:
+                    from bilibot.services.token_usage import record_usage_safe
+
+                    record_usage_safe(
+                        provider_id=self.llm_id,
+                        model=self.model,
+                        kind="chat",
+                        prompt_tokens=int(getattr(usage, "prompt_tokens", 0) or 0),
+                        completion_tokens=int(
+                            getattr(usage, "completion_tokens", 0) or 0
+                        ),
+                        total_tokens=int(getattr(usage, "total_tokens", 0) or 0),
+                        meta={"stream": True, "chars": chars},
+                    )
+                except Exception:
+                    pass
 
     async def vision_analyze(
         self,
@@ -804,6 +889,21 @@ class LLMProvider:
             base = self.vision_base_url if self._vision_pool.slots else self.base_url
             attempts = max(1, min(pool.key_count or 1, 4))
             last_exc: Optional[BaseException] = None
+            requested_budget = max(1, int(max_tokens or 250))
+
+            def _extract(resp):
+                if resp and resp.choices:
+                    message = resp.choices[0].message
+                    result = getattr(message, "content", None)
+                    # Reasoning-style vision models (e.g. qwen-vl routes behind
+                    # agnes) can return the answer only in reasoning_content
+                    # with an empty content — identical to generate().
+                    if not result and getattr(resp.choices[0], "finish_reason", "stop") != "length":
+                        result = getattr(message, "reasoning_content", None)
+                    if result:
+                        return str(result).strip()
+                return None
+
             for _ in range(attempts):
                 async with pool.checkout() as slot:
                     if slot is None:
@@ -815,8 +915,22 @@ class LLMProvider:
                         response = await client.chat.completions.create(
                             model=vision_model,
                             messages=[{"role": "user", "content": content}],
-                            max_tokens=max_tokens,
+                            max_tokens=requested_budget,
                         )
+                        result = _extract(response)
+                        # A small vision budget can be spent entirely on
+                        # reasoning tokens, leaving an empty content. Retry once
+                        # with a comfortable budget instead of dropping the frame.
+                        if result is None and requested_budget < 512:
+                            finish = getattr(response.choices[0], "finish_reason", "stop") if response and response.choices else ""
+                            reasoning = getattr(response.choices[0].message, "reasoning_content", None) if response and response.choices else None
+                            if finish == "length" and reasoning:
+                                response = await client.chat.completions.create(
+                                    model=vision_model,
+                                    messages=[{"role": "user", "content": content}],
+                                    max_tokens=512,
+                                )
+                                result = _extract(response)
                         try:
                             from bilibot.services.token_usage import record_response_safe
                             record_response_safe(
@@ -827,9 +941,7 @@ class LLMProvider:
                             )
                         except Exception:
                             pass
-                        if response.choices:
-                            return response.choices[0].message.content.strip()
-                        return None
+                        return result
                     except Exception as exc:
                         last_exc = exc
                         if _is_rate_limit_error(exc) and attempts > 1:
@@ -985,7 +1097,7 @@ class LLMProvider:
         if not self._chat_pool.slots:
             return False, "客户端未初始化（api_key 为空或 openai 库未安装）"
         try:
-            result = await self.generate("你好", max_tokens=10)
+            result = await self.generate("你好", max_tokens=200)
             if result is not None:
                 return True, ""
             return False, "API 返回空响应"
@@ -1109,7 +1221,7 @@ class LLMProvider:
                     retry_after = self._chat_pool.earliest_ready_in()
                     return (
                         False,
-                        f"RateLimitExhaustedError: all keys cooling"
+                        "RateLimitExhaustedError: all keys cooling"
                         + (f" (retry_after≈{retry_after:.1f}s)" if retry_after > 0 else ""),
                     )
                 client = self._ensure_client(slot, self.base_url)
@@ -1139,7 +1251,6 @@ class LLMProvider:
                     "prompt": "test",
                     "n": 1,
                     "size": "1024x1024",
-                    "response_format": "url",
                 }
                 timeout = aiohttp.ClientTimeout(total=30)
                 async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
@@ -1161,6 +1272,148 @@ class LLMProvider:
                             continue
                         return False, last_err
             return False, last_err or "连接失败"
+        except Exception as e:
+            return False, f"{type(e).__name__}: {e}"
+
+    @staticmethod
+    def normalize_rerank_score(score: float) -> float:
+        """Map provider relevance_score into [0, 1].
+
+        SiliconFlow / BGE style APIs return 0..1 floats; some gateways emit 0..100.
+        """
+        value = float(score)
+        if not math.isfinite(value):
+            raise ValueError("rerank score is not finite")
+        if value > 1.0 and value <= 100.0:
+            value = value / 100.0
+        return max(0.0, min(1.0, value))
+
+    async def rerank(
+        self,
+        query: str,
+        documents: Sequence[str],
+        top_n: Optional[int] = None,
+    ) -> List[dict]:
+        """Call SiliconFlow-style POST {base_url}/rerank.
+
+        Returns list of ``{"index": int, "relevance_score": float}`` (scores in 0..1).
+        """
+        docs = [str(d) for d in documents]
+        if not docs:
+            return []
+        keys = self.api_keys or ([self.api_key] if self.api_key else [])
+        if not keys:
+            raise RuntimeError(f"[{self.llm_id}] rerank api_key 未配置")
+        if not self.model:
+            raise RuntimeError(f"[{self.llm_id}] rerank model 未配置")
+
+        n = len(docs) if top_n is None else max(1, min(int(top_n), len(docs)))
+        payload = {
+            "model": self.model,
+            "query": str(query or ""),
+            "documents": docs,
+            "top_n": n,
+            "return_documents": False,
+        }
+        import aiohttp
+
+        now = time.monotonic()
+        ready_keys = [
+            key
+            for key in keys
+            if float(self._rerank_key_cooldown_until.get(key, 0.0) or 0.0) <= now
+        ]
+        if not ready_keys:
+            soonest = min(
+                float(self._rerank_key_cooldown_until.get(key, 0.0) or 0.0)
+                for key in keys
+            )
+            wait = max(0.0, soonest - now)
+            raise RuntimeError(
+                f"[{self.llm_id}] rerank 所有密钥均在 429 冷却中（约 {wait:.0f}s 后可重试）"
+            )
+
+        last_err: Optional[BaseException] = None
+        for key in ready_keys[:4]:
+            headers = {
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+            }
+            timeout = aiohttp.ClientTimeout(total=max(5, int(self.timeout or 30)))
+            try:
+                async with aiohttp.ClientSession(
+                    headers=headers, timeout=timeout
+                ) as session:
+                    async with session.post(
+                        f"{self.base_url.rstrip('/')}/rerank",
+                        json=payload,
+                    ) as resp:
+                        text = await resp.text()
+                        if resp.status == 429:
+                            self._rerank_key_cooldown_until[key] = (
+                                time.monotonic() + self.rate_limit_cooldown_seconds
+                            )
+                            last_err = RuntimeError(f"HTTP 429: {text[:200]}")
+                            continue
+                        if resp.status in (401, 403):
+                            last_err = RuntimeError(
+                                f"HTTP {resp.status}: {text[:200]}"
+                            )
+                            continue
+                        if resp.status != 200:
+                            raise RuntimeError(
+                                f"[{self.llm_id}] rerank HTTP {resp.status}: {text[:300]}"
+                            )
+                        try:
+                            body = json.loads(text) if text else {}
+                        except json.JSONDecodeError as exc:
+                            raise RuntimeError(
+                                f"[{self.llm_id}] rerank invalid JSON: {text[:200]}"
+                            ) from exc
+                        rows = body.get("results") if isinstance(body, dict) else None
+                        if not isinstance(rows, list):
+                            raise RuntimeError(
+                                f"[{self.llm_id}] rerank response missing results[]"
+                            )
+                        out: List[dict] = []
+                        for row in rows:
+                            if not isinstance(row, dict):
+                                continue
+                            idx = row.get("index")
+                            score = row.get("relevance_score")
+                            if not isinstance(idx, int) or not 0 <= idx < len(docs):
+                                continue
+                            if isinstance(score, bool) or not isinstance(
+                                score, (int, float)
+                            ):
+                                continue
+                            try:
+                                norm = self.normalize_rerank_score(float(score))
+                            except (TypeError, ValueError):
+                                continue
+                            out.append({"index": idx, "relevance_score": norm})
+                        return out
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_err = exc
+                continue
+        if last_err is not None:
+            raise RuntimeError(
+                f"[{self.llm_id}] rerank failed: {type(last_err).__name__}: {last_err}"
+            ) from last_err
+        raise RuntimeError(f"[{self.llm_id}] rerank failed: no usable API key")
+
+    async def test_rerank(self) -> Tuple[bool, str]:
+        """Probe dedicated rerank endpoint with a minimal query/document pair."""
+        keys = self.api_keys or ([self.api_key] if self.api_key else [])
+        if not keys:
+            return False, "api_key 未配置"
+        if not self.model:
+            return False, "未配置 Rerank 模型名"
+        try:
+            rows = await self.rerank("test query", ["test document about query"], top_n=1)
+            if rows:
+                return True, ""
+            return False, "API 返回空 results"
         except Exception as e:
             return False, f"{type(e).__name__}: {e}"
 

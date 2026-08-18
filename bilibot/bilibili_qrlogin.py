@@ -4,8 +4,7 @@ B站扫码登录 API 适配器
 import asyncio
 import logging
 import time
-import json
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict
 import aiohttp
 import qrcode
 import io
@@ -223,9 +222,6 @@ class BilibiliQRLogin:
             if not sessdata:
                 return {"success": False, "message": "SESSDATA为空"}
 
-            raw = self.config.get_raw_config()
-            accounts_list = raw.get("accounts", [])
-
             def _write_fields(target: dict) -> None:
                 target["sessdata"] = sessdata
                 if bili_jct:
@@ -239,23 +235,25 @@ class BilibiliQRLogin:
                 if refresh_token:
                     target["refresh_token"] = refresh_token
 
-            # V2：account_id 非空且 accounts 列表存在对应账号 → 写入账号段
-            if account_id and accounts_list:
-                updated = False
-                for acc in accounts_list:
-                    if acc.get("id") == account_id:
-                        _write_fields(acc)
-                        updated = True
-                        break
-                if not updated:
-                    return {"success": False, "message": f"未找到账号 id={account_id}"}
-            else:
-                # V1 兼容：写入 bilibili 段
-                bili = raw.setdefault("bilibili", {})
-                _write_fields(bili)
+            def _mutator(raw: dict) -> None:
+                accounts_list = raw.get("accounts", [])
+                # V2：account_id 非空且 accounts 列表存在对应账号 → 写入账号段
+                if account_id and accounts_list:
+                    updated = False
+                    for acc in accounts_list:
+                        if acc.get("id") == account_id:
+                            _write_fields(acc)
+                            updated = True
+                            break
+                    if not updated:
+                        raise ValueError(f"未找到账号 id={account_id}")
+                else:
+                    # V1 兼容：写入 bilibili 段
+                    bili = raw.setdefault("bilibili", {})
+                    _write_fields(bili)
 
-            # 用 save_config 保存到文件并热重载（更新属性对象 + _raw_config）
-            self.config.save_config(raw, self.config_path)
+            # 用 atomic_update 在写锁内读-改-写，避免与并发 /api/config PATCH 丢失更新
+            self.config.atomic_update(self.config_path, _mutator)
 
             return {
                 "success": True,
@@ -266,6 +264,8 @@ class BilibiliQRLogin:
                     "has_sessdata": True,
                 }
             }
+        except ValueError as ve:
+            return {"success": False, "message": str(ve)}
         except Exception as e:
             logger.error(f"保存配置失败: {e}")
             return {"success": False, "message": str(e)}

@@ -12,7 +12,9 @@
 由 service.py 中的 LLMVisionAdapter 适配主项目 LLMProvider。
 """
 import asyncio
+import json
 import logging
+import math
 import os
 import re
 import subprocess
@@ -21,7 +23,7 @@ import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, List, Optional, Tuple
 
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger("bilibot.video_u.visual")
 
@@ -40,6 +42,68 @@ SUBTITLE_VISION_PROMPT = (
     "请在描述末尾另起一行，以「【字幕】」开头原样转写字幕文本；没有字幕则不写该行。"
     "不要添加任何主观推测或修辞手法。"
 )
+
+
+def build_packed_vision_prompt(frame_count: int, vision_prompt: str = "") -> str:
+    """Prompt for one composite image containing ``frame_count`` tiles."""
+    base = str(vision_prompt or "").strip() or DEFAULT_VISION_PROMPT
+    return (
+        f"{base}\n\n"
+        f"当前图片是由 {frame_count} 个视频帧拼接成的画布，"
+        f"按从左到右、从上到下的顺序排列，每格左上角有白色数字编号（1 到 {frame_count}）。\n"
+        "请逐格客观、凝练地描述每一帧（每帧 1-2 句话），"
+        "重点关注场景、主体动作和显眼文字。\n"
+        "只输出一个合法 JSON 对象，格式："
+        '{"frames":[{"index":1,"description":"第 1 帧的描述"},'
+        '{"index":2,"description":"第 2 帧的描述"}]}'
+        "，index 必须覆盖 1 到 "
+        f"{frame_count}，不要输出任何其他文字。"
+    )
+
+
+def parse_packed_descriptions(raw: str, frame_count: int) -> Optional[List[str]]:
+    """Parse the packed JSON response into one description per tile.
+
+    Returns ``None`` when the response cannot be parsed (caller may retry);
+    otherwise a list of exactly ``frame_count`` strings (missing tiles = "").
+    """
+    if not raw:
+        return None
+    text = str(raw).strip()
+    fence = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
+    if fence:
+        text = fence.group(1).strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            return None
+        try:
+            payload = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            return None
+    rows = None
+    if isinstance(payload, dict):
+        rows = payload.get("frames") or payload.get("results")
+    elif isinstance(payload, list):
+        rows = payload
+    if not isinstance(rows, list):
+        return None
+    descriptions = [""] * frame_count
+    for item in rows[: frame_count * 2]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            idx = int(item.get("index") or item.get("id") or 0)
+        except (TypeError, ValueError):
+            continue
+        if idx < 1 or idx > frame_count:
+            continue
+        desc = str(item.get("description") or item.get("desc") or "").strip()
+        if desc:
+            descriptions[idx - 1] = desc
+    return descriptions
 
 
 @dataclass
@@ -116,14 +180,19 @@ def _select_timeline_frames(frame_numbers: List[int], limit: int) -> List[int]:
     return sorted(selected)
 
 
-def _clamp_max_keyframes(value: int, *, default: int = 32) -> int:
-    """抽帧上限：镜头未超上限则全抽，超过则等距下采样。"""
+def _clamp_max_keyframes(value: int, *, default: int = 32, pack_factor: int = 1) -> int:
+    """抽帧上限：镜头未超上限则全抽，超过则等距下采样。
+
+    开启帧拼接时（pack_factor > 1），硬顶按每张拼图包含的帧数放大，
+    从而在不增加 Vision 请求数量的前提下成倍提高抽帧数量。
+    """
     try:
         n = int(value)
     except (TypeError, ValueError):
         n = default
+    factor = max(1, int(pack_factor or 1))
     # 64 is the explicit high-detail ceiling; default active browsing uses 32.
-    return max(1, min(n, 64))
+    return max(1, min(n, 64 * factor))
 
 
 def _resize_image(image_path: str, max_size: int) -> str:
@@ -145,6 +214,100 @@ def _resize_image(image_path: str, max_size: int) -> str:
     except Exception as e:
         logger.warning(f"缩放图片失败 {image_path}: {e}")
         return image_path
+
+
+def _grid_layout(count: int) -> Tuple[int, int]:
+    """(columns, rows) for a roughly square contact sheet."""
+    if count <= 0:
+        return 1, 1
+    cols = max(1, int(math.ceil(math.sqrt(count))))
+    rows = max(1, int(math.ceil(count / cols)))
+    return cols, rows
+
+
+def _composite_pack_id(output_dir: str, pack_index: int) -> str:
+    return os.path.join(output_dir, f"pack_{pack_index:04d}.jpg")
+
+
+def build_contact_sheet(
+    frames: List[Tuple[int, str]],
+    output_dir: str,
+    *,
+    pack_index: int = 0,
+    tile_size: int = 512,
+) -> str:
+    """拼接连续帧为一张带编号的九宫格图片。
+
+    Returns the composite image path. The original per-frame files stay on
+    disk so each parsed description can still be attached to its own
+    timestamp/frame in the behavior log.
+    """
+    if not frames:
+        raise ValueError("frames must not be empty")
+    count = len(frames)
+    cols, rows = _grid_layout(count)
+    cell = max(128, min(1024, int(tile_size)))
+    canvas = Image.new("RGB", (cols * cell, rows * cell), (16, 16, 16))
+    draw = ImageDraw.Draw(canvas)
+    try:
+        font = ImageFont.load_default(size=max(18, cell // 8))
+    except Exception:
+        try:
+            font = ImageFont.load_default()
+        except Exception:
+            font = None
+    for index, (_frame_number, path) in enumerate(frames):
+        try:
+            with Image.open(path) as frame:
+                thumb = frame.convert("RGB").resize((cell, cell), Image.Resampling.LANCZOS)
+        except Exception as exc:
+            logger.warning("拼接帧失败，使用空白占位: %s (%s)", path, exc)
+            thumb = Image.new("RGB", (cell, cell), (64, 64, 64))
+        x = (index % cols) * cell
+        y = (index // cols) * cell
+        canvas.paste(thumb, (x, y))
+        # White index badge so the model can reference "1..N" unambiguously.
+        label = str(index + 1)
+        if font is not None:
+            try:
+                box = draw.textbbox((x + 8, y + 8), label, font=font)
+                draw.rectangle([box[0] - 4, box[1] - 2, box[2] + 4, box[3] + 2], fill=(255, 255, 255))
+                draw.text((x + 8, y + 8), label, fill=(0, 0, 0), font=font)
+            except Exception:
+                pass
+    path = _composite_pack_id(output_dir, pack_index)
+    canvas.save(path, quality=88)
+    logger.info(
+        "拼接 %s 帧为一张图: %s (%sx%s, cell=%s)",
+        count,
+        path,
+        cols,
+        rows,
+        cell,
+    )
+    return path
+
+
+def build_packed_frames(
+    frames: List[Tuple[int, str]],
+    output_dir: str,
+    frames_per_tile: int = 4,
+    tile_size: int = 512,
+) -> List[Tuple[List[Tuple[int, str]], str]]:
+    """Group consecutive frames into composite packs.
+
+    Returns ``[(frame_group, composite_path), ...]`` preserving original
+    per-frame metadata inside each group.
+    """
+    per = max(1, min(9, int(frames_per_tile)))
+    packs: List[Tuple[List[Tuple[int, str]], str]] = []
+    for pack_index, start in enumerate(range(0, len(frames), per)):
+        group = frames[start : start + per]
+        # Even a singleton tail must become a (1-tile) pack: dropping it here
+        # would silently never describe the final frame while require_complete
+        # still passes on the larger groups.
+        packs.append((group, build_contact_sheet(group, output_dir, pack_index=pack_index, tile_size=tile_size)))
+    return packs
 
 
 def _extract_frames_fallback(
@@ -381,14 +544,17 @@ def _prepare_visual_frames(
     scenedetect_threshold: float = 27.0,
     image_max_size: int = 768,
     max_keyframes: int = 32,
+    max_keyframes_pack_factor: int = 1,
 ) -> Tuple[List[Tuple[int, str]], List[Tuple[int, str]], int]:
     """CPU/ffmpeg-heavy keyframe extraction + resize (must not run on event loop).
 
-    max_keyframes：抽帧上限（可配置，默认 32，硬顶 64）。
+    max_keyframes：抽帧上限（可配置，默认 32；帧拼接开启时按每图帧数放大）。
     - scenedetect：镜头数 ≤ 上限则全抽，否则在镜头中点上等距抽上限张
     - katna/ffmpeg：直接以该上限为抽帧目标（无镜头列表时）
     """
-    no_of_frames = _clamp_max_keyframes(max_keyframes)
+    no_of_frames = _clamp_max_keyframes(
+        max_keyframes, pack_factor=max_keyframes_pack_factor
+    )
     logger.info(f"抽帧上限: {no_of_frames}")
 
     frames = extract_keyframes(
@@ -482,6 +648,9 @@ async def describe_visual_track(
     min_success_ratio: float = 0.5,
     max_keyframes: int = 32,
     executor=None,
+    frame_pack_enabled: bool = False,
+    frames_per_tile: int = 4,
+    frame_pack_tile_size: int = 512,
 ) -> Tuple[List[VisualEvent], bool]:
     """
     视觉轨处理入口
@@ -492,6 +661,10 @@ async def describe_visual_track(
         frame_max_retries: 单帧瞬时故障（连接/超时）额外重试次数
         frame_retry_backoff_seconds: 单帧重试退避基数（秒，线性：1x, 2x, ...）
         min_success_ratio: require_complete 时最低成功帧比例（0~1）
+        frame_pack_enabled: 把连续帧拼接成带编号的九宫格，一次请求描述多帧；
+            开启后 max_keyframes 硬顶按 frames_per_tile 放大
+        frames_per_tile: 每张拼接图包含的帧数（1-9，建议 2x2=4）
+        frame_pack_tile_size: 拼接图内每格的最大边长（像素）
 
     Returns:
         (视觉事件列表, 是否画面基本静止)
@@ -500,6 +673,7 @@ async def describe_visual_track(
     # Prefer the caller's dedicated executor so heavy extract does not starve the
     # default pool used by Web/memory asyncio.to_thread handlers.
     loop = asyncio.get_running_loop()
+    pack_factor = max(1, min(9, int(frames_per_tile))) if frame_pack_enabled else 1
     frames, resized_frames, no_of_frames = await loop.run_in_executor(
         executor,
         _prepare_visual_frames,
@@ -511,6 +685,7 @@ async def describe_visual_track(
         scenedetect_threshold,
         image_max_size,
         max_keyframes,
+        pack_factor,
     )
     if not frames:
         logger.warning("未抽到任何关键帧")
@@ -540,9 +715,21 @@ async def describe_visual_track(
     except (TypeError, ValueError):
         ratio = 0.5
     ratio = min(1.0, max(0.0, ratio))
+    pack_enabled = bool(frame_pack_enabled) and len(resized_frames) > 1
+    packs: List[Tuple[List[Tuple[int, str]], str]] = []
+    if pack_enabled:
+        packs = await loop.run_in_executor(
+            executor,
+            build_packed_frames,
+            resized_frames,
+            output_dir,
+            frames_per_tile,
+            frame_pack_tile_size,
+        )
     logger.info(
         f"Vision request budget: {vision_requests_per_minute:g}/min, "
         f"concurrency={effective_window}, frames={len(resized_frames)}, "
+        f"packed={len(packs)} packs (enabled={pack_enabled}), "
         f"frame_retries={retries}, min_success_ratio={ratio:g}"
     )
 
@@ -603,12 +790,102 @@ async def describe_visual_track(
             )
         return None
 
-    tasks = [
-        _describe_one(index, frame_number, path)
-        for index, (frame_number, path) in enumerate(resized_frames)
-    ]
-    # Per-frame failures are degraded to None; never cancel the whole batch on one bad frame.
-    results = await asyncio.gather(*tasks)
+    async def _describe_pack(
+        group: List[Tuple[int, str]],
+        sheet_path: str,
+    ) -> List[Optional[VisualEvent]]:
+        """One vision request for a composite image → per-frame VisualEvents."""
+        count = len(group)
+        prompt = build_packed_vision_prompt(
+            count, vision_prompt or DEFAULT_VISION_PROMPT
+        )
+        attempts = retries + 1
+        # Composite JSON covers `count` frames; 250 tokens is enough for a
+        # single frame but truncates a 4/9-frame JSON, and truncated non-None
+        # text is never retried with a larger budget. Scale with tile count.
+        pack_budget = max(512, min(2048, 256 * count))
+        for attempt in range(attempts):
+            try:
+                async with semaphore:
+                    await pacer.wait_turn()
+                    try:
+                        raw = await llm.describe_image(
+                            sheet_path, prompt=prompt, max_tokens=pack_budget
+                        )
+                    except TypeError:
+                        raw = await llm.describe_image(
+                            sheet_path, prompt=prompt
+                        )
+            except Exception as e:
+                transient = _is_transient_vision_error(e)
+                if transient and attempt + 1 < attempts:
+                    delay = backoff * (attempt + 1) if backoff else 0.5
+                    logger.warning(
+                        "拼接图 Vision 瞬时失败 pack=%s attempt=%s/%s %s；%.1fs 后重试",
+                        sheet_path,
+                        attempt + 1,
+                        attempts,
+                        type(e).__name__,
+                        delay,
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.warning(
+                    "拼接图 Vision 失败 pack=%s after %s attempt(s): %s: %s",
+                    sheet_path,
+                    attempt + 1,
+                    type(e).__name__,
+                    e,
+                )
+                return [None] * count
+            descriptions = parse_packed_descriptions(str(raw or ""), count)
+            if descriptions is not None and any(descriptions):
+                events: List[Optional[VisualEvent]] = []
+                for (frame_number, image_path), description in zip(group, descriptions):
+                    if not description:
+                        events.append(None)
+                        continue
+                    timestamp = round(frame_number / fps, 2) if fps else 0.0
+                    events.append(
+                        VisualEvent(
+                            timestamp=timestamp,
+                            frame_number=frame_number,
+                            image_path=image_path,
+                            description=description,
+                        )
+                    )
+                return events
+            if attempt + 1 < attempts:
+                prompt = (
+                    prompt
+                    + "\n\n上一次输出不是合法 JSON（或缺少 frames 数组）。"
+                    "请严格只输出："
+                    '{"frames":[{"index":1,"description":"..."}, ...]}'
+                )
+                await asyncio.sleep(backoff * (attempt + 1) if backoff else 0.2)
+                continue
+            logger.warning(
+                "拼接图 Vision 返回无法解析，跳过 pack=%s raw=%s",
+                sheet_path,
+                str(raw or "")[:160],
+            )
+        return [None] * count
+
+    if packs:
+        # Request count = number of packs; frame coverage = sum of tiles.
+        nested = await asyncio.gather(
+            *[_describe_pack(group, sheet_path) for group, sheet_path in packs]
+        )
+        results: List[Optional[VisualEvent]] = [
+            event for pack_events in nested for event in pack_events
+        ]
+    else:
+        tasks = [
+            _describe_one(index, frame_number, path)
+            for index, (frame_number, path) in enumerate(resized_frames)
+        ]
+        # Per-frame failures are degraded to None; never cancel the whole batch on one bad frame.
+        results = await asyncio.gather(*tasks)
     visual_events = [r for r in results if r is not None]
     visual_events.sort(key=lambda x: x.timestamp)
 

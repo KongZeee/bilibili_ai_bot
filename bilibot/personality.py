@@ -7,9 +7,7 @@ BiliBot 人格系统
 - 场景规则路由
 """
 import logging
-import random
 from datetime import datetime
-from typing import Any, Dict, List, Optional
 
 from bilibot.app.config_loader import ConfigLoader
 
@@ -31,7 +29,6 @@ class PersonalitySystem:
         speaking_style = base.get("speaking_style", "")
         boundaries = base.get("boundaries", "")
         owner_name = base.get("owner_name", "主人")
-        owner_mid = base.get("owner_mid", "")
         bot_name = base.get("bot_name", "")
 
         if bot_name:

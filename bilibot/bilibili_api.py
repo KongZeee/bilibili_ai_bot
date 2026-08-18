@@ -14,21 +14,17 @@ B站 API 适配器
 """
 import asyncio
 import hashlib
-import hmac
 import json
 import os
 import random
 import re
 import time
-import base64
 import urllib.parse
 import logging
 from typing import Optional, Dict, List, Tuple
-from datetime import datetime
 
 import aiohttp
 # PIL is lazily imported inside functions that need it
-from io import BytesIO
 
 logger = logging.getLogger("bilibot.bilibili")
 
@@ -41,31 +37,51 @@ async def _stream_download_to_file(
     *,
     timeout: int = 600,
     chunk_size: int = 256 * 1024,
+    max_bytes: int = 0,
 ) -> bool:
     """Stream HTTP body to disk without buffering the whole file in memory.
 
-    Returns True on HTTP 200 + complete write; False on non-200.
-    Propagates network/IO exceptions to the caller.
+    Returns True on HTTP 200 + complete write; False on non-200 or when
+    ``max_bytes`` is exceeded. Partial files are removed before returning
+    False and on network errors, so callers never inherit half downloads.
     """
-    async with session.get(
-        url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
-    ) as resp:
-        if resp.status != 200:
-            logger.warning(f"下载失败: HTTP {resp.status} for {url[:120]}")
-            return False
+    try:
+        async with session.get(
+            url, headers=headers, timeout=aiohttp.ClientTimeout(total=timeout)
+        ) as resp:
+            if resp.status != 200:
+                logger.warning(f"下载失败: HTTP {resp.status} for {url[:120]}")
+                return False
 
-        def _open_out():
-            return open(path, "wb")
+            def _open_out():
+                return open(path, "wb")
 
-        out = await asyncio.to_thread(_open_out)
+            out = await asyncio.to_thread(_open_out)
+            downloaded = 0
+            try:
+                async for chunk in resp.content.iter_chunked(chunk_size):
+                    if not chunk:
+                        continue
+                    downloaded += len(chunk)
+                    if max_bytes > 0 and downloaded > max_bytes:
+                        logger.warning(
+                            "下载字节数 %d 超过上限 %d，中止下载: %s",
+                            downloaded,
+                            max_bytes,
+                            path,
+                        )
+                        return False
+                    await asyncio.to_thread(out.write, chunk)
+            finally:
+                await asyncio.to_thread(out.close)
+            return True
+    except Exception:
         try:
-            async for chunk in resp.content.iter_chunked(chunk_size):
-                if not chunk:
-                    continue
-                await asyncio.to_thread(out.write, chunk)
-        finally:
-            await asyncio.to_thread(out.close)
-        return True
+            if os.path.exists(path):
+                os.remove(path)
+        except Exception:
+            pass
+        raise
 
 # WBI混键表
 MIXIN_KEY_ENC_TAB = [
@@ -245,6 +261,7 @@ class BilibiliAPI:
         timeout: int = 10,
         *,
         allow_not_found: bool = False,
+        log_transport_errors: bool = True,
     ) -> Tuple[Optional[Dict], Optional[str]]:
         """
         HTTP GET请求
@@ -261,8 +278,8 @@ class BilibiliAPI:
                 params.pop("wts", None)
                 params.setdefault("sort", 0)
 
-        session = await self._get_session()
         try:
+            session = await self._get_session()
             async with session.get(
                 url,
                 params=params,
@@ -277,20 +294,28 @@ class BilibiliAPI:
                             logger.warning(f"API返回错误: {data.get('message', '')} for {url}")
                         return data, None
                     except json.JSONDecodeError:
-                        logger.error(f"JSON解析失败: {text[:200]}")
+                        if log_transport_errors:
+                            logger.error(f"JSON解析失败: {text[:200]}")
                         return None, text
                 else:
                     if resp.status == 404 and allow_not_found:
-                        logger.debug(f"可选 API 不存在: HTTP 404 for {url}")
-                    else:
+                        if log_transport_errors:
+                            logger.debug(f"可选 API 不存在: HTTP 404 for {url}")
+                    elif log_transport_errors:
                         logger.error(f"HTTP {resp.status} for {url}")
                     return None, f"HTTP {resp.status}"
         except asyncio.TimeoutError:
-            logger.error(f"请求超时: {url}")
+            if log_transport_errors:
+                logger.error(f"请求超时: {url}")
             return None, "timeout"
+        except (aiohttp.ClientError, OSError) as e:
+            if log_transport_errors:
+                logger.error(f"请求失败: {e}")
+            return None, f"network:{type(e).__name__}"
         except Exception as e:
-            logger.error(f"请求失败: {e}")
-            return None, str(e)
+            if log_transport_errors:
+                logger.error(f"请求失败: {e}")
+            return None, f"internal:{type(e).__name__}"
     
     async def _http_post(self, url: str, data: Optional[Dict] = None, timeout: int = 10) -> Tuple[Optional[Dict], Optional[str]]:
         """HTTP POST请求。
@@ -443,7 +468,7 @@ class BilibiliAPI:
 
         # 构造签名字符串（wts 在内）
         query = "&".join(f"{k}={urllib.parse.quote(str(v))}" for k, v in params.items())
-        w_rid = hashlib.md5((query + mix_key).encode()).hexdigest()
+        w_rid = hashlib.md5((query + mix_key).encode(), usedforsecurity=False).hexdigest()
         params["w_rid"] = w_rid
 
         return params
@@ -458,14 +483,6 @@ class BilibiliAPI:
         if not updates:
             return
         bili = self.config.bilibili
-        raw = None
-        try:
-            raw = self.config.get_raw_config()
-        except Exception:
-            raw = None
-        bili_raw = None
-        if isinstance(raw, dict):
-            bili_raw = raw.setdefault("bilibili", {})
 
         field_map = {
             "sessdata": "sessdata",
@@ -475,6 +492,31 @@ class BilibiliAPI:
             "buvid4": "buvid4",
             "refresh_token": "refresh_token",
         }
+
+        def _mutate_raw(raw: dict) -> None:
+            bili_raw = raw.setdefault("bilibili", {})
+            for src, attr in field_map.items():
+                if src not in updates:
+                    continue
+                val = str(updates[src] or "")
+                if val:
+                    bili_raw[attr] = val
+
+        persisted = False
+        atomic_update = getattr(self.config, "atomic_update", None)
+        filepath = getattr(self.config, "filepath", None) or getattr(
+            self.config, "config_path", None
+        )
+        if callable(atomic_update) and filepath:
+            try:
+                atomic_update(filepath, _mutate_raw)
+                persisted = True
+            except Exception as exc:
+                logger.warning(
+                    "credential persist via atomic_update failed (keeping in-memory): %s",
+                    exc,
+                )
+
         for src, attr in field_map.items():
             if src not in updates:
                 continue
@@ -483,10 +525,12 @@ class BilibiliAPI:
                 continue
             if hasattr(bili, attr):
                 setattr(bili, attr, val)
-            if isinstance(bili_raw, dict):
-                bili_raw[attr] = val
             if attr == "bili_jct":
                 self._csrf_token = val
+        if not persisted:
+            logger.debug(
+                "credentials updated in memory only (no atomic_update/filepath on config loader)"
+            )
 
     def _notify_credential_update(self, updates: Dict[str, str]) -> None:
         cb = self._credential_update_cb
@@ -596,6 +640,30 @@ class BilibiliAPI:
         except Exception as e:
             return "", str(e)
 
+    async def resolve_shortlink(
+        self, url: str, timeout: int = 10
+    ) -> Tuple[str, Optional[str]]:
+        """解析 b23.tv 短链接，返回跳转目标 URL（不跟随重定向）。
+
+        Returns:
+            (location, error_text)。非 b23.tv 输入或请求失败时 location 为空。
+        """
+        if not url or "b23.tv" not in url:
+            return "", "not a b23.tv shortlink"
+        session = await self._get_session()
+        try:
+            async with session.get(
+                url,
+                headers=self._get_headers(),
+                timeout=aiohttp.ClientTimeout(total=timeout),
+                allow_redirects=False,
+            ) as resp:
+                if resp.status in (301, 302, 303, 307, 308):
+                    return str(resp.headers.get("Location") or ""), None
+                return "", f"HTTP {resp.status}"
+        except Exception as e:
+            return "", str(e)
+
     async def refresh_cookie(self, force: bool = False) -> Tuple[bool, str]:
         """使用 refresh_token 刷新 SESSDATA / bili_jct（官方 Web 协议）
 
@@ -617,6 +685,12 @@ class BilibiliAPI:
             try:
                 if not force:
                     need, msg = await self.check_need_cookie_refresh()
+                    if msg.startswith(("检查失败", "检查出错")):
+                        # Transient cookie/info failures must not be treated as
+                        # "still valid": keep the existing cookie but surface
+                        # the check failure so the scheduler logs a warning.
+                        logger.warning("Cookie 刷新检查失败，保留现有 Cookie: %s", msg)
+                        return False, f"检查失败: {msg}"
                     if not need:
                         return True, msg
 
@@ -782,12 +856,13 @@ class BilibiliAPI:
         return last_response
     
     async def get_user_info(self, mid: int) -> Optional[Dict]:
-        """获取用户信息"""
+        """获取用户信息（WBI 签名接口）"""
+        params = await self.sign_wbi({"mid": int(mid)})
         data, _ = await self._http_get(
             "https://api.bilibili.com/x/space/wbi/acc/info",
-            params={"mid": mid},
+            params=params,
         )
-        return data.get("data") if data else None
+        return data.get("data") if isinstance(data, dict) else None
     
     # ══════════════════════════════════════
     #  视频信息
@@ -982,7 +1057,16 @@ class BilibiliAPI:
             return None
         return data.get("data", {}).get("dash")
 
-    async def download_video(self, bvid: str, cid: int, save_path: str, quality: int = 64) -> Optional[str]:
+    async def download_video(
+        self,
+        bvid: str,
+        cid: int,
+        save_path: str,
+        quality: int = 64,
+        *,
+        max_bytes: int = 0,
+        timeout: int = 600,
+    ) -> Optional[str]:
         """
         下载 B站视频到本地（DASH 格式，分别下载视频和音频流）
 
@@ -991,11 +1075,12 @@ class BilibiliAPI:
             cid: 视频 CID
             save_path: 保存路径（含文件名，不含扩展名）
             quality: 清晰度（默认 64=720P，节省带宽）
+            max_bytes: 视频流字节上限（0=不限制，PRD-V5 §8.2）
+            timeout: 单流下载超时秒数
 
         Returns:
             成功返回 mp4 文件路径，失败返回 None
         """
-        import tempfile
 
         dash = await self.get_video_play_url(bvid, cid, quality=quality)
         if not dash:
@@ -1037,7 +1122,12 @@ class BilibiliAPI:
         # 下载视频流（流式写盘，避免整文件进内存）
         try:
             ok = await _stream_download_to_file(
-                session, video_url, video_file, headers, timeout=600
+                session,
+                video_url,
+                video_file,
+                headers,
+                timeout=timeout,
+                max_bytes=max_bytes,
             )
             if not ok:
                 # 清理可能的部分下载文件
@@ -1060,20 +1150,43 @@ class BilibiliAPI:
                     pass
             return None
 
-        # 下载音频流（可选，失败不影响）
+        # 下载音频流。DASH 有音轨但下载失败时不能静默产出无音轨 mp4：
+        # 那会让 preprocess 把 has_audio=False 当成“本来就无声”，
+        # ASR 证据被无声吞掉（require_complete_audio 仍会通过）。
         audio_downloaded = False
         if audios:
             audio_url = audios[0].get("baseUrl") or audios[0].get("base_url") or audios[0].get("url")
             if audio_url:
                 try:
                     ok = await _stream_download_to_file(
-                        session, audio_url, audio_file, headers, timeout=300
+                        session,
+                        audio_url,
+                        audio_file,
+                        headers,
+                        timeout=max(30, timeout),
+                        max_bytes=max_bytes,
                     )
                     if ok:
                         audio_downloaded = True
                         logger.info(f"音频流下载完成: {audio_file}")
+                    else:
+                        logger.warning("音频流下载失败（HTTP/字节上限），终止下载")
+                        for tmp in [video_file, audio_file]:
+                            try:
+                                if os.path.exists(tmp):
+                                    os.remove(tmp)
+                            except Exception:
+                                pass
+                        return None
                 except Exception as e:
-                    logger.warning(f"下载音频流失败（不影响视频分析）: {e}")
+                    logger.warning(f"下载音频流失败，终止下载: {e}")
+                    for tmp in [video_file, audio_file]:
+                        try:
+                            if os.path.exists(tmp):
+                                os.remove(tmp)
+                        except Exception:
+                            pass
+                    return None
 
         # 合并视频和音频（ffmpeg 子进程异步化，避免阻塞事件循环）
         try:
@@ -1271,6 +1384,31 @@ class BilibiliAPI:
             },
         )
         return data
+
+    async def delete_reply(
+        self,
+        oid: int,
+        rpid: int,
+        *,
+        comment_type: int = 1,
+    ) -> bool:
+        """删除自己的评论（用于清理 B站阿瓦隆 state=17 的隐藏回复）。"""
+        data, err = await self._http_post(
+            "https://api.bilibili.com/x/v2/reply/del",
+            data={
+                "type": comment_type,
+                "oid": oid,
+                "rpid": rpid,
+                "csrf": self._csrf_token,
+            },
+            timeout=15,
+        )
+        ok = bool(data and data.get("code") == 0)
+        if ok:
+            logger.info(f"已删除自己发布的评论: oid={oid} rpid={rpid}")
+        else:
+            logger.warning(f"删除评论失败: oid={oid} rpid={rpid} err={err or data}")
+        return ok
 
     async def like_reply(
         self,
@@ -1702,7 +1840,12 @@ class BilibiliAPI:
         return False
     
     async def get_user_dynamics(self, host_uid: int, offset: int = 0, limit: int = 20) -> Optional[Dict]:
-        """获取用户动态"""
+        """获取用户动态。
+
+        The former ``dynamic_svr/new_dyn`` fallback now returns HTTP 404 on
+        Bilibili. Retry the supported endpoint once instead of turning a
+        timeout into a second guaranteed error and misleading success path.
+        """
         params = {
             "host_mid": host_uid,
             "visit_id": "",
@@ -1710,21 +1853,30 @@ class BilibiliAPI:
             "timezone_offset": -480,
             "features": "itemOpusStyle,listOnlyfans,opusBigCover,onlyfansVote,decorationCard,forwardListHidden,ugcDelete",
         }
-        data, err = await self._http_get(
-            "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space",
-            params=params,
-        )
+        endpoint = "https://api.bilibili.com/x/polymer/web-dynamic/v1/feed/space"
+        data, err = await self._http_get(endpoint, params=params)
         if data and data.get("code") == 0:
             return data
-        logger.warning(f"新版动态列表获取失败，尝试旧接口兜底: {err or data}")
-        data, _ = await self._http_get(
-            "https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/new_dyn",
-            params={
-                "host_uid": host_uid,
-                "offset_dynamic_id": offset,
-                "need_top": 1,
-            },
-        )
+
+        # A short retry handles the observed transient feed timeouts without
+        # calling the retired endpoint that has been returning HTTP 404.
+        if err in {"timeout", "network"} or str(err or "").startswith(("timeout:", "network:")):
+            await asyncio.sleep(0.5)
+            retry_data, retry_err = await self._http_get(endpoint, params=params)
+            if retry_data and retry_data.get("code") == 0:
+                return retry_data
+            logger.warning(
+                "新版动态列表重试失败: host=%s error=%s",
+                host_uid,
+                retry_err or retry_data,
+            )
+            return retry_data
+
+        if str(err or "").startswith("HTTP 404"):
+            logger.warning("新版动态列表接口返回 404: host=%s", host_uid)
+            return None
+
+        logger.warning("新版动态列表获取失败: host=%s error=%s", host_uid, err or data)
         return data
     
     # ══════════════════════════════════════
@@ -1749,12 +1901,12 @@ class BilibiliAPI:
         return data
     
     async def search_users(self, keyword: str, page: int = 1, ps: int = 20) -> Optional[Dict]:
-        """搜索用户"""
+        """搜索用户（B站 wbi/search/type 要求 search_type=bili_user）"""
         params = await self.sign_wbi({
             "keyword": keyword,
             "page": page,
             "pagesize": ps,
-            "search_type": "user",
+            "search_type": "bili_user",
         })
         
         data, _ = await self._http_get(
@@ -2280,11 +2432,78 @@ class BilibiliAPI:
             raw_list = []
         return {"data": {"list": raw_list}}
     
+    @staticmethod
+    def _notification_error_kind(error: Optional[str]) -> str:
+        text = str(error or "")
+        normalized = text.casefold().strip()
+        if normalized == "timeout":
+            return "timeout"
+        if text.startswith("network:") or normalized == "network":
+            return "network"
+        # Keep compatibility with callers/tests that still pass the pre-
+        # normalization aiohttp/OSError text instead of ``network:Type``.
+        if any(
+            fragment in normalized
+            for fragment in (
+                "connection reset",
+                "connection refused",
+                "cannot connect",
+                "server disconnected",
+                "temporarily unavailable",
+                "name or service not known",
+            )
+        ):
+            return "network"
+        if text.startswith("HTTP "):
+            return "http"
+        if text.startswith("internal:"):
+            return "internal"
+        return "unknown"
+
+    @classmethod
+    def _notification_error_is_retryable(cls, error: Optional[str]) -> bool:
+        return cls._notification_error_kind(error) in {"timeout", "network"}
+
+    async def _get_notification_feed(self, endpoint: str) -> Optional[Dict]:
+        """Read a notification feed with one bounded jittered retry."""
+        params = {"platform": "web", "build": 0, "mobi_app": "web"}
+        data, err = await self._http_get(
+            endpoint,
+            params=params,
+            log_transport_errors=False,
+        )
+        if data is not None:
+            return data
+        if not self._notification_error_is_retryable(err):
+            logger.warning(
+                "通知 API 读取失败 endpoint=%s error_kind=%s",
+                endpoint,
+                self._notification_error_kind(err),
+            )
+            return None
+
+        # Notification reads are idempotent; recover one transient timeout or
+        # network failure without turning a single missed poll into a retry loop.
+        await asyncio.sleep(0.35 + random.uniform(0.0, 0.30))
+        retry_data, retry_err = await self._http_get(
+            endpoint,
+            params=params,
+            log_transport_errors=False,
+        )
+        if retry_data is not None:
+            logger.debug("通知 API transient error recovered after one retry: %s", endpoint)
+            return retry_data
+        logger.warning(
+            "通知 API 读取失败 endpoint=%s error_kind=%s after_retry=1",
+            endpoint,
+            self._notification_error_kind(retry_err),
+        )
+        return None
+
     async def get_reply_notifications(self) -> Optional[Dict]:
         """获取回复我的评论通知（msgfeed/reply）"""
-        data, _ = await self._http_get(
-            "https://api.bilibili.com/x/msgfeed/reply",
-            params={"platform": "web", "build": 0, "mobi_app": "web"},
+        data = await self._get_notification_feed(
+            "https://api.bilibili.com/x/msgfeed/reply"
         )
         self._record_authenticated_response(data)
         return data
@@ -2295,9 +2514,8 @@ class BilibiliAPI:
         返回结构与 get_reply_notifications 一致（items[]/user/item），
         item.type 通常为 "at"，business_id 视场景而定（视频评论/动态评论等）。
         """
-        data, _ = await self._http_get(
-            "https://api.bilibili.com/x/msgfeed/at",
-            params={"platform": "web", "build": 0, "mobi_app": "web"},
+        data = await self._get_notification_feed(
+            "https://api.bilibili.com/x/msgfeed/at"
         )
         self._record_authenticated_response(data)
         return data

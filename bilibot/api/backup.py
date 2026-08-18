@@ -182,6 +182,14 @@ def _collect_restore_entries(backup_dir: Path) -> list[tuple[Path, Path]]:
     for source in sorted(backup_dir.rglob("*")):
         if not source.is_file() or source.name.casefold() in legacy_names:
             continue
+        # SQLite sidecars are never part of a backup archive (create path
+        # excludes them). Read-only restore staging used to materialize
+        # zero-byte sidecars next to backup sources; restoring those over a
+        # live WAL database would be dangerous, so drop them unconditionally.
+        if source.name.casefold().endswith((".db-wal", ".db-shm", ".db-journal")):
+            continue
+        if source.suffix.lower() not in {".db", ".json"}:
+            continue
         relative = source.relative_to(backup_dir)
         parts = relative.parts
         is_canonical_brain = (
@@ -285,9 +293,13 @@ def _stage_restore_entries(
         staged = stage_root / relative
         staged.parent.mkdir(parents=True, exist_ok=True)
         if source.suffix.lower() == ".db":
+            # Backup archives only contain static .db snapshots (sidecars are
+            # filtered above). A plain byte copy is sufficient and, unlike a
+            # sqlite read connection, never materializes -wal/-shm siblings
+            # inside the archive being restored.
             try:
-                _sqlite_online_backup(source, staged)
-            except sqlite3.Error as exc:
+                shutil.copy2(source, staged)
+            except OSError as exc:
                 raise RestoreValidationError(
                     f"SQLite restore candidate is unreadable: {relative}"
                 ) from exc

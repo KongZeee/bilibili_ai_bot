@@ -33,11 +33,10 @@ bilibili:
 """
 import asyncio
 import logging
-import uuid
-from typing import Dict, List, Optional, Any, TYPE_CHECKING
+from typing import Dict, List, Optional, TYPE_CHECKING
 
 from bilibot.account.instance import AccountInstance
-from bilibot.account.config_registry import AccountConfigRegistry, REDACTED_PLACEHOLDER
+from bilibot.account.config_registry import AccountConfigRegistry
 
 logger = logging.getLogger("bilibot.account")
 
@@ -97,7 +96,7 @@ class AccountManager:
             from bilibot.services.layout_migrate import maybe_auto_migrate
 
             maybe_auto_migrate(self.data_root, sole_id)
-        except Exception as exc:  # noqa: BROAD_EXCEPT_OK — boot must not die on migrate
+        except Exception as exc:  # noqa: BLE001 — boot must not die on migrate
             logger.error(
                 "flat layout auto-migrate failed (continuing boot): %s",
                 exc,

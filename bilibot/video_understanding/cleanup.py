@@ -18,12 +18,66 @@ logger = logging.getLogger("bilibot.video_u.cleanup")
 
 _SCHEDULED: List[threading.Timer] = []
 _SCHEDULED_LOCK = threading.Lock()
+_MISSING = object()
 
 
 def cleanup_now(paths: List[str]) -> None:
     """立即删除指定路径"""
     for path in paths:
         if not path:
+            continue
+        try:
+            if os.path.isfile(path):
+                os.remove(path)
+                logger.info(f"已删除临时文件: {path}")
+            elif os.path.isdir(path):
+                shutil.rmtree(path)
+                logger.info(f"已删除临时目录: {path}")
+        except Exception as e:
+            logger.warning(f"清理失败 {path}: {e}")
+
+
+def _snapshot_paths(paths: Iterable[Optional[str]]) -> dict[str, Optional[tuple]]:
+    """Capture (mtime_ns, size) for each existing path; missing paths map to None."""
+    snapshots: dict[str, Optional[tuple]] = {}
+    for path in paths:
+        if not path:
+            continue
+        try:
+            st = os.stat(str(path))
+            snapshots[str(path)] = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            snapshots[str(path)] = None
+    return snapshots
+
+
+def cleanup_paths_if_unchanged(
+    paths: Iterable[Optional[str]],
+    snapshots: Optional[dict] = None,
+) -> None:
+    """Delete paths only when they still match the scheduling-time snapshot.
+
+    Delayed cleanup timers are dangerous when paths are reused (e.g. the same
+    ``video_temp/{bvid}.mp4`` re-downloaded for a new task): an old timer must
+    never delete a fresh file that happens to live at the same path. Missing
+    entries in ``snapshots`` are skipped — a file that appears after scheduling
+    is not ours to delete.
+    """
+    snaps = snapshots or _snapshot_paths(paths)
+    for path in paths:
+        if not path:
+            continue
+        expected = snaps.get(str(path), _MISSING)
+        if expected is _MISSING or expected is None:
+            continue
+        try:
+            st = os.stat(str(path))
+            if (st.st_mtime_ns, st.st_size) != expected:
+                logger.info(
+                    "跳过延迟清理，路径已被复用或修改: %s", path
+                )
+                continue
+        except OSError:
             continue
         try:
             if os.path.isfile(path):
@@ -96,12 +150,12 @@ def cleanup_orphaned_video_temp(
                 )
                 continue
             if os.path.isfile(path):
-                # 删除 .mp4、.m4s、.mp3、.wav 等临时媒体文件
-                ext = os.path.splitext(name)[1].lower()
-                if ext in (".mp4", ".m4s", ".mp3", ".wav", ".flv", ".mkv"):
-                    os.remove(path)
-                    cleaned += 1
-                    logger.info(f"启动清理孤儿文件: {name}")
+                # video_temp is a bot-owned runtime directory. Any file older
+                # than the retention window is an orphan (known media extensions
+                # or not) and can be removed.
+                os.remove(path)
+                cleaned += 1
+                logger.info(f"启动清理孤儿文件: {name}")
             elif os.path.isdir(path):
                 # 删除工作目录（关键帧、音频分析等）
                 shutil.rmtree(path)
@@ -115,14 +169,29 @@ def cleanup_orphaned_video_temp(
     return cleaned
 
 
-def schedule_cleanup(paths: List[str], delay_seconds: int = 1800) -> threading.Timer:
-    """延迟清理临时文件"""
+def schedule_cleanup(
+    paths: List[str],
+    delay_seconds: int = 1800,
+    *,
+    delete_if_appears: bool = False,
+) -> threading.Timer:
+    """延迟清理临时文件。
 
+    默认只删除与调度时快照一致的文件（路径复用保护）。
+    ``delete_if_appears=True`` 用于调用方持有唯一随机路径的场景
+    （如确定性 task_id 的预处理超时目录）：即使调度时目录尚未被
+    后台线程创建，超时后也直接删除，不会泄漏到下次启动。
+    """
+
+    snapshots = _snapshot_paths(paths)
     holder: dict[str, threading.Timer] = {}
 
     def _run():
         try:
-            cleanup_now(paths)
+            if delete_if_appears:
+                cleanup_now(paths)
+            else:
+                cleanup_paths_if_unchanged(paths, snapshots=snapshots)
         finally:
             timer_ref = holder.get("timer")
             if timer_ref is not None:

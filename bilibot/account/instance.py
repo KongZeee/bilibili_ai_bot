@@ -215,14 +215,22 @@ class AccountInstance:
             embedding_provider = (
                 self.llm_manager.resolve_embedding() if self.llm_manager else None
             )
+            rerank_provider = (
+                self.llm_manager.resolve_rerank() if self.llm_manager else None
+            )
             self.memory_brain = MemoryBrainService(
                 self.account_id,
                 self.account_data_dir,
                 chat_provider=self.llm,
                 embedding_provider=embedding_provider,
+                rerank_provider=rerank_provider,
                 memory_config=self.account_config_loader.memory,
             )
-            await self.memory_brain.start()
+            raw_cfg = self.account_config_loader.get_raw_config() or {}
+            bot_uid = str(
+                (raw_cfg.get("bilibili") or {}).get("dede_user_id") or ""
+            ).strip()
+            await self.memory_brain.start(bot_actor_id=bot_uid)
             # Narrow compatibility alias. It points to V6 and never opens legacy files.
             self.knowledge_memory = self.memory_brain
             logger.info(f"[{self.account_id}] V6 记忆大脑已启动")

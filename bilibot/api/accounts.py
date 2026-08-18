@@ -225,6 +225,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
     async def add_account(request: Request) -> JSONResponse:
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             acc_id = body.get("id") or ""
             if not acc_id:
                 return fail("VALIDATION_ERROR", "账号 ID 不能为空")
@@ -299,6 +301,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             if not account_manager.has_account(acc_id):
                 return fail("NOT_FOUND", f"账号不存在: {acc_id}")
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             # PRD-V5 §5.3 LLM-501：校验 llm_id（仅在 PATCH 中显式提供时校验）
             if "llm_id" in body:
                 err = _validate_llm_id(llm_manager, body.get("llm_id", ""))
@@ -341,6 +345,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             if not acc:
                 return fail("NOT_FOUND", f"账号不存在: {acc_id}")
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             profile_id = body.get("profile_id", "")
             persona_id = body.get("persona_id", "")
 
@@ -401,6 +407,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             if not acc:
                 return fail("NOT_FOUND", f"账号不存在: {acc_id}")
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             persona_id = body.get("persona_id", "")
             if not persona_id:
                 return fail("VALIDATION_ERROR", "persona_id 不能为空")
@@ -457,6 +465,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             if not acc:
                 return fail("NOT_FOUND", f"账号不存在: {acc_id}")
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             llm_id = body.get("llm_id", "")
             # PRD-V5 §5.3 LLM-501：校验 llm_id 指向已存在且 enabled 的 Provider
             err = _validate_llm_id(llm_manager, llm_id)
@@ -565,7 +575,8 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
             await _cleanup_terminal_qr_sessions()
 
             now = time.time()
-            # 加锁：清理该账号过期/终态会话 + 检查活跃会话（TOCTOU 防护）
+            # 加锁：清理该账号过期/终态会话 + 检查活跃会话，并且在同一把锁内
+            # 调用 B站 API 和写入新会话，避免 check-then-insert 的 TOCTOU。
             async with _get_qr_lock():
                 for sid in list(_qr_sessions.keys()):
                     sess = _qr_sessions[sid]
@@ -582,22 +593,20 @@ def create_accounts_routes(account_manager, config_loader, config_path: str = "c
                             and sess.get("status") not in _QR_TERMINAL_STATUSES):
                         return fail("QR_SESSION_EXISTS", "该账号已有活跃的二维码登录会话，请等待过期后重试")
 
-            # 调用 B站 API 获取二维码
-            from ..bilibili_qrlogin import BilibiliQRLogin
-            qr_login = BilibiliQRLogin(config_loader, config_path=config_path)
-            try:
-                result = await qr_login.get_qrcode()
-            finally:
-                await qr_login.close()
+                # 调用 B站 API 获取二维码
+                from ..bilibili_qrlogin import BilibiliQRLogin
+                qr_login = BilibiliQRLogin(config_loader, config_path=config_path)
+                try:
+                    result = await qr_login.get_qrcode()
+                finally:
+                    await qr_login.close()
 
-            if "error" in result:
-                return fail("QRCODE_FAILED", str(result["error"]), status_code=400)
+                if "error" in result:
+                    return fail("QRCODE_FAILED", str(result["error"]), status_code=400)
 
-            raw_key = result["key"]
-            key_hash = _sha256_hex(raw_key)
+                raw_key = result["key"]
+                key_hash = _sha256_hex(raw_key)
 
-            # 加锁：创建会话（不含 raw key）
-            async with _get_qr_lock():
                 qr_session_id = uuid.uuid4().hex
                 _qr_sessions[qr_session_id] = {
                     "account_id": acc_id,

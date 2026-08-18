@@ -17,7 +17,7 @@ import asyncio
 import hashlib
 import inspect
 import logging
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from .models import SceneType, ReplyContext
 from .models.generation import (

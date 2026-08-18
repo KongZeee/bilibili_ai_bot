@@ -1,5 +1,11 @@
 # 敏感与运行时数据，勿打入镜像
 config.yaml
+config.yaml.*
+*.yaml.backup_*
+*.yml.backup_*
+*.backup_*
+.hermes/
+.autoplan-runtime/
 data/
 .git/
 .github/

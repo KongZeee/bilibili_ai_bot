@@ -15,8 +15,9 @@
 """
 import logging
 import uuid
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional
 
+from bilibot.app.config_loader import is_sensitive_placeholder
 from bilibot.llm.provider import (
     CompletionConcurrencyGate,
     LLMProvider,
@@ -31,8 +32,9 @@ VISION = "vision"
 EMBEDDING = "embedding"
 ASR = "asr"
 IMAGE = "image"
+RERANK = "rerank"
 
-PROVIDER_TYPES = [CHAT, VISION, EMBEDDING, ASR, IMAGE]
+PROVIDER_TYPES = [CHAT, VISION, EMBEDDING, ASR, IMAGE, RERANK]
 
 # 各类型的配置段名
 CONFIG_KEYS = {
@@ -41,6 +43,7 @@ CONFIG_KEYS = {
     EMBEDDING: "embedding_providers",
     ASR: "asr_providers",
     IMAGE: "image_providers",
+    RERANK: "rerank_providers",
 }
 
 
@@ -109,6 +112,7 @@ class ModelRouter:
         self._load_embedding_providers(raw)
         self._load_asr_providers(raw)
         self._load_image_providers(raw)
+        self._load_rerank_providers(raw)
 
         # 自动补全路由（未配置时取第一个启用的）
         for t in PROVIDER_TYPES:
@@ -513,7 +517,6 @@ class ModelRouter:
     def _load_asr_providers(self, raw: dict):
         """加载 ASR 模型 Provider"""
         asr_list = raw.get("asr_providers", [])
-        has_asr_list = False
         if asr_list:
             for item in asr_list:
                 if not isinstance(item, dict):
@@ -529,7 +532,6 @@ class ModelRouter:
                     logger.info(f"[router] 已加载 ASR Provider: {pid} ({cfg.get('model', '')})")
                 except Exception as e:
                     logger.error(f"[router] 加载 ASR Provider {pid} 失败: {e}")
-            has_asr_list = True
 
         # 本地 Whisper 配置
         lw = raw.get("asr_providers", [])
@@ -601,6 +603,26 @@ class ModelRouter:
                 logger.info("[router] V1迁移文生图 Provider: default-image")
             except Exception:
                 pass
+
+    def _load_rerank_providers(self, raw: dict):
+        """加载 Rerank 模型 Provider（SiliconFlow-style /rerank，顶层 model/base_url/api_key）。"""
+        rerank_list = raw.get("rerank_providers", [])
+        if not rerank_list:
+            return
+        for i, cfg in enumerate(rerank_list):
+            if not isinstance(cfg, dict):
+                continue
+            pid = cfg.get("id") or f"rerank_{i}"
+            cfg = self._fallback_api_key(raw, cfg)
+            cfg = dict(cfg)
+            cfg["rate_limit_cooldown_seconds"] = self._rate_limit_cooldown_seconds
+            try:
+                self._pools[RERANK][pid] = LLMProvider(pid, cfg)
+                logger.info(
+                    f"[router] 已加载 Rerank Provider: {pid} ({cfg.get('model', '')})"
+                )
+            except Exception as e:
+                logger.error(f"[router] 加载 Rerank Provider {pid} 失败: {e}")
 
     def _fallback_api_key(self, raw: dict, cfg: dict) -> dict:
         """api_key / api_keys 留空时回退到默认对话 Provider"""
@@ -696,6 +718,9 @@ class ModelRouter:
 
     def resolve_image(self) -> Optional[LLMProvider]:
         return self.resolve(IMAGE)
+
+    def resolve_rerank(self) -> Optional[LLMProvider]:
+        return self.resolve(RERANK)
 
     def get_routing(self) -> dict:
         """获取当前路由配置"""
@@ -817,7 +842,17 @@ class ModelRouter:
             return False
         # 敏感字段留空时从旧实例继承
         new_config = {**config, "id": pid}
-        if not new_config.get("api_key") and "api_keys" not in new_config:
+        submitted_key = new_config.get("api_key")
+        submitted_keys = new_config.get("api_keys")
+        keys_are_placeholder = (
+            isinstance(submitted_keys, list)
+            and bool(submitted_keys)
+            and all(is_sensitive_placeholder(value) for value in submitted_keys)
+        )
+        if is_sensitive_placeholder(submitted_key) or keys_are_placeholder:
+            new_config["api_key"] = old.api_key
+            new_config["api_keys"] = list(getattr(old, "api_keys", []) or [])
+        elif not new_config.get("api_key") and "api_keys" not in new_config:
             new_config["api_key"] = old.api_key
             new_config["api_keys"] = list(getattr(old, "api_keys", []) or [])
         elif not new_config.get("api_key") and new_config.get("api_keys"):

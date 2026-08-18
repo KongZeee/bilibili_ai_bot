@@ -119,7 +119,7 @@ def create_replies_routes(audit_store, account_manager=None) -> list[Route]:
                 "page": result["page"],
                 "page_size": result["page_size"],
             })
-        except Exception as e:
+        except Exception:
             logger.exception("list_replies 失败")
             return fail_internal()
 
@@ -134,7 +134,7 @@ def create_replies_routes(audit_store, account_manager=None) -> list[Route]:
                 "context_summary": item.get("context_summary", ""),
                 "prompt_preview": item.get("prompt_preview", ""),
             })
-        except Exception as e:
+        except Exception:
             logger.exception("get_reply_context 失败")
             return fail_internal()
 
@@ -322,6 +322,16 @@ def create_replies_routes(audit_store, account_manager=None) -> list[Route]:
                 if scheduler.reply_state_store is None:
                     return fail("NO_REPLY_STORE", "回复状态存储未就绪", status_code=503)
 
+                current_state = (
+                    scheduler.reply_state_store.get_state(comment_type, source_rpid)
+                    or {}
+                )
+                if current_state.get("state") in ("published", "published_legacy"):
+                    return ok({
+                        "message": "该评论已发布成功，无需重试",
+                        "comment": output,
+                    })
+
                 # 不消耗 attempts，next_retry_at=now，避免一点就 failed
                 scheduler.reply_state_store.mark_manual_retry(
                     comment_type,
@@ -340,8 +350,8 @@ def create_replies_routes(audit_store, account_manager=None) -> list[Route]:
                 return fail("UNSUPPORTED_SCENE", f"不支持的场景类型: {scene}", status_code=400)
 
         except Exception as e:
-            logger.exception("retry_reply 失败")
-            return fail_internal(f"重试失败: {e}")
+            logger.exception("retry_reply 失败: %s", e)
+            return fail_internal("重试失败，请查看服务端日志")
         finally:
             if lock_key:
                 with _retry_lock:

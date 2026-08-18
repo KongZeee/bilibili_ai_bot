@@ -165,8 +165,22 @@ class CompanionStore:
         self._save("runtime.json", data)
 
     def patch_runtime(self, **kwargs: Any) -> Dict[str, Any]:
-        rt = self.get_runtime()
-        rt.update(kwargs)
-        rt["updated_ts"] = time.time()
-        self.save_runtime(rt)
-        return rt
+        def _apply(rt: Dict[str, Any]) -> None:
+            rt.update(kwargs)
+
+        return self.update_runtime(_apply)
+
+    def update_runtime(self, mutator) -> Dict[str, Any]:
+        """Atomic read-modify-write for runtime.json under the store lock.
+
+        Concurrent hooks (browse/dynamic cooldowns, archive failure counters,
+        rhythm timestamps) previously patched independently and could clobber
+        each other's fields.
+        """
+        with self._lock:
+            raw = self._load("runtime.json", {})
+            rt = raw if isinstance(raw, dict) else {}
+            mutator(rt)
+            rt["updated_ts"] = time.time()
+            self._save("runtime.json", rt)
+            return rt

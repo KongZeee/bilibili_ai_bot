@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import re
 import secrets
@@ -19,7 +20,7 @@ import unicodedata
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Optional, Sequence
 
 try:
     import jieba
@@ -31,12 +32,15 @@ from .models import (
     ClaimedJob,
     HealthReport,
     IdempotencyConflictError,
+    Observation,
     ObservationEnvelope,
     ReingestBlockedError,
     SCHEMA_VERSION,
     SourceDocument,
     VectorDimensionError,
 )
+
+logger = logging.getLogger("bilibot.memory_brain.store")
 
 
 _CJK_RUN_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]+")
@@ -374,6 +378,7 @@ CREATE TABLE IF NOT EXISTS memory_embeddings (
     UNIQUE(target_type, target_id, model_id)
 );
 CREATE INDEX IF NOT EXISTS idx_memory_embeddings_scan ON memory_embeddings(model_id, target_type, id);
+CREATE INDEX IF NOT EXISTS idx_memory_embeddings_event ON memory_embeddings(event_id, target_type);
 
 CREATE TABLE IF NOT EXISTS memory_entities (
     id TEXT PRIMARY KEY,
@@ -441,6 +446,7 @@ CREATE TABLE IF NOT EXISTS brain_jobs (
     completed_at REAL
 );
 CREATE INDEX IF NOT EXISTS idx_brain_jobs_ready ON brain_jobs(status, available_at, leased_until);
+CREATE INDEX IF NOT EXISTS idx_brain_jobs_event ON brain_jobs(event_id, created_at, id);
 
 CREATE TABLE IF NOT EXISTS recall_traces (
     id TEXT PRIMARY KEY,
@@ -571,6 +577,82 @@ def _json_loads(value: str | None, default: Any) -> Any:
         return default
 
 
+def _looks_like_platform_uid(value: Any) -> bool:
+    text = str(value or "").strip()
+    return bool(text) and text.isdigit()
+
+
+def _pseudonymize_actor_payload(
+    value: Any,
+    pseudonymize,
+    *,
+    bot_actor_id: str = "",
+) -> tuple[Any, bool]:
+    """Recursively replace raw platform actor IDs in structured payloads."""
+    if isinstance(value, Mapping):
+        out: dict[str, Any] = {}
+        changed = False
+        for key, item in value.items():
+            if key in {"mid", "user_id", "actor_id", "uid"} and _looks_like_platform_uid(item):
+                out[key] = (
+                    "self"
+                    if bot_actor_id and str(item).strip() == str(bot_actor_id).strip()
+                    else pseudonymize(str(item).strip())
+                )
+                changed = True
+            else:
+                child, child_changed = _pseudonymize_actor_payload(
+                    item, pseudonymize, bot_actor_id=bot_actor_id
+                )
+                out[key] = child
+                changed = changed or child_changed
+        return out, changed
+    if isinstance(value, list):
+        out = []
+        changed = False
+        for item in value:
+            child, child_changed = _pseudonymize_actor_payload(
+                item, pseudonymize, bot_actor_id=bot_actor_id
+            )
+            out.append(child)
+            changed = changed or child_changed
+        return out, changed
+    return value, False
+
+
+def _legacy_event_has_raw_actor(conn: sqlite3.Connection, event_id: str) -> bool:
+    row = conn.execute(
+        "SELECT speaker_actor_id FROM memory_events WHERE id=?", (event_id,)
+    ).fetchone()
+    if row is not None and _looks_like_platform_uid(row["speaker_actor_id"]):
+        return True
+    obs = conn.execute(
+        "SELECT 1 FROM memory_observations WHERE event_id=? AND actor_id "
+        "GLOB '*[0-9]*'",
+        (event_id,),
+    ).fetchone()
+    if obs is not None:
+        return True
+    for srow in conn.execute(
+        "SELECT structured_json,full_text FROM memory_sources WHERE event_id=?",
+        (event_id,),
+    ).fetchall():
+        for blob in (srow["structured_json"], srow["full_text"]):
+            if not blob:
+                continue
+            try:
+                payload = json.loads(blob)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            _, changed = _pseudonymize_actor_payload(
+                payload,
+                lambda value: value,
+            )
+            if changed:
+                return True
+    return False
+
+
 def content_hash(value: str | bytes) -> str:
     raw = value if isinstance(value, bytes) else value.encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
@@ -596,16 +678,31 @@ def estimate_tokens(text: str) -> int:
     return len(_TOKEN_RE.findall(text))
 
 
+MAX_FTS_SOURCE_CHARS = 200_000
+
+
 def build_fts_text(text: str, stable_ids: Iterable[str] = ()) -> str:
     """Build unicode61 input with Jieba search terms and explicit CJK bigrams."""
 
     normalized = normalize_search_text(text)
+    # Long documents are recalled through their chunks; event-level FTS only
+    # needs a bounded prefix. Unbounded ASR/behavior-log rows would otherwise
+    # inflate the FTS table ~5x and make inserts pathologically slow.
+    if len(normalized) > MAX_FTS_SOURCE_CHARS:
+        normalized = normalized[:MAX_FTS_SOURCE_CHARS]
     terms: list[str] = [normalize_search_text(item) for item in stable_ids if item]
-    if jieba is not None and normalized:
+    # Single repeated character for tens of thousands of chars (OCR/ASR noise)
+    # makes jieba and the bigram loop quadratic. Skip both and keep the raw
+    # prefix only — such input has no useful search tokens.
+    pathological_single_run = (
+        bool(normalized) and len(normalized) > 10_000 and len(set(normalized)) == 1
+    )
+    if jieba is not None and normalized and not pathological_single_run:
         terms.extend(token.strip() for token in jieba.cut_for_search(normalized) if token.strip())
-    for match in _CJK_RUN_RE.finditer(normalized):
-        run = match.group(0)
-        terms.extend(run[index : index + 2] for index in range(max(0, len(run) - 1)))
+    if not pathological_single_run:
+        for match in _CJK_RUN_RE.finditer(normalized):
+            run = match.group(0)
+            terms.extend(run[index : index + 2] for index in range(max(0, len(run) - 1)))
     return " ".join([normalized, *terms]).strip()
 
 
@@ -710,25 +807,30 @@ class _VectorCacheEntry:
 
 
 def _envelope_hash(envelope: ObservationEnvelope, sources: Sequence[SourceDocument]) -> str:
-    payload = asdict(envelope)
-    # Account identity is a store boundary, not archived content. Excluding it
-    # preserves hashes written before the optional account_id contract existed.
-    payload.pop("account_id", None)
-    # occurred_at is a capture timestamp, not archived content. Excluding it
-    # prevents retries (which re-call time.time()) from producing different
-    # content_hash for the same observation and triggering
-    # IdempotencyConflictError -> account risk pause.
-    payload.pop("occurred_at", None)
-    payload["sources"] = [
-        {
-            **asdict(source),
-            "observations": [
-                {k: v for k, v in asdict(item).items() if k != "occurred_at"}
-                for item in source.normalized_observations()
-            ],
-        }
-        for source in sources
-    ]
+    # Hash only what archive_observation actually persists. Top-level legacy
+    # envelope fields (source_text / source_data / observations / account_id /
+    # occurred_at) are either redundant with normalized sources or store
+    # boundaries, and must not make identical rows look like conflicts.
+    payload = {
+        "event_type": envelope.event_type,
+        "event_title": envelope.event_title,
+        "event_summary": envelope.event_summary,
+        "speaker_actor_id": envelope.speaker_actor_id,
+        "persona_id": envelope.persona_id,
+        "scene": envelope.scene,
+        "importance": envelope.importance,
+        "metadata": envelope.metadata,
+        "sources": [
+            {
+                **asdict(source),
+                "observations": [
+                    {k: v for k, v in asdict(item).items() if k != "occurred_at"}
+                    for item in source.normalized_observations()
+                ],
+            }
+            for source in sources
+        ],
+    }
     return content_hash(_json_dumps(payload))
 
 
@@ -894,6 +996,37 @@ def chunk_text(
     return chunks
 
 
+class VectorScanTooLargeError(RuntimeError):
+    """Full-scan vector search would exceed the configured row budget.
+
+    Callers should degrade to FTS/deterministic channels instead of freezing
+    the request path on a multi-GB sequential BLOB scan.
+
+    Design decision: no ANN index (sqlite-vec / HNSW) is introduced.  This
+    project keeps SQLite + numpy authoritative; the bounded scan plus the
+    recall-layer candidate prefilter is the measured safety net, and an ANN
+    extension would add a native dependency for a scale this single-account
+    runtime has not demonstrated.  Raise ``vector_full_scan_row_limit`` only
+    after benchmarking the concrete row count on the deployment host.
+
+    Measured on a Windows dev host (2026-08, SQLite BLOB + numpy matmul):
+    20,000 rows x 512-dim float32 ≈ 79.8 MB on disk (≈2x raw vector bytes);
+    warm full-scan search ≈ 0.59-1.04 s (~19-34k rows/s) after the cache is
+    loaded.  50,000 rows x 512-dim ≈ 199.3 MB, warm scan ≈ 1.29 s
+    (~39k rows/s), and the row-budget guard rejects an over-limit scan in
+    ~14 ms.  Extrapolating, a 100 GB raw-vector corpus (≈25M rows x 1024-dim)
+    would take tens of minutes to full-scan, so production recall paths must
+    go through FTS/candidate prefilter rather than raw full scans.
+    """
+
+    def __init__(self, *, rows: int, limit: int):
+        self.rows = int(rows)
+        self.limit = int(limit)
+        super().__init__(
+            f"vector scan rows {self.rows} exceed configured limit {self.limit}"
+        )
+
+
 class MemoryBrainStore:
     """Thread-safe short-connection store for exactly one account database."""
 
@@ -911,12 +1044,16 @@ class MemoryBrainStore:
         link_job_max_attempts: int = 3,
         vector_batch_size: int = 2048,
         vector_cache_limit: int = 50_000,
+        vector_full_scan_row_limit: int = 50_000,
     ) -> None:
         self.db_path = Path(db_path)
         self.account_id = str(account_id)
         self._write_lock = threading.RLock()
         self._vector_cache_lock = threading.RLock()
         self._vector_cache: dict[tuple[str, str], _VectorCacheEntry] = {}
+        # Total rows across ALL (model_id, target_type) cache entries so the
+        # configured cache budget is a global memory bound, not a per-entry one.
+        self._vector_cache_rows = 0
         self.configure_runtime(
             chunk_target_chars=chunk_target_chars,
             chunk_hard_chars=chunk_hard_chars,
@@ -927,6 +1064,7 @@ class MemoryBrainStore:
             link_job_max_attempts=link_job_max_attempts,
             vector_batch_size=vector_batch_size,
             vector_cache_limit=vector_cache_limit,
+            vector_full_scan_row_limit=vector_full_scan_row_limit,
         )
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
@@ -943,6 +1081,7 @@ class MemoryBrainStore:
         link_job_max_attempts: int = 3,
         vector_batch_size: int = 2048,
         vector_cache_limit: int = 50_000,
+        vector_full_scan_row_limit: int = 50_000,
     ) -> None:
         self.chunk_target_chars = max(1, int(chunk_target_chars))
         self.chunk_hard_chars = max(self.chunk_target_chars, int(chunk_hard_chars))
@@ -956,7 +1095,9 @@ class MemoryBrainStore:
         with self._vector_cache_lock:
             self.vector_batch_size = max(1, int(vector_batch_size))
             self.vector_cache_limit = max(0, int(vector_cache_limit))
+            self.vector_full_scan_row_limit = max(0, int(vector_full_scan_row_limit))
             self._vector_cache.clear()
+            self._vector_cache_rows = 0
 
     def _chunk_observation(self, text: str, previous_text: str = "") -> list[dict[str, Any]]:
         return chunk_text(
@@ -1065,6 +1206,24 @@ class MemoryBrainStore:
                     (secrets.token_hex(32), now),
                 )
                 conn.commit()
+                # Drain any WAL left behind by a previous unclean shutdown
+                # before workers start writing. Otherwise the first writes can
+                # trigger multi-second autocheckpoints and surface as
+                # "database is locked" in the memory worker.
+                try:
+                    checkpoint_row = conn.execute(
+                        "PRAGMA wal_checkpoint(TRUNCATE)"
+                    ).fetchone()
+                    if checkpoint_row and int(checkpoint_row[0]):
+                        logger.warning(
+                            "memory brain init: WAL TRUNCATE checkpoint busy: %s",
+                            tuple(checkpoint_row),
+                        )
+                except sqlite3.OperationalError as exc:
+                    logger.warning(
+                        "memory brain init: WAL TRUNCATE checkpoint skipped: %s",
+                        exc,
+                    )
             except Exception:
                 if conn.in_transaction:
                     conn.rollback()
@@ -1091,6 +1250,15 @@ class MemoryBrainStore:
             raise ValueError("source_type is required")
         if any(not source.source_type.strip() for source in sources):
             raise ValueError("every source must have a source_type")
+        # Defense in depth: the redaction boundary lives in
+        # MemoryBrainService.archive_private_message. Direct store callers must
+        # not be able to persist unredacted PM bodies.
+        if source_type == "private_message":
+            meta = envelope.metadata if isinstance(envelope.metadata, Mapping) else {}
+            if not bool(meta.get("redacted")):
+                raise ValueError(
+                    "private_message sources must be redacted before store archive"
+                )
         digest = _envelope_hash(envelope, sources)
         now = time.time()
 
@@ -1106,7 +1274,7 @@ class MemoryBrainStore:
                         f"idempotency key {key!r} was explicitly deleted and cannot be re-ingested"
                     )
                 existing = conn.execute(
-                    "SELECT id,content_hash FROM memory_events WHERE idempotency_key=?", (key,)
+                    "SELECT id,content_hash,index_status FROM memory_events WHERE idempotency_key=?", (key,)
                 ).fetchone()
                 if existing:
                     if existing["content_hash"] != digest:
@@ -1114,6 +1282,42 @@ class MemoryBrainStore:
                             f"idempotency key {key!r} already exists with different content"
                         )
                     result = self._archive_result(conn, existing["id"], digest, created=False)
+                    # Replay repair: a "ready" event whose derived rows vanished
+                    # must be rebuilt before we claim idempotent success.
+                    if str(existing["index_status"] or "") == "ready":
+                        chunk_count = conn.execute(
+                            "SELECT COUNT(*) FROM memory_chunks WHERE event_id=?",
+                            (existing["id"],),
+                        ).fetchone()[0]
+                        event_fts_count = conn.execute(
+                            "SELECT COUNT(*) FROM memory_event_fts WHERE event_id=?",
+                            (existing["id"],),
+                        ).fetchone()[0]
+                        observation_count = conn.execute(
+                            "SELECT COUNT(*) FROM memory_observations WHERE event_id=?",
+                            (existing["id"],),
+                        ).fetchone()[0]
+                        if event_fts_count == 0 or (chunk_count == 0 and observation_count > 0):
+                            report = self._repair_event_derivations_tx(conn, existing["id"])
+                            logger.warning(
+                                "idempotent replay repaired missing derived rows "
+                                "event=%s report=%s",
+                                existing["id"],
+                                report,
+                            )
+                        missing_jobs = self._missing_derivation_job_types_tx(
+                            conn, existing["id"]
+                        )
+                        if missing_jobs:
+                            requeued = self._requeue_event_jobs_tx(
+                                conn, existing["id"], missing_jobs, now
+                            )
+                            logger.warning(
+                                "idempotent replay detected missing enrichment rows "
+                                "event=%s requeued_jobs=%s",
+                                existing["id"],
+                                requeued,
+                            )
                     conn.commit()
                     return result
 
@@ -1638,6 +1842,84 @@ class MemoryBrainStore:
         finally:
             conn.close()
 
+    def list_open_activity_intents(self, limit: int = 500) -> list[dict[str, Any]]:
+        """Durable begin_activity intents that have no terminal outcome yet.
+
+        Used at boot to close intents orphaned by a previous process crash.
+        """
+        conn = self._connect()
+        try:
+            intent_rows = conn.execute(
+                "SELECT id,event_type,title,summary,scene,occurred_at,metadata_json "
+                "FROM memory_events WHERE event_type='action_intent' "
+                "ORDER BY occurred_at ASC LIMIT ?",
+                (max(1, min(int(limit), 2000)),),
+            ).fetchall()
+            if not intent_rows:
+                return []
+            intent_keys = {
+                str(
+                    _json_loads(row["metadata_json"], {})
+                    .get("activity_key")
+                    or _json_loads(row["metadata_json"], {})
+                    .get("action_key")
+                    or ""
+                ).strip()
+                for row in intent_rows
+            }
+            intent_keys.discard("")
+            terminal_keys = set()
+            if intent_keys:
+                # Resolve terminal outcomes for exactly these intent keys, not
+                # a global newest-N window: with >5000 terminal events an old
+                # completed intent would otherwise be misclassified as open.
+                placeholders = ",".join("?" for _ in intent_keys)
+                params = list(intent_keys) + list(intent_keys)
+                try:
+                    terminal_rows = conn.execute(
+                        f"""SELECT metadata_json FROM memory_events
+                            WHERE event_type IN ('action_outcome','bot_action')
+                              AND (
+                                json_extract(metadata_json,'$.activity_key') IN ({placeholders})
+                                OR json_extract(metadata_json,'$.action_key') IN ({placeholders})
+                              )
+                            LIMIT 10000""",
+                        params,
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    # JSON1 unavailable: bounded full scan fallback (still keyed
+                    # by the requested intents after extraction).
+                    terminal_rows = conn.execute(
+                        "SELECT metadata_json FROM memory_events "
+                        "WHERE event_type IN ('action_outcome','bot_action') "
+                        "ORDER BY occurred_at DESC LIMIT 20000"
+                    ).fetchall()
+                for row in terminal_rows:
+                    meta = _json_loads(row["metadata_json"], {})
+                    key = str(meta.get("activity_key") or meta.get("action_key") or "").strip()
+                    if key and key in intent_keys:
+                        terminal_keys.add(key)
+            result = []
+            for row in intent_rows:
+                meta = _json_loads(row["metadata_json"], {})
+                key = str(meta.get("activity_key") or meta.get("action_key") or "").strip()
+                if not key or key in terminal_keys:
+                    continue
+                result.append(
+                    {
+                        "event_id": row["id"],
+                        "action_key": key,
+                        "action_type": str(meta.get("action_type") or ""),
+                        "scene": str(row["scene"] or ""),
+                        "title": str(row["title"] or ""),
+                        "summary": str(row["summary"] or ""),
+                        "occurred_at": float(row["occurred_at"] or 0.0),
+                    }
+                )
+            return result
+        finally:
+            conn.close()
+
     def stats(self) -> dict[str, Any]:
         conn = self._connect()
         try:
@@ -2057,6 +2339,19 @@ class MemoryBrainStore:
         if target_type not in {"event", "chunk"}:
             raise ValueError("target_type must be 'event' or 'chunk'")
         blob, dimension = encode_vector(vector)
+        # Pre-validate the target before registering a model row so a bad
+        # target_id cannot leave an orphaned embedding_models entry.
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                table = "memory_events" if target_type == "event" else "memory_chunks"
+                target_exists = conn.execute(
+                    f"SELECT 1 FROM {table} WHERE id=?", (target_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+        if not target_exists:
+            raise KeyError(f"unknown {target_type} target: {target_id}")
         model_id = self.register_embedding_model(provider, model, dimension, config_hash)
         now = time.time()
         with self._write_lock:
@@ -2120,9 +2415,48 @@ class MemoryBrainStore:
     ) -> None:
         with self._vector_cache_lock:
             if model_id is not None and target_type is not None:
-                self._vector_cache.pop((model_id, target_type), None)
+                entry = self._vector_cache.pop((model_id, target_type), None)
+                if entry is not None:
+                    self._vector_cache_rows = max(
+                        0,
+                        self._vector_cache_rows
+                        - int(getattr(entry.matrix, "shape", (0,))[0] or 0),
+                    )
             else:
                 self._vector_cache.clear()
+                self._vector_cache_rows = 0
+
+    @staticmethod
+    def _vector_cache_entry_rows(entry: _VectorCacheEntry) -> int:
+        try:
+            return int(entry.matrix.shape[0])
+        except Exception:
+            return 0
+
+    def _cache_entry_with_global_budget(
+        self,
+        cache_key: tuple[str, str],
+        entry: _VectorCacheEntry,
+    ) -> bool:
+        """Insert cache entry while keeping the TOTAL cached rows ≤ limit."""
+        rows = self._vector_cache_entry_rows(entry)
+        if rows <= 0 or rows > self.vector_cache_limit:
+            return False
+        # Evict other entries (insertion-ordered ≈ least recently hit, because
+        # hits re-insert their key at the end) until the new entry fits.
+        while self._vector_cache_rows + rows > self.vector_cache_limit:
+            victim = next(
+                (key for key in self._vector_cache if key != cache_key), None
+            )
+            if victim is None:
+                return False
+            removed = self._vector_cache.pop(victim)
+            self._vector_cache_rows = max(
+                0, self._vector_cache_rows - self._vector_cache_entry_rows(removed)
+            )
+        self._vector_cache[cache_key] = entry
+        self._vector_cache_rows += rows
+        return True
 
     def _build_vector_cache_entry(
         self,
@@ -2268,10 +2602,21 @@ class MemoryBrainStore:
         provider: str | None = None,
         model: str | None = None,
         config_hash: str = "",
+        event_ids: Sequence[str] | None = None,
     ) -> list[dict[str, Any]]:
         if target_type not in {"event", "chunk"}:
             raise ValueError("target_type must be 'event' or 'chunk'")
         query = normalize_vector(query_vector)
+        # Optional candidate prefilter: rank vectors only for events already
+        # surfaced by FTS / identifiers. This bounds a 100GB scan to a few
+        # hundred rows at the cost of purely semantic recall.
+        filter_ids: list[str] | None = None
+        if event_ids:
+            filter_ids = sorted(
+                {str(item) for item in event_ids if str(item or "").strip()}
+            )[:1000]
+            if not filter_ids:
+                return []
         exact_model = model_id is None and bool(provider and model)
         result_limit = max(1, min(int(limit), 1000))
         batch_size = self.vector_batch_size if batch_size is None else max(1, int(batch_size))
@@ -2286,6 +2631,7 @@ class MemoryBrainStore:
             and self.vector_cache_limit > 0
             and model_id is not None
             and not exact_model
+            and filter_ids is None
         ):
             cache_key = (model_id, target_type)
             with self._vector_cache_lock:
@@ -2295,6 +2641,10 @@ class MemoryBrainStore:
                         raise VectorDimensionError(
                             f"query dimension {len(query)} does not match model dimension {entry.dimension}"
                         )
+                    # Touch: move key to the end so global-budget eviction keeps
+                    # recently used entries first.
+                    self._vector_cache.pop(cache_key, None)
+                    self._vector_cache[cache_key] = entry
                     return self._rank_cached_vectors(
                         entry,
                         query,
@@ -2345,16 +2695,27 @@ class MemoryBrainStore:
             # Full-index completeness belongs in health reports, not recall gates —
             # partial embedding progress must still return partial hits.
             embedding_count: int | None = None
+            filter_sql = ""
+            filter_params: tuple = ()
+            if filter_ids is not None:
+                placeholders = ",".join("?" for _ in filter_ids)
+                filter_sql = f" AND event_id IN ({placeholders})"
+                filter_params = tuple(filter_ids)
             if exact_model:
                 indexed = conn.execute(
-                    "SELECT count(*) FROM memory_embeddings WHERE model_id=? AND target_type=?",
-                    (model_id, target_type),
+                    f"SELECT count(*) FROM memory_embeddings "
+                    f"WHERE model_id=? AND target_type=?{filter_sql}",
+                    (model_id, target_type, *filter_params),
                 ).fetchone()[0]
                 if not indexed:
                     return []
                 embedding_count = int(indexed)
 
-            if np is not None and self.vector_cache_limit > 0:
+            if (
+                np is not None
+                and self.vector_cache_limit > 0
+                and filter_ids is None
+            ):
                 cache_key = (model_id, target_type)
                 # Warm-cache fast path: skip COUNT(*) when entry already loaded.
                 with self._vector_cache_lock:
@@ -2375,9 +2736,15 @@ class MemoryBrainStore:
                 if embedding_count is None:
                     embedding_count = int(
                         conn.execute(
-                            "SELECT count(*) FROM memory_embeddings WHERE model_id=? AND target_type=?",
-                            (model_id, target_type),
+                            f"SELECT count(*) FROM memory_embeddings "
+                            f"WHERE model_id=? AND target_type=?{filter_sql}",
+                            (model_id, target_type, *filter_params),
                         ).fetchone()[0]
+                    )
+                scan_limit = max(0, int(getattr(self, "vector_full_scan_row_limit", 0) or 0))
+                if scan_limit and embedding_count > scan_limit:
+                    raise VectorScanTooLargeError(
+                        rows=int(embedding_count), limit=scan_limit
                     )
                 if embedding_count <= self.vector_cache_limit:
                     with self._vector_cache_lock:
@@ -2394,8 +2761,11 @@ class MemoryBrainStore:
                                 expected_count=embedding_count,
                                 np=np,
                             )
-                            if entry is not None:
-                                self._vector_cache[cache_key] = entry
+                        if entry is not None:
+                            if not self._cache_entry_with_global_budget(
+                                cache_key, entry
+                            ):
+                                entry = None
                         if entry is not None:
                             return self._rank_cached_vectors(
                                 entry,
@@ -2411,10 +2781,10 @@ class MemoryBrainStore:
             last_id = ""
             while True:
                 rows = conn.execute(
-                    """SELECT id,target_id,event_id,vector_blob FROM memory_embeddings
-                       WHERE model_id=? AND target_type=? AND id>?
-                       ORDER BY id LIMIT ?""",
-                    (model_id, target_type, last_id, batch_size),
+                    f"SELECT id,target_id,event_id,vector_blob FROM memory_embeddings "
+                    f"WHERE model_id=? AND target_type=?{filter_sql} AND id>? "
+                    f"ORDER BY id LIMIT ?",
+                    (model_id, target_type, *filter_params, last_id, batch_size),
                 ).fetchall()
                 if not rows:
                     break
@@ -2532,6 +2902,345 @@ class MemoryBrainStore:
             ),
         )
 
+    def _missing_derivation_job_types_tx(
+        self,
+        conn: sqlite3.Connection,
+        event_id: str,
+    ) -> list[str]:
+        """Return job types whose produced derived rows are now missing.
+
+        Produced-row watermarks are read from live job payloads first and from
+        the event's ``_v6_result_watermarks`` metadata second (copied there by
+        ``prune_finished_jobs`` before terminal job rows were removed).  For
+        legacy rows without any watermark only embedding jobs can be detected
+        safely: a completed embed job always produced at least one vector,
+        whereas zero extracted entities or zero suggested links are legitimate.
+        """
+        job_rows = conn.execute(
+            "SELECT job_type,status,payload_json FROM brain_jobs "
+            "WHERE event_id=? ORDER BY created_at,id",
+            (event_id,),
+        ).fetchall()
+        chunk_count = int(
+            conn.execute(
+                "SELECT COUNT(*) FROM memory_chunks WHERE event_id=?",
+                (event_id,),
+            ).fetchone()[0]
+            or 0
+        )
+        current = {
+            "event_embeddings": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings "
+                    "WHERE event_id=? AND target_type='event'",
+                    (event_id,),
+                ).fetchone()[0]
+                or 0
+            ),
+            "chunk_embeddings": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_embeddings "
+                    "WHERE event_id=? AND target_type='chunk'",
+                    (event_id,),
+                ).fetchone()[0]
+                or 0
+            ),
+            "entity_mentions": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_entity_mentions WHERE event_id=?",
+                    (event_id,),
+                ).fetchone()[0]
+                or 0
+            ),
+            "links": int(
+                conn.execute(
+                    "SELECT COUNT(*) FROM memory_links WHERE source_event_id=?",
+                    (event_id,),
+                ).fetchone()[0]
+                or 0
+            ),
+        }
+        expected_by_type = {
+            "embed_event": "event_embeddings",
+            "embed_chunks": "chunk_embeddings",
+            "extract_entities": "entity_mentions",
+            "link_associations": "links",
+        }
+        # Job payload watermarks (authoritative while the job row exists).
+        payload_watermarks: dict[str, dict[str, int]] = {}
+        row_status: dict[str, str] = {}
+        for row in job_rows:
+            job_type = str(row["job_type"] or "")
+            row_status[job_type] = str(row["status"] or "")
+            payload = _json_loads(row["payload_json"], {})
+            produced = payload.get("result_counts") if isinstance(payload, Mapping) else {}
+            if isinstance(produced, Mapping):
+                payload_watermarks[job_type] = {
+                    str(key): int(value)
+                    for key, value in produced.items()
+                    if str(key) in current
+                }
+        # Metadata watermarks survive prune_finished_jobs.
+        metadata_row = conn.execute(
+            "SELECT metadata_json FROM memory_events WHERE id=?", (event_id,)
+        ).fetchone()
+        metadata_watermarks: dict[str, int] = {}
+        if metadata_row is not None:
+            meta = _json_loads(metadata_row["metadata_json"], {})
+            if isinstance(meta, Mapping):
+                stored = meta.get("_v6_result_watermarks")
+                if isinstance(stored, Mapping):
+                    metadata_watermarks = {
+                        str(key): int(value)
+                        for key, value in stored.items()
+                        if str(key) in current
+                    }
+        missing: list[str] = []
+        for job_type, produced_field in expected_by_type.items():
+            expected: Optional[int] = None
+            job_wm = payload_watermarks.get(job_type)
+            if job_wm is not None and produced_field in job_wm:
+                expected = job_wm[produced_field]
+            elif produced_field in metadata_watermarks:
+                expected = metadata_watermarks[produced_field]
+            if expected is not None:
+                if current[produced_field] < expected:
+                    missing.append(job_type)
+                continue
+            if job_type == "embed_event" and row_status.get(job_type) == "completed":
+                if current["event_embeddings"] == 0:
+                    missing.append(job_type)
+            elif job_type == "embed_chunks" and row_status.get(job_type) == "completed":
+                if chunk_count > 0 and current["chunk_embeddings"] == 0:
+                    missing.append(job_type)
+        return list(dict.fromkeys(missing))
+
+    def _requeue_event_jobs_tx(
+        self,
+        conn: sqlite3.Connection,
+        event_id: str,
+        job_types: Sequence[str],
+        now: float,
+    ) -> list[str]:
+        """Requeue or recreate enrichment job rows for one event (same tx)."""
+        requeued: list[str] = []
+        for job_type in job_types:
+            job_type = str(job_type).strip()
+            if not job_type:
+                continue
+            existing = conn.execute(
+                "SELECT id,status FROM brain_jobs WHERE event_id=? AND job_type=?",
+                (event_id, job_type),
+            ).fetchone()
+            if existing is None:
+                job_id = _new_id("job")
+                conn.execute(
+                    """INSERT INTO brain_jobs(
+                        id,dedupe_key,job_type,event_id,payload_json,status,attempts,
+                        max_attempts,available_at,created_at,updated_at
+                    ) VALUES(?,?,?,?,?,'pending',0,?,?,?,?)""",
+                    (
+                        job_id,
+                        f"{event_id}:{job_type}",
+                        job_type,
+                        event_id,
+                        _json_dumps({"event_id": event_id}),
+                        (
+                            self.link_job_max_attempts
+                            if job_type == "link_associations"
+                            else self.job_max_attempts
+                        ),
+                        now,
+                        now,
+                        now,
+                    ),
+                )
+                requeued.append(job_type)
+            elif existing["status"] not in ("processing", "blocked", "dead"):
+                changed = conn.execute(
+                    """UPDATE brain_jobs SET status='pending',attempts=0,available_at=?,
+                        lease_owner=NULL,leased_until=NULL,last_error='',completed_at=NULL,
+                        updated_at=? WHERE id=? AND status NOT IN
+                        ('processing','blocked','dead')""",
+                    (now, now, existing["id"]),
+                ).rowcount
+                if changed:
+                    requeued.append(job_type)
+        if requeued:
+            conn.execute(
+                "UPDATE memory_events SET index_status='pending',updated_at=? WHERE id=?",
+                (now, event_id),
+            )
+        return requeued
+
+    def scan_derivation_repairs(
+        self,
+        *,
+        limit: int = 500,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Scan ready events and requeue only evidence-backed missing derivations.
+
+        Covers rows that never went through idempotent replay: a completed
+        embed/entity/link job with ``result_counts`` watermarks (or the legacy
+        completed-embed signal) is compared against the live derived rows and
+        missing jobs are recreated.  Events with no evidence are left alone —
+        zero extracted entities/links can be a legitimate outcome.
+        """
+        bounded = max(1, min(int(limit), 2000))
+        now = time.time()
+        repaired: dict[str, list[str]] = {}
+        scanned = 0
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                # dry_run only reads. A read-only scan must not hold a write
+                # transaction: on a large legacy DB the old implementation
+                # held BEGIN IMMEDIATE for ~190s and starved the durable worker
+                # into "database is locked" crashes.
+                if not dry_run:
+                    conn.execute("BEGIN IMMEDIATE")
+                rows = conn.execute(
+                    "SELECT id FROM memory_events WHERE index_status='ready' "
+                    "ORDER BY updated_at,id LIMIT ?",
+                    (bounded,),
+                ).fetchall()
+                scanned = len(rows)
+                for row in rows:
+                    event_id = str(row["id"] or "")
+                    missing = self._missing_derivation_job_types_tx(conn, event_id)
+                    if not missing:
+                        continue
+                    if dry_run:
+                        repaired[event_id] = missing
+                        continue
+                    requeued = self._requeue_event_jobs_tx(
+                        conn, event_id, missing, now
+                    )
+                    if requeued:
+                        repaired[event_id] = requeued
+                if not dry_run:
+                    conn.commit()
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.close()
+        return {
+            "scanned": scanned,
+            "repaired_events": len(repaired),
+            "dry_run": bool(dry_run),
+            "details": repaired,
+        }
+
+    def _repair_event_derivations_tx(
+        self,
+        conn: sqlite3.Connection,
+        event_id: str,
+    ) -> dict[str, int]:
+        """Rebuild chunks + both FTS tables for one event (same-transaction).
+
+        Used when an idempotent replay finds a ``ready`` event whose derived
+        rows were lost by external interference.
+        """
+        event = conn.execute(
+            "SELECT id FROM memory_events WHERE id=?", (event_id,)
+        ).fetchone()
+        if not event:
+            raise KeyError(f"unknown event: {event_id}")
+        observations = conn.execute(
+            "SELECT id,source_id,ordinal,text FROM memory_observations "
+            "WHERE event_id=? ORDER BY ordinal",
+            (event_id,),
+        ).fetchall()
+        source_external = {
+            row["id"]: row["external_id"]
+            for row in conn.execute(
+                "SELECT id,external_id FROM memory_sources WHERE event_id=?",
+                (event_id,),
+            ).fetchall()
+        }
+        now = time.time()
+        rebuilt_chunks = 0
+        # Chunk rows are about to be recreated with new IDs; old chunk
+        # embeddings reference deleted chunk IDs and would both leak in vector
+        # search and make _missing_derivation_job_types_tx believe embed_chunks
+        # is already done (leaving the new chunks vectorless).
+        conn.execute(
+            "DELETE FROM memory_embeddings WHERE event_id=? AND target_type='chunk'",
+            (event_id,),
+        )
+        if observations:
+            conn.execute("DELETE FROM memory_chunks WHERE event_id=?", (event_id,))
+            conn.execute("DELETE FROM memory_chunk_fts WHERE event_id=?", (event_id,))
+            chunk_ordinal = 0
+            previous_text = ""
+            for observation in observations:
+                for chunk in self._chunk_observation(
+                    observation["text"], previous_text
+                ):
+                    chunk_id = _new_id("chk")
+                    conn.execute(
+                        """INSERT INTO memory_chunks(
+                            id,event_id,source_id,observation_id,ordinal,observation_ordinal,
+                            text,content_hash,start_char,end_char,overlap_chars,char_count,
+                            token_count,created_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            chunk_id,
+                            event_id,
+                            observation["source_id"],
+                            observation["id"],
+                            chunk_ordinal,
+                            observation["ordinal"],
+                            chunk["text"],
+                            content_hash(chunk["text"]),
+                            chunk["start_char"],
+                            chunk["end_char"],
+                            chunk["overlap_chars"],
+                            chunk["char_count"],
+                            chunk["token_count"],
+                            now,
+                        ),
+                    )
+                    conn.execute(
+                        "INSERT INTO memory_chunk_fts(chunk_id,event_id,search_text) VALUES(?,?,?)",
+                        (
+                            chunk_id,
+                            event_id,
+                            build_fts_text(
+                                chunk["text"],
+                                (
+                                    chunk_id,
+                                    event_id,
+                                    source_external.get(observation["source_id"], ""),
+                                ),
+                            ),
+                        ),
+                    )
+                    chunk_ordinal += 1
+                    rebuilt_chunks += 1
+                previous_text = observation["text"]
+        self._rebuild_event_fts(conn, event_id)
+        return {"chunks": rebuilt_chunks, "event_fts": 1, "chunk_fts": rebuilt_chunks}
+
+    def repair_event_derivations(self, event_id: str) -> dict[str, int]:
+        """Public wrapper for same-transaction derived-row repair."""
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                report = self._repair_event_derivations_tx(conn, event_id)
+                conn.commit()
+                return report
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.close()
+
     def update_event_summary(self, event_id: str, summary: str) -> None:
         now = time.time()
         with self._write_lock:
@@ -2648,6 +3357,70 @@ class MemoryBrainStore:
                 raise
             finally:
                 conn.close()
+
+    def suggest_entity_links(
+        self,
+        event_id: str,
+        candidate_event_ids: Sequence[str],
+        *,
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        """Deterministic ``related_to`` links from shared extracted entities.
+
+        Used as an evidence-based fallback when the LLM linker returns an
+        empty/None result: entity co-occurrence is exactly the kind of topical
+        association ``related_to`` is allowed to express, and it never invents
+        a target the brain has not already seen.
+        """
+        bounded = max(1, min(int(limit), 24))
+        candidates = [str(item) for item in candidate_event_ids if item]
+        candidates = list(dict.fromkeys(candidates))[:50]
+        if not candidates:
+            return []
+        conn = self._connect()
+        try:
+            source_rows = conn.execute(
+                "SELECT DISTINCT entity_id FROM memory_entity_mentions WHERE event_id=?",
+                (event_id,),
+            ).fetchall()
+            source_entities = {str(row["entity_id"]) for row in source_rows}
+            if not source_entities:
+                return []
+            placeholders = ",".join("?" for _ in source_entities)
+            ranked: list[tuple[float, str]] = []
+            for candidate_id in candidates:
+                if candidate_id == event_id:
+                    continue
+                rows = conn.execute(
+                    f"""SELECT DISTINCT entity_id FROM memory_entity_mentions
+                        WHERE event_id=? AND entity_id IN ({placeholders})""",
+                    [candidate_id, *source_entities],
+                ).fetchall()
+                overlap = len(rows)
+                if overlap <= 0:
+                    continue
+                candidate_count = int(
+                    conn.execute(
+                        "SELECT COUNT(DISTINCT entity_id) FROM memory_entity_mentions WHERE event_id=?",
+                        (candidate_id,),
+                    ).fetchone()[0]
+                    or 0
+                )
+                union = max(1, len(source_entities) + candidate_count - overlap)
+                weight = min(0.95, max(0.3, overlap / union))
+                ranked.append((weight, candidate_id))
+            ranked.sort(reverse=True)
+            return [
+                {
+                    "target_event_id": candidate_id,
+                    "relation_type": "related_to",
+                    "weight": round(weight, 4),
+                    "evidence_ids": [event_id, candidate_id],
+                }
+                for weight, candidate_id in ranked[:bounded]
+            ]
+        finally:
+            conn.close()
 
     def upsert_links(
         self,
@@ -2926,18 +3699,442 @@ class MemoryBrainStore:
             finally:
                 conn.close()
 
-    def complete_job(self, job_id: str, worker_id: str) -> bool:
+    def complete_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        result_counts: Optional[Mapping[str, int]] = None,
+    ) -> bool:
+        """Mark a leased job completed; optionally persist produced-row counts.
+
+        ``result_counts`` is the durability watermark used by idempotent replay
+        repair to decide whether derived rows (embeddings/entities/links) were
+        lost after the job completed.
+        """
         now = time.time()
         with self._write_lock:
             conn = self._connect()
             try:
-                changed = conn.execute(
-                    """UPDATE brain_jobs SET status='completed',lease_owner=NULL,leased_until=NULL,
-                        last_error='',completed_at=?,updated_at=?
-                        WHERE id=? AND status='processing' AND lease_owner=?""",
-                    (now, now, job_id, worker_id),
-                ).rowcount
+                if result_counts:
+                    row = conn.execute(
+                        "SELECT payload_json FROM brain_jobs "
+                        "WHERE id=? AND status='processing' AND lease_owner=?",
+                        (job_id, worker_id),
+                    ).fetchone()
+                    if not row:
+                        return False
+                    payload = _json_loads(row["payload_json"], {})
+                    payload["result_counts"] = {
+                        str(key): int(value) for key, value in result_counts.items()
+                    }
+                    changed = conn.execute(
+                        """UPDATE brain_jobs SET status='completed',lease_owner=NULL,
+                            leased_until=NULL,last_error='',payload_json=?,
+                            completed_at=?,updated_at=?
+                            WHERE id=? AND status='processing' AND lease_owner=?""",
+                        (_json_dumps(payload), now, now, job_id, worker_id),
+                    ).rowcount
+                else:
+                    changed = conn.execute(
+                        """UPDATE brain_jobs SET status='completed',lease_owner=NULL,leased_until=NULL,
+                            last_error='',completed_at=?,updated_at=?
+                            WHERE id=? AND status='processing' AND lease_owner=?""",
+                        (now, now, job_id, worker_id),
+                    ).rowcount
                 return bool(changed)
+            finally:
+                conn.close()
+
+    def prune_finished_jobs(self, *, older_than_seconds: float = 30 * 24 * 3600) -> int:
+        """Remove terminal outbox rows (completed/dead) older than the window.
+
+        ``brain_jobs`` is operational bookkeeping, not memory content: pruning
+        terminal rows cannot lose events/chunks/vectors/FTS. Before deletion,
+        produced-row watermarks (``result_counts``) are copied into the event's
+        ``metadata_json`` under ``_v6_result_watermarks`` so a later idempotent
+        replay can still detect derived rows lost after the job row is gone.
+        Tombstones are intentionally never pruned — they are the privacy guard
+        against re-ingesting explicitly deleted content.
+        """
+        now = time.time()
+        cutoff = now - max(1.0, float(older_than_seconds))
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                doomed = conn.execute(
+                    "SELECT job_type,event_id,payload_json FROM brain_jobs "
+                    "WHERE status IN ('completed','dead') "
+                    "AND COALESCE(completed_at, updated_at, 0) < ?",
+                    (cutoff,),
+                ).fetchall()
+                changed = conn.execute(
+                    "DELETE FROM brain_jobs WHERE status IN ('completed','dead') "
+                    "AND COALESCE(completed_at, updated_at, 0) < ?",
+                    (cutoff,),
+                ).rowcount
+                watermarks: dict[str, dict[str, int]] = {}
+                for row in doomed:
+                    payload = _json_loads(row["payload_json"], {})
+                    counts = payload.get("result_counts") if isinstance(payload, Mapping) else {}
+                    if not isinstance(counts, Mapping) or not counts:
+                        continue
+                    event_wm = watermarks.setdefault(str(row["event_id"] or ""), {})
+                    for key, value in counts.items():
+                        try:
+                            event_wm[str(key)] = int(value)
+                        except (TypeError, ValueError):
+                            continue
+                for event_id, produced in watermarks.items():
+                    meta_row = conn.execute(
+                        "SELECT metadata_json FROM memory_events WHERE id=?",
+                        (event_id,),
+                    ).fetchone()
+                    if meta_row is None:
+                        continue
+                    meta = _json_loads(meta_row["metadata_json"], {})
+                    if not isinstance(meta, dict):
+                        meta = {}
+                    prior = meta.get("_v6_result_watermarks")
+                    merged = dict(prior) if isinstance(prior, Mapping) else {}
+                    merged.update(produced)
+                    meta["_v6_result_watermarks"] = merged
+                    conn.execute(
+                        "UPDATE memory_events SET metadata_json=?,updated_at=? WHERE id=?",
+                        (_json_dumps(meta), now, event_id),
+                    )
+                conn.commit()
+                return int(changed or 0)
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def prune_recall_traces(
+        self,
+        *,
+        older_than_seconds: float = 7 * 24 * 3600,
+        keep_recent: int = 5000,
+    ) -> int:
+        """Bound operational recall diagnostics; never touches memory content.
+
+        recall_traces / recall_candidates are debug bookkeeping only. Keep the
+        newest ``keep_recent`` traces and drop the rest once older than the
+        retention window (candidate rows cascade via FK).
+        """
+        now = time.time()
+        cutoff = now - max(1.0, float(older_than_seconds))
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                changed = conn.execute(
+                    """DELETE FROM recall_traces WHERE created_at < ?
+                        AND id NOT IN (
+                            SELECT id FROM recall_traces
+                            ORDER BY created_at DESC, id DESC LIMIT ?
+                        )""",
+                    (cutoff, max(1, int(keep_recent))),
+                ).rowcount
+                conn.commit()
+                return int(changed or 0)
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def pseudonymize_legacy_actors(
+        self,
+        pseudonymize,
+        *,
+        bot_actor_id: str = "",
+        dry_run: bool = False,
+    ) -> int:
+        """One-time remediation: replace legacy raw platform UIDs with pseudonyms.
+
+        Older builds stored raw Bilibili mids as ``speaker_actor_id`` /
+        ``observation.actor_id`` and inside structured source payloads
+        (hot-comment/thread JSON). This rewrites those rows to the same
+        account-salt pseudonym produced by ``PrivateMessageRedactor``, updates
+        row hashes, and recomputes the event content hash so future idempotent
+        replays match the pseudonymized envelopes emitted by current callers.
+
+        ``dry_run=True`` only counts affected events and changes nothing.
+        """
+        if not callable(pseudonymize):
+            raise ValueError("pseudonymize must be callable")
+
+        def map_actor(value: Any) -> str:
+            raw = str(value or "").strip()
+            if not _looks_like_platform_uid(raw):
+                return raw
+            if bot_actor_id and raw == str(bot_actor_id).strip():
+                return "self"
+            try:
+                return str(pseudonymize(raw))
+            except Exception:
+                # Fail-closed placeholder, never leave the raw UID behind.
+                return "actor_" + content_hash("bilibot-legacy-actor:" + raw)[:24]
+
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                event_ids = [
+                    row[0]
+                    for row in conn.execute("SELECT id FROM memory_events").fetchall()
+                ]
+                affected = 0
+                if dry_run:
+                    return sum(
+                        1
+                        for event_id in event_ids
+                        if _legacy_event_has_raw_actor(conn, event_id)
+                    )
+                conn.execute("BEGIN IMMEDIATE")
+                for event_id in event_ids:
+                    if not _legacy_event_has_raw_actor(conn, event_id):
+                        continue
+                    event = conn.execute(
+                        "SELECT event_type,title,summary,speaker_actor_id,"
+                        "persona_id,scene,importance,metadata_json "
+                        "FROM memory_events WHERE id=?",
+                        (event_id,),
+                    ).fetchone()
+                    if event is None:
+                        continue
+                    new_speaker = map_actor(event["speaker_actor_id"])
+                    source_rows = conn.execute(
+                        "SELECT id,ordinal,source_type,external_id,full_text,"
+                        "structured_json FROM memory_sources WHERE event_id=? "
+                        "ORDER BY ordinal",
+                        (event_id,),
+                    ).fetchall()
+                    sources: list[SourceDocument] = []
+                    source_changed = False
+                    for srow in source_rows:
+                        data = _json_loads(srow["structured_json"], {})
+                        new_data, data_changed = _pseudonymize_actor_payload(
+                            data,
+                            pseudonymize,
+                            bot_actor_id=bot_actor_id,
+                        )
+                        full_text = str(srow["full_text"] or "")
+                        new_full = full_text
+                        full_changed = False
+                        try:
+                            parsed_full = json.loads(full_text)
+                            sanitized_full, full_changed = _pseudonymize_actor_payload(
+                                parsed_full,
+                                pseudonymize,
+                                bot_actor_id=bot_actor_id,
+                            )
+                            if full_changed:
+                                new_full = json.dumps(
+                                    sanitized_full,
+                                    ensure_ascii=False,
+                                    sort_keys=True,
+                                    indent=2,
+                                    default=_json_default,
+                                )
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                        observations: list[Observation] = []
+                        obs_rows = conn.execute(
+                            "SELECT id,ordinal,modality,actor_id,external_id,text,"
+                            "structured_json,occurred_at,start_ms,end_ms,ignored,"
+                            "ignore_reason,extractor_version FROM memory_observations "
+                            "WHERE source_id=? ORDER BY ordinal",
+                            (srow["id"],),
+                        ).fetchall()
+                        for orow in obs_rows:
+                            new_actor = map_actor(orow["actor_id"])
+                            odata = _json_loads(orow["structured_json"], {})
+                            new_odata, odata_changed = _pseudonymize_actor_payload(
+                                odata,
+                                pseudonymize,
+                                bot_actor_id=bot_actor_id,
+                            )
+                            new_text = orow["text"]
+                            text_changed = False
+                            if (
+                                full_changed
+                                and orow["modality"] == srow["source_type"]
+                                and orow["text"] == full_text
+                            ):
+                                # The archive wrote a fallback observation that
+                                # echoes the source full_text; sanitized
+                                # full_text must propagate into that row too.
+                                new_text = new_full
+                                text_changed = True
+                            observations.append(
+                                Observation(
+                                    text=new_text,
+                                    modality=orow["modality"],
+                                    actor_id=new_actor,
+                                    occurred_at=orow["occurred_at"],
+                                    start_ms=orow["start_ms"],
+                                    end_ms=orow["end_ms"],
+                                    external_id=orow["external_id"],
+                                    data=new_odata,
+                                    ignored=bool(orow["ignored"]),
+                                    ignore_reason=orow["ignore_reason"] or "",
+                                    extractor_version=orow["extractor_version"] or "",
+                                )
+                            )
+                            if (
+                                new_actor != orow["actor_id"]
+                                or odata_changed
+                                or text_changed
+                            ):
+                                source_changed = True
+                                conn.execute(
+                                    "UPDATE memory_observations SET actor_id=?,"
+                                    "structured_json=?,content_hash=?,text=? WHERE id=?",
+                                    (
+                                        new_actor,
+                                        _json_dumps(new_odata),
+                                        _observation_row_hash(
+                                            ordinal=orow["ordinal"],
+                                            observation=observations[-1],
+                                        ),
+                                        new_text,
+                                        orow["id"],
+                                    ),
+                                )
+                        if data_changed or full_changed:
+                            source_changed = True
+                            conn.execute(
+                                "UPDATE memory_sources SET structured_json=?,"
+                                "full_text=?,content_hash=? WHERE id=?",
+                                (
+                                    _json_dumps(new_data),
+                                    new_full,
+                                    _source_row_hash(
+                                        ordinal=srow["ordinal"],
+                                        source_type=srow["source_type"],
+                                        external_id=srow["external_id"],
+                                        full_text=new_full,
+                                        structured_data=new_data,
+                                    ),
+                                    srow["id"],
+                                ),
+                            )
+                        sources.append(
+                            SourceDocument(
+                                source_type=srow["source_type"],
+                                full_text=new_full,
+                                external_id=srow["external_id"],
+                                data=new_data,
+                                observations=tuple(observations),
+                            )
+                        )
+                    if (
+                        new_speaker == event["speaker_actor_id"]
+                        and not source_changed
+                    ):
+                        # Candidate check was a false positive (e.g. pseudonym
+                        # containing digits); leave the event untouched.
+                        continue
+                    metadata = _json_loads(event["metadata_json"], {})
+                    # ``summary`` is an enriched derived field, not part of the
+                    # original envelope hash. Reconstruct the original
+                    # event_summary for the ingestion adapters that can carry
+                    # raw actor rows; future replays compute their hash against
+                    # the original summary, not the enrichment.
+                    event_summary = event["summary"]
+                    event_type = str(event["event_type"] or "")
+                    if event_type in {"conversation_message", "conversation_context"}:
+                        event_summary = ""
+                    elif event_type == "video_metadata_observation":
+                        owner_name = ""
+                        if isinstance(metadata, Mapping):
+                            owner_name = str(metadata.get("owner") or "")
+                        event_summary = (
+                            f"获取了视频《{event['title']}》的元数据，UP主 {owner_name}"
+                        ).strip()
+                    elif event_type == "video_observation":
+                        video_detail = next(
+                            (
+                                item.full_text
+                                for item in sources
+                                if item.source_type == "video_detail"
+                            ),
+                            "",
+                        )
+                        if video_detail:
+                            event_summary = video_detail
+                        else:
+                            owner_name = ""
+                            if isinstance(metadata, Mapping):
+                                owner_name = str(metadata.get("owner") or "")
+                            event_summary = (
+                                f"观察了视频《{event['title']}》，UP主 {owner_name}"
+                            )
+                    envelope = ObservationEnvelope(
+                        idempotency_key="legacy-pseudonymization",
+                        event_type=event["event_type"],
+                        event_title=event["title"],
+                        event_summary=event_summary,
+                        speaker_actor_id=new_speaker,
+                        persona_id=event["persona_id"],
+                        scene=event["scene"],
+                        importance=float(event["importance"] or 0.5),
+                        metadata=metadata,
+                        sources=tuple(sources),
+                    )
+                    new_digest = _envelope_hash(envelope, sources)
+                    if (
+                        new_speaker != event["speaker_actor_id"]
+                        or source_changed
+                        or new_digest != conn.execute(
+                            "SELECT content_hash FROM memory_events WHERE id=?",
+                            (event_id,),
+                        ).fetchone()[0]
+                    ):
+                        conn.execute(
+                            "UPDATE memory_events SET speaker_actor_id=?,"
+                            "content_hash=?,updated_at=? WHERE id=?",
+                            (new_speaker, new_digest, time.time(), event_id),
+                        )
+                        if event_type == "video_metadata_observation":
+                            # The adapter's idempotency key embeds the compact
+                            # metadata digest; after pseudonymizing owner.mid
+                            # the key must move with it or future replays would
+                            # create a duplicate row.
+                            from .ingestion import _stable_hash
+
+                            safe_metadata = (
+                                sources[0].data if sources else {}
+                            )
+                            oid_or_bvid = ""
+                            if isinstance(metadata, Mapping):
+                                oid_or_bvid = str(
+                                    metadata.get("oid")
+                                    or metadata.get("bvid")
+                                    or ""
+                                )
+                            new_key = (
+                                f"video_metadata:{self.account_id}:"
+                                f"{oid_or_bvid}:{_stable_hash(safe_metadata)}"
+                            )
+                            conn.execute(
+                                "UPDATE memory_events SET idempotency_key=? "
+                                "WHERE id=?",
+                                (new_key, event_id),
+                            )
+                        if source_changed:
+                            self._rebuild_event_fts(conn, event_id)
+                        affected += 1
+                conn.commit()
+                return affected
+            except Exception:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
             finally:
                 conn.close()
 
@@ -3015,7 +4212,8 @@ class MemoryBrainStore:
                 # attempts already bumped on claim_jobs; do not double-count here.
                 attempts = int(row["attempts"])
                 status = "dead" if attempts >= row["max_attempts"] else "retry"
-                delay = 0.0 if status == "dead" else min(3600.0, 5.0 * (2 ** max(0, attempts - 1)))
+                # PRD 9.1：min(30 * 2^(attempt-1), 3600)
+                delay = 0.0 if status == "dead" else min(3600.0, 30.0 * (2 ** max(0, attempts - 1)))
                 conn.execute(
                     """UPDATE brain_jobs SET status=?,available_at=?,lease_owner=NULL,
                         leased_until=NULL,last_error=?,updated_at=? WHERE id=?""",
@@ -3036,17 +4234,36 @@ class MemoryBrainStore:
             finally:
                 conn.close()
 
-    def unblock_blocked_jobs(self, job_types: Sequence[str] | None = None) -> int:
+    def unblock_blocked_jobs(
+        self,
+        job_types: Sequence[str] | None = None,
+        *,
+        min_blocked_age_seconds: float = 0.0,
+    ) -> int:
         """Re-open blocked jobs when a provider becomes available.
 
         P0-D: reset attempts to 0 on unblock. claim_jobs increments attempts on
         every start; without a reset, a job that was blocked after several
         claims can become pending forever (attempts >= max_attempts still
         blocks claim).
+
+        The common case is zero blocked rows. Count first so the worker's
+        1s poll does not start a no-op write transaction on a large brain
+        (which can contend with WAL checkpoints and stall for the full SQLite
+        busy timeout).
+
+        ``min_blocked_age_seconds`` keeps recently blocked jobs in place.
+        Without it, a provider that returns no result for one specific job is
+        misdiagnosed as ProviderNotConfigured and the job loops
+        claim→block→unblock forever, resetting attempts each cycle.
         """
         now = time.time()
-        params: list[Any] = [now, now]
+        grace = max(0.0, float(min_blocked_age_seconds))
+        params: list[Any] = []
         where = "status='blocked'"
+        if grace > 0:
+            where += " AND updated_at<=?"
+            params.append(now - grace)
         if job_types:
             values = [str(value) for value in job_types]
             where += f" AND job_type IN ({','.join('?' for _ in values)})"
@@ -3054,11 +4271,16 @@ class MemoryBrainStore:
         with self._write_lock:
             conn = self._connect()
             try:
+                count = conn.execute(
+                    f"SELECT COUNT(*) FROM brain_jobs WHERE {where}", params
+                ).fetchone()[0]
+                if not count:
+                    return 0
                 changed = conn.execute(
                     f"""UPDATE brain_jobs SET status='pending',attempts=0,available_at=?,
                         last_error='',lease_owner=NULL,leased_until=NULL,
                         updated_at=? WHERE {where}""",
-                    params,
+                    [now, now, *params],
                 ).rowcount
                 return int(changed)
             finally:
@@ -3384,12 +4606,12 @@ class MemoryBrainStore:
         with self._write_lock:
             conn = self._connect()
             try:
-                changed = conn.execute(
+                conn.execute(
                     "UPDATE memory_events SET index_status=?,updated_at=? WHERE id=?",
                     (status, time.time(), event_id),
-                ).rowcount
-                if not changed:
-                    raise KeyError(f"unknown event: {event_id}")
+                )
+                # Deleted-while-processing is a valid race for the durable
+                # worker: the row is gone, there is nothing left to index.
             finally:
                 conn.close()
 

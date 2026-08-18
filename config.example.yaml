@@ -20,6 +20,9 @@ chat_providers:
     model: "Qwen/Qwen2.5-72B-Instruct"
     max_tokens: 1024
     temperature: 0.8
+    # 推理型模型（如 agnes-2.0-flash）单次调用可能耗时数分钟；
+    # 建议显式放大 HTTP 超时，避免记忆富化被 APITimeoutError 打断。
+    timeout: 600
     enabled: true
   # 可添加更多：
   # - id: openai
@@ -39,6 +42,7 @@ vision_providers:
     #   - "sk-vision-2"
     base_url: "https://api.siliconflow.cn/v1"
     model: "Qwen/Qwen2-VL-72B-Instruct"
+    timeout: 600
     enabled: false
 
 # ── Embedding 模型（记忆系统向量检索） ──
@@ -48,6 +52,15 @@ embedding_providers:
     api_key: ""                    # 留空则回退到对话模型的 api_key
     base_url: "https://api.siliconflow.cn/v1"
     model: "BAAI/bge-m3"
+    enabled: false
+
+# ── Rerank 模型（记忆召回精排；优先于对话 JSON 重排） ──
+rerank_providers:
+  - id: siliconflow-rerank
+    name: 硅基流动 Rerank
+    api_key: ""                    # 留空则回退到对话模型的 api_key
+    base_url: "https://api.siliconflow.cn/v1"
+    model: "BAAI/bge-reranker-v2-m3"
     enabled: false
 
 # ── ASR 语音识别模型（视频理解音频轨） ──
@@ -81,6 +94,7 @@ model_routing:
   chat: siliconflow               # 对话（主动回复/动态/记忆提取）
   vision: siliconflow-vision      # 视频视觉轨
   embedding: siliconflow-embed    # 记忆向量检索
+  rerank: siliconflow-rerank      # 记忆重排序（专用模型；未启用则回退 chat JSON）
   asr: siliconflow-asr            # 视频音频轨
   image: agnes-image              # 动态配图
 
@@ -366,6 +380,10 @@ reply:
   min_comment_length: 2
   # 是否回复自己的评论
   reply_own: false
+  # 评论发布最小间隔（秒），降低低等级账号触发阿瓦隆的概率
+  min_publish_interval_seconds: 120
+  # 检测到阿瓦隆 state=17 隐藏后，自动暂停评论回复的时长（秒），到期自动恢复
+  risk_pause_seconds: 7200
 
 # ── 视频分析（视听双轨理解） ──
 # 注意：Vision/ASR 模型配置已迁移到 vision_providers / asr_providers + model_routing
@@ -387,9 +405,14 @@ video_analysis:
   frame_extractor: "ffmpeg"
   scenedetect_threshold: 27.0
   image_max_size: 768
-  # 抽帧上限：镜头数 ≤ 本值则按镜头全抽；超过则在镜头中点上等距抽本值张（默认 150）
-  # 主动视频默认 32 帧；高细节场景可调到 48-64，运行时硬顶 64
+  # 抽帧上限：镜头数 ≤ 本值则按镜头全抽；超过则在镜头中点上等距抽本值张
+  # 默认 32；未开启帧拼接时运行时硬顶 64
   max_keyframes: 32
+  # 帧拼接（九宫格）：把连续帧合并成一张带编号的大图，一次 Vision 请求描述多帧，
+  # 从而在不增加请求数量的前提下成倍提高抽帧数量（硬顶变为 64 * frames_per_tile）
+  frame_pack_enabled: false
+  frames_per_tile: 4          # 每张拼接图包含的帧数（1-9，建议 4）
+  frame_pack_tile_size: 512   # 拼接图内每格的最大边长（像素）
   # 视觉并发窗口（期望值）；实际并发 = min(本值, 视觉硬顶, 密钥数×每密钥并发)
   vision_window_size: 2
   # 视觉请求起步速率（每分钟）；多 key 时运行时按密钥数线性放大
@@ -412,12 +435,23 @@ memory:
   recall_candidate_limit: 12
   recall_inject_limit: 5
   recall_association_limit: 2
-  # 单次 LLM rerank 与整条召回链的硬预算；超时会保留 FTS/vector 确定性结果
+  # 单次 LLM rerank 的硬预算；召回总预算是 embedding + rerank 的模型调用软预算，
+  # 本地 SQLite 检索不受它约束。超时保留 FTS/vector 确定性结果
   rerank_timeout_seconds: 8
-  recall_total_timeout_seconds: 10
+  # 真实大库（>20k chunks）实测 10s 会让 chunk_vector/global_recent 通道超时，
+  # 生产/调试召回结果抖动；建议 30s。
+  recall_total_timeout_seconds: 30
   rerank_relevance_baseline: 0.65
-  # 后台富化不得长期占用在线回复/召回配额
-  enrichment_chat_timeout_seconds: 12
+  # 确定性 fallback 注入阈值。中文口语查询即使命中多个特征词，
+  # lexical_coverage 也常在 0.43 左右；0.80/0.88 会全部拒掉。
+  # 追求更保守时再调回 0.80/0.88。
+  fallback_direct_threshold: 0.40
+  fallback_association_threshold: 0.55
+  # 专用交叉编码器（BGE 式 0..1 分数）比 chat JSON 重排分数软，独立基线
+  rerank_model_relevance_baseline: 0.20
+  # 后台富化（摘要/实体/关联）单次调用预算。推理型模型常把输出预算
+  # 花在 reasoning_content 上，12s 会频繁超时；实测建议 300。
+  enrichment_chat_timeout_seconds: 300
   link_candidate_limit: 12
   link_job_max_attempts: 3
   prompt_char_budget: 5000
@@ -428,12 +462,22 @@ memory:
   chunk_overlap_chars: 100
   job_max_attempts: 8
   vector_cache_limit: 50000
+  # 向量全表扫描行数预算（默认 5 万行，约 200MB BLOB，冷扫描约 2-3 秒）。
+  # 超出时向量通道报错并降级 FTS/确定性检索，避免超大记忆库拖死在线回复。
+  # NVMe/大内存环境可调大；100GB 级库应迁移 ANN 索引，而不是设 0。
+  vector_full_scan_row_limit: 50000
   vector_batch_size: 2048
+  # 大库召回策略（默认 false）：只对 FTS/标识符/图扩展先命中的事件做向量精排。
+  # 100GB 级记忆库建议开启：向量扫描从全表缩小到数百个候选，恢复秒级响应；
+  # 代价是词面完全无关的纯语义召回会被跳过。
+  vector_candidate_prefilter: false
 
 # ── Web 管理面板 ──
 # 安全建议：
 # - host 默认仅本机；需要远程访问时再改为 0.0.0.0，并务必改掉默认密码 + 前置反向代理/HTTPS
 # - admin_password 为默认 admin123（明文或 bcrypt 哈希匹配）且 host 非 localhost 时，进程将拒绝启动 Web
+# - bcrypt 支持 $2a$/$2b$/$2y$ 三种前缀；配置 PATCH 对已哈希密码不会再二次哈希
+# - 登录限流使用「直连 IP」+「IP+用户名」双桶，反向代理共享出口 IP 时不会一个攻击者锁死所有用户
 # - 会话为进程内存储，仅支持单进程（workers=1），勿多副本横向扩展 Web
 # - 配置 PATCH 使用 config_revision 乐观锁；OBJECT_ARRAY（profiles/accounts/*_providers）禁止用字符串提交
 # - 备份 create 原子写 .name.creating + replace；list/download/restore/delete 均跳过半成品；过期 staging 约 1h 清理

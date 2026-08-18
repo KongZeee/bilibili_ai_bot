@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import time
-from typing import Any, Mapping, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 from .models import DEFAULT_JOB_TYPES, Observation, ObservationEnvelope, SourceDocument
 
@@ -47,7 +47,15 @@ def _clip_text(value: Any, limit: int) -> str:
     return text[: max(0, int(limit))]
 
 
-def _compact_video_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
+def _clean_text(value: Any) -> str:
+    """规范化但绝不截断（PRD 6.4：full_text/observation 禁止 [:N]）。"""
+    return " ".join(str(value or "").replace("\x00", " ").split())
+
+
+def _compact_video_metadata(
+    value: Mapping[str, Any] | None,
+    pseudonymize_actor: Callable[[Any], str] | None = None,
+) -> dict[str, Any]:
     """Keep recall-relevant video facts without archiving multi-megabyte API blobs."""
     raw = dict(value or {})
     compact: dict[str, Any] = {}
@@ -72,8 +80,13 @@ def _compact_video_metadata(value: Mapping[str, Any] | None) -> dict[str, Any]:
             compact[key] = item if isinstance(item, (int, float, bool)) else _clip_text(item, limit)
     owner = raw.get("owner")
     if isinstance(owner, Mapping):
+        raw_mid = str(owner.get("mid") or "")
         compact["owner"] = {
-            "mid": _clip_text(owner.get("mid"), 40),
+            "mid": (
+                pseudonymize_actor(raw_mid)
+                if callable(pseudonymize_actor) and raw_mid
+                else _clip_text(raw_mid, 40)
+            ),
             "name": _clip_text(owner.get("name"), 120),
         }
     stat = raw.get("stat")
@@ -306,9 +319,10 @@ def video_metadata_observation(
     metadata: Mapping[str, Any],
     persona_id: str = "",
     scene: str = "reply_comment",
+    pseudonymize_actor: Callable[[Any], str] | None = None,
 ) -> ObservationEnvelope:
     """Archive complete video metadata fetched for a model context."""
-    safe_metadata = _compact_video_metadata(metadata)
+    safe_metadata = _compact_video_metadata(metadata, pseudonymize_actor)
     digest = _stable_hash(safe_metadata)
     bvid = str(safe_metadata.get("bvid") or "")
     title = str(safe_metadata.get("title") or "")
@@ -438,21 +452,32 @@ def video_observation(
     tags: Sequence[str] = (),
     persona_id: str = "",
     video_detail: str = "",
+    pseudonymize_actor: Callable[[Any], str] | None = None,
 ) -> ObservationEnvelope:
     raw_context = context if isinstance(context, Mapping) else {}
-    metadata = _compact_video_metadata(raw_context.get("metadata") or {})
+    metadata = _compact_video_metadata(
+        raw_context.get("metadata") or {}, pseudonymize_actor
+    )
     hot_comments_raw = raw_context.get("hot_comments") or []
-    hot_comments = [
-        {
-            "rpid": _clip_text(row.get("rpid") or row.get("id"), 60),
-            "mid": _clip_text(row.get("mid") or row.get("user_id"), 60),
-            "content": _clip_text(
-                row.get("content") or row.get("message") or row.get("text"), 1200
-            ),
-        }
-        for row in list(hot_comments_raw)[:10]
-        if isinstance(row, Mapping)
-    ]
+    hot_comments = []
+    for row in list(hot_comments_raw)[:10]:
+        if not isinstance(row, Mapping):
+            continue
+        raw_actor = str(row.get("mid") or row.get("user_id") or "")
+        stored_actor = (
+            pseudonymize_actor(raw_actor)
+            if callable(pseudonymize_actor)
+            else _clip_text(raw_actor, 60)
+        )
+        hot_comments.append(
+            {
+                "rpid": _clip_text(row.get("rpid") or row.get("id"), 60),
+                "mid": stored_actor,
+                "content": _clean_text(
+                    row.get("content") or row.get("message") or row.get("text")
+                ),
+            }
+        )
     search_reference = _compact_web_reference(raw_context.get("search_reference") or {})
     audiovisual = _safe_structured(raw_context.get("audiovisual") or {})
     if not isinstance(audiovisual, Mapping):
@@ -466,14 +491,14 @@ def video_observation(
         # Allow callers to stash it on context as well.
         detail_text = str(raw_context.get("video_detail") or "").strip()
     if detail_text:
-        if len(detail_text) > 2000:
-            detail_text = detail_text[:2000].rstrip()
+        # PRD 6.4：证据正文不截断；prompt 侧的 ≤2000 字预算由 gateway
+        # 的 _prefer_audiovisual_source_text / recall 渲染层执行。
         sources.append(
             SourceDocument(
                 source_type="video_detail",
                 external_id=bvid or oid,
                 full_text=detail_text,
-                data={"max_chars": 2000, "kind": "audiovisual_digest"},
+                data={"kind": "audiovisual_digest"},
                 observations=(
                     Observation(
                         text=detail_text,
@@ -536,7 +561,7 @@ def video_observation(
 
     audio_rows = [
         {
-            "text": _clip_text(row.get("text"), 1600),
+            "text": _clean_text(row.get("text")),
             "source": _clip_text(row.get("source"), 40),
             "start": row.get("start"),
             "end": row.get("end"),
@@ -575,8 +600,8 @@ def video_observation(
         {
             "timestamp": row.get("timestamp"),
             "frame_number": row.get("frame_number"),
-            "description": _clip_text(row.get("description"), 1200),
-            "ocr_text": _clip_text(row.get("ocr_text") or row.get("ocr"), 800),
+            "description": _clean_text(row.get("description")),
+            "ocr_text": _clean_text(row.get("ocr_text") or row.get("ocr")),
         }
         for row in list(audiovisual.get("visual_observations") or [])[:128]
         if isinstance(row, Mapping)

@@ -7,17 +7,17 @@ Web 面板 - 修复版
 会话存储为进程内 dict，仅支持单进程（workers=1）。
 多 worker / 多副本部署下会话不会共享，请勿横向扩展 Web 进程。
 """
+import asyncio
 import logging
 import ipaddress
 import time
-import json
 import hashlib
 import hmac
 import random
 import secrets
 import bcrypt
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Any, Optional, Dict
 
 from starlette.applications import Starlette
 from starlette.routing import Route
@@ -73,6 +73,117 @@ def is_weak_admin_password(stored: str) -> bool:
     return False
 
 
+_READINESS_STALE_AFTER_SECONDS = 15 * 60.0
+_MEMORY_HEALTH_CACHE_TTL_SECONDS = 30.0
+
+
+def _memory_readiness_ok(memory_brain: Any, runtime_scheduler: Any) -> bool:
+    """Run the existing memory health probe off-loop with a short cache."""
+    health_check = getattr(memory_brain, "health_check", None)
+    if not callable(health_check):
+        return False
+    now = time.monotonic()
+    cached = getattr(runtime_scheduler, "_readiness_memory_health_cache", None)
+    if isinstance(cached, tuple) and len(cached) == 2:
+        cached_at, cached_ok = cached
+        if now - float(cached_at) < _MEMORY_HEALTH_CACHE_TTL_SECONDS:
+            return bool(cached_ok)
+    try:
+        report = health_check()
+        if isinstance(report, dict):
+            ok = bool(report.get("ok"))
+        else:
+            ok = bool(getattr(report, "ok", False))
+    except Exception:
+        ok = False
+    setattr(runtime_scheduler, "_readiness_memory_health_cache", (now, ok))
+    return ok
+
+
+def build_public_readiness(
+    *,
+    scheduler: Any = None,
+    account_manager: Any = None,
+    safety_checker: Any = None,
+) -> Dict[str, Any]:
+    """Build a non-sensitive readiness result for local operational monitoring."""
+    checks = {
+        "service": True,
+        "account_running": False,
+        "account_authenticated": False,
+        "llm_available": False,
+        "global_pause_clear": False,
+        "account_pause_clear": False,
+        "task_runs_clear": False,
+        "pm_states_clear": False,
+        "memory_available": False,
+    }
+    try:
+        # A scheduler object alone is insufficient: it can remain allocated after
+        # AccountInstance has stopped or its managed task has failed.
+        get_sole = getattr(account_manager, "get_sole", None)
+        instance = get_sole() if callable(get_sole) else None
+        runtime_scheduler = getattr(instance, "scheduler", None)
+        if runtime_scheduler is None:
+            return {"ready": False, "checks": checks}
+
+        account_id = str(getattr(instance, "account_id", "") or "")
+        status_reader = getattr(instance, "get_status", None)
+        status = status_reader() if callable(status_reader) else None
+        if not account_id or not isinstance(status, dict) or safety_checker is None:
+            return {"ready": False, "checks": checks}
+
+        running = bool(status.get("running"))
+        is_running = getattr(instance, "is_running", None)
+        if callable(is_running):
+            running = running and bool(is_running())
+        checks["account_running"] = bool(status.get("enabled")) and running
+        checks["account_authenticated"] = bool(status.get("authenticated"))
+        checks["llm_available"] = bool(status.get("has_llm")) and str(
+            status.get("state") or ""
+        ) not in {"failed", "degraded"}
+
+        memory_brain = getattr(instance, "memory_brain", None)
+        task_store = getattr(runtime_scheduler, "task_store", None)
+        pm_state_store = getattr(runtime_scheduler, "pm_state_store", None)
+        stale_task_count = getattr(task_store, "count_stale_active", None)
+        stale_pm_count = getattr(pm_state_store, "count_stale_intermediate", None)
+        if (
+            not account_id
+            or task_store is None
+            or pm_state_store is None
+            or memory_brain is None
+            or not callable(stale_task_count)
+            or not callable(stale_pm_count)
+        ):
+            return {"ready": False, "checks": checks}
+
+        checks["global_pause_clear"] = not bool(safety_checker.is_paused())
+        checks["account_pause_clear"] = not bool(
+            safety_checker.is_account_paused(account_id)
+        )
+        checks["task_runs_clear"] = (
+            task_store.count_by_account(account_id, status="result_unknown") == 0
+            and stale_task_count(
+                account_id,
+                stale_after=_READINESS_STALE_AFTER_SECONDS,
+            ) == 0
+        )
+        checks["pm_states_clear"] = (
+            pm_state_store.count_result_unknown(account_id) == 0
+            and stale_pm_count(
+                account_id,
+                stale_after=_READINESS_STALE_AFTER_SECONDS,
+            ) == 0
+        )
+        checks["memory_available"] = _memory_readiness_ok(
+            memory_brain, runtime_scheduler
+        )
+    except Exception:
+        logger.debug("public readiness check failed closed", exc_info=True)
+    return {"ready": all(checks.values()), "checks": checks}
+
+
 class NoCacheStaticFiles(StaticFiles):
     """Prevent stale ES modules from keeping an older control panel alive."""
 
@@ -95,6 +206,7 @@ class AuthMiddleware(BaseHTTPMiddleware):
         "/login",
         "/api/login",
         "/api/status/public",
+        "/api/status/ready",
     }
 
     def _is_anon(self, path: str) -> bool:
@@ -179,8 +291,10 @@ _sessions: Dict[str, dict] = {}
 _session_ttl: int = 3600  # 默认 1h，由配置覆盖
 _idle_timeout: int = 900  # Task 30：无活动超时（滑动续期），默认 15 分钟
 
-# M22 登录频率限制：IP -> 失败时间戳列表
+# M22 登录频率限制：IP -> 失败时间戳列表；IP+用户名 -> 失败时间戳列表
+# 第二个桶防止反向代理后共享出口 IP 时一个攻击者锁死所有用户。
 _login_attempts: Dict[str, list] = {}
+_login_user_attempts: Dict[str, list] = {}
 _LOGIN_WINDOW_SECONDS: int = 300  # 5 分钟窗口
 _LOGIN_MAX_FAILURES: int = 10     # 窗口内最大失败次数
 
@@ -231,13 +345,14 @@ def _enforce_user_session_limit(username: str, max_per_user: int = 5) -> None:
 def _cleanup_login_attempts() -> None:
     """M22：清理过期的登录失败记录"""
     now = time.time()
-    for ip in list(_login_attempts.keys()):
-        _login_attempts[ip] = [
-            ts for ts in _login_attempts[ip]
-            if now - ts < _LOGIN_WINDOW_SECONDS
-        ]
-        if not _login_attempts[ip]:
-            _login_attempts.pop(ip, None)
+    for bucket in (_login_attempts, _login_user_attempts):
+        for key in list(bucket.keys()):
+            bucket[key] = [
+                ts for ts in bucket[key]
+                if now - ts < _LOGIN_WINDOW_SECONDS
+            ]
+            if not bucket[key]:
+                bucket.pop(key, None)
 
 
 def create_web_app(
@@ -281,11 +396,15 @@ def create_web_app(
 
     async def dashboard_page(request: Request) -> HTMLResponse:
         """仪表盘页面"""
-        return HTMLResponse(_get_dashboard_html())
+        response = HTMLResponse(_get_dashboard_html())
+        response.headers["Content-Security-Policy"] = _DASHBOARD_CSP_HEADER
+        return response
 
     async def login_page(request: Request) -> HTMLResponse:
         """登录页面"""
-        return HTMLResponse(_get_login_html())
+        response = HTMLResponse(_get_login_html())
+        response.headers["Content-Security-Policy"] = _DASHBOARD_CSP_HEADER
+        return response
 
     # ═══════════════════════════════════════════════════════
     #  认证 API
@@ -318,11 +437,18 @@ def create_web_app(
                 return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             username = str(body.get("username", ""))
             password = str(body.get("password", ""))
+            user_attempt_key = f"{client_ip}\n{username}"
+            user_attempts = _login_user_attempts.get(user_attempt_key, [])
+            if len(user_attempts) >= _LOGIN_MAX_FAILURES:
+                return JSONResponse(
+                    {"success": False, "error": {"code": "TOO_MANY_REQUESTS", "message": "该用户登录失败次数过多，请稍后再试", "details": {}}},
+                    status_code=429,
+                )
 
             # Task 16：密码哈希校验（支持 bcrypt，兼容明文）
             stored_password = config_loader.web.admin_password
             username_ok = hmac.compare_digest(username.encode(), config_loader.web.admin_username.encode())
-            if stored_password.startswith("$2b$"):
+            if stored_password.startswith(("$2a$", "$2b$", "$2y$")):
                 password_ok = bcrypt.checkpw(password.encode(), stored_password.encode())
             else:
                 password_ok = hmac.compare_digest(password.encode(), stored_password.encode())
@@ -343,8 +469,9 @@ def create_web_app(
                 # M23：登录成功后顺便清理过期会话（按概率触发，与会话数解耦）
                 if random.random() < 0.01:
                     cleanup_sessions()
-                # M22：登录成功，清除该 IP 的失败记录
+                # M22：登录成功，清除该 IP 与该用户的失败记录
                 _login_attempts.pop(client_ip, None)
+                _login_user_attempts.pop(user_attempt_key, None)
 
                 # Task 30：token 仅通过 HttpOnly Cookie 下发，不再放入响应体
                 resp = JSONResponse({"success": True})
@@ -358,13 +485,18 @@ def create_web_app(
                 )
                 return resp
             else:
-                # M22：记录失败时间戳
+                # M22：记录失败时间戳（IP 桶 + IP/用户名桶）
                 _login_attempts.setdefault(client_ip, []).append(time.time())
+                _login_user_attempts.setdefault(user_attempt_key, []).append(time.time())
                 return fail("INVALID_CREDENTIALS", "用户名或密码错误", status_code=401)
         except Exception as e:
             logger.error(f"登录处理异常: {e}", exc_info=True)
             # Task 18：异常路径也计入登录失败次数
             _login_attempts.setdefault(client_ip, []).append(time.time())
+            try:
+                _login_user_attempts.setdefault(user_attempt_key, []).append(time.time())
+            except NameError:
+                pass
             return fail_internal()
 
     async def api_logout(request: Request) -> JSONResponse:
@@ -395,12 +527,22 @@ def create_web_app(
     # ═══════════════════════════════════════════════════════
 
     async def api_status_public(request: Request) -> JSONResponse:
-        """公开健康状态（不泄露敏感信息）"""
+        """公开存活状态（不泄露敏感信息）"""
         import bilibot
         return JSONResponse({
             "running": True,
             "version": bilibot.__version__,
         })
+
+    async def api_status_ready(request: Request) -> JSONResponse:
+        """公开就绪状态，仅供本机 monitor 判断业务可用性。"""
+        report = await asyncio.to_thread(
+            build_public_readiness,
+            scheduler=scheduler,
+            account_manager=account_manager,
+            safety_checker=safety_checker,
+        )
+        return JSONResponse(report, status_code=200 if report["ready"] else 503)
 
     async def api_status(request: Request) -> JSONResponse:
         """获取系统状态（需登录）
@@ -539,6 +681,7 @@ def create_web_app(
     # 系统（公开 + 需登录）
     system_routes = [
         Route("/api/status/public", api_status_public, methods=["GET"]),
+        Route("/api/status/ready", api_status_ready, methods=["GET"]),
         Route("/api/status", api_status, methods=["GET"]),
         Route("/api/bilibili/qrcode", api_get_qrcode, methods=["GET"]),
         Route("/api/bilibili/qrcode/status", api_qrcode_status, methods=["GET", "POST"]),
@@ -661,7 +804,7 @@ def create_web_app(
 
     async def api_safety_pause(request: Request) -> JSONResponse:
         """全局暂停 Bot（PRD §5.9）"""
-        from ..api.responses import ok, fail_invalid_input
+        from ..api.responses import ok
         reason = ""
         try:
             body = await request.json()
@@ -854,11 +997,24 @@ def _static_version(filename: str) -> str:
     try:
         path = Path(__file__).parent / "static" / filename
         content = path.read_bytes()
-        v = hashlib.md5(content).hexdigest()[:8]
+        v = hashlib.md5(content, usedforsecurity=False).hexdigest()[:8]
         _STATIC_VERSION_CACHE[filename] = v
         return v
     except Exception:
         return "0"
+
+
+_DASHBOARD_CSP_HEADER = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
+    "font-src 'self' https://fonts.gstatic.com data:; "
+    "img-src 'self' data: blob:; "
+    "connect-src 'self'; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "frame-ancestors 'none'"
+)
 
 
 def _get_dashboard_html() -> str:
@@ -869,18 +1025,9 @@ def _get_dashboard_html() -> str:
     base_v = _static_version("css/base.css")
     layout_v = _static_version("css/layout.css")
     comp_v = _static_version("css/components.css")
-    # CSP：允许本站资源 + Google Fonts（display=swap 样式与字体文件）
-    csp = (
-        "default-src 'self'; "
-        "script-src 'self'; "
-        "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; "
-        "font-src 'self' https://fonts.gstatic.com data:; "
-        "img-src 'self' data: blob:; "
-        "connect-src 'self'; "
-        "object-src 'none'; "
-        "base-uri 'self'; "
-        "frame-ancestors 'none'"
-    )
+    # CSP meta：允许本站资源 + Google Fonts（display=swap 样式与字体文件）。
+    # frame-ancestors 只能通过 HTTP 头生效，由 dashboard/login 路由单独下发。
+    csp = _DASHBOARD_CSP_HEADER.replace("; frame-ancestors 'none'", "")
     return f"""<!DOCTYPE html>
 <html lang="zh-CN" style="color-scheme: light dark">
 <head>

@@ -35,20 +35,6 @@ def _format_time(seconds: float) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def _match_visuals(
-    audio_event: AudioEvent,
-    visual_events: List[VisualEvent],
-    tolerance: float = 1.5,
-) -> List[VisualEvent]:
-    matched = []
-    lower = audio_event.start - tolerance
-    upper = audio_event.end + tolerance
-    for ve in visual_events:
-        if lower <= ve.timestamp <= upper:
-            matched.append(ve)
-    return matched
-
-
 def align_events(
     audio_events: List[AudioEvent],
     visual_events: List[VisualEvent],
@@ -66,8 +52,15 @@ def align_events(
         for ve in visual_events:
             ve.description = first_desc
 
+    matched_visual_idx: set = set()
     for ae in audio_events:
-        matched = _match_visuals(ae, visual_events)
+        matched = []
+        lower = ae.start - 1.5
+        upper = ae.end + 1.5
+        for idx, ve in enumerate(visual_events):
+            if lower <= ve.timestamp <= upper:
+                matched.append(ve)
+                matched_visual_idx.add(idx)
         blocks.append(
             TimeBlock(start=ae.start, end=ae.end, audio=[ae], visuals=matched)
         )
@@ -79,6 +72,17 @@ def align_events(
                     start=ve.timestamp, end=ve.timestamp, audio=[], visuals=[ve]
                 )
             )
+    else:
+        # Visual frames that no audio segment covers must still enter the
+        # behavior log. Dropping them here would make the digest blind to all
+        # silent visual stretches of videos that do contain speech.
+        for idx, ve in enumerate(visual_events):
+            if idx not in matched_visual_idx:
+                blocks.append(
+                    TimeBlock(
+                        start=ve.timestamp, end=ve.timestamp, audio=[], visuals=[ve]
+                    )
+                )
 
     blocks.sort(key=lambda b: b.start)
 

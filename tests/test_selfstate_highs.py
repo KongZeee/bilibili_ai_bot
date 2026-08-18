@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime
 
+from bilibot.companion import service as service_mod
 from bilibot.companion.models import LifeState
 from bilibot.companion.service import CompanionLifeService
 
@@ -32,14 +33,42 @@ def test_pm_replied_does_not_leak_body_into_prompt_surface(tmp_path):
     for item in state.salient_recent or []:
         assert secret not in item
         assert "回了私信" in item
-    assert any("网友甲" in (x or "") for x in (state.salient_recent or []))
+        assert "网友甲" not in (item or "")
 
     surface = svc.get_prompt_surface()
     assert secret not in surface
     assert "phone" not in surface
-    # Body may live only on non-injected runtime.
+    assert "网友甲" not in surface
+    # Body and actor may live only on non-injected runtime.
     runtime = svc.store.get_runtime()
     assert secret[:20] in (runtime.get("last_private_message_preview") or "")
+    assert runtime.get("last_private_message_actor") == "网友甲"
+
+
+def test_stale_browse_session_count_decays_and_does_not_block_motives(tmp_path):
+    svc = _svc(tmp_path)
+    now = datetime(2026, 8, 16, 15, 0, 0)
+    svc.store.patch_runtime(
+        browse_session_count=4,
+        last_proactive_video_ts=now.timestamp() - 3 * 3600,
+    )
+    queue = svc.rank_motives(now)
+    top = queue.top()
+    # 3 小时前的会话不应继续把 rest 顶到 7 分以上
+    assert top is not None
+    assert not (top.suggested_action == "rest" and top.score >= 7.0)
+
+
+def test_fresh_browse_session_count_still_raises_rest(tmp_path):
+    svc = _svc(tmp_path)
+    now = datetime(2026, 8, 16, 15, 0, 0)
+    svc.store.patch_runtime(
+        browse_session_count=4,
+        last_proactive_video_ts=now.timestamp() - 60,
+    )
+    queue = svc.rank_motives(now)
+    assert queue.top().suggested_action == "rest"
+    assert queue.top().score >= 7.0
 
 
 def test_thread_category_replace_and_creative_finished_not_ongoing(tmp_path):
@@ -89,11 +118,27 @@ def test_thread_category_replace_and_creative_finished_not_ongoing(tmp_path):
     assert any("写完了《夜航》" in s for s in state.salient_recent)
 
 
-def test_day_roll_preserves_salient_and_threads(tmp_path):
+def test_day_roll_preserves_salient_and_threads(tmp_path, monkeypatch):
+    # Freeze "now" to 10:00 so this test is deterministic regardless of the
+    # wall-clock hour.  The real day-roll deliberately keeps a late-night
+    # activity between 00:00-05:00 (late_roll), which made this test fail
+    # whenever the suite ran in the small hours.
+    class FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 7, 20, 10, 0, 0)
+
+    monkeypatch.setattr(service_mod, "datetime", FixedDateTime)
+    monkeypatch.setattr(
+        service_mod, "now_cn", lambda: FixedDateTime(2026, 7, 20, 10, 0, 0)
+    )
+    monkeypatch.setattr(
+        service_mod, "today_cn", lambda: FixedDateTime(2026, 7, 20, 10, 0, 0).date()
+    )
+
     svc = _svc(tmp_path)
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
     old = LifeState(
-        date=yesterday,
+        date="2026-07-19",
         energy=55,
         sleep="正常",
         mood_bias="平静",
@@ -106,8 +151,7 @@ def test_day_roll_preserves_salient_and_threads(tmp_path):
     svc.store.save_life_state(old)
 
     state = svc.ensure_life_state()
-    today = datetime.now().strftime("%Y-%m-%d")
-    assert state.date == today
+    assert state.date == "2026-07-20"
     assert state.activity == ""
     assert state.message_seed == ""
     assert "小说：《续》写作中" in state.ongoing_threads

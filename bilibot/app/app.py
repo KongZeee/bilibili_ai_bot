@@ -36,6 +36,46 @@ _LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 _logging_file_path: Optional[str] = None
 
 
+class _Utf8SafeConsoleStream:
+    """Console stream that never crashes on characters the Windows code page rejects.
+
+    Logging messages may legitimately contain emoji (⚠️) or rare CJK glyphs while
+    the console wrapper uses cp936/cp1252.  Instead of raising UnicodeEncodeError
+    inside StreamHandler.emit, encode with the console's own codec and replace
+    unrepresentable characters.
+    """
+
+    def __init__(self):
+        self._buffer = getattr(sys.stdout, "buffer", None)
+        self._fallback = None if self._buffer is not None else sys.stdout
+        self._encoding = getattr(sys.stdout, "encoding", None) or "utf-8"
+
+    def write(self, text: str) -> int:
+        if self._buffer is not None:
+            try:
+                payload = text.encode(self._encoding, errors="replace")
+                return self._buffer.write(payload)
+            except Exception:
+                pass
+        if self._fallback is None:
+            self._fallback = sys.stdout
+        try:
+            return self._fallback.write(text)
+        except UnicodeEncodeError:
+            safe = text.encode("ascii", errors="replace").decode("ascii")
+            return self._fallback.write(safe)
+
+    def flush(self) -> None:
+        target = self._buffer if self._buffer is not None else self._fallback
+        flush = getattr(target, "flush", None)
+        if callable(flush):
+            flush()
+
+    @property
+    def encoding(self) -> str:
+        return self._encoding
+
+
 def _resolve_log_file_path(log_file: str, data_dir: str) -> str:
     """将 logging.file 规范到 data_dir 内，防止路径穿越写出系统文件。"""
     data_root = Path(data_dir or "./data").resolve()
@@ -84,6 +124,7 @@ def setup_logging(config: dict):
         os.makedirs(log_dir, exist_ok=True)
 
     root = logging.getLogger()
+    console_stream = _Utf8SafeConsoleStream()
     # 首次：尚无 handler 时用 basicConfig
     if not root.handlers:
         logging.basicConfig(
@@ -91,7 +132,7 @@ def setup_logging(config: dict):
             format=_LOG_FORMAT,
             datefmt=_LOG_DATEFMT,
             handlers=[
-                logging.StreamHandler(sys.stdout),
+                logging.StreamHandler(console_stream),
                 logging.handlers.RotatingFileHandler(
                     log_file,
                     maxBytes=max_bytes,
@@ -105,6 +146,11 @@ def setup_logging(config: dict):
         root.setLevel(level)
         for handler in list(root.handlers):
             handler.setLevel(level)
+            # 热重载/测试注入时统一替换控制台流，避免 GBK 控制台编码崩溃
+            if isinstance(handler, logging.StreamHandler) and not isinstance(
+                handler, logging.handlers.RotatingFileHandler
+            ):
+                handler.stream = console_stream
         # 文件路径或滚动参数变更 → 替换 RotatingFileHandler
         need_new_file = True
         for handler in list(root.handlers):
@@ -363,7 +409,7 @@ class BiliBotApp:
         # Web 服务
         web_config = self.config.get("web", {})
         web_enabled = bool(web_config.get("enabled", True))
-        host = web_config.get("host", "0.0.0.0")
+        host = web_config.get("host", "127.0.0.1")
         port = int(web_config.get("port", 8080))
 
         if not web_enabled:

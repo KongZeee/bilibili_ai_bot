@@ -247,29 +247,37 @@ def migrate_to_bot_layout(
         result["message"] = "no legacy source; bot/ ready for bootstrap"
         return result
 
-    if _dir_nonempty(dest) and source.is_dir() and not force:
-        # Allow re-entry when dest only has incomplete partial copies without marker.
-        if _marker_matches(marker):
-            result["status"] = "error"
-            result["errors"].append("destination non-empty with marker but brain not ready")
-            result["message"] = "refusing migrate without force"
-            return result
-        # If dest has any real content besides what we might re-copy, require force.
-        existing = {p.relative_to(dest) for p in dest.rglob("*") if p.is_file()}
-        if existing:
-            result["status"] = "error"
-            result["errors"].append(
-                f"destination {dest} is non-empty ({len(existing)} files); pass force=True"
-            )
-            result["message"] = "refusing to clobber non-empty bot/ without force"
-            return result
-
     files = _iter_source_files(source)
     if not files and not source_brain.is_file():
         result["status"] = "error"
         result["errors"].append(f"legacy source has no files: {source}")
         result["message"] = "empty source"
         return result
+
+    if _dir_nonempty(dest) and source.is_dir() and not force:
+        # Re-entry after a partial copy is allowed only when every existing
+        # dest file is one we would copy from the legacy source; the copy loop
+        # then resumes missing/different files. Any foreign file still needs
+        # explicit force.
+        if _marker_matches(marker):
+            result["status"] = "error"
+            result["errors"].append("destination non-empty with marker but brain not ready")
+            result["message"] = "refusing migrate without force"
+            return result
+        allowed = {p.relative_to(source) for p in files}
+        existing = {p.relative_to(dest) for p in dest.rglob("*") if p.is_file()}
+        foreign = sorted(str(p) for p in existing - allowed)
+        if foreign:
+            result["status"] = "error"
+            result["errors"].append(
+                f"destination {dest} is non-empty with foreign files {foreign}; pass force=True"
+            )
+            result["message"] = "refusing to clobber non-migrated bot/ content without force"
+            return result
+        result["message"] = (
+            f"resuming partial migration; destination already has "
+            f"{len(existing)} of the legacy source files"
+        )
 
     for src_file in files:
         rel = src_file.relative_to(source)

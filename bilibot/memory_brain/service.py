@@ -12,7 +12,7 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from .gateway import MemoryModelGateway
+from .gateway import EmptyModelResultError, MemoryModelGateway
 from .models import (
     ActivityMemoryError,
     IdempotencyConflictError,
@@ -65,8 +65,10 @@ def rebind_all_live_brains(
     *,
     chat_provider=None,
     embedding_provider=None,
+    rerank_provider=None,
     rebind_chat: bool = False,
     rebind_embedding: bool = False,
+    rebind_rerank: bool = False,
 ) -> int:
     """对所有存活 MemoryBrain 热重绑 provider。返回成功数。"""
     n = 0
@@ -75,8 +77,10 @@ def rebind_all_live_brains(
             brain.rebind_providers(
                 chat_provider=chat_provider,
                 embedding_provider=embedding_provider,
+                rerank_provider=rerank_provider,
                 rebind_chat=rebind_chat,
                 rebind_embedding=rebind_embedding,
+                rebind_rerank=rebind_rerank,
             )
             n += 1
         except Exception as e:
@@ -203,6 +207,7 @@ class MemoryBrainService:
         *,
         chat_provider: Any = None,
         embedding_provider: Any = None,
+        rerank_provider: Any = None,
         memory_config: Any = None,
         store: MemoryBrainStore | None = None,
     ) -> None:
@@ -221,6 +226,9 @@ class MemoryBrainService:
             ),
             "vector_batch_size": int(_config_value(memory_config, "vector_batch_size", 2048)),
             "vector_cache_limit": int(_config_value(memory_config, "vector_cache_limit", 50_000)),
+            "vector_full_scan_row_limit": int(
+                _config_value(memory_config, "vector_full_scan_row_limit", 50_000)
+            ),
         }
         self.store = store or MemoryBrainStore(
             self.db_path,
@@ -232,7 +240,10 @@ class MemoryBrainService:
         if self.store.account_id and self.store.account_id != self.account_id:
             raise ValueError("memory store account does not match service account")
         self.gateway = MemoryModelGateway(
-            chat_provider, embedding_provider, account_id=self.account_id
+            chat_provider,
+            embedding_provider,
+            account_id=self.account_id,
+            rerank_provider=rerank_provider,
         )
         self.worker = PersistentMemoryWorker(
             self.store,
@@ -247,6 +258,7 @@ class MemoryBrainService:
         # Ephemeral mid-action working memory: survives across steps of one
         # activity until finish/clear. Not durable — durable truth stays in store.
         self._working_memory: dict[str, dict[str, Any]] = {}
+        self._last_consolidation_outcome: dict[str, Any] = {}
         self.recall_engine = RecallEngine(
             self.store,
             self.gateway,
@@ -263,6 +275,18 @@ class MemoryBrainService:
             relevance_baseline=float(
                 _config_value(memory_config, "rerank_relevance_baseline", 0.65)
             ),
+            dedicated_rerank_baseline=float(
+                _config_value(memory_config, "rerank_model_relevance_baseline", 0.20)
+            ),
+            fallback_direct_threshold=float(
+                _config_value(memory_config, "fallback_direct_threshold", 0.40)
+            ),
+            fallback_association_threshold=float(
+                _config_value(memory_config, "fallback_association_threshold", 0.55)
+            ),
+            vector_candidate_prefilter=bool(
+                _config_value(memory_config, "vector_candidate_prefilter", False)
+            ),
             vector_batch_size=store_config["vector_batch_size"],
         )
         self.redactor = PrivateMessageRedactor(self.store.get_privacy_salt())
@@ -271,15 +295,145 @@ class MemoryBrainService:
         self._worker_task: asyncio.Task | None = None
         self._interactive_recall_count = 0
 
-    async def start(self) -> None:
+    async def start(self, *, bot_actor_id: str = "") -> None:
         if self._worker_task is not None and not self._worker_task.done():
             return
         self._stop_event = asyncio.Event()
+        # Drain leftover WAL off the event loop before the durable worker
+        # starts. An unclean previous shutdown can leave a large WAL whose
+        # first autocheckpoint stalls writes for the full SQLite busy timeout.
+        checkpoint = getattr(self.store, "checkpoint", None)
+        if callable(checkpoint):
+            try:
+                started = time.monotonic()
+                report = await asyncio.to_thread(checkpoint, "TRUNCATE")
+                elapsed = time.monotonic() - started
+                if elapsed > 5.0:
+                    logger.warning(
+                        "memory brain WAL drain took %.1fs account=%s report=%s",
+                        elapsed,
+                        self.account_id,
+                        report,
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "memory brain WAL drain failed account=%s: %s",
+                    self.account_id,
+                    type(exc).__name__,
+                )
+        # Legacy privacy remediation: replace raw platform actor IDs written
+        # by older builds before the durable worker starts touching rows.
+        try:
+            legacy = await asyncio.to_thread(
+                self.store.pseudonymize_legacy_actors,
+                lambda value: self.redactor.pseudonymize_identifier(
+                    value, namespace="uid"
+                ),
+                bot_actor_id=str(bot_actor_id or ""),
+            )
+            if legacy:
+                logger.warning(
+                    "memory brain pseudonymized %s legacy actor rows account=%s",
+                    legacy,
+                    self.account_id,
+                )
+        except Exception as exc:
+            logger.warning(
+                "legacy actor pseudonymization failed account=%s: %s",
+                self.account_id,
+                type(exc).__name__,
+            )
         self._worker_task = asyncio.create_task(
             self.worker.run_forever(self._stop_event),
             name=f"memory-brain-worker:{self.account_id}",
         )
         register_live_brain(self)
+        # Cross-process reconciliation: close intents orphaned by a crash.
+        try:
+            await self.close_stale_activity_intents(older_than_seconds=60.0)
+        except Exception as exc:
+            logger.warning(
+                "startup activity intent reconciliation failed account=%s: %s",
+                self.account_id,
+                type(exc).__name__,
+            )
+        # Evidence-backed derivation repair for rows that lost embeddings/
+        # entities/links without ever being replayed.
+        try:
+            report = await asyncio.to_thread(
+                self.store.scan_derivation_repairs, limit=100
+            )
+            if report.get("repaired_events"):
+                logger.warning(
+                    "startup derivation repair account=%s requeued %s events: %s",
+                    self.account_id,
+                    report.get("repaired_events"),
+                    list(report.get("details", {}).keys())[:20],
+                )
+        except Exception as exc:
+            logger.warning(
+                "startup derivation repair scan failed account=%s: %s",
+                self.account_id,
+                type(exc).__name__,
+            )
+
+    async def close_stale_activity_intents(
+        self,
+        *,
+        older_than_seconds: float = 60.0,
+        limit: int = 500,
+    ) -> int:
+        """Reconcile durable activity intents left open by a previous process.
+
+        Called from ``start()``. Only intents older than the grace window are
+        closed, so a fast restart cannot race its own just-opened activity.
+        """
+        lister = getattr(self.store, "list_open_activity_intents", None)
+        if not callable(lister):
+            return 0
+        try:
+            intents = lister(limit=limit)
+        except Exception as exc:
+            logger.warning(
+                "list_open_activity_intents failed account=%s: %s",
+                self.account_id,
+                type(exc).__name__,
+            )
+            return 0
+        now = time.time()
+        grace = max(0.0, float(older_than_seconds))
+        closed = 0
+        for item in intents:
+            try:
+                if now - float(item.get("occurred_at") or 0.0) < grace:
+                    continue
+                await self.finish_activity(
+                    action_key=str(item.get("action_key") or ""),
+                    action_type=str(item.get("action_type") or "activity"),
+                    result_text="进程重启后回收未完成的活动意图",
+                    state="failed",
+                    scene=str(item.get("scene") or "system"),
+                    title=str(item.get("title") or item.get("action_type") or "activity"),
+                    metadata={
+                        "startup_reconcile": True,
+                        "intent_event_id": str(item.get("event_id") or ""),
+                    },
+                )
+                closed += 1
+            except Exception as exc:
+                logger.warning(
+                    "stale activity intent close failed account=%s key=%s: %s",
+                    self.account_id,
+                    item.get("action_key"),
+                    type(exc).__name__,
+                )
+        if closed:
+            logger.info(
+                "closed %s stale activity intents for account=%s",
+                closed,
+                self.account_id,
+            )
+        return closed
 
     def set_enrichment_throttled(self, enabled: bool, *, reason: str = "") -> None:
         """Pause expensive entity/link chat jobs while vision owns the model pool."""
@@ -334,22 +488,26 @@ class MemoryBrainService:
         *,
         chat_provider: Any = None,
         embedding_provider: Any = None,
+        rerank_provider: Any = None,
         rebind_chat: bool = False,
         rebind_embedding: bool = False,
+        rebind_rerank: bool = False,
     ) -> None:
         """热重载模型提供方：更新 gateway，worker/recall 共享同一 gateway 引用。
 
-        默认不改任何侧；设 rebind_chat/rebind_embedding=True 时写入对应 provider
-        （可为 None，表示清空该能力，embed 任务会 block 直至再次配置）。
+        默认不改任何侧；设 rebind_*=True 时写入对应 provider
+        （可为 None，表示清空该能力，embed/rerank 会 block 直至再次配置）。
         """
         kwargs: dict[str, Any] = {}
         if rebind_chat:
             kwargs["chat_provider"] = chat_provider
         if rebind_embedding:
             kwargs["embedding_provider"] = embedding_provider
+        if rebind_rerank:
+            kwargs["rerank_provider"] = rerank_provider
         if kwargs:
             self.gateway.rebind_providers(**kwargs)
-            # recall_engine 可能缓存了独立 chat/embedding 引用，必须与 gateway 同步。
+            # recall_engine 可能缓存了独立 chat/embedding/rerank 引用，必须与 gateway 同步。
             # 始终刷新 model_gateway；被 rebind 的侧写入新 provider（含显式 None）。
             re = getattr(self, "recall_engine", None)
             if re is not None:
@@ -365,6 +523,11 @@ class MemoryBrainService:
                 if rebind_chat:
                     try:
                         re.chat_provider = chat_provider
+                    except Exception:
+                        pass
+                if rebind_rerank:
+                    try:
+                        re.rerank_provider = rerank_provider
                     except Exception:
                         pass
 
@@ -490,13 +653,43 @@ class MemoryBrainService:
     async def run_jobs_until_idle(self, max_jobs: int = 1000) -> WorkerRunReport:
         return await self.worker.run_until_idle(max_jobs=max_jobs)
 
-    async def consolidate_recent(self, day_key: str, limit: int = 40) -> int:
+    def _set_consolidation_outcome(
+        self,
+        outcome: str,
+        *,
+        reflection_count: int = 0,
+        error_kind: str = "",
+    ) -> None:
+        self._last_consolidation_outcome = {
+            "outcome": str(outcome),
+            "reflection_count": max(0, int(reflection_count or 0)),
+            "error_kind": str(error_kind or ""),
+        }
+
+    def get_last_consolidation_outcome(self) -> dict[str, Any]:
+        """Return non-sensitive diagnostics for the most recent consolidation."""
+        return dict(self._last_consolidation_outcome)
+
+    async def consolidate_recent(
+        self, day_key: str, limit: int = 40, timeout: float | None = None
+    ) -> int:
         """Add one evidence-linked nightly reflection without rewriting sources."""
+        self._set_consolidation_outcome("started")
         marker = f"nightly:{day_key}"
         if await asyncio.to_thread(self.has_identifier, marker):
+            self._set_consolidation_outcome("already_completed")
             return 0
         if not self.gateway.chat_configured:
+            self._set_consolidation_outcome("chat_unconfigured")
             return 0
+        # Reasoning chat models can spend tens of seconds on chain-of-thought
+        # before emitting the JSON array; reuse the durable worker's timeout
+        # budget instead of a hardcoded 30s that produces flaky nightly runs.
+        chat_timeout = (
+            self.worker.enrichment_chat_timeout_seconds
+            if timeout is None
+            else max(1.0, float(timeout))
+        )
         events = await asyncio.to_thread(self.store.recent_events, max(2, min(limit, 100)))
         compact = [
             {
@@ -511,6 +704,7 @@ class MemoryBrainService:
             and (event.get("summary") or event.get("content") or event.get("title"))
         ]
         if len(compact) < 2:
+            self._set_consolidation_outcome("insufficient_evidence")
             return 0
         allowed_ids = {str(item["event_id"]) for item in compact}
         prompt = (
@@ -521,14 +715,32 @@ class MemoryBrainService:
             "reported user claim into a verified fact.\n"
             + json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
         )
-        rows = await self.gateway.generate_json(
-            prompt,
-            max_tokens=600,
-            temperature=0.0,
-            timeout=30.0,
-        )
+        try:
+            rows = await self.gateway.generate_json(
+                prompt,
+                max_tokens=600,
+                temperature=0.0,
+                timeout=chat_timeout,
+            )
+        except (EmptyModelResultError, ValueError, json.JSONDecodeError) as exc:
+            # 推理模型对严格 JSON prompt 可能返回空/散文/截断；夜间巩固
+            # 是软任务，不得让主循环记 ERROR，下个窗口再试。
+            self._set_consolidation_outcome(
+                "invalid_model_output", error_kind=type(exc).__name__
+            )
+            logger.warning(
+                "nightly consolidation model result unusable account=%s: %s",
+                self.account_id,
+                type(exc).__name__,
+            )
+            return 0
         if not isinstance(rows, list):
-            raise ValueError("nightly consolidation must return a JSON array")
+            self._set_consolidation_outcome("invalid_model_output", error_kind="ValueError")
+            logger.warning(
+                "nightly consolidation model result unusable account=%s: ValueError",
+                self.account_id,
+            )
+            return 0
         allowed_relations = {
             "reflection",
             "updates",
@@ -552,6 +764,7 @@ class MemoryBrainService:
                 continue
             validated.append({"summary": summary, "relation": relation, "evidence": evidence})
         if not validated:
+            self._set_consolidation_outcome("zero_reflections")
             return 0
 
         from .ingestion import text_observation
@@ -598,6 +811,9 @@ class MemoryBrainService:
                         self.account_id,
                         exc_info=True,
                     )
+        self._set_consolidation_outcome(
+            "success", reflection_count=len(validated)
+        )
         return len(validated)
 
     def bind_reflection_apply_hook(self, hook: Any) -> None:

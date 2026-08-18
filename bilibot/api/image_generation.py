@@ -195,7 +195,9 @@ def create_image_generation_routes(config_loader, config_path: str):
             try:
                 body = await request.json()
             except Exception:
-                pass
+                body = {}
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             prompt = body.get("prompt", "").strip()
             if not prompt:
                 return fail("INVALID_INPUT", "请输入 prompt 提示词", status_code=400)

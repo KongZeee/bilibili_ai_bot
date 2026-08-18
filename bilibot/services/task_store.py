@@ -25,7 +25,7 @@ import random
 import sqlite3
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -194,9 +194,10 @@ class TaskRunStore:
                     finished_at REAL,
                     updated_at REAL NOT NULL,
                     grace_window INTEGER DEFAULT 900,
-                    UNIQUE(idempotency_key)
+                    UNIQUE(account_id, idempotency_key)
                 )
             """)
+            self._migrate_task_idempotency_schema(conn)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_task_status ON task_runs(status)"
             )
@@ -213,6 +214,68 @@ class TaskRunStore:
             conn.commit()
         finally:
             conn.close()
+
+    def _migrate_task_idempotency_schema(self, conn) -> None:
+        """Rebuild legacy task_runs tables whose UNIQUE(idempotency_key) was global.
+
+        The contract is account_id + idempotency_key; old on-disk schemas keep
+        the global constraint even though CREATE TABLE IF NOT EXISTS cannot
+        alter it, so rebuild once with data preserved.
+        """
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_runs'"
+        ).fetchone()
+        table_sql = str(row[0] or "") if row else ""
+        if (
+            "UNIQUE(idempotency_key)" not in table_sql
+            or "UNIQUE(account_id, idempotency_key)" in table_sql
+        ):
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute("ALTER TABLE task_runs RENAME TO task_runs_legacy")
+            conn.execute("""
+                CREATE TABLE task_runs (
+                    task_id TEXT PRIMARY KEY,
+                    account_id TEXT NOT NULL,
+                    scene TEXT NOT NULL,
+                    idempotency_key TEXT NOT NULL,
+                    trigger_type TEXT,
+                    status TEXT NOT NULL DEFAULT 'scheduled',
+                    scheduled_at REAL,
+                    not_before REAL,
+                    lease_until REAL,
+                    attempt INTEGER NOT NULL DEFAULT 0,
+                    max_attempts INTEGER NOT NULL DEFAULT 3,
+                    next_retry_at REAL,
+                    input_json TEXT DEFAULT '{}',
+                    result_json TEXT DEFAULT '{}',
+                    last_error_code TEXT,
+                    last_error TEXT,
+                    created_at REAL NOT NULL,
+                    started_at REAL,
+                    finished_at REAL,
+                    updated_at REAL NOT NULL,
+                    grace_window INTEGER DEFAULT 900,
+                    UNIQUE(account_id, idempotency_key)
+                )
+            """)
+            columns = (
+                "task_id,account_id,scene,idempotency_key,trigger_type,status,"
+                "scheduled_at,not_before,lease_until,attempt,max_attempts,"
+                "next_retry_at,input_json,result_json,last_error_code,last_error,"
+                "created_at,started_at,finished_at,updated_at,grace_window"
+            )
+            conn.execute(
+                f"INSERT INTO task_runs({columns}) SELECT {columns} FROM task_runs_legacy"
+            )
+            conn.execute("DROP TABLE task_runs_legacy")
+            conn.commit()
+            logger.info("task_runs schema migrated to account-scoped idempotency keys")
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
 
     # ═══════════════════════════════════════════════════════
     #  Create
@@ -301,7 +364,8 @@ class TaskRunStore:
         conn = self._get_conn()
         try:
             row = conn.execute(
-                "SELECT * FROM task_runs WHERE idempotency_key=?", (idempotency_key,)
+                "SELECT * FROM task_runs WHERE idempotency_key=? AND account_id=?",
+                (idempotency_key, self.account_id),
             ).fetchone()
             return TaskRun.from_row(row) if row else None
         finally:
@@ -391,6 +455,38 @@ class TaskRunStore:
         finally:
             conn.close()
 
+    def count_stale_active(
+        self,
+        account_id: str,
+        *,
+        stale_after: float = 900.0,
+        now: Optional[float] = None,
+    ) -> int:
+        """Count active TaskRuns that outlived their recovery grace period."""
+        now = time.time() if now is None else float(now)
+        cutoff = now - max(0.0, float(stale_after))
+        conn = self._get_conn()
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM task_runs WHERE account_id=? AND ("
+                "(status=? AND updated_at <= ?) OR "
+                "(status IN (?, ?) AND ((lease_until IS NOT NULL AND lease_until <= ?) "
+                "OR (lease_until IS NULL AND updated_at <= ?)))"
+                ")",
+                (
+                    account_id,
+                    STATUS_INTERRUPTED,
+                    cutoff,
+                    STATUS_CLAIMED,
+                    STATUS_RUNNING,
+                    cutoff,
+                    cutoff,
+                ),
+            ).fetchone()
+            return int(row[0] if row else 0)
+        finally:
+            conn.close()
+
     def count_succeeded_today(
         self, account_id: str, scene: str, now: Optional[float] = None,
     ) -> int:
@@ -452,6 +548,32 @@ class TaskRunStore:
             rows = conn.execute(
                 "SELECT * FROM task_runs WHERE status=? ORDER BY updated_at ASC",
                 (STATUS_INTERRUPTED,),
+            ).fetchall()
+            return [TaskRun.from_row(r) for r in rows]
+        finally:
+            conn.close()
+
+    def list_running_expired(
+        self,
+        *,
+        lease_overdue_seconds: float = 300.0,
+        now: Optional[float] = None,
+    ) -> List[TaskRun]:
+        """Running tasks whose lease expired beyond the grace window.
+
+        The scheduler watchdog uses this to recover orphaned TaskRuns whose
+        coroutine already died without finalizing the database row.
+        """
+        now = now or time.time()
+        overdue = max(0.0, float(lease_overdue_seconds))
+        cutoff = now - overdue
+        conn = self._get_conn()
+        try:
+            rows = conn.execute(
+                "SELECT * FROM task_runs WHERE status=? "
+                "AND lease_until IS NOT NULL AND lease_until <= ? "
+                "ORDER BY updated_at ASC",
+                (STATUS_RUNNING, cutoff),
             ).fetchall()
             return [TaskRun.from_row(r) for r in rows]
         finally:
@@ -522,7 +644,8 @@ class TaskRunStore:
         try:
             cur = conn.execute(
                 "UPDATE task_runs SET status=?, result_json=?, finished_at=?, "
-                "updated_at=?, lease_until=NULL, next_retry_at=NULL "
+                "updated_at=?, lease_until=NULL, next_retry_at=NULL, "
+                "last_error_code='', last_error='' "
                 "WHERE task_id=? AND status=?",
                 (STATUS_SUCCEEDED, result_json, now, now, task_id, STATUS_RUNNING),
             )
@@ -543,38 +666,48 @@ class TaskRunStore:
         conn = self._get_conn()
         try:
             row = conn.execute(
-                "SELECT attempt, max_attempts FROM task_runs WHERE task_id=?",
+                "SELECT attempt, max_attempts, status FROM task_runs WHERE task_id=?",
                 (task_id,),
             ).fetchone()
             if row is None:
+                return False
+            if row["status"] not in (STATUS_RUNNING, STATUS_CLAIMED, STATUS_SCHEDULED):
+                # Terminal states are final; a late watchdog/retry coroutine must
+                # never pull succeeded/result_unknown back into retry_wait.
                 return False
             attempt = row["attempt"]
             max_att = row["max_attempts"]
 
             if not retryable or attempt + 1 >= max_att:
                 # 达到上限或不可重试 → failed
-                conn.execute(
+                cur = conn.execute(
                     "UPDATE task_runs SET status=?, attempt=?, last_error_code=?, "
                     "last_error=?, finished_at=?, updated_at=?, lease_until=NULL, "
-                    "next_retry_at=NULL WHERE task_id=?",
-                    (STATUS_FAILED, attempt + 1, error_code, error, now, now, task_id),
+                    "next_retry_at=NULL WHERE task_id=? AND status IN (?, ?, ?)",
+                    (
+                        STATUS_FAILED, attempt + 1, error_code, error, now, now,
+                        task_id, STATUS_RUNNING, STATUS_CLAIMED, STATUS_SCHEDULED,
+                    ),
                 )
                 conn.commit()
-                return True
+                return cur.rowcount > 0
             # 还能重试 → retry_wait（指数退避）
             new_attempt = attempt + 1
             base = min(2 ** new_attempt, 300)
             jitter = random.uniform(0, base * 0.1)
             next_retry_at = now + base + jitter
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE task_runs SET status=?, attempt=?, last_error_code=?, "
                 "last_error=?, next_retry_at=?, updated_at=?, lease_until=NULL "
-                "WHERE task_id=?",
-                (STATUS_RETRY_WAIT, new_attempt, error_code, error,
-                 next_retry_at, now, task_id),
+                "WHERE task_id=? AND status IN (?, ?, ?)",
+                (
+                    STATUS_RETRY_WAIT, new_attempt, error_code, error,
+                    next_retry_at, now, task_id,
+                    STATUS_RUNNING, STATUS_CLAIMED, STATUS_SCHEDULED,
+                ),
             )
             conn.commit()
-            return True
+            return cur.rowcount > 0
         finally:
             conn.close()
 
@@ -589,7 +722,7 @@ class TaskRunStore:
             cur = conn.execute(
                 "UPDATE task_runs SET status=?, last_error_code=?, last_error=?, "
                 "finished_at=?, updated_at=?, lease_until=NULL, next_retry_at=NULL "
-                "WHERE task_id=?",
+                "WHERE task_id=? AND status='running'",
                 (STATUS_RESULT_UNKNOWN, "PLATFORM_RESULT_UNCERTAIN", error,
                  now, now, task_id),
             )
@@ -683,12 +816,58 @@ class TaskRunStore:
         finally:
             conn.close()
 
+    def clear_succeeded_errors(self, now: Optional[float] = None) -> int:
+        """Clear stale failure diagnostics from already-succeeded TaskRuns."""
+        now = now or time.time()
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE task_runs SET last_error_code='', last_error='', updated_at=? "
+                "WHERE status=? AND (COALESCE(last_error_code, '')<>'' "
+                "OR COALESCE(last_error, '')<>'')",
+                (now, STATUS_SUCCEEDED),
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
+    def expire_scheduled_before(
+        self,
+        account_id: str,
+        scene: str,
+        before: float,
+        now: Optional[float] = None,
+    ) -> int:
+        """Expire only scheduled rows from before a day-boundary timestamp."""
+        now = now or time.time()
+        conn = self._get_conn()
+        try:
+            cur = conn.execute(
+                "UPDATE task_runs SET status=?, finished_at=?, updated_at=? "
+                "WHERE account_id=? AND scene=? AND status=? AND scheduled_at < ?",
+                (
+                    STATUS_EXPIRED,
+                    now,
+                    now,
+                    account_id,
+                    scene,
+                    STATUS_SCHEDULED,
+                    float(before),
+                ),
+            )
+            conn.commit()
+            return cur.rowcount
+        finally:
+            conn.close()
+
     def clear_account_scene_today(
         self, account_id: str, scene: str, now: Optional[float] = None,
     ) -> int:
-        """PRD-V5：跨天时清理当日内存计划前，先把旧的 scheduled 标记 expired
+        """Compatibility helper that expires all scheduled rows for a scene.
 
-        注意：只清理 scheduled 状态，已完成/失败的历史保留。
+        New daily scheduling code must use ``expire_scheduled_before`` so a
+        same-day process restart cannot invalidate future slots.
         """
         now = now or time.time()
         conn = self._get_conn()

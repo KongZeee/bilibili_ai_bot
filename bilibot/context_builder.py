@@ -16,8 +16,10 @@ PRD-V5 §5.1 ACC-502：每个账号拥有独立 ContextBuilder，
 build() 校验 account_id 隔离，防止跨账号读取 recent behavior。
 """
 import logging
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from bilibot.models import ReplyContext
 
 logger = logging.getLogger("bilibot.context")
 
@@ -101,7 +103,7 @@ class ContextBuilder:
         bot_thread_replies = _value(context, "bot_thread_replies", []) or []
         context_recent_actions = _value(context, "recent_bot_actions", []) or []
         mood = _value(context, "mood", "")
-        video_context_complete = _value(context, "video_context_complete", True)
+        video_context_complete = _value(context, "video_context_complete", False)
 
         # 1. 视频 / 动态
         if video:

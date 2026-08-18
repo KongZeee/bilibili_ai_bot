@@ -18,11 +18,9 @@
 - POST /api/personas/import/github - 从 GitHub URL 导入
 - POST /api/personas/{id}/evaluate - 自动评测人格
 """
+from .responses import fail_invalid_input
 import asyncio
-import json
 import logging
-import uuid
-from starlette.responses import JSONResponse
 from starlette.requests import Request
 
 logger = logging.getLogger("bilibot.api.personas")
@@ -170,7 +168,12 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None, accoun
 
     async def copy_persona(request: Request) -> JSONResponse:
         persona_id = request.path_params.get("id")
-        body = await request.json() if request.method == "POST" else {}
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        if not isinstance(body, dict):
+            return fail_invalid_input("请求体必须是 JSON 对象")
         new_name = body.get("name")
         persona = persona_store.copy_persona(persona_id, new_name)
         if not persona:
@@ -184,6 +187,8 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None, accoun
         """测试人格（只返回 prompt，不真实发布）"""
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail_invalid_input("请求体必须是 JSON 对象")
             test_input = body.get("input", "")
             persona_id = body.get("persona_id")
             use_llm = body.get("use_llm", False)
@@ -261,7 +266,7 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None, accoun
         })
 
     async def import_persona(request: Request) -> JSONResponse:
-        from .responses import fail, fail_invalid_input
+        from .responses import fail_invalid_input
         try:
             try:
                 body = await request.json()
@@ -314,6 +319,8 @@ def create_personas_routes(persona_store, orchestrator, llm_manager=None, accoun
         from .responses import fail, fail_internal
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                return fail("INVALID_INPUT", "请求体必须是 JSON 对象", status_code=400)
             url = body.get("github_url", "")
             if not url:
                 return fail("INVALID_INPUT", "缺少 github_url 参数", status_code=400)

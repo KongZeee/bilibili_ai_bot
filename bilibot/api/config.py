@@ -68,6 +68,7 @@ OBJECT_ARRAY_FIELDS = {
     "embedding_providers",
     "asr_providers",
     "image_providers",
+    "rerank_providers",
 }
 
 
@@ -144,6 +145,9 @@ MEMORY_FIELD_CONTRACT = {
     "rerank_timeout_seconds": "restart_account",
     "recall_total_timeout_seconds": "restart_account",
     "rerank_relevance_baseline": "restart_account",
+    "rerank_model_relevance_baseline": "restart_account",
+    "fallback_direct_threshold": "restart_account",
+    "fallback_association_threshold": "restart_account",
     "enrichment_chat_timeout_seconds": "restart_account",
     "link_candidate_limit": "restart_account",
     "link_job_max_attempts": "restart_account",
@@ -155,7 +159,9 @@ MEMORY_FIELD_CONTRACT = {
     "chunk_overlap_chars": "restart_account",
     "job_max_attempts": "restart_account",
     "vector_cache_limit": "restart_account",
+    "vector_full_scan_row_limit": "restart_account",
     "vector_batch_size": "restart_account",
+    "vector_candidate_prefilter": "restart_account",
 }
 
 # V6 memory 配置字段消费映射（schema_path → owner → reload_level → test_id）
@@ -187,6 +193,21 @@ MEMORY_CONFIG_FIELD_MAP = {
         "test_id": "test_v6_recall_time_budgets",
     },
     "memory.rerank_relevance_baseline": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_rerank_contract",
+    },
+    "memory.rerank_model_relevance_baseline": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_rerank_contract",
+    },
+    "memory.fallback_direct_threshold": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_rerank_contract",
+    },
+    "memory.fallback_association_threshold": {
         "owner": "MemoryRecallEngine",
         "reload_level": "restart_account",
         "test_id": "test_v6_rerank_contract",
@@ -245,6 +266,16 @@ MEMORY_CONFIG_FIELD_MAP = {
         "owner": "MemoryBrainStore",
         "reload_level": "restart_account",
         "test_id": "test_v6_vector_batches",
+    },
+    "memory.vector_full_scan_row_limit": {
+        "owner": "MemoryBrainStore",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_vector_batches",
+    },
+    "memory.vector_candidate_prefilter": {
+        "owner": "MemoryRecallEngine",
+        "reload_level": "restart_account",
+        "test_id": "test_v6_vector_prefilter",
     },
     "memory.vector_batch_size": {
         "owner": "MemoryBrainStore",
@@ -1146,6 +1177,9 @@ def _build_config_schema() -> dict:
                 "rerank_timeout_seconds": {"type": "number", "label": "重排超时（秒）"},
                 "recall_total_timeout_seconds": {"type": "number", "label": "召回总预算（秒）"},
                 "rerank_relevance_baseline": {"type": "number", "label": "重排相关度基线"},
+                "rerank_model_relevance_baseline": {"type": "number", "label": "专用重排模型基线"},
+                "fallback_direct_threshold": {"type": "number", "label": "Fallback 直接阈值"},
+                "fallback_association_threshold": {"type": "number", "label": "Fallback 联想阈值"},
                 "enrichment_chat_timeout_seconds": {"type": "number", "label": "后台富化超时（秒）"},
                 "link_candidate_limit": {"type": "number", "label": "关联候选上限"},
                 "link_job_max_attempts": {"type": "number", "label": "关联任务最大重试"},
@@ -1157,7 +1191,9 @@ def _build_config_schema() -> dict:
                 "chunk_overlap_chars": {"type": "number", "label": "相邻分块重叠字符"},
                 "job_max_attempts": {"type": "number", "label": "索引任务最大重试"},
                 "vector_cache_limit": {"type": "number", "label": "向量缓存上限"},
+                "vector_full_scan_row_limit": {"type": "number", "label": "向量全表扫描行数预算"},
                 "vector_batch_size": {"type": "number", "label": "向量扫描批大小"},
+                "vector_candidate_prefilter": {"type": "boolean", "label": "向量候选预过滤（大库）"},
             }
         },
         "reply": {
@@ -1500,6 +1536,55 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                     },
                 }, status_code=400)
 
+            # 单账号护栏：通用 PATCH 不得通过对象数组替换语义移除/更换唯一账号。
+            # 添加、删除、切换账号必须走 /api/accounts 专用接口。
+            if "accounts" in body:
+                existing_accounts = raw_config.get("accounts") or []
+                existing_ids = {
+                    str(item.get("id") or "")
+                    for item in existing_accounts
+                    if isinstance(item, dict) and item.get("id")
+                }
+                submitted = body.get("accounts")
+                submitted_ids = {
+                    str(item.get("id") or "")
+                    for item in submitted
+                    if isinstance(item, dict) and item.get("id")
+                }
+                if not isinstance(submitted, list) or not submitted:
+                    return fail(
+                        "ACCOUNTS_GUARDED",
+                        "accounts 不能清空，请使用账号管理接口",
+                        status_code=400,
+                    )
+                missing = existing_ids - submitted_ids
+                if missing:
+                    return fail(
+                        "ACCOUNTS_GUARDED",
+                        f"通用配置 PATCH 不能移除账号: {', '.join(sorted(missing))}，"
+                        "请使用账号管理接口",
+                        status_code=400,
+                    )
+                if len(submitted_ids) != len(submitted):
+                    return fail(
+                        "ACCOUNTS_GUARDED",
+                        "accounts 对象数组中的条目必须具有唯一 id",
+                        status_code=400,
+                    )
+            if "default_account" in body:
+                new_default = str(body.get("default_account") or "")
+                allowed_ids = {
+                    str(item.get("id") or "")
+                    for item in (body.get("accounts") or raw_config.get("accounts") or [])
+                    if isinstance(item, dict) and item.get("id")
+                }
+                if new_default and new_default not in allowed_ids:
+                    return fail(
+                        "ACCOUNTS_GUARDED",
+                        "default_account 必须指向已配置的账号，请使用账号管理接口",
+                        status_code=400,
+                    )
+
             # 2. 类型规范化
             try:
                 normalized = _normalize_by_schema(body, schema)
@@ -1528,7 +1613,7 @@ def create_config_routes(config_loader, config_file_path: str = "config.yaml", a
                 if isinstance(web_norm, dict):
                     new_pwd = web_norm.get("admin_password")
                     if (new_pwd and isinstance(new_pwd, str)
-                            and not new_pwd.startswith("$2b$")
+                            and not new_pwd.startswith(("$2a$", "$2b$", "$2y$"))
                             and not is_sensitive_placeholder(new_pwd)):
                         web_norm["admin_password"] = bcrypt.hashpw(
                             new_pwd.encode(), bcrypt.gensalt()

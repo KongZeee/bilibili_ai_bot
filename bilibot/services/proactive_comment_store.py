@@ -628,9 +628,12 @@ class ProactiveCommentStore:
 
         达到 max_attempts → 直接 failed。
         increment_attempt=False：仅延期（如限流），不消耗 attempt 预算。
-        from_statuses：可选限制来源状态（默认不限制，兼容旧调用）。
+        from_statuses：可选限制来源状态（默认仅限 claimed/publishing/retry_wait，
+        避免终态被迟到调用拉回队列）。
         """
         now = now or time.time()
+        if from_statuses is None:
+            from_statuses = (STATUS_CLAIMED, STATUS_PUBLISHING, STATUS_RETRY_WAIT)
         conn = self._get_conn()
         try:
             row = conn.execute(

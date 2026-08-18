@@ -12,7 +12,7 @@ from .bootstrap import (
     layout_marker_path,
     legacy_account_dir,
 )
-from .gateway import EmbeddingBatch, MemoryModelGateway
+from .gateway import EmbeddingBatch, EmptyModelResultError, MemoryModelGateway
 from .ingestion import (
     bangumi_episode_observation,
     bot_action_observation,
@@ -59,6 +59,7 @@ __all__ = [
     "ClaimedJob",
     "CleanupRecord",
     "EmbeddingBatch",
+    "EmptyModelResultError",
     "HealthReport",
     "IdempotencyConflictError",
     "BOT_DIR_NAME",

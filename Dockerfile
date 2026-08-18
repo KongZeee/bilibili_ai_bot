@@ -1,9 +1,15 @@
 FROM python:3.11-slim
 
+# 可用 --build-arg APT_MIRROR=mirrors.aliyun.com 等镜像源加速/绕过网络限制
+ARG APT_MIRROR=deb.debian.org
+
 WORKDIR /app
 
 # 安装系统依赖
-RUN apt-get update && apt-get install -y \
+RUN if [ "$APT_MIRROR" != "deb.debian.org" ]; then \
+        sed -i "s|deb.debian.org|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources || true; \
+    fi && \
+    apt-get update && apt-get install -y \
     git \
     curl \
     ffmpeg \
@@ -24,10 +30,12 @@ RUN mkdir -p data \
 
 # 暴露端口
 EXPOSE 8080
+ENV BILIBOT_WEB_PORT=8080
 
-# 健康检查（公开状态端点，无需鉴权）
+# 健康检查（公开状态端点，无需鉴权；BILIBOT_WEB_PORT 需与 config web.port 一致，
+# 且 web.enabled=true，否则该 HTTP 探针无法通过）
 HEALTHCHECK --interval=30s --timeout=5s --start-period=40s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8080/api/status/public || exit 1
+    CMD curl -fsS http://127.0.0.1:${BILIBOT_WEB_PORT}/api/status/public || exit 1
 
 USER bilibot
 

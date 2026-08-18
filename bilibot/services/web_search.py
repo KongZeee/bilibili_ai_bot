@@ -39,10 +39,12 @@ import random
 import re
 import time
 from collections import OrderedDict
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
+
+from bilibot.services.clock import now_cn, today_cn
 
 logger = logging.getLogger("bilibot.services.web_search")
 
@@ -215,9 +217,17 @@ class WebSearchService:
         self.api_key: str = ws_config.get("api_key", "")
         self.api_base: str = ws_config.get("api_base", "")
         self.model: str = ws_config.get("model", "")
-        self.max_results: int = int(ws_config.get("max_results", 5))
+        try:
+            self.max_results: int = int(ws_config.get("max_results", 5))
+        except (TypeError, ValueError):
+            self.max_results = 5
+        self.max_results = max(1, min(self.max_results, 20))
         # PRD V4 SEA-006：日预算
-        self.daily_budget: int = int(ws_config.get("daily_budget_per_account", 100))
+        try:
+            self.daily_budget: int = int(ws_config.get("daily_budget_per_account", 100))
+        except (TypeError, ValueError):
+            self.daily_budget = 100
+        self.daily_budget = max(1, self.daily_budget)
         # PRD V4 SEA-002：场景级开关矩阵
         self.scenes: Dict[str, Dict] = ws_config.get("scenes", {}) or {}
         # PRD V4 SEA-006：缓存 TTL 配置
@@ -247,10 +257,43 @@ class WebSearchService:
 
     def reload_config(self, config: dict):
         """PRD V4 SEA-007：热重载配置"""
+        old_api_base = getattr(self, "api_base", "")
+        old_clients = self._clients
+        old_session = self._session
         self._load_config(config)
         # SEA-605：重置缓存的客户端/Session，使 backend/api_base 变更后能重新创建
         self._clients = {}
         self._session = None
+        # Custom 能力探测缓存与 endpoint 强相关，换 endpoint/backend 后必须重探
+        if self.backend != "custom" or self.api_base != old_api_base:
+            self._custom_probed = False
+            self._custom_capable = False
+
+        async def _close_old_resources() -> None:
+            for client in old_clients.values():
+                close = getattr(client, "close", None)
+                if callable(close):
+                    try:
+                        await close()
+                    except Exception:
+                        pass
+            if old_session is not None and not old_session.closed:
+                try:
+                    await old_session.close()
+                except Exception:
+                    pass
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+        if loop is not None and loop.is_running():
+            loop.create_task(_close_old_resources())
+        else:
+            try:
+                asyncio.run(_close_old_resources())
+            except Exception:
+                pass
         logger.info("联网搜索配置已热重载")
 
     # ── 场景检查 ──
@@ -304,14 +347,14 @@ class WebSearchService:
 
     def _budget_key(self, date_str: str = "") -> str:
         """PRD-V5 §10.1 SEA-502：预算键含 account_id + date"""
-        date_str = date_str or datetime.now().strftime("%Y-%m-%d")
+        date_str = date_str or today_cn().isoformat()
         if self.account_id:
             return f"{self.account_id}:{date_str}"
         return date_str
 
     def _check_daily_budget(self) -> bool:
         """PRD V4 SEA-006：检查日预算是否超限"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_cn().isoformat()
         if self._daily_count_date != today:
             self._daily_count = 0
             self._daily_count_date = today
@@ -322,7 +365,7 @@ class WebSearchService:
 
     def _increment_daily_count(self):
         """扣减日预算并持久化（PRD-V5 §10.1 SEA-502：重启不清零）"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_cn().isoformat()
         if self._daily_count_date != today:
             self._daily_count = 0
             self._daily_count_date = today
@@ -348,7 +391,7 @@ class WebSearchService:
     async def _release_budget(self):
         """PRD-V5 §10.1 SEA-502：退回预先扣减的日预算（搜索失败时调用）"""
         async with self._budget_lock:
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = today_cn().isoformat()
             if self._daily_count_date != today:
                 # 跨天了，无需退回（当日计数已重置）
                 return
@@ -438,10 +481,28 @@ class WebSearchService:
                 return None
             return dict(shared)
 
+        # 注册 in-flight Future 必须先于任何 await（同步注册，避免两个协程
+        # 都通过上面的检查后再双双扣预算、双双发起真实请求）。
+        loop = asyncio.get_running_loop()
+        fut = loop.create_future()
+        self._inflight[inflight_key] = fut
+
+        def _release_inflight() -> None:
+            self._inflight.pop(inflight_key, None)
+
         # PRD V4 SEA-006 / PRD-V5 §10.1 SEA-502：日预算原子化检查+扣减（防并发超预算）
         # SEA-603：采用"先扣减后搜索，失败则退回"策略，保证失败不消耗预算
-        if not await self._try_acquire_budget():
+        try:
+            acquired = await self._try_acquire_budget()
+        except BaseException:
+            if not fut.done():
+                fut.set_result(None)
+            _release_inflight()
+            raise
+        if not acquired:
             logger.warning(f"联网搜索日预算已耗尽 ({self._daily_count}/{self.daily_budget})")
+            fut.set_result(None)
+            _release_inflight()
             return None
 
         # PRD-V5 §4.3 SEA-501：安全日志（仅记录 hash + 脱敏预览，不记录原始查询）
@@ -466,11 +527,6 @@ class WebSearchService:
             except Exception as e:
                 logger.debug(f"外部披露审计记录失败（不影响搜索）: {e}")
 
-        # 注册 in-flight Future（同步注册，避免协程间竞态）
-        loop = asyncio.get_running_loop()
-        fut = loop.create_future()
-        self._inflight[inflight_key] = fut
-
         result: Optional[Dict[str, Any]] = None
         try:
             result = await self._search_with_retry(query, deadline)
@@ -485,7 +541,7 @@ class WebSearchService:
                 # SEA-603：搜索成功，预算已在发起调用前预先扣减，保留扣减
                 result["query"] = query
                 result["backend"] = self.backend
-                result["fetched_at"] = datetime.now().isoformat()
+                result["fetched_at"] = now_cn().isoformat()
                 result["freshness"] = freshness
                 result["scene"] = scene
                 result["cached"] = False
@@ -579,7 +635,9 @@ class WebSearchService:
         status = getattr(exc, "status_code", None)
         if status is not None:
             return self._is_retryable_status(int(status))
-        # openai 库的 APIStatusError 暴露 .status_code 属性；网络层错误视为可重试
+        # OpenAI SDK 的纯网络层异常没有 status_code；按类名识别可重试
+        if type(exc).__name__ in ("APITimeoutError", "APIConnectionError"):
+            return True
         return isinstance(exc, (aiohttp.ClientError, asyncio.TimeoutError))
 
     async def search_text(self, query: str, scene: str = "",
@@ -1120,7 +1178,7 @@ UP主：{owner}
         """清理超过 30 天的历史预算记录，避免 _budget_store 无限增长"""
         if not self._budget_store:
             return
-        cutoff = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+        cutoff = (now_cn() - timedelta(days=30)).strftime("%Y-%m-%d")
         # key 格式为 "account_id:YYYY-MM-DD" 或 "YYYY-MM-DD"，日期始终为末尾 10 字符
         self._budget_store = {
             k: v for k, v in self._budget_store.items()
@@ -1165,7 +1223,7 @@ UP主：{owner}
             raw = self.ds.load_json(self._budget_filename, {})
             self._budget_store = {str(k): int(v) for k, v in raw.items()} if raw else {}
             self._prune_budget_store()
-            today = datetime.now().strftime("%Y-%m-%d")
+            today = today_cn().isoformat()
             key = self._budget_key(today)
             self._daily_count = int(self._budget_store.get(key, 0))
             self._daily_count_date = today
@@ -1174,7 +1232,7 @@ UP主：{owner}
 
     def get_today_summary(self) -> Dict[str, int]:
         """获取今日搜索预算使用情况"""
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = today_cn().isoformat()
         if self._daily_count_date != today:
             self._daily_count = 0
             self._daily_count_date = today

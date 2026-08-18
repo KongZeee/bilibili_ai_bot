@@ -502,6 +502,7 @@ async def test_private_message_self_query(seeded_store):
             source_external_id="pm1",
             source_text="亚托莉在私信中发送消息：你好呀，我是亚托莉。",
             event_title="私信回复",
+            metadata={"redacted": True},
             job_types=(),
         )
     )

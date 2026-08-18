@@ -12,7 +12,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .responses import ok, fail, fail_not_found, fail_internal
+from .responses import fail
 
 logger = logging.getLogger("bilibot.api.tasks")
 

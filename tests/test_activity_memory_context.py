@@ -285,6 +285,42 @@ class _SafetySpy:
 
 
 @pytest.mark.asyncio
+async def test_companion_exploration_uses_fallback_scene_consistently(tmp_path):
+    class SceneWeb(_ExploreWeb):
+        def __init__(self):
+            self.scenes: list[str] = []
+
+        def is_scene_enabled(self, scene):
+            return scene == "proactive_video"
+
+        async def search(self, _query, scene=None, **_kwargs):
+            self.scenes.append(scene or "")
+            return {"items": [{"title": "result", "snippet": "public material"}]}
+
+    class Brain:
+        async def begin_activity(self, **kwargs):
+            return SimpleNamespace(prompt_text="", event_ids=(), recent_self_actions=())
+
+        async def archive_observation_async(self, _envelope):
+            return SimpleNamespace(source_committed=True)
+
+        async def finish_activity(self, **kwargs):
+            return "event-id"
+
+    web = SceneWeb()
+    service = CompanionLifeService(
+        "acc",
+        str(tmp_path),
+        config_loader=_ExploreConfig(),
+        memory_brain=Brain(),
+        web_search=web,
+    )
+    note = await service.maybe_explore(force=True)
+    assert note is not None
+    assert web.scenes == ["proactive_video"]
+
+
+@pytest.mark.asyncio
 async def test_companion_explorations_have_unique_activity_keys(tmp_path):
     class Brain:
         def __init__(self):
@@ -685,6 +721,42 @@ def test_dynamic_image_anime_style_is_available_and_applied():
     assert "no text, no watermark" in prompt
 
 
+@pytest.mark.asyncio
+async def test_dynamic_prompt_keeps_active_persona_identity_in_final_provider_prompt():
+    from bilibot.scheduler import Scheduler
+
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.llm = MagicMock()
+    scheduler.llm.generate = AsyncMock(return_value="A generic girl reading beside a window")
+    scheduler.account_id = "atri-account"
+    scheduler.persona_store = MagicMock()
+    scheduler.persona_store.resolve_persona.return_value = SimpleNamespace(
+        id="atri",
+        name="亚托莉",
+        appearance="浅米色双马尾、紫红色眼眸、白蓝水手服和红色蝴蝶结",
+    )
+    scheduler.config_loader = MagicMock()
+    scheduler.config_loader.get_raw_config.return_value = {
+        "dynamic_publish": {"image_style": "anime"}
+    }
+
+    result = await scheduler._generate_image_prompt(
+        "午后在窗边看书",
+        persona_id="atri",
+    )
+
+    assert result is not None
+    assert "亚托莉" in result
+    assert "浅米色双马尾、紫红色眼眸、白蓝水手服和红色蝴蝶结" in result
+    assert "Character identity lock" in result
+    assert "generic girl" in result
+    assert "浅米色双马尾" in scheduler.llm.generate.await_args.args[0]
+    scheduler.persona_store.resolve_persona.assert_called_once_with(
+        account_id="atri-account",
+        task_persona_id="atri",
+    )
+
+
 def test_dynamic_image_custom_style_and_empty_custom_fallback():
     from bilibot.image.styles import (
         DEFAULT_IMAGE_STYLE,
@@ -957,6 +1029,28 @@ def test_partial_llm_plan_is_merged_into_full_fallback_schedule():
     assert evening.activity == "把刚看的海边故事画成小草图"
     assert evening.basis == "llm_partial"
     assert merged[-1].activity == "睡眠"
+
+
+def test_partial_llm_plan_cannot_overwrite_sleep_slot():
+    from bilibot.companion.models import PlanItem
+    from bilibot.companion.service import _fallback_plan_items, _merge_partial_plan_items
+
+    fallback = _fallback_plan_items(8, interests=["动画"], weekday="周一")
+    merged = _merge_partial_plan_items(
+        fallback,
+        [
+            PlanItem(
+                time="23:30",
+                end="07:00",
+                activity="连夜刷视频不睡觉",
+                mood="兴奋",
+            )
+        ],
+    )
+
+    sleep_slot = next(item for item in merged if item.time == "23:30")
+    assert sleep_slot.activity == "睡眠"
+    assert sleep_slot.end == "07:00"
 
 
 @pytest.mark.asyncio

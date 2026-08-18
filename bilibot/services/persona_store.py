@@ -180,24 +180,15 @@ class PersonaStore:
             PersonaExample(**e) for e in data.get("examples", [])
         ]
         
-        persona = Persona(
-            id=pid,
-            name=data.get("name", "新人格"),
-            description=data.get("description", ""),
-            base_prompt=data.get("base_prompt", ""),
-            speaking_style=data.get("speaking_style", ""),
-            boundaries=data.get("boundaries", ""),
-            relationship_rules=data.get("relationship_rules", ""),
-            reply_rules=data.get("reply_rules", ""),
-            proactive_comment_rules=data.get("proactive_comment_rules", ""),
-            dynamic_rules=data.get("dynamic_rules", ""),
-            weekly_rules=data.get("weekly_rules", ""),
-            examples=examples,
-            enabled=data.get("enabled", True),
-            created_at=now,
-            updated_at=now,
-            appearance=data.get("appearance", ""),
-        )
+        # Prefer from_dict so optional fields (lore / social guards) stay in sync
+        payload = dict(data or {})
+        payload["id"] = pid
+        payload["name"] = data.get("name", "新人格")
+        payload["created_at"] = now
+        payload["updated_at"] = now
+        if examples:
+            payload["examples"] = [e.to_dict() if hasattr(e, "to_dict") else e for e in examples]
+        persona = Persona.from_dict(payload)
         
         self._personas[pid] = persona
         self._save()
@@ -211,14 +202,59 @@ class PersonaStore:
         
         p = self._personas[persona_id]
         
-        # 更新字段
-        for field in ["name", "description", "base_prompt", "speaking_style",
-                      "boundaries", "relationship_rules", "reply_rules",
-                      "proactive_comment_rules", "dynamic_rules", "weekly_rules",
-                      "enabled", "appearance"]:
+        # 更新字段（含 lore / 公开回复精简配置）
+        for field in [
+            "name",
+            "description",
+            "base_prompt",
+            "lore_prompt",
+            "speaking_style",
+            "boundaries",
+            "relationship_rules",
+            "reply_rules",
+            "private_message_rules",
+            "proactive_comment_rules",
+            "dynamic_rules",
+            "weekly_rules",
+            "enabled",
+            "appearance",
+            "life_background",
+            "diary_rules",
+            "creative_rules",
+            "social_public_guard_enabled",
+            "social_base_prompt_cap",
+        ]:
             if field in data:
-                setattr(p, field, data[field])
-        
+                val = data[field]
+                if field == "social_base_prompt_cap":
+                    try:
+                        val = max(0, int(val or 0))
+                    except (TypeError, ValueError):
+                        val = 0
+                elif field == "social_public_guard_enabled":
+                    val = bool(val)
+                setattr(p, field, val)
+
+        if "social_guard_names" in data:
+            raw = data.get("social_guard_names") or []
+            if isinstance(raw, str):
+                raw = [
+                    x.strip()
+                    for x in raw.replace("\n", ",").split(",")
+                    if x.strip()
+                ]
+            p.social_guard_names = list(raw) if isinstance(raw, list) else []
+
+        if "interests" in data:
+            interests = data.get("interests") or []
+            if isinstance(interests, str):
+                interests = [
+                    x.strip()
+                    for x in interests.replace("\n", ",").split(",")
+                    if x.strip()
+                ]
+            p.interests = list(interests) if isinstance(interests, list) else []
+
         if "examples" in data:
             p.examples = [PersonaExample(**e) for e in data["examples"]]
         
@@ -251,24 +287,13 @@ class PersonaStore:
         new_id = f"copy_{uuid.uuid4().hex[:6]}"
         
         now = datetime.now().isoformat()
-        copied = Persona(
-            id=new_id,
-            name=new_name or f"{p.name} (副本)",
-            description=p.description,
-            base_prompt=p.base_prompt,
-            speaking_style=p.speaking_style,
-            boundaries=p.boundaries,
-            relationship_rules=p.relationship_rules,
-            reply_rules=p.reply_rules,
-            proactive_comment_rules=p.proactive_comment_rules,
-            dynamic_rules=p.dynamic_rules,
-            weekly_rules=p.weekly_rules,
-            examples=list(p.examples),
-            enabled=True,
-            created_at=now,
-            updated_at=now,
-            appearance=p.appearance,
-        )
+        copied_data = p.to_dict()
+        copied_data["id"] = new_id
+        copied_data["name"] = new_name or f"{p.name} (副本)"
+        copied_data["enabled"] = True
+        copied_data["created_at"] = now
+        copied_data["updated_at"] = now
+        copied = Persona.from_dict(copied_data)
         
         self._personas[new_id] = copied
         self._save()

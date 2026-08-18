@@ -13,7 +13,6 @@ import logging
 import random
 import re
 import time
-from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("bilibot.humanized_behavior")
@@ -175,7 +174,6 @@ class HumanBehaviorSimulator:
         Returns:
             str: 新情绪
         """
-        moods = ["normal", "happy", "excited", "bored", "curious"]
         weights = {
             "normal": 40,
             "happy": 25,
@@ -353,26 +351,26 @@ class VideoBrowser:
                 f"一口气看完根本停不下来{mood_expressions['suffix'][0]}",
             ],
             "happy": [
-                f"挺不错的视频呢~",
+                "挺不错的视频呢~",
                 f"哈哈这个很有意思{mood_expressions['emoji'][0]}",
                 f"不错不错，推荐{mood_expressions['suffix'][0]}",
                 f"看完心情变好了{mood_expressions['emoji'][0]}",
             ],
             "normal": [
-                f"看了这个视频",
-                f"还不错",
-                f"挺有意思的",
-                f"看完了",
+                "看了这个视频",
+                "还不错",
+                "挺有意思的",
+                "看完了",
             ],
             "bored": [
-                f"...看了",
-                f"还行吧",
-                f"就那样",
-                f"...",
+                "...看了",
+                "还行吧",
+                "就那样",
+                "...",
             ],
             "curious": [
                 f"这个视频有点意思{mood_expressions['emoji'][0]}",
-                f"想知道更多细节",
+                "想知道更多细节",
                 f"这个角度没见过{mood_expressions['emoji'][0]}",
             ],
         }
@@ -766,10 +764,8 @@ UP主: {owner}
         system_prompt = "你是一个真实的B站用户，正在看视频并评价。"
         if personality_info:
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
-        if companion_context and str(companion_context).strip():
-            system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
-        if mem_block:
-            system_prompt += f"\n\n【记忆提示】\n{mem_block[:600]}"
+        # companion_context / memory_evidence are untrusted-derived content:
+        # keep them in the user prompt only, never in the system prompt.
 
         # 长 digest + 搜索参考时 300 tokens 容易截断 JSON；放宽并允许一次重试。
         max_tokens = 500
@@ -912,10 +908,7 @@ UP主: {owner}
         system_prompt = "你是一个真实的B站用户，正在发评论。"
         if personality_info:
             system_prompt += f"\n\n你的性格设定:\n{personality_info}"
-        if companion_context and str(companion_context).strip():
-            system_prompt += f"\n\n{str(companion_context).strip()[:400]}"
-        if mem_block:
-            system_prompt += f"\n\n【记忆提示】\n{mem_block[:500]}"
+        # companion_context / memory_evidence stay user-side only.
 
         try:
             from bilibot.services.token_usage import usage_context

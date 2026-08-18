@@ -7,7 +7,7 @@ LLM 适配器
 import logging
 import re
 import json
-from typing import Optional, List, Dict, Any, Union, TYPE_CHECKING
+from typing import Optional, List, Any
 
 # 可选依赖：openai 未安装时仍允许模块被导入（仅在不调用真实 API 时使用）
 try:

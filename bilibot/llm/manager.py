@@ -68,6 +68,18 @@ class LLMManager(ModelRouter):
             return super().remove_provider(CHAT, ptype_or_pid)
         return super().remove_provider(ptype_or_pid, pid)
 
+    def add_provider(self, config: dict) -> str:
+        """V2 兼容：1-arg 添加默认作为 chat provider"""
+        return super().add_provider(CHAT, config)
+
+    def update_provider(self, pid: str, config: dict) -> bool:
+        """V2 兼容：2-arg 更新默认作为 chat provider"""
+        return super().update_provider(CHAT, pid, config)
+
+    def set_default(self, pid: str) -> bool:
+        """V2 兼容：设置默认 chat provider"""
+        return self.set_routing(CHAT, pid)
+
     async def generate(
         self,
         prompt: str,

@@ -12,8 +12,6 @@
 import hashlib
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import Optional
 
 from starlette.routing import Route
 from starlette.responses import JSONResponse
@@ -27,7 +25,6 @@ logger = logging.getLogger("bilibot.api.dynamic_drafts")
 
 def _get_draft_store_for_account(account_manager, acc_id: str):
     """获取账号对应的 DynamicDraftStore（与 scheduler 共享同一 DB 文件）"""
-    from bilibot.services.dynamic_draft_store import DynamicDraftStore
     acc = account_manager.get_account(acc_id)
     if not acc or not acc.scheduler:
         return None

@@ -575,6 +575,10 @@ class ReplyStateStore:
                 (self.account_id, ct, rpid),
             ).fetchone()
             existing = dict(row) if row else None
+            if existing and existing.get("state") in ("published", "published_legacy"):
+                # 已发布终态不可被 UI 重试拉回队列（审计缺失时也绝不能双发）。
+                conn.rollback()
+                return dict(existing)
             attempts = int(existing["attempts"]) if existing else 0
             max_att = int(existing["max_attempts"]) if existing else self.max_attempts
             # 若已达上限，手动重试时抬高 max_attempts，允许再试一次
